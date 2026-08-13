@@ -65,6 +65,68 @@ describe("AdminUsersPage", () => {
     });
   });
 
+  it("confirms before disabling a user and refreshes the account list", async () => {
+    const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1",
+      usernameNormalized: "viewer",
+      displayName: "观众",
+      isDisabled: false,
+      isAdmin: false,
+      canManageServer: false,
+      canRemoteAccess: false,
+      canDownload: false,
+    }] });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    const disable = vi.spyOn(api, "disableAdminUser").mockResolvedValue({ user: {
+      id: "user-1",
+      usernameNormalized: "viewer",
+      displayName: "观众",
+      isDisabled: true,
+      isAdmin: false,
+    } });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("观众"));
+    });
+    const deleteButton = container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]');
+    act(() => deleteButton?.click());
+    expect(confirm).toHaveBeenCalledWith("确定要删除账户“观众”吗？删除后账户将被禁用，无法登录。");
+    expect(disable).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await act(async () => {
+      deleteButton?.click();
+      await vi.waitFor(() => expect(disable).toHaveBeenCalledWith("user-1"));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    });
+  });
+
+  it("shows a delete failure next to the affected account", async () => {
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1",
+      usernameNormalized: "viewer",
+      displayName: "观众",
+      isDisabled: false,
+      isAdmin: false,
+      canManageServer: false,
+      canRemoteAccess: false,
+      canDownload: false,
+    }] });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "disableAdminUser").mockRejectedValue(new Error("最后一个管理员不能删除"));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("观众"));
+      container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]')?.click();
+      await vi.waitFor(() => expect(container.textContent).toContain("最后一个管理员不能删除"));
+    });
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("最后一个管理员不能删除");
+  });
+
   function renderPage() {
     container = document.createElement("div");
     document.body.append(container);
