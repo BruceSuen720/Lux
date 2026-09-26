@@ -6815,6 +6815,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 将 postprocessing target page 上限从 16k 调到 32k，继续用单条 SQL 写 SOURCE/ITEM 两类 target，不增加逐行 bind 参数。对同 fixture 交错三轮 A/B 后，60k 文件对应的 target INSERT 从 4 条减到 2 条、target DML 从 14 条减到 8 条；target 物化中位数 SQLite 630 → 560 ms，PostgreSQL 2.549 → 2.523 s。重扫、前台 p95、目录列表 p95 和 batch p95 中位数均未回退超过 5%，PostgreSQL WAL 中位数增加约 1.4%，最大锁 waiter 为 0。索引计时先于 target 阶段，不能把观察到的索引时间差归因于此调整；SQLite 索引性能门仍开放。完整数据见 `docs/PERFORMANCE.md`。
 
+2026-09-27 优化 SQLite `media_items_search_ai`：新媒体条目插入时不再逐条查询必为空的 `item_aliases`，alias 后续变化仍由 alias trigger 更新搜索索引。新 migration `0146_skip_empty_alias_lookup_on_media_item_insert.sql` 与启动时兼容表重建逻辑均使用空 alias。60k/600 同机交错三轮后，SQLite 首扫索引中位数从 2.236 降至 2.085 秒（快约 6.7%），无变化重扫和前台 p95 基本持平；PostgreSQL 路径未改变，首扫中位数从 5.855 到 5.887 秒。SQLite 仍比 LUX-270 的 2.018 秒参考慢约 3.3%，PostgreSQL WAL 差异尚未归因，因此 LUX-275 阶段门继续开放，详见 `docs/PERFORMANCE.md`。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

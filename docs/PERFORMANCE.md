@@ -540,3 +540,22 @@ cargo test --release --locked \
 | PostgreSQL 16 / 32k | 5.862 / 5.904 / 5.828 s；**5.862 s** | 2,629 / 2,356 / 2,523 ms；**2,523 ms** | 3,000 ms | 286 / 312 ms | 801 ms | 35 / 8 | 2 | 210,311,667 bytes / 0 |
 
 32k 页把每后端的 target INSERT 从 4 条减到 2 条，target DML 从 14 条降至 8 条。target 阶段中位数 SQLite 快约 11.1%，PostgreSQL 快约 1.0%；PostgreSQL WAL 增约 1.4%，最大 waiter 仍为 0。无变化重扫、前台 p95、目录列表 p95 和 batch p95 中位数均未超过 5% 回退。首扫在 target 阶段之前已经计时，表中首扫差异是运行波动，不能归因于 page size。SQLite 仍未满足 LUX-270 的 2.018 秒索引完成参考，LUX-275 阶段门保持开放；这些本机数据不外推 NAS/x86_64。
+
+### LUX-275 SQLite 搜索触发器空 alias 查询 A/B
+
+2026-09-27 对提交 `71982fef` 的旧 INSERT trigger 与候选 migration `0146_skip_empty_alias_lookup_on_media_item_insert.sql` 做三轮交错 release 基准。旧 trigger 每插入一个媒体条目都会按 `item_id` 查询 `item_aliases` 并执行 `group_concat`；新媒体条目受外键保护，不可能在 INSERT trigger 前已有 alias，后续 alias 的插入/更新/删除仍由原有 alias trigger 刷新全文索引。新库启动时还会由 SQLite 兼容修复重建 `media_items`；因此 `src/storage/migration.rs` 中重建该 trigger 的定义也同步改为 `''`。
+
+两版共用 SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914` 的 60,000 文件 / 600 目录 fixture，Apple M4 / 16 GiB / ARM64；SQLite 使用 `synchronous=FULL` 并关闭 100 ms 锁采样，PostgreSQL 使用本机 Docker PostgreSQL 16.15，每轮新建空数据库并保留锁等待采样。每次运行包含 120k target 物化、无变化重扫和扫描期间的 50 个前台请求。性能二进制直接执行 `lux_270_manifest_job_scan_benchmark --ignored --nocapture --test-threads=1`；原始 release test 总墙钟包括以上各阶段及基准初始化。
+
+| 后端 / trigger | 首扫索引：三轮 / 中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 中位数 | batch p95 中位数 | SQL / DML 中位数 | 基准总墙钟中位数 | WAL 中位数 / 最大 waiter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite / 旧版 | 2.750 / 2.236 / 2.216 s；**2.236 s** | 581 ms | 978 ms | 240 ms | 322 ms | 376 / 119 | 4.25 s | — |
+| SQLite / 空 alias 快速路径 | 2.085 / 2.157 / 2.069 s；**2.085 s** | 558 ms | 968 ms | 240 ms | 288 ms | 376 / 119 | 4.04 s | — |
+| PostgreSQL 16 / 旧版 | 5.855 / 5.876 / 5.831 s；**5.855 s** | 2,327 ms | 3,061 ms | 275 ms | 780 ms | 344 / 95 | 13.49 s | 210,384,596 bytes / 0 |
+| PostgreSQL 16 / SQLite-only migration | 5.887 / 5.822 / 5.984 s；**5.887 s** | 2,387 ms | 3,097 ms | 277 ms | 791 ms | 344 / 95 | 13.51 s | 222,086,857 bytes / 0 |
+
+SQLite 首扫索引中位数快约 6.7%，基准总墙钟快约 4.9%；无变化重扫和前台 p95 基本持平，batch p95 下降约 10.6%，SQL/DML 数量不变。`positive_index_apply` 累计中位数为 1.076 → 1.062 秒；该值是批次累计工作时间，不是墙钟时间。首扫 2.085 秒仍比 LUX-270 的 2.018 秒参考慢约 3.3%，所以没有关闭 LUX-275。
+
+PostgreSQL 代码路径未被这项 SQLite 优化修改；首扫中位数变化约 +0.5%，重扫、前台 p95 和 batch p95 均在 5% 以内，最大锁 waiter 为 0。WAL 中位数观察到 210.4 → 222.1 MB（约 +5.6%）；本轮 PG SQL/DML 计数相同，且每轮使用随机生成的条目 ID，因此该 WAL 差异的成因未由这次 A/B 确认，不归因于 SQLite migration。结果仅代表本机 ARM64 和临时数据库，不外推 NAS/x86_64。
+
+复跑沿用本节前的 release 命令及同一 fixture；SQLite 设置 `LUX_PERF_BACKEND=sqlite LUX_PERF_SQLITE_SYNCHRONOUS=FULL LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设置 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。候选版改动文件为 `migrations/0146_skip_empty_alias_lookup_on_media_item_insert.sql` 和 `src/storage/migration.rs`；alias 检索回归由 `tests/search.rs::fts_search_matches_chinese_titles_and_aliases_with_acl` 覆盖。
