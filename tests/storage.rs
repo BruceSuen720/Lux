@@ -135,6 +135,18 @@ fn postgres_media_search_refresh_owns_provider_index_refresh() {
 }
 
 #[test]
+fn postgres_provider_insert_refresh_filters_empty_provider_documents() {
+    let migration =
+        include_str!("../migrations-postgres/0146_skip_empty_provider_index_expansion.sql");
+
+    assert!(migration.contains("WITH provider_rows AS MATERIALIZED"));
+    assert!(migration.contains("WHERE n.provider_ids_json IS NOT NULL"));
+    assert!(migration.contains("AND n.provider_ids_json <> '{}'"));
+    assert!(migration.contains("FROM provider_rows n"));
+    assert!(migration.contains("json_each_text(n.provider_ids_json::json)"));
+}
+
+#[test]
 fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     let migration =
         include_str!("../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");

@@ -587,3 +587,16 @@ PostgreSQL 代码路径未被这项 SQLite 优化修改；首扫中位数变化�
 | PostgreSQL 16 / 删除两条前缀索引 | 5.962 / 5.824 / 6.133 s；**5.962 s** | 2,406 ms | 3,090 ms | 264 ms | 356 ms | 812 ms | 344 / 95 | 198,472,015 bytes / 0 |
 
 两后端首扫索引完成都没有稳定改善：SQLite 候选中位数慢约 2.3%，PostgreSQL 仅快约 0.1%。target 阶段略快，但不在首扫索引计时内；PG WAL 中位数低约 6.8%，现有三轮无法排除随机数据与写入波动，不能归因于索引删除。为遵守 LUX-275 的端到端收益门，候选 migration、兼容重建改动与测试均撤回；这一候选不保留为性能优化。数据只代表本机 ARM64，不外推 NAS/x86_64。
+
+### PostgreSQL providerless INSERT trigger 快速路径 A/B
+
+2026-09-27 在 `209b8754` 基线上评估 PostgreSQL migration `0146_skip_empty_provider_index_expansion.sql`。已有 statement-level `media_items` INSERT trigger 会把 transition table 每一行传给 `json_each_text`；扫描新媒体条目通常 `provider_ids_json IS NULL` 或 `{}`，因此候选先物化并过滤出非空 provider JSON，再调用 JSON table function。搜索索引仍为所有新条目写入，provider 派生索引只为非空 JSON 写入。SQLite 代码和 schema 未变。
+
+基线和候选在 Apple M4 / 16 GiB / ARM64、60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）上交错运行三轮 release 基准。PostgreSQL 为 Docker 16.15，每轮新空库并采样锁等待；SQLite 使用 `synchronous=FULL` 并关闭锁采样。每轮包括 120k target 物化、无变化重扫和 50 个前台请求。
+
+| PostgreSQL 16 | 首扫索引完成：三轮 / 中位数 | `movie_item_insert` 累计中位数 | `positive_index_apply` 累计中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 中位数 | 目录列表 p95 中位数 | batch p95 中位数 | SQL / DML 中位数 | WAL 中位数 / 最大 waiter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 基线 | 6.143 / 6.184 / 5.993 s；**6.143 s** | 1,844 ms | 4,530 ms | 2,451 ms | 3,195 ms | 277 ms | 368 ms | 807 ms | 344 / 95 | 220,946,496 bytes / 0 |
+| providerless JSON 快速路径 | 6.043 / 5.976 / 5.860 s；**5.976 s** | 1,793 ms | 4,433 ms | 2,453 ms | 3,165 ms | 268 ms | 374 ms | 800 ms | 344 / 95 | 221,833,274 bytes / 0 |
+
+三组配对首扫都变快，候选中位数快约 2.7%；`movie_item_insert` 和 `positive_index_apply` 累计中位数分别下降约 2.8% 和 2.1%。target、无变化重扫、前台 p95 与 batch p95 中位数均未回退超过 5%，最大锁 waiter 为 0。WAL 仅高约 0.4%，不视为确定性变化。候选保留为 PostgreSQL 写入优化；它不改变 SQLite 指标，LUX-275 的 SQLite 首扫门仍开放。结果只代表本机 ARM64 和临时 PostgreSQL 容器，不外推 NAS/x86_64。
