@@ -446,3 +446,39 @@ PostgreSQL 候选将总 DML 减少约 27%、SQL 减少约 11%，三类主要批�
 Lite 的收益主要来自移除逐目录 frontier 的数据库写入和恢复查询；它不表示 Manifest 的全部语义可以删除。SQLite 当前中位数仍高于 LUX-270 的 2.018 秒参考，PostgreSQL 只有单轮结果，且所有数据只代表本机 ARM64 和临时数据库，不能关闭 LUX-275 或外推 NAS/x86_64。
 
 实现与语义边界见 `docs/decisions/045-manifest-lite-discovery.md`。
+
+### Jellyfin 风格目录批处理 A/B（实验路径）
+
+2026-09-27 在同一台 Apple M4 / 16 GiB / ARM64 机器上，以相同的 60,000 文件、600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）交替运行三轮 Lite 与 Jellyfin 风格路径。SQLite 使用 `synchronous=FULL`，关闭会每 100 ms 写入一次的 SQLite 锁采样器；PostgreSQL 使用本机 Docker PostgreSQL 16.15 和每轮全新数据库，保留锁等待采样。两种路径都生成 120,000 个 targets，并在扫描期间采样 50 个前台请求。
+
+Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同目录新增项成组 `CreateItems`，然后继续递归验证目录；`DirectoryService` 另有扫描期间的目录项、文件元数据和路径缓存。[Folder.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/MediaBrowser.Controller/Entities/Folder.cs)、[LibraryManager.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/Emby.Server.Implementations/Library/LibraryManager.cs)、[DirectoryService.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/MediaBrowser.Controller/Providers/DirectoryService.cs)。Lux 原型只对照“按父目录独立解析和提交”：这个 fixture 每个目录约 100 个文件，因此同目录文件会在一个有界批次内完成准备并单独提交；更大的目录仍按 Lux 的 chunk 上限流式处理。Lite 则跨目录合并为有界事务。原型复用 Lux 的 Manifest、二次 stat、CAS、root 删除门槛和 target barrier，没有移植 Jellyfin 的 metadata/provider 对象模型，也没有引入其 scan-scoped cache。它只在 `experimental-jellyfin-scan` feature 下可选，默认仍是 Lite。
+
+| 后端 / 方案 | 首扫索引完成（三轮；中位数） | 120k target 物化中位数 | 无变化重扫（三轮；中位数） | 正向提交批次 | SQL / DML | batch p95 | 前台请求 p95 | WAL 中位数 / 最大锁 waiter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite Lite grouped | 2.880 / 2.335 / 2.300 s；**2.335 s** | 0.753 s | 1.027 / 1.044 / 0.968 s；**1.027 s** | 8 | 385 / 128 | 328 ms | 242 ms | — |
+| SQLite Jellyfin folder batch | 2.744 / 2.688 / 2.708 s；**2.708 s** | 0.752 s | 9.737 / 9.842 / 9.877 s；**9.842 s** | 600 | 8,583 / 4,819 | 377 ms | 246 ms | — |
+| PostgreSQL 16 Lite grouped | 6.026 / 6.124 / 5.881 s；**6.026 s** | 2.907 s | 3.380 / 3.091 / 3.138 s；**3.138 s** | 8 | 353 / 104 | 796 ms | 281 ms | 222,668,454 bytes / 0 |
+| PostgreSQL 16 Jellyfin folder batch | 66.313 / 62.534 / 63.054 s；**63.054 s** | 2.308 s | 11.119 / 4.614 / 6.148 s；**6.148 s** | 600 | 9,215 / 4,819 | 15,831 ms | 270 ms | 227,071,287 bytes / 0 |
+
+在这组均匀分布 fixture 上，目录模式让 SQLite 首扫慢约 16%，无变化重扫约 9.6 倍；PostgreSQL 首扫约 10.5 倍、重扫约 2 倍。PostgreSQL 的 batch p95 从 796 ms 增至 15.8 s。阶段计时也指向数据库路径：PostgreSQL `baseline_query` 累计中位数从 96 ms 增至 22.68 s，`positive_index_apply` 从 4.49 s 增至 31.25 s；目录 open/readdir/stat 累计合计约从 154 ms 增至 754 ms。阶段值是累计工作时间，不能相加当作墙钟。SQL/DML 增长与 8 → 600 个提交一致，而 WAL 仅增加约 2%，锁 waiter 仍为 0；主要代价是逐目录数据库往返和事务固定开销，不是锁争用。target 物化时间独立测量，不计入首扫索引完成时间。
+
+历史方案供定位，不与上面的同构三轮 A/B 混算：
+
+| 历史方案 | SQLite 首扫 | PostgreSQL 首扫 | 说明 |
+|---|---:|---:|---|
+| LUX-045 直接扫描（提交 `4802c939`） | 2.105 s | — | 旧版记录；不含本轮 Manifest / 120k target 完成口径 |
+| 旧持久 frontier（2026-09-26 单轮） | 4.310 s | 14.989 s | 没有同轮重扫样本 |
+| 最初 Manifest 实现 | 202.468 s | 142.229 s | LUX-270 初版，后来已大幅收敛 SQL/DML |
+
+本轮又尝试运行当前工作树的 LUX-045 全流程基准；进程满核超过 5 分钟仍未结束，遂停止，未形成有效计时。因此历史 LUX-045 的 2.105 秒只能作为旧版本参考，不能宣称当前直接扫描快于 Manifest Lite。
+
+结论：不把逐目录提交设为默认方案。可借鉴的是“先得到完整目录快照，再一次解析同目录成员”；Lux 后续若采用，仍应把多目录结果交给有界批量 writer 合并提交，并针对 scan-scoped 文件系统缓存单独测量。该实验不关闭 LUX-275 阶段门，也不代表 NAS/x86_64 性能。
+
+复跑时，用同一个 60k fixture 分别设置 `LUX_PERF_MANIFEST_STRATEGY=lite_grouped` 和 `jellyfin_folder_batch`，SQLite 设 `LUX_PERF_BACKEND=sqlite LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。release test 命令为：
+
+```bash
+CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target \
+cargo test --release --locked --features experimental-jellyfin-scan \
+  --test performance lux_270_manifest_job_scan_benchmark -- \
+  --ignored --nocapture --test-threads=1
+```

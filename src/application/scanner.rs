@@ -4442,9 +4442,41 @@ pub struct ScanJobService {
     resources: ResourceMetrics,
     default_scan_concurrency: usize,
     scan_concurrency_override: Option<usize>,
+    #[cfg(feature = "experimental-jellyfin-scan")]
+    manifest_discovery_strategy: ManifestDiscoveryStrategy,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
+}
+
+#[cfg(feature = "experimental-jellyfin-scan")]
+/// Folder grouping choices used only by the opt-in scan benchmark.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ManifestDiscoveryStrategy {
+    #[default]
+    LiteGrouped,
+    JellyfinFolderBatch,
+}
+
+#[cfg(feature = "experimental-jellyfin-scan")]
+fn manifest_discovery_directory_groups(
+    strategy: ManifestDiscoveryStrategy,
+    relative_directories: &[String],
+) -> Vec<Vec<String>> {
+    match strategy {
+        ManifestDiscoveryStrategy::LiteGrouped => {
+            if relative_directories.is_empty() {
+                Vec::new()
+            } else {
+                vec![relative_directories.to_vec()]
+            }
+        }
+        ManifestDiscoveryStrategy::JellyfinFolderBatch => relative_directories
+            .iter()
+            .cloned()
+            .map(|directory| vec![directory])
+            .collect(),
+    }
 }
 
 struct LocalMetadataWorkerHandle {
@@ -4484,10 +4516,24 @@ impl ScanJobService {
                 .ok()
                 .flatten()
                 .and_then(|value| usize::try_from(value).ok()),
+            #[cfg(feature = "experimental-jellyfin-scan")]
+            manifest_discovery_strategy: ManifestDiscoveryStrategy::LiteGrouped,
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
             lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Builds a scan service with an experimental benchmark-only discovery strategy.
+    /// The selected strategy is not stored in the scan job; use it only for isolated benchmarks.
+    #[cfg(feature = "experimental-jellyfin-scan")]
+    pub fn new_with_manifest_discovery_strategy(
+        database: Database,
+        strategy: ManifestDiscoveryStrategy,
+    ) -> Self {
+        let mut service = Self::new(database);
+        service.manifest_discovery_strategy = strategy;
+        service
     }
 
     pub fn with_scan_lock(mut self, scan_lock: Arc<Semaphore>) -> Self {
@@ -6047,6 +6093,38 @@ impl ScanJobService {
         Ok(Some(result))
     }
 
+    #[cfg(feature = "experimental-jellyfin-scan")]
+    async fn discover_scan_manifest_directory_groups(
+        &self,
+        context: ManifestRootDiscoveryContext<'_>,
+        relative_directories: &[String],
+        strategy: ManifestDiscoveryStrategy,
+    ) -> Result<Option<ManifestDiscoveryDirectoryResult>, ScannerError> {
+        let mut combined = ManifestDiscoveryDirectoryResult::default();
+        for group in manifest_discovery_directory_groups(strategy, relative_directories) {
+            let discovered = if group.len() == 1 {
+                self.discover_scan_manifest_directory_batches(context, &group[0])
+                    .await?
+            } else {
+                self.discover_scan_manifest_directory_group_batches(context, &group)
+                    .await?
+            };
+            let Some(discovered) = discovered else {
+                return Ok(None);
+            };
+            combined.observed_file_count = combined
+                .observed_file_count
+                .saturating_add(discovered.observed_file_count);
+            combined.created_items = combined
+                .created_items
+                .saturating_add(discovered.created_items);
+            combined
+                .child_directories
+                .extend(discovered.child_directories);
+        }
+        Ok(Some(combined))
+    }
+
     async fn commit_pending_manifest_directory_chunks(
         &self,
         context: ManifestRootDiscoveryContext<'_>,
@@ -6329,10 +6407,25 @@ impl ScanJobService {
                 preparation_concurrency,
                 expected_root_identity,
             };
-            match self
-                .discover_scan_manifest_directory_group_batches(context, &relative_directories)
-                .await
+            #[cfg(feature = "experimental-jellyfin-scan")]
+            let discovery = if self.manifest_discovery_strategy
+                == ManifestDiscoveryStrategy::JellyfinFolderBatch
             {
+                self.discover_scan_manifest_directory_groups(
+                    context,
+                    &relative_directories,
+                    self.manifest_discovery_strategy,
+                )
+                .await
+            } else {
+                self.discover_scan_manifest_directory_group_batches(context, &relative_directories)
+                    .await
+            };
+            #[cfg(not(feature = "experimental-jellyfin-scan"))]
+            let discovery = self
+                .discover_scan_manifest_directory_group_batches(context, &relative_directories)
+                .await;
+            match discovery {
                 Ok(Some(discovered)) => {
                     discovered_count = discovered_count.saturating_add(
                         i64::try_from(discovered.observed_file_count).unwrap_or(i64::MAX),
@@ -11906,6 +11999,29 @@ mod tests {
         stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
         stat_manifest_root_sync,
     };
+
+    #[cfg(feature = "experimental-jellyfin-scan")]
+    use super::{ManifestDiscoveryStrategy, manifest_discovery_directory_groups};
+
+    #[cfg(feature = "experimental-jellyfin-scan")]
+    #[test]
+    fn jellyfin_strategy_resolves_each_parent_directory_as_its_own_batch() {
+        let directories = vec!["A".to_owned(), "B".to_owned()];
+        assert_eq!(
+            manifest_discovery_directory_groups(
+                ManifestDiscoveryStrategy::JellyfinFolderBatch,
+                &directories
+            ),
+            vec![vec!["A".to_owned()], vec!["B".to_owned()]]
+        );
+        assert_eq!(
+            manifest_discovery_directory_groups(
+                ManifestDiscoveryStrategy::LiteGrouped,
+                &directories
+            ),
+            vec![directories]
+        );
+    }
 
     #[test]
     fn configured_scan_concurrency_prefers_global_override_then_library_value() {
