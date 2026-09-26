@@ -6811,6 +6811,10 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 移除 Lite 每个正向批次重复更新根目录队列行的无效果 SQL，把该状态更新留到内存 frontier 清空后的收尾事务。SQLite release 单轮扫描 DML 从 128 降至 119；首扫 2.894 秒与之前 2.914 秒三轮中位数接近，不作为稳定加速收益。PostgreSQL 一次 release 运行完成（首扫 6.709 秒），样本不足以作性能比较；target 语义集成测试通过，完整双后端阶段门仍开放。
 
+2026-09-27 在 LUX-275 中评估有界的两目录首批预读：只并发目录打开与第一页读取，仍按原顺序交给单一数据库 writer，单路最多 4k、提交边界仍为 8k。与已提交顺序 reader 做同 fixture 交错三轮 A/B，SQLite 首扫中位数 2.246 → 2.217 秒，PostgreSQL 6.008 → 5.791 秒；DML 和提交批次数不变，target、无变化重扫、前台 p95 与 batch p95 中位数均未回退超过 5%。SQLite 差异落在样本波动范围内，考虑额外 reader 调度复杂度，不保留该候选，代码仍使用顺序 reader。完整样本及回退决定见 `docs/PERFORMANCE.md`；LUX-275 严格阶段门保持开放。
+
+2026-09-27 将 postprocessing target page 上限从 16k 调到 32k，继续用单条 SQL 写 SOURCE/ITEM 两类 target，不增加逐行 bind 参数。对同 fixture 交错三轮 A/B 后，60k 文件对应的 target INSERT 从 4 条减到 2 条、target DML 从 14 条减到 8 条；target 物化中位数 SQLite 630 → 560 ms，PostgreSQL 2.549 → 2.523 s。重扫、前台 p95、目录列表 p95 和 batch p95 中位数均未回退超过 5%，PostgreSQL WAL 中位数增加约 1.4%，最大锁 waiter 为 0。索引计时先于 target 阶段，不能把观察到的索引时间差归因于此调整；SQLite 索引性能门仍开放。完整数据见 `docs/PERFORMANCE.md`。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

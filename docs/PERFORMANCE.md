@@ -512,3 +512,31 @@ cargo test --release --locked \
   --test performance lux_270_manifest_job_scan_benchmark -- \
   --ignored --nocapture --test-threads=1
 ```
+
+### LUX-275 两目录首批预读 A/B（已否决实验）
+
+2026-09-27 对最近已提交的顺序目录 reader（`7952e4e5`）与候选实现做交错 release A/B。两版使用同一 SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914` 的 60,000 文件 / 600 目录 fixture，每后端各三轮；每轮交替先跑的版本。硬件为 Apple M4 / 16 GiB（`uname -m=arm64`），PostgreSQL 为本机 PostgreSQL 16.15 容器、每次首扫使用独立空库；SQLite 使用 `synchronous=FULL` 并关闭 100 ms 锁采样器，PostgreSQL 保留锁等待采样。
+
+候选只并行打开两个目录并预读各自第一页，处理仍按目录原顺序交给同一个 writer。reader 总数上限为 2，每路首批最多 4,000 个文件，数据库正向提交仍按 8,000 文件分批；没有引入读写流水线或并行事务。
+
+| 后端 / reader | 首扫索引：三轮 / 中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | batch p95 中位数 | SQL / DML 中位数 | 正向提交批次 | WAL 中位数 / 最大 waiter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite 顺序 | 2.763 / 2.177 / 2.246 s；**2.246 s** | 620 ms | 976 ms | 238 / 375 ms | 308 ms | 376 / 119 | 8 | — |
+| SQLite 两目录首批预读 | 2.217 / 2.244 / 2.201 s；**2.217 s** | 628 ms | 933 ms | 236 / 383 ms | 312 ms | 376 / 119 | 8 | — |
+| PostgreSQL 16 顺序 | 5.898 / 6.113 / 6.008 s；**6.008 s** | 2.513 s | 3.037 s | 264 / 309 ms | 796 ms | 344 / 95 | 8 | 210,321,664 bytes / 0 |
+| PostgreSQL 16 两目录首批预读 | 5.778 / 5.791 / 5.805 s；**5.791 s** | 2.483 s | 2.955 s | 264 / 300 ms | 776 ms | 344 / 95 | 8 | 210,333,350 bytes / 0 |
+
+预读实验的首扫中位数相对同机顺序版快约 1.3%（SQLite）和 3.6%（PostgreSQL）；target、无变化重扫、前台 p95 和 batch p95 中位数均未超过 5% 回退，DML、正向提交批次和 WAL 基本不变。SQLite 有一轮顺序版比预读版慢约 20%，另两轮差距约为 3% 内；因此 1.3% 的中位数变化没有越过本机运行波动。综合收益和增加的 reader 调度复杂度，不保留预读候选；代码继续使用顺序 reader。顺序版首扫中位数 2.246 秒仍比 LUX-270 的 2.018 秒参考慢约 11.3%，阶段 22 / LUX-275 性能门继续开放。这些本机 ARM64 结果不外推 NAS/x86_64。
+
+### LUX-275 32k target page A/B
+
+2026-09-27 对 16k 与 32k postprocessing target page 做交错 release A/B，各后端各三轮，使用与上节相同的 60k/600 fixture 和 Apple M4 / 16 GiB ARM64 环境。PostgreSQL 为每轮新建的本机 16.15 空库；SQLite 为 `synchronous=FULL` 且关闭锁采样器。32k 页仍有硬上限；查询用 seek cursor 和 LIMIT 取路径，SQL 每页只绑定固定数量的游标、generation 与 page limit，没有逐行 bind 参数。每页的 SOURCE 与 ITEM target 仍在单一 SQL、单一事务内一起提交，ready barrier 仍在所有根完成后推进。
+
+| 后端 / page size | 首扫索引：三轮 / 中位数 | 120k target 物化：三轮 / 中位数 | 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | batch p95 中位数 | target SQL / DML | target INSERT | WAL 中位数 / 最大 waiter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite / 16k | 2.788 / 2.252 / 2.276 s；**2.276 s** | 617 / 630 / 635 ms；**630 ms** | 968 ms | 237 / 375 ms | 324 ms | 50 / 14 | 4 | — |
+| SQLite / 32k | 2.173 / 2.185 / 2.155 s；**2.173 s** | 560 / 568 / 556 ms；**560 ms** | 976 ms | 234 / 381 ms | 299 ms | 32 / 8 | 2 | — |
+| PostgreSQL 16 / 16k | 5.919 / 6.062 / 6.009 s；**6.009 s** | 2,400 / 2,566 / 2,549 ms；**2,549 ms** | 3,092 ms | 279 / 311 ms | 789 ms | 55 / 14 | 4 | 207,410,538 bytes / 0 |
+| PostgreSQL 16 / 32k | 5.862 / 5.904 / 5.828 s；**5.862 s** | 2,629 / 2,356 / 2,523 ms；**2,523 ms** | 3,000 ms | 286 / 312 ms | 801 ms | 35 / 8 | 2 | 210,311,667 bytes / 0 |
+
+32k 页把每后端的 target INSERT 从 4 条减到 2 条，target DML 从 14 条降至 8 条。target 阶段中位数 SQLite 快约 11.1%，PostgreSQL 快约 1.0%；PostgreSQL WAL 增约 1.4%，最大 waiter 仍为 0。无变化重扫、前台 p95、目录列表 p95 和 batch p95 中位数均未超过 5% 回退。首扫在 target 阶段之前已经计时，表中首扫差异是运行波动，不能归因于 page size。SQLite 仍未满足 LUX-270 的 2.018 秒索引完成参考，LUX-275 阶段门保持开放；这些本机数据不外推 NAS/x86_64。

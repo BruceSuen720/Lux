@@ -85,7 +85,7 @@ const MANIFEST_PATH_QUERY_POSTGRES_CHUNK_SIZE: usize = 5_000;
 const MEDIA_ITEM_HIERARCHY_SQLITE_CHUNK_SIZE: usize = 2_000;
 const MEDIA_ITEM_HIERARCHY_POSTGRES_CHUNK_SIZE: usize = 4_000;
 const MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW: usize = 15;
-pub(crate) const MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE: usize = 16_000;
+pub(crate) const MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE: usize = 32_000;
 
 pub(crate) fn manifest_positive_index_insert_chunk_size(backend: DatabaseBackend) -> usize {
     let (chunk_size, max_bind_parameters) = match backend {

@@ -1321,8 +1321,8 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         statement_counts.dml_statement_count_containing("WITH PAGE_SOURCES AS MATERIALIZED");
     assert_eq!(
         target_insert_statement_count,
-        file_count.div_ceil(16_000),
-        "Lite target materialization should insert source and item targets in one statement per bounded page"
+        file_count.div_ceil(32_000),
+        "Lite target materialization should insert source and item targets in one statement per bounded 32k page"
     );
     let postprocessing_target_count_query =
         format!("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = {job_id_placeholder}");
