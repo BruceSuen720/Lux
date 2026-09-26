@@ -638,3 +638,21 @@ LUX_PERF_DISABLE_LOCK_MONITOR=1 \
 | `columnsize=0` | 2,710 / 2,137 / 2,196 / 2,232 / 2,067 / 2,099 / 2,015 / 2,156 / 2,031 ms；**2,137 ms** | 428.0 ms | 1,044.1 ms | 552 ms | 972 ms | 238 / 374 ms | 295 ms | 376 / 119 |
 
 九轮首扫中位数快约 2.9%；`movie_item_insert` 累计中位数快约 3.1%。无变化重扫慢约 1.7%、前台 p95 慢约 1.7%，仍低于 5% 回退门；target 基本持平，目录列表 p95 和 batch p95 改善。反向运行的三组配对首扫都更快；九轮中候选有一轮 2,710 ms、基线有一轮 2,462 ms 明显偏慢，故保留原始分布并以中位数报告。SQLite DML 仍为 119，批次数不变。migration 会一次性重建现有 FTS 索引；升级回归确认 title、独立 sort title、original title、alias 均仍可搜索，且重建后没有 `media_search_docsize` 表。PostgreSQL 不使用此 migration；SQLite 中位数 2,137 ms 仍高于 LUX-270 的 2,018 ms 参考，LUX-275 阶段门继续开放。本机 ARM64 结果不外推 NAS/x86_64。
+
+### LUX-275 SQLite PRAGMA 与 16k discovery 批次实验（未保留）
+
+2026-09-27 使用 Apple M4 / 16 GiB / ARM64、SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914` 的 60,000 文件 / 600 目录 fixture，SQLite `synchronous=FULL`、锁采样关闭。固定 release 基准二进制交错运行；PRAGMA 候选统一设置到连接池每条 SQLite 连接。基准现在接受 `LUX_PERF_SQLITE_CACHE_KIB`、`LUX_PERF_SQLITE_WAL_AUTOCHECKPOINT_PAGES` 和 `LUX_PERF_SQLITE_TEMP_STORE`，并报告实际值及首扫后 WAL 文件大小。SQLite [`cache_size`](https://sqlite.org/pragma.html#pragma_cache_size) 为每连接页缓存；[`wal_autocheckpoint`](https://www.sqlite.org/wal.html#automatic_checkpoint) 默认在约 1,000 页后触发自动 checkpoint；[`temp_store`](https://sqlite.org/pragma.html#pragma_temp_store) 控制临时表和索引的存放位置。
+
+| SQLite 设置 | 首扫索引 | 无变化重扫 | 前台 / 目录列表 p95 | batch p95 | 首扫后 WAL 文件 | 结果 |
+|---|---:|---:|---:|---:|---:|---|
+| 每连接 cache 2 MiB / 默认 | 2,786 / 2,237 / 2,271 / 2,325 / 2,234 / 2,179 / 2,230 / 2,320 ms；中位数 **2,254 ms** | 928 ms | 238 / 366 ms | 310 ms | 约 17 MiB | 基线 |
+| 每连接 cache 4 MiB | 2,209 / 2,200 / 2,217 / 2,168 / 2,201 / 2,216 / 2,211 / 2,208 ms；中位数 **2,209 ms** | 979 ms | 239 / 386 ms | 305 ms | 约 17 MiB | 首扫快约 2.0%，无变化重扫慢约 5.4%、目录列表 p95 慢约 5.3%；不采用 |
+| `wal_autocheckpoint=1000` | 2,767 / 2,318 / 2,332 ms；中位数 **2,332 ms** | 933 ms | 241 / 366 ms | 321 ms | 17.2 MiB | 默认值 |
+| `wal_autocheckpoint=5000` | 2,338 / 2,262 / 2,313 ms；中位数 **2,313 ms** | 949 ms | 238 / 381 ms | 334 ms | 33.8 MiB | 首扫快约 0.8%，没有稳定收益 |
+| `wal_autocheckpoint=10000` | 2,302 / 2,286 / 2,291 ms；中位数 **2,291 ms** | 944 ms | 236 / 338 ms | 337 ms | 49.1 MiB | 首扫快约 1.8%，WAL 接近增至 3 倍；不采用 |
+| `temp_store=DEFAULT` | 2,555 / 2,178 / 2,124 ms；中位数 **2,178 ms** | 957 ms | 235 / 372 ms | 304 ms | 17.2 MiB | 默认模式 |
+| `temp_store=MEMORY` | 2,284 / 2,326 / 2,322 ms；中位数 **2,322 ms** | 1,022 ms | 236 / 462 ms | 350 ms | 17.2 MiB | 首扫慢约 6.6%、目录列表 p95 慢约 24%；不采用 |
+
+另将 discovery work unit、正向文件批次和 observation 上限从 8k / 8,192 提至 16k / 16,384，目录组从 80 提至 160。三组交错 SQLite 运行的首扫：8k 为 2,265 / 2,144 / 2,267 ms（中位数 2,265 ms），16k 为 2,269 / 2,195 / 2,200 ms（中位数 2,200 ms）；配对差异不稳定。正向事务数从 8 降至 4，SQL/DML 从 376/119 降至 296/103；代价是无变化重扫从 996 增至 1,110 ms（慢约 11.4%）、batch p95 从 308 增至 588 ms（长约 91%），目录列表 p95 从 400 增至 429 ms。候选未通过延迟回退门，正式预算恢复为 8,000 文件 / 8,192 observation。
+
+这些结果只代表本机 ARM64；没有把试验 PRAGMA 或 16k 批次留在运行时代码，LUX-275 严格性能门仍开放。

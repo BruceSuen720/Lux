@@ -6827,6 +6827,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 保留 PostgreSQL provider 索引 INSERT trigger 的快速路径：在 transition table 的非空 `provider_ids_json` 过滤后才执行 `json_each_text`，搜索条目仍全部写入，NULL 与 `{}` 的 provider 索引语义不变。60k/600 同机交错三轮，PG 首扫中位数 6.143 → 5.976 秒（快约 2.7%），三组配对均改善；`positive_index_apply` 快约 2.1%，重扫、前台 p95、batch p95 和 WAL 均未超过回退门。SQLite 路径未改，LUX-275 的双后端门仍开放；完整数据见 `docs/PERFORMANCE.md`。
 
+2026-09-27 评估 SQLite 每连接 cache 扩容、WAL 自动 checkpoint 阈值、`temp_store=MEMORY` 和 16k discovery/storage 批次。候选的首扫收益很小或不稳定，同时出现无变化重扫、目录查询或 batch p95 超过回退门的情况；没有保留任何运行时 PRAGMA 或 16k discovery 批次，正式 discovery/file/entry 上限维持 80 / 8,000 / 8,192。基准专用 PRAGMA 开关和详细对照留在 `docs/PERFORMANCE.md`；LUX-275 阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

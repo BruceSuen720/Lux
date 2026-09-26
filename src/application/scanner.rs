@@ -11896,15 +11896,15 @@ fn configured_scan_concurrency(
 #[cfg(test)]
 mod tests {
     use super::{
-        MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader,
-        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
-        MixedClassificationCache, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
-        PendingManifestDirectoryChunk, ScanJobService, ScannerError,
-        classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
-        is_lite_manifest_discovery, manifest_root_identity_matches, media_source_folder,
-        normalize_incremental_path, read_manifest_strm_target, safe_scan_activity_label,
-        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
-        stat_manifest_root_sync,
+        MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
+        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader, ManifestRemovalOutcome,
+        ManifestRootDiscoveryContext, MixedClassification, MixedClassificationCache,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
+        ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
+        configured_scan_concurrency, is_lite_manifest_discovery, manifest_root_identity_matches,
+        media_source_folder, normalize_incremental_path, read_manifest_strm_target,
+        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
 
     #[test]
@@ -11925,8 +11925,12 @@ mod tests {
     #[test]
     fn manifest_discovery_budget_stays_within_streamed_file_budget() {
         assert_eq!(MANIFEST_DISCOVERY_BATCH_SIZE, 80);
+        assert_eq!(MANIFEST_STREAMED_INDEX_BATCH_SIZE, 8_000);
+        assert_eq!(MANIFEST_STREAMED_ENTRY_BATCH_SIZE, 8_192);
         const _: () =
             assert!(MANIFEST_DISCOVERY_BATCH_SIZE * 100 <= MANIFEST_STREAMED_INDEX_BATCH_SIZE);
+        const _: () =
+            assert!(MANIFEST_STREAMED_INDEX_BATCH_SIZE < MANIFEST_STREAMED_ENTRY_BATCH_SIZE);
     }
 
     #[tokio::test]

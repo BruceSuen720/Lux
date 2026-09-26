@@ -655,6 +655,30 @@ async fn postgres_wal_bytes(database: &Database) -> Result<u64, sqlx::Error> {
     Ok(wal_bytes.parse().unwrap_or_default())
 }
 
+async fn configure_sqlite_benchmark_pragma(
+    database: &Database,
+    pragma: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool_connections = env::var("LUX_DB_MAX_CONNECTIONS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(8);
+    if !(1..=100).contains(&pool_connections) {
+        return Err("LUX_DB_MAX_CONNECTIONS must be between 1 and 100".into());
+    }
+    let mut configured_connections = Vec::with_capacity(pool_connections);
+    for _ in 0..pool_connections {
+        let mut connection = database.pool().acquire().await?;
+        sqlx::query(sqlx::AssertSqlSafe(pragma.clone()))
+            .execute(&mut *connection)
+            .await?;
+        configured_connections.push(connection);
+    }
+    drop(configured_connections);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with scripts/run-performance.sh for the LUX-045 ARM64 gate"]
 async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Error>> {
@@ -945,9 +969,75 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             .execute(database.pool())
             .await?;
     }
+    if backend == "sqlite"
+        && let Some(cache_kib) = env::var_os("LUX_PERF_SQLITE_CACHE_KIB")
+    {
+        let cache_kib = cache_kib
+            .to_string_lossy()
+            .parse::<usize>()
+            .map_err(|_| "LUX_PERF_SQLITE_CACHE_KIB must be an integer")?;
+        if !(512..=65_536).contains(&cache_kib) {
+            return Err("LUX_PERF_SQLITE_CACHE_KIB must be between 512 and 65536".into());
+        }
+        configure_sqlite_benchmark_pragma(&database, format!("PRAGMA cache_size = -{cache_kib}"))
+            .await?;
+    }
+    if backend == "sqlite"
+        && let Some(checkpoint_pages) = env::var_os("LUX_PERF_SQLITE_WAL_AUTOCHECKPOINT_PAGES")
+    {
+        let checkpoint_pages = checkpoint_pages
+            .to_string_lossy()
+            .parse::<usize>()
+            .map_err(|_| "LUX_PERF_SQLITE_WAL_AUTOCHECKPOINT_PAGES must be an integer")?;
+        if checkpoint_pages > 1_000_000 {
+            return Err("LUX_PERF_SQLITE_WAL_AUTOCHECKPOINT_PAGES must not exceed 1000000".into());
+        }
+        configure_sqlite_benchmark_pragma(
+            &database,
+            format!("PRAGMA wal_autocheckpoint = {checkpoint_pages}"),
+        )
+        .await?;
+    }
+    if backend == "sqlite"
+        && let Some(temp_store) = env::var_os("LUX_PERF_SQLITE_TEMP_STORE")
+    {
+        let temp_store = temp_store.to_string_lossy().to_ascii_uppercase();
+        if !matches!(temp_store.as_str(), "DEFAULT" | "FILE" | "MEMORY") {
+            return Err("LUX_PERF_SQLITE_TEMP_STORE must be DEFAULT, FILE, or MEMORY".into());
+        }
+        configure_sqlite_benchmark_pragma(&database, format!("PRAGMA temp_store = {temp_store}"))
+            .await?;
+    }
     let sqlite_synchronous_level = if backend == "sqlite" {
         Some(
             sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+                .fetch_one(database.pool())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let sqlite_cache_size_pages = if backend == "sqlite" {
+        Some(
+            sqlx::query_scalar::<_, i64>("PRAGMA cache_size")
+                .fetch_one(database.pool())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let sqlite_wal_autocheckpoint_pages = if backend == "sqlite" {
+        Some(
+            sqlx::query_scalar::<_, i64>("PRAGMA wal_autocheckpoint")
+                .fetch_one(database.pool())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let sqlite_temp_store_mode = if backend == "sqlite" {
+        Some(
+            sqlx::query_scalar::<_, i64>("PRAGMA temp_store")
                 .fetch_one(database.pool())
                 .await?,
         )
@@ -1085,6 +1175,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         }
     }
     let manifest_index_ms = first_scan_started.elapsed().as_millis();
+    let sqlite_wal_file_bytes_after_index = if backend == "sqlite" {
+        fs::metadata(temp_dir.path().join("config/lux.db-wal"))
+            .ok()
+            .map(|metadata| metadata.len())
+    } else {
+        None
+    };
     let manifest_stage_timings = statement_counts.scan_stage_values();
     let recorded_stages = stage_names(&manifest_stage_timings);
     for phase in [
@@ -1505,6 +1602,10 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
                 .then_some(sqlite_lock_wait_errors),
             "sqliteBusyTimeoutMs": sqlite_busy_timeout_ms,
             "sqliteSynchronousLevel": sqlite_synchronous_level,
+            "sqliteCacheSizePages": sqlite_cache_size_pages,
+            "sqliteWalAutocheckpointPages": sqlite_wal_autocheckpoint_pages,
+            "sqliteWalFileBytesAfterIndex": sqlite_wal_file_bytes_after_index,
+            "sqliteTempStoreMode": sqlite_temp_store_mode,
         }),
         json!({
             "foregroundDuringScan": scan_running_before_api,
