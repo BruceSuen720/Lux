@@ -572,3 +572,18 @@ PostgreSQL 代码路径未被这项 SQLite 优化修改；首扫中位数变化�
 | providerless 短路候选 | 2.259 / 2.314 / 2.280 s；**2.280 s** | 583 ms | 983 ms | 253 ms | 326 ms | 376 / 119 | 4.35 s |
 
 候选的 `movie_item_insert` 累计时间中位数从 459.0 降到 449.5 ms，但 `positive_index_apply` 基本持平（1,085.8 → 1,083.3 ms），首扫反而慢约 1.2%，基准总墙钟慢约 1.4%。因此 migration、兼容重建改动及其临时测试均已撤回；不将子阶段变化当作全链路收益。PostgreSQL 未重测，因为它不使用此 SQLite trigger 路径。
+
+### SQLite/PostgreSQL 层级索引前缀去重 A/B（未保留）
+
+2026-09-27 在 `67e1a0db` 基线上评估删除 `media_items(parent_id, removed_at)` 和 `(series_id, removed_at)` 两个窄索引；它们分别被 `(parent_id, removed_at, has_available_source)` 和 `(series_id, removed_at, has_available_source)` 的前缀覆盖。候选同步更新了 SQLite 兼容表重建逻辑，并由空库迁移删除两条旧索引。SQLite schema/EXPLAIN 回归和 PostgreSQL 空库启动迁移测试通过，确认层级查询仍命中保留的复合索引。
+
+基线与候选在 Apple M4 / 16 GiB / ARM64、同一 SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914` 的 60,000 文件 / 600 目录 fixture 上交错各跑三轮 release 基准。SQLite 为 `synchronous=FULL`、关闭锁采样；PostgreSQL 为本机 Docker 16.15，每轮使用新空库并采样锁等待。每轮还测 120k targets、无变化重扫和 50 并发前台请求。
+
+| 后端/索引 | 首扫索引完成：三轮 / 中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 中位数 | 目录列表 p95 中位数 | batch p95 中位数 | SQL / DML 中位数 | WAL 中位数 / 最大 waiter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite / 基线 | 2.334 / 2.259 / 2.277 s；**2.277 s** | 578 ms | 1,007 ms | 230 ms | 366 ms | 324 ms | 376 / 119 | — |
+| SQLite / 删除两条前缀索引 | 2.669 / 2.330 / 2.165 s；**2.330 s** | 564 ms | 984 ms | 236 ms | 375 ms | 319 ms | 376 / 119 | — |
+| PostgreSQL 16 / 基线 | 5.894 / 5.968 / 6.041 s；**5.968 s** | 2,503 ms | 3,094 ms | 266 ms | 339 ms | 800 ms | 344 / 95 | 213,008,651 bytes / 0 |
+| PostgreSQL 16 / 删除两条前缀索引 | 5.962 / 5.824 / 6.133 s；**5.962 s** | 2,406 ms | 3,090 ms | 264 ms | 356 ms | 812 ms | 344 / 95 | 198,472,015 bytes / 0 |
+
+两后端首扫索引完成都没有稳定改善：SQLite 候选中位数慢约 2.3%，PostgreSQL 仅快约 0.1%。target 阶段略快，但不在首扫索引计时内；PG WAL 中位数低约 6.8%，现有三轮无法排除随机数据与写入波动，不能归因于索引删除。为遵守 LUX-275 的端到端收益门，候选 migration、兼容重建改动与测试均撤回；这一候选不保留为性能优化。数据只代表本机 ARM64，不外推 NAS/x86_64。

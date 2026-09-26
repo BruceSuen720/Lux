@@ -6819,6 +6819,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 同日评估 SQLite provider-ID INSERT trigger 对 `provider_ids_json IS NULL` 的短路。该候选将 `movie_item_insert` 子阶段中位数降低约 2.1%，但 60k/600 全链路首扫中位数反而从 2.254 增至 2.280 秒，故撤回候选及 migration，性能日志保留否决数据。LUX-275 继续只保留有稳定端到端收益的改动。
 
+2026-09-27 评估 SQLite/PostgreSQL 两条层级索引前缀去重：移除 `(parent_id, removed_at)` 与 `(series_id, removed_at)`，保留含 `has_available_source` 的三列复合索引。SQLite schema/查询计划和 PostgreSQL 空库迁移测试通过，但同 fixture 交错三轮首扫中位数分别为 SQLite 2.277 → 2.330 秒、PostgreSQL 5.968 → 5.962 秒，没有形成稳定的双后端首扫收益；候选 migration、兼容重建调整和回归测试已撤回。target 阶段的轻微改善及 PG WAL 变化不能代替首扫门槛，LUX-275 继续开放，完整数据见 `docs/PERFORMANCE.md`。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
