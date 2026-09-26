@@ -1168,6 +1168,12 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let (raw_statement_count, dml_statement_count) = statement_counts.snapshot();
     let dml_summary_counts = statement_counts.dml_summary_snapshot();
     let unclassified_cte_summaries = statement_counts.unclassified_cte_summary_snapshot();
+    let lite_root_directory_state_updates = statement_counts
+        .dml_statement_count_containing("UPDATE SCAN_MANIFEST_DIRECTORIES SET STATE");
+    assert_eq!(
+        lite_root_directory_state_updates, 1,
+        "Lite discovery should mark its root directory complete once, after the in-memory frontier is empty"
+    );
     let scan_statement_count = raw_statement_count.saturating_sub(postgres_lock_wait_samples);
     let scan_job_target_statement_count = dml_summary_counts
         .iter()

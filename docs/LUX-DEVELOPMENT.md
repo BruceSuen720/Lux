@@ -6809,6 +6809,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 继续将每个有界 source 页的 SOURCE/ITEM target 写入合并为单条 SQL，并将页从 8k 调至 16k。相对 8k 合并写入候选，target 物化中位数由 SQLite 0.684 → 0.629 秒、PostgreSQL 2.660 → 2.466 秒；INSERT 页数各从 8 降为 4，索引和无变化重扫未出现超过 5% 的回退。SQLite 索引中位数仍为 2.914 秒，高于 LUX-270 的 2.018 秒参考，因此 LUX-275 阶段门继续开放；各阶段结果见 `docs/PERFORMANCE.md`。
 
+2026-09-27 移除 Lite 每个正向批次重复更新根目录队列行的无效果 SQL，把该状态更新留到内存 frontier 清空后的收尾事务。SQLite release 单轮扫描 DML 从 128 降至 119；首扫 2.894 秒与之前 2.914 秒三轮中位数接近，不作为稳定加速收益。PostgreSQL 一次 release 运行完成（首扫 6.709 秒），样本不足以作性能比较；target 语义集成测试通过，完整双后端阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

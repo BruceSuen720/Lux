@@ -500,6 +500,10 @@ Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同�
 
 16k 页使 target 阶段相对同一合并语句的 8k 页在 SQLite 快约 8.0%、PostgreSQL 快约 7.3%，并将 target INSERT 次数减半；索引、无变化重扫、前台 p95 与 batch p95 均未出现超过 5% 的回退。16k 的 PostgreSQL WAL 中位数为 207,871,938 bytes，三轮最大锁 waiter 为 0。SQLite 索引中位数 2.914 s 仍高于 LUX-270 的 2.018 s 参考，target 调整也不会改变索引计时范围；因此 LUX-275 严格门继续开放。此实验只代表本机 ARM64 与临时 PostgreSQL，不外推 NAS/x86_64。
 
+### Lite 根目录状态更新去重
+
+Lite 不把子目录 frontier 写入 `scan_manifest_directories`，但此前每个正向提交批次只要完成了任意目录，就会再次尝试更新该表中的根目录行；其 `state <> 'COMPLETE'` 条件让后续调用成为无效果 UPDATE。现在只在 Lite frontier 清空的收尾事务中更新根目录状态。对同一 60k/600 fixture 的 SQLite release 单轮测量，Lite 根目录状态 UPDATE 从 10 条降为 1 条，扫描 DML 从 128 条降为 119 条；首扫为 2.894 s、无变化重扫 969 ms、前台 p95 231 ms。首扫单轮与此前 2.914 s 三轮中位数基本相同，故仅记录冗余 SQL 的减少，不把它算作稳定加速。PostgreSQL 单轮为首扫 6.709 s、target 2.496 s、无变化重扫 3.212 s、前台 p95 259 ms、batch p95 932 ms，WAL 208,039,460 bytes、锁等待为 0；这组单轮只用于确认该路径可运行，不作为性能差异结论。LUX-275 仍开放。
+
 当前基准入口只运行 Lite 路径。复跑时使用同一个 60k fixture；SQLite 设 `LUX_PERF_BACKEND=sqlite LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。release test 命令为：
 
 ```bash

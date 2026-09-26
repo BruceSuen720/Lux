@@ -1728,8 +1728,10 @@ async fn streamed_manifest_add_does_not_claim_a_concurrent_filesystem_entry()
     let job = jobs.create_movie_scan_job(library.id).await?;
     let trigger_sql = format!(
         "CREATE TRIGGER claim_manifest_add_after_observation
-         AFTER UPDATE ON scan_manifest_directories
-         WHEN NEW.relative_path = '' AND NEW.state = 'COMPLETE'
+         AFTER UPDATE ON scan_manifest_roots
+         WHEN NEW.state = 'SCANNING'
+           AND OLD.completed_directory_count = 0
+           AND NEW.completed_directory_count > 0
            AND NEW.manifest_id = (
                SELECT id FROM scan_manifests WHERE job_id = '{}'
            )
@@ -1810,8 +1812,10 @@ async fn streamed_manifest_change_cas_does_not_overwrite_a_newer_incremental_ent
         .await?;
     let trigger_sql = format!(
         "CREATE TRIGGER advance_manifest_baseline_after_observation
-         AFTER UPDATE ON scan_manifest_directories
-         WHEN NEW.relative_path = '' AND NEW.state = 'COMPLETE'
+         AFTER UPDATE ON scan_manifest_roots
+         WHEN NEW.state = 'SCANNING'
+           AND OLD.completed_directory_count = 0
+           AND NEW.completed_directory_count > 0
            AND NEW.manifest_id = '{}'
          BEGIN
              UPDATE filesystem_entries
@@ -1911,9 +1915,10 @@ async fn unstable_manifest_observation_that_disappears_is_not_removed_in_same_sc
         .await?;
     let trigger_sql = format!(
         "CREATE TRIGGER advance_manifest_baseline_before_discovery_diff
-         AFTER UPDATE ON scan_manifest_directories
-         WHEN NEW.relative_path = ''
-           AND NEW.state = 'COMPLETE'
+         AFTER UPDATE ON scan_manifest_roots
+         WHEN NEW.state = 'SCANNING'
+           AND OLD.completed_directory_count = 0
+           AND NEW.completed_directory_count > 0
            AND NEW.manifest_id = '{}'
          BEGIN
              UPDATE filesystem_entries
@@ -2010,9 +2015,10 @@ async fn unchanged_manifest_observation_uses_fingerprint_cas_before_advancing_ge
         .await?;
     let trigger_sql = format!(
         "CREATE TRIGGER advance_unchanged_manifest_baseline_after_observation
-         AFTER UPDATE ON scan_manifest_directories
-         WHEN NEW.relative_path = ''
-           AND NEW.state = 'COMPLETE'
+         AFTER UPDATE ON scan_manifest_roots
+         WHEN NEW.state = 'SCANNING'
+           AND OLD.completed_directory_count = 0
+           AND NEW.completed_directory_count > 0
            AND NEW.manifest_id = '{}'
          BEGIN
              UPDATE filesystem_entries

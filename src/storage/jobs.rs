@@ -2127,22 +2127,6 @@ impl Database {
             .ok_or_else(|| {
                 StorageError::Conflict("manifest root is not available for discovery".to_owned())
             })?;
-        if lite_mode && !completed_directories.is_empty() {
-            self.query(
-                "UPDATE scan_manifest_directories
-                 SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
-                 WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ''
-                   AND state <> 'COMPLETE'",
-            )
-            .bind(chunk.manifest_id)
-            .bind(chunk.library_root_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
         record_manifest_storage_stage(
             "root_checkpoint",
             root_checkpoint_started,
