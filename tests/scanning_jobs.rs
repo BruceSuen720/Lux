@@ -1419,8 +1419,10 @@ async fn postprocessing_targets_materialize_after_index_and_keep_new_item_preced
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     let changed = root.join("Example.Movie.2024.1080p.mkv");
+    let changed_only = root.join("Different.Movie.2023.1080p.mkv");
     tokio::fs::write(&changed, b"before").await?;
     tokio::fs::write(root.join("Example.Movie.2024.2160p.mkv"), b"stable").await?;
+    tokio::fs::write(&changed_only, b"before").await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
@@ -1429,6 +1431,7 @@ async fn postprocessing_targets_materialize_after_index_and_keep_new_item_preced
     let first = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&first.id, 100, None).await?;
     tokio::fs::write(&changed, b"after-with-a-new-size").await?;
+    tokio::fs::write(&changed_only, b"after-with-a-new-size").await?;
     tokio::fs::write(root.join("Example.Movie.2024.720p.mkv"), b"new version").await?;
 
     let second = jobs.create_movie_scan_job(library.id).await?;
@@ -1453,15 +1456,15 @@ async fn postprocessing_targets_materialize_after_index_and_keep_new_item_preced
     .bind(&second.id)
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(source_kinds, vec!["CHANGED", "NEW"]);
-    let item_kind: String = sqlx::query_scalar(
+    assert_eq!(source_kinds, vec!["CHANGED", "CHANGED", "NEW"]);
+    let item_kinds: Vec<String> = sqlx::query_scalar(
         "SELECT change_kind FROM scan_job_targets
-         WHERE job_id = ? AND target_type = 'ITEM'",
+         WHERE job_id = ? AND target_type = 'ITEM' ORDER BY change_kind",
     )
     .bind(&second.id)
-    .fetch_one(database.pool())
+    .fetch_all(database.pool())
     .await?;
-    assert_eq!(item_kind, "NEW");
+    assert_eq!(item_kinds, vec!["CHANGED", "NEW"]);
     let ready: i64 = sqlx::query_scalar(
         "SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?",
     )

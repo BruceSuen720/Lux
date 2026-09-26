@@ -487,6 +487,19 @@ Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同�
 
 快速路径的 SQLite target SQL/DML 为 94/34 条，PostgreSQL 为 103/34 条；PostgreSQL WAL 三轮中位数为 221,962,439 bytes，最大锁 waiter 为 0。候选运行的扫描索引中位数为 SQLite 2.898 s、PostgreSQL 6.216 s，无变化重扫为 0.993 s、3.179 s。索引计时在 target 代码运行之前结束，这段改动不会进入索引或重扫路径；这些跨时段差值不能归因于快速路径，也不能据此宣称首扫总时间改善。LUX-275 阶段门仍开放。
 
+### 合并 target 写入与 16k 有界页
+
+随后将每个游标页的 SOURCE 和 ITEM target 合并为同一条 `INSERT ... SELECT ... UNION ALL`，复用一次物化的 source page；CHANGED 页仍按 generation 检查 NEW 优先级。页大小从 8,000 调到 16,000 个 source，单次语句写入两类 target。下面比较同一候选路径的 8k 与 16k；硬件为 Apple M4 / 16 GiB / ARM64，fixture 为 60,000 files / 600 directories，SQLite 使用 `synchronous=FULL` 并关闭锁采样，PostgreSQL 16.15 每轮使用新临时库并采集 WAL 与锁等待。
+
+| 后端 / 页大小 | 索引完成中位数 | 120k targets 中位数 | 无变化重扫中位数 | 前台 50 请求 p95 中位数 | target SQL / DML | target INSERT 次数 | batch p95 中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SQLite / 8k | 2.876 s | 684 ms | 961 ms | 237 ms | 86 / 26 | 8 | 未记录 |
+| SQLite / 16k | 2.914 s | 629 ms | 962 ms | 234 ms | 50 / 14 | 4 | 401 ms |
+| PostgreSQL 16 / 8k | 6.666 s | 2.660 s | 3.346 s | 283 ms | 95 / 26 | 8 | 933 ms |
+| PostgreSQL 16 / 16k | 6.617 s | 2.466 s | 2.997 s | 263 ms | 55 / 14 | 4 | 937 ms |
+
+16k 页使 target 阶段相对同一合并语句的 8k 页在 SQLite 快约 8.0%、PostgreSQL 快约 7.3%，并将 target INSERT 次数减半；索引、无变化重扫、前台 p95 与 batch p95 均未出现超过 5% 的回退。16k 的 PostgreSQL WAL 中位数为 207,871,938 bytes，三轮最大锁 waiter 为 0。SQLite 索引中位数 2.914 s 仍高于 LUX-270 的 2.018 s 参考，target 调整也不会改变索引计时范围；因此 LUX-275 严格门继续开放。此实验只代表本机 ARM64 与临时 PostgreSQL，不外推 NAS/x86_64。
+
 当前基准入口只运行 Lite 路径。复跑时使用同一个 60k fixture；SQLite 设 `LUX_PERF_BACKEND=sqlite LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。release test 命令为：
 
 ```bash

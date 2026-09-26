@@ -6807,6 +6807,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 增加 target 物化 NEW-stage 快速路径，移除该阶段每个 item 的冗余 NEW-source `EXISTS` 检查，同时保留 CHANGED 阶段的优先级判定。同机三轮的 120k target 物化中位数：SQLite 0.753 → 0.704 秒，PostgreSQL 2.907 → 2.674 秒；首扫索引、无变化重扫及其他 LUX-275 门槛仍未关闭，完整结果见 `docs/PERFORMANCE.md`。
 
+2026-09-27 继续将每个有界 source 页的 SOURCE/ITEM target 写入合并为单条 SQL，并将页从 8k 调至 16k。相对 8k 合并写入候选，target 物化中位数由 SQLite 0.684 → 0.629 秒、PostgreSQL 2.660 → 2.466 秒；INSERT 页数各从 8 降为 4，索引和无变化重扫未出现超过 5% 的回退。SQLite 索引中位数仍为 2.914 秒，高于 LUX-270 的 2.018 秒参考，因此 LUX-275 阶段门继续开放；各阶段结果见 `docs/PERFORMANCE.md`。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

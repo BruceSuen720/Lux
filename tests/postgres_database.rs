@@ -1094,6 +1094,73 @@ async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_postprocessing_targets_preserve_changed_and_new_item_kinds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library(
+            &format!("PostgreSQL target changes {}", Uuid::now_v7()),
+            luxd::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("media");
+    fs::create_dir_all(&root)?;
+    let changed = root.join("Example.Movie.2024.1080p.mkv");
+    let changed_only = root.join("Different.Movie.2023.1080p.mkv");
+    fs::write(&changed, b"before")?;
+    fs::write(root.join("Example.Movie.2024.2160p.mkv"), b"stable")?;
+    fs::write(&changed_only, b"before")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 media root")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    fs::write(&changed, b"after-with-a-new-size")?;
+    fs::write(&changed_only, b"after-with-a-new-size")?;
+    fs::write(root.join("Example.Movie.2024.720p.mkv"), b"new version")?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&second.id, 100).await?.completed {
+            break;
+        }
+    }
+    jobs.materialize_manifest_postprocessing_targets(&second.id)
+        .await?;
+    let source_kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_targets
+         WHERE job_id = $1 AND target_type = 'SOURCE' ORDER BY change_kind",
+    )
+    .bind(&second.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(source_kinds, vec!["CHANGED", "CHANGED", "NEW"]);
+    let item_kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_targets
+         WHERE job_id = $1 AND target_type = 'ITEM' ORDER BY change_kind",
+    )
+    .bind(&second.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_kinds, vec!["CHANGED", "NEW"]);
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_rescan_of_existing_movie_uses_integer_boolean_projection()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

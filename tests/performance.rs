@@ -198,6 +198,16 @@ impl QueryStatementCounts {
         summaries
     }
 
+    fn dml_statement_count_containing(&self, marker: &str) -> usize {
+        self.dml_summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(summary, _)| summary.contains(marker))
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
     fn unclassified_cte_summary_snapshot(&self) -> Vec<(usize, String)> {
         let summaries = self
             .unclassified_cte_summaries
@@ -317,7 +327,12 @@ fn is_dml_statement_summary(summary: &str) -> bool {
         || normalized.starts_with("WITH INCOMING ( RELATIVE_PATH, …");
     let truncated_seen_paths_cte =
         normalized.starts_with("WITH INCOMING_SEEN_PATHS(RELATIVE_PATH) AS (VALUES …");
-    if incoming_observation_cte || truncated_path_observation_cte || truncated_seen_paths_cte {
+    let materialized_target_cte = normalized.starts_with("WITH PAGE_SOURCES AS MATERIALIZED");
+    if incoming_observation_cte
+        || truncated_path_observation_cte
+        || truncated_seen_paths_cte
+        || materialized_target_cte
+    {
         return true;
     }
     normalized.starts_with("WITH ")
@@ -336,6 +351,15 @@ fn is_dml_statement_summary(summary: &str) -> bool {
 fn query_counter_classifies_dml_statements_inside_common_table_expressions() {
     assert!(is_dml_statement_summary(
         "WITH sidecar_directories(directory) AS (VALUES (?)) INSERT INTO scan_job_targets"
+    ));
+    assert!(is_dml_statement_summary(
+        "WITH page_sources AS MATERIALIZED (SELECT id FROM filesystem_entries) INSERT INTO scan_job_targets"
+    ));
+    assert!(is_dml_statement_summary(
+        "WITH page_sources AS MATERIALIZED (SELECT id FROM filesystem_entries)"
+    ));
+    assert!(is_dml_statement_summary(
+        "WITH page_sources AS MATERIALIZED"
     ));
     assert!(!is_dml_statement_summary(
         "WITH latest AS (SELECT path FROM scan_manifest_entries) SELECT path FROM latest"
@@ -779,13 +803,14 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(unchanged.skipped_files, file_count);
 
     let incremental_directory = media_root.join("bucket-0000");
-    for index in 60_000..60_000 + INCREMENTAL_FILES {
-        let year = 2000 + index % 100;
-        tokio::fs::write(
-            incremental_directory.join(format!("Fixture.Movie.{index:06}.{year}.mkv")),
-            b"LUX PERF INCREMENTAL FIXTURE\n",
-        )
-        .await?;
+    let incremental_fixture_paths = (60_000..60_000 + INCREMENTAL_FILES)
+        .map(|index| {
+            let year = 2000 + index % 100;
+            incremental_directory.join(format!("Fixture.Movie.{index:06}.{year}.mkv"))
+        })
+        .collect::<Vec<_>>();
+    for path in &incremental_fixture_paths {
+        tokio::fs::write(path, b"LUX PERF INCREMENTAL FIXTURE\n").await?;
     }
     let incremental_started = Instant::now();
     let incremental = scanner
@@ -797,6 +822,9 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(incremental.created_sources, INCREMENTAL_FILES);
     assert_eq!(incremental.skipped_files, 100);
     assert_eq!(incremental.marked_missing, 0);
+    for path in incremental_fixture_paths {
+        tokio::fs::remove_file(path).await?;
+    }
 
     let non_pending_probe_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE probe_status <> 'PENDING'")
@@ -1283,6 +1311,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let target_stage_timings = statement_counts.scan_stage_values();
     let (postprocessing_target_sql_count, postprocessing_target_dml_count) =
         statement_counts.snapshot();
+    let target_insert_statement_count =
+        statement_counts.dml_statement_count_containing("WITH PAGE_SOURCES AS MATERIALIZED");
+    assert_eq!(
+        target_insert_statement_count,
+        file_count.div_ceil(16_000),
+        "Lite target materialization should insert source and item targets in one statement per bounded page"
+    );
     let postprocessing_target_count_query =
         format!("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = {job_id_placeholder}");
     let postprocessing_target_count: i64 =
@@ -1434,6 +1469,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "targetStageTimings": target_stage_timings,
             "postprocessingTargetSqlStatementCount": postprocessing_target_sql_count,
             "postprocessingTargetDmlStatementCount": postprocessing_target_dml_count,
+            "postprocessingTargetInsertStatementCount": target_insert_statement_count,
             "postprocessingTargetCount": postprocessing_target_count,
             "batchP50Ms": batch_p50_ms,
             "batchP95Ms": batch_p95_ms,

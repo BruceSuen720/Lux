@@ -1355,14 +1355,26 @@ impl Database {
         else {
             return Ok(false);
         };
-        let source_result = self
-            .query(
-                "INSERT INTO scan_job_targets (
-                     job_id, target_type, target_id, source_id, item_id, change_kind,
-                     probe_state, metadata_state, thumbnail_state
-                 )
-                 SELECT ?, 'SOURCE', source.id, source.id, source.item_id,
-                        entry.last_seen_change_kind, 'PENDING', 'SKIPPED', 'SKIPPED'
+        // The bounded page is materialized once and supplies both target types.
+        // NEW-stage entries imply NEW item targets; CHANGED retains the global
+        // lookup so an item with any NEW source keeps NEW precedence.
+        let item_change_kind = if target_stage == "NEW" {
+            "'NEW'"
+        } else {
+            "CASE WHEN EXISTS (
+                 SELECT 1
+                 FROM media_sources new_source
+                 JOIN filesystem_entries new_entry
+                   ON new_entry.id = new_source.filesystem_entry_id
+                 WHERE new_source.item_id = page_sources.item_id
+                   AND new_entry.last_seen_generation = ?
+                   AND new_entry.last_seen_change_kind = 'NEW'
+             ) THEN 'NEW' ELSE 'CHANGED' END"
+        };
+        let statement = format!(
+            "WITH page_sources AS MATERIALIZED (
+                 SELECT source.id AS source_id, source.item_id,
+                        entry.last_seen_change_kind AS change_kind
                  FROM filesystem_entries entry
                  JOIN media_sources source ON source.filesystem_entry_id = entry.id
                  WHERE entry.library_root_id = ? AND entry.last_seen_generation = ?
@@ -1370,88 +1382,50 @@ impl Database {
                    AND entry.last_seen_change_kind = ?
                    AND entry.relative_path > COALESCE(?, '')
                    AND entry.relative_path <= ?
-                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
-            )
-            .bind(job_id)
+             ),
+             target_rows (
+                 target_type, target_id, source_id, item_id, change_kind,
+                 probe_state, metadata_state, thumbnail_state
+             ) AS (
+                 SELECT 'SOURCE', source_id, source_id, item_id, change_kind,
+                        'PENDING', 'SKIPPED', 'SKIPPED'
+                 FROM page_sources
+                 UNION ALL
+                 SELECT 'ITEM', page_sources.item_id, NULL, page_sources.item_id,
+                        {item_change_kind}, 'SKIPPED', 'PENDING', 'PENDING'
+                 FROM page_sources
+                 GROUP BY page_sources.item_id
+             )
+             INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, source_id, item_id, change_kind,
+                 probe_state, metadata_state, thumbnail_state
+             )
+             SELECT ?, target_type, target_id, source_id, item_id, change_kind,
+                    probe_state, metadata_state, thumbnail_state
+             FROM target_rows
+             WHERE 1 = 1
+             ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+        );
+        // Only the stage-specific SQL expression above is interpolated; all data stays bound.
+        let mut insert_query = self
+            .query(sqlx::AssertSqlSafe(statement))
             .bind(library_root_id)
             .bind(generation)
             .bind(target_stage)
             .bind(after_relative_path)
-            .bind(through_relative_path)
+            .bind(through_relative_path);
+        if target_stage == "CHANGED" {
+            insert_query = insert_query.bind(generation);
+        }
+        let target_result = insert_query
+            .bind(job_id)
             .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        // The NEW stage is already restricted to NEW entries, so each grouped item is NEW.
-        let item_result = if target_stage == "NEW" {
-            self.query(
-                "INSERT INTO scan_job_targets (
-                     job_id, target_type, target_id, item_id, change_kind,
-                     probe_state, metadata_state, thumbnail_state
-                 )
-                 SELECT ?, 'ITEM', source.item_id, source.item_id, 'NEW',
-                        'SKIPPED', 'PENDING', 'PENDING'
-                 FROM filesystem_entries entry
-                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
-                 WHERE entry.library_root_id = ? AND entry.last_seen_generation = ?
-                   AND entry.entry_kind = 'FILE'
-                   AND entry.last_seen_change_kind = 'NEW'
-                   AND entry.relative_path > COALESCE(?, '')
-                   AND entry.relative_path <= ?
-                 GROUP BY source.item_id
-                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
-            )
-            .bind(job_id)
-            .bind(library_root_id)
-            .bind(generation)
-            .bind(after_relative_path)
-            .bind(through_relative_path)
-            .execute(&mut **transaction)
-            .await
-        } else {
-            self.query(
-                "INSERT INTO scan_job_targets (
-                     job_id, target_type, target_id, item_id, change_kind,
-                     probe_state, metadata_state, thumbnail_state
-                 )
-                 SELECT ?, 'ITEM', source.item_id, source.item_id,
-                        CASE WHEN EXISTS (
-                            SELECT 1
-                            FROM media_sources new_source
-                            JOIN filesystem_entries new_entry
-                              ON new_entry.id = new_source.filesystem_entry_id
-                            WHERE new_source.item_id = source.item_id
-                              AND new_entry.last_seen_generation = ?
-                              AND new_entry.last_seen_change_kind = 'NEW'
-                        ) THEN 'NEW' ELSE 'CHANGED' END,
-                        'SKIPPED', 'PENDING', 'PENDING'
-                 FROM filesystem_entries entry
-                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
-                 WHERE entry.library_root_id = ? AND entry.last_seen_generation = ?
-                   AND entry.entry_kind = 'FILE'
-                   AND entry.last_seen_change_kind = ?
-                   AND entry.relative_path > COALESCE(?, '')
-                   AND entry.relative_path <= ?
-                 GROUP BY source.item_id
-                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
-            )
-            .bind(job_id)
-            .bind(generation)
-            .bind(library_root_id)
-            .bind(generation)
-            .bind(target_stage)
-            .bind(after_relative_path)
-            .bind(through_relative_path)
-            .execute(&mut **transaction)
-            .await
-        }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(source_result.rows_affected() > 0 || item_result.rows_affected() > 0)
+        Ok(target_result.rows_affected() > 0)
     }
 
     pub(crate) async fn list_scan_manifest_directories(
