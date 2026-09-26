@@ -559,3 +559,16 @@ SQLite 首扫索引中位数快约 6.7%，基准总墙钟快约 4.9%；无变化
 PostgreSQL 代码路径未被这项 SQLite 优化修改；首扫中位数变化约 +0.5%，重扫、前台 p95 和 batch p95 均在 5% 以内，最大锁 waiter 为 0。WAL 中位数观察到 210.4 → 222.1 MB（约 +5.6%）；本轮 PG SQL/DML 计数相同，且每轮使用随机生成的条目 ID，因此该 WAL 差异的成因未由这次 A/B 确认，不归因于 SQLite migration。结果仅代表本机 ARM64 和临时数据库，不外推 NAS/x86_64。
 
 复跑沿用本节前的 release 命令及同一 fixture；SQLite 设置 `LUX_PERF_BACKEND=sqlite LUX_PERF_SQLITE_SYNCHRONOUS=FULL LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设置 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。候选版改动文件为 `migrations/0146_skip_empty_alias_lookup_on_media_item_insert.sql` 和 `src/storage/migration.rs`；alias 检索回归由 `tests/search.rs::fts_search_matches_chinese_titles_and_aliases_with_acl` 覆盖。
+
+### SQLite provider-ID INSERT trigger 短路 A/B（未保留）
+
+2026-09-27 在提交 `9cf43819` 上评估给 SQLite `media_item_provider_ids_ai` 增加 `WHEN NEW.provider_ids_json IS NOT NULL`，避免无 provider ID 的新条目执行一次 `json_each('{}')`。候选包含升级 migration 和启动时兼容重建修正；功能测试确认 providerless item 不生成派生索引行，实际 TMDB ID 仍进入索引。候选最后未保留，因为全链路没有改善。
+
+基准继续使用同一 Apple M4 / 16 GiB / ARM64 和 60k/600 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`），SQLite `synchronous=FULL`、锁采样关闭，每版三轮：
+
+| SQLite trigger | 首扫索引：三轮 / 中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 中位数 | batch p95 中位数 | SQL / DML | 基准总墙钟中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 原 trigger | 2.156 / 2.254 / 2.288 s；**2.254 s** | 580 ms | 1,010 ms | 247 ms | 320 ms | 376 / 119 | 4.29 s |
+| providerless 短路候选 | 2.259 / 2.314 / 2.280 s；**2.280 s** | 583 ms | 983 ms | 253 ms | 326 ms | 376 / 119 | 4.35 s |
+
+候选的 `movie_item_insert` 累计时间中位数从 459.0 降到 449.5 ms，但 `positive_index_apply` 基本持平（1,085.8 → 1,083.3 ms），首扫反而慢约 1.2%，基准总墙钟慢约 1.4%。因此 migration、兼容重建改动及其临时测试均已撤回；不将子阶段变化当作全链路收益。PostgreSQL 未重测，因为它不使用此 SQLite trigger 路径。

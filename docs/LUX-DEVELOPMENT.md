@@ -6817,6 +6817,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 优化 SQLite `media_items_search_ai`：新媒体条目插入时不再逐条查询必为空的 `item_aliases`，alias 后续变化仍由 alias trigger 更新搜索索引。新 migration `0146_skip_empty_alias_lookup_on_media_item_insert.sql` 与启动时兼容表重建逻辑均使用空 alias。60k/600 同机交错三轮后，SQLite 首扫索引中位数从 2.236 降至 2.085 秒（快约 6.7%），无变化重扫和前台 p95 基本持平；PostgreSQL 路径未改变，首扫中位数从 5.855 到 5.887 秒。SQLite 仍比 LUX-270 的 2.018 秒参考慢约 3.3%，PostgreSQL WAL 差异尚未归因，因此 LUX-275 阶段门继续开放，详见 `docs/PERFORMANCE.md`。
 
+同日评估 SQLite provider-ID INSERT trigger 对 `provider_ids_json IS NULL` 的短路。该候选将 `movie_item_insert` 子阶段中位数降低约 2.1%，但 60k/600 全链路首扫中位数反而从 2.254 增至 2.280 秒，故撤回候选及 migration，性能日志保留否决数据。LUX-275 继续只保留有稳定端到端收益的改动。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
