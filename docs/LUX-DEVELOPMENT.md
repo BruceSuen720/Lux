@@ -6805,6 +6805,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 补充的 Jellyfin 目录批处理实验见 `docs/PERFORMANCE.md`。`experimental-jellyfin-scan` 仅用于同机对照，按父目录分别解析并提交；在 60k fixture 上没有优于 Lite，特别是 PostgreSQL 首扫中位数为 63.054 秒，对照 Lite 为 6.026 秒。实验代码不改变默认路径。当前 LUX-045 直接扫描全流程在满核运行 5 分钟后被停止，未得到可用的新计时；文档中的旧版 2.105 秒不作为本轮等价性能门证据。LUX-275 严格阶段门仍开放。
 
+2026-09-27 增加 target 物化 NEW-stage 快速路径，移除该阶段每个 item 的冗余 NEW-source `EXISTS` 检查，同时保留 CHANGED 阶段的优先级判定。同机三轮的 120k target 物化中位数：SQLite 0.753 → 0.704 秒，PostgreSQL 2.907 → 2.674 秒；首扫索引、无变化重扫及其他 LUX-275 门槛仍未关闭，完整结果见 `docs/PERFORMANCE.md`。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进及 Jellyfin 对照实验）：`Cargo.toml`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

@@ -474,6 +474,19 @@ Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同�
 
 结论：不把逐目录提交设为默认方案。可借鉴的是“先得到完整目录快照，再一次解析同目录成员”；Lux 后续若采用，仍应把多目录结果交给有界批量 writer 合并提交，并针对 scan-scoped 文件系统缓存单独测量。该实验不关闭 LUX-275 阶段门，也不代表 NAS/x86_64 性能。
 
+### NEW target 物化快速路径
+
+2026-09-27 对 Lite grouped 的 target 物化增加 NEW 阶段快速路径：该阶段的输入已经限定为 `last_seen_change_kind = 'NEW'`，因此 ITEM target 直接写入 `NEW`，省去逐 item 查询同一 generation 是否存在 NEW source 的相关 `EXISTS`。CHANGED 阶段仍保留原判定，确保一个 item 同时含有 NEW 与 CHANGED source 时，ITEM target 仍优先标记 NEW。上方 Jellyfin A/B 的 Lite target 时间作为改动前同机基线。
+
+同一 Apple M4 / 16 GiB / ARM64、本机 PostgreSQL 16.15、相同 60k/600 fixture 和 SQLite `synchronous=FULL` 配置下，候选代码分别运行三轮；每轮 PostgreSQL 使用新数据库，SQLite 关闭每 100 ms 写事务的锁采样器。结果只将 target 阶段与改动前基线比较：
+
+| 后端 | 指标 | 改动前三轮中位数 | 快速路径三轮原始值 | 快速路径中位数 | 差异 |
+|---|---|---:|---:|---:|---:|
+| SQLite | 120k target 物化 | 0.753 s | 0.683 / 0.704 / 0.709 s | 0.704 s | 快约 6.5% |
+| PostgreSQL 16 | 120k target 物化 | 2.907 s | 2.676 / 2.674 / 2.602 s | 2.674 s | 快约 8.0% |
+
+快速路径的 SQLite target SQL/DML 为 94/34 条，PostgreSQL 为 103/34 条；PostgreSQL WAL 三轮中位数为 221,962,439 bytes，最大锁 waiter 为 0。候选运行的扫描索引中位数为 SQLite 2.898 s、PostgreSQL 6.216 s，无变化重扫为 0.993 s、3.179 s。索引计时在 target 代码运行之前结束，这段改动不会进入索引或重扫路径；这些跨时段差值不能归因于快速路径，也不能据此宣称首扫总时间改善。LUX-275 阶段门仍开放。
+
 复跑时，用同一个 60k fixture 分别设置 `LUX_PERF_MANIFEST_STRATEGY=lite_grouped` 和 `jellyfin_folder_batch`，SQLite 设 `LUX_PERF_BACKEND=sqlite LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。release test 命令为：
 
 ```bash
