@@ -19,8 +19,6 @@ use axum::{
     response::Response,
     routing::get,
 };
-#[cfg(feature = "experimental-jellyfin-scan")]
-use luxd::application::scanner::ManifestDiscoveryStrategy;
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -1008,25 +1006,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         cookie_value(login.headers(), "lux_session")
     );
 
-    let scan_strategy =
-        env::var("LUX_PERF_MANIFEST_STRATEGY").unwrap_or_else(|_| "lite_grouped".to_owned());
-    let jobs = match scan_strategy.as_str() {
-        "lite_grouped" => ScanJobService::new(database.clone()),
-        #[cfg(feature = "experimental-jellyfin-scan")]
-        "jellyfin_folder_batch" => ScanJobService::new_with_manifest_discovery_strategy(
-            database.clone(),
-            ManifestDiscoveryStrategy::JellyfinFolderBatch,
-        ),
-        #[cfg(not(feature = "experimental-jellyfin-scan"))]
-        "jellyfin_folder_batch" => {
-            return Err(
-                "jellyfin_folder_batch requires --features experimental-jellyfin-scan".into(),
-            );
-        }
-        unsupported => {
-            return Err(format!("unsupported LUX_PERF_MANIFEST_STRATEGY {unsupported:?}").into());
-        }
-    };
+    let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     let postgres_wal_before = if backend == "postgres" {
         Some(postgres_wal_bytes(&database).await?)
@@ -1169,17 +1149,10 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let positive_commit_batch_count = statement_counts.manifest_positive_commit_batch_count();
     let max_positive_commit_batch_count =
         file_count.div_ceil(8_000) + directory_count.div_ceil(200) + 5;
-    if scan_strategy == "jellyfin_folder_batch" {
-        assert_eq!(
-            positive_commit_batch_count, directory_count,
-            "Jellyfin folder mode should commit each non-empty fixture directory as one resolved batch"
-        );
-    } else {
-        assert!(
-            positive_commit_batch_count <= max_positive_commit_batch_count,
-            "streamed positive indexes should checkpoint no more than 8,000 files per transaction; transactions={positive_commit_batch_count}, upper_bound={max_positive_commit_batch_count}"
-        );
-    }
+    assert!(
+        positive_commit_batch_count <= max_positive_commit_batch_count,
+        "streamed positive indexes should checkpoint no more than 8,000 files per transaction; transactions={positive_commit_batch_count}, upper_bound={max_positive_commit_batch_count}"
+    );
     assert_eq!(
         scan_job_target_statement_count, 0,
         "index-completion measurement must not include postprocessing target materialization"
@@ -1248,7 +1221,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         dml_statement_count <= max_scan_dml_count,
         "Manifest scan issued {dml_statement_count} DML statements for {file_count} files; limit is {max_scan_dml_count}"
     );
-    if scan_strategy == "lite_grouped" && matches!(backend.as_str(), "sqlite" | "postgres") {
+    if matches!(backend.as_str(), "sqlite" | "postgres") {
         assert!(
             dml_statement_count < 209,
             "LUX-275 backend batching should reduce scan DML from the 209-statement baseline; backend={backend}, observed {dml_statement_count}"
@@ -1442,7 +1415,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "commit": luxd::COMMIT,
             "architecture": std::env::consts::ARCH,
             "databaseBackend": backend,
-            "scanDiscoveryStrategy": scan_strategy,
+            "scanDiscoveryStrategy": "lite_grouped",
             "derivedIndexTriggersDisabled": derived_index_triggers_disabled,
             "fileCount": file_count,
             "manifestIndexMs": manifest_index_ms,

@@ -6,9 +6,6 @@ rust-version = "1.94"
 description = "Lux personal media server"
 license = "MIT"
 
-[features]
-experimental-jellyfin-scan = []
-
 [dependencies]
 argon2 = "0.5.3"
 ab_glyph = "0.2"

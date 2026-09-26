@@ -447,11 +447,11 @@ Lite 的收益主要来自移除逐目录 frontier 的数据库写入和恢复�
 
 实现与语义边界见 `docs/decisions/045-manifest-lite-discovery.md`。
 
-### Jellyfin 风格目录批处理 A/B（实验路径）
+### Jellyfin 风格目录批处理（已否决的历史对照）
 
 2026-09-27 在同一台 Apple M4 / 16 GiB / ARM64 机器上，以相同的 60,000 文件、600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）交替运行三轮 Lite 与 Jellyfin 风格路径。SQLite 使用 `synchronous=FULL`，关闭会每 100 ms 写入一次的 SQLite 锁采样器；PostgreSQL 使用本机 Docker PostgreSQL 16.15 和每轮全新数据库，保留锁等待采样。两种路径都生成 120,000 个 targets，并在扫描期间采样 50 个前台请求。
 
-Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同目录新增项成组 `CreateItems`，然后继续递归验证目录；`DirectoryService` 另有扫描期间的目录项、文件元数据和路径缓存。[Folder.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/MediaBrowser.Controller/Entities/Folder.cs)、[LibraryManager.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/Emby.Server.Implementations/Library/LibraryManager.cs)、[DirectoryService.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/MediaBrowser.Controller/Providers/DirectoryService.cs)。Lux 原型只对照“按父目录独立解析和提交”：这个 fixture 每个目录约 100 个文件，因此同目录文件会在一个有界批次内完成准备并单独提交；更大的目录仍按 Lux 的 chunk 上限流式处理。Lite 则跨目录合并为有界事务。原型复用 Lux 的 Manifest、二次 stat、CAS、root 删除门槛和 target barrier，没有移植 Jellyfin 的 metadata/provider 对象模型，也没有引入其 scan-scoped cache。它只在 `experimental-jellyfin-scan` feature 下可选，默认仍是 Lite。
+Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同目录新增项成组 `CreateItems`，然后继续递归验证目录；`DirectoryService` 另有扫描期间的目录项、文件元数据和路径缓存。[Folder.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/MediaBrowser.Controller/Entities/Folder.cs)、[LibraryManager.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/Emby.Server.Implementations/Library/LibraryManager.cs)、[DirectoryService.cs](https://github.com/jellyfin/jellyfin/blob/390296c9c8160bb6ad6f01b41226398776d21a83/MediaBrowser.Controller/Providers/DirectoryService.cs)。Lux 曾实现一个仅供对照的原型：按父目录分别解析和提交，每目录约 100 个文件，因此同目录文件在一个有界批次内完成准备并单独提交；更大的目录仍按 Lux 的 chunk 上限流式处理。原型复用 Lux 的 Manifest、二次 stat、CAS、root 删除门槛和 target barrier，没有移植 Jellyfin 的 metadata/provider 对象模型，也没有引入其 scan-scoped cache。基于下方数据，逐目录提交显著增加数据库往返与事务固定开销；该原型和 feature 已从当前代码中移除，以下结果仅作为已否决方案的历史对照。
 
 | 后端 / 方案 | 首扫索引完成（三轮；中位数） | 120k target 物化中位数 | 无变化重扫（三轮；中位数） | 正向提交批次 | SQL / DML | batch p95 | 前台请求 p95 | WAL 中位数 / 最大锁 waiter |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -472,7 +472,7 @@ Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同�
 
 本轮又尝试运行当前工作树的 LUX-045 全流程基准；进程满核超过 5 分钟仍未结束，遂停止，未形成有效计时。因此历史 LUX-045 的 2.105 秒只能作为旧版本参考，不能宣称当前直接扫描快于 Manifest Lite。
 
-结论：不把逐目录提交设为默认方案。可借鉴的是“先得到完整目录快照，再一次解析同目录成员”；Lux 后续若采用，仍应把多目录结果交给有界批量 writer 合并提交，并针对 scan-scoped 文件系统缓存单独测量。该实验不关闭 LUX-275 阶段门，也不代表 NAS/x86_64 性能。
+结论：不采用逐目录提交方案，相关实现已移除。后续优化继续以 Lite 的有界跨目录读取和批量提交为基线；目录快照或 scan-scoped 文件系统缓存只有在独立测量证明收益后再考虑。该历史实验不关闭 LUX-275 阶段门，也不代表 NAS/x86_64 性能。
 
 ### NEW target 物化快速路径
 
@@ -487,11 +487,11 @@ Jellyfin 当前代码先完整收集一个目录的 child snapshot，再对同�
 
 快速路径的 SQLite target SQL/DML 为 94/34 条，PostgreSQL 为 103/34 条；PostgreSQL WAL 三轮中位数为 221,962,439 bytes，最大锁 waiter 为 0。候选运行的扫描索引中位数为 SQLite 2.898 s、PostgreSQL 6.216 s，无变化重扫为 0.993 s、3.179 s。索引计时在 target 代码运行之前结束，这段改动不会进入索引或重扫路径；这些跨时段差值不能归因于快速路径，也不能据此宣称首扫总时间改善。LUX-275 阶段门仍开放。
 
-复跑时，用同一个 60k fixture 分别设置 `LUX_PERF_MANIFEST_STRATEGY=lite_grouped` 和 `jellyfin_folder_batch`，SQLite 设 `LUX_PERF_BACKEND=sqlite LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。release test 命令为：
+当前基准入口只运行 Lite 路径。复跑时使用同一个 60k fixture；SQLite 设 `LUX_PERF_BACKEND=sqlite LUX_PERF_DISABLE_LOCK_MONITOR=1`，PostgreSQL 设 `LUX_PERF_BACKEND=postgres POSTGRES_TEST_DATABASE=<disposable-empty-db>`。release test 命令为：
 
 ```bash
 CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target \
-cargo test --release --locked --features experimental-jellyfin-scan \
+cargo test --release --locked \
   --test performance lux_270_manifest_job_scan_benchmark -- \
   --ignored --nocapture --test-threads=1
 ```
