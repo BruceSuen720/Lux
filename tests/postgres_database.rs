@@ -477,6 +477,41 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         provider_row,
         ("tmdb".to_owned(), "123".to_owned(), "MOVIE".to_owned())
     );
+    let providerless_item_id = Uuid::now_v7().to_string();
+    let empty_provider_item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, provider_ids_json,
+            identification_status, has_available_source
+        ) VALUES
+            ($1, $3, 'MOVIE', 'Postgres Providerless Movie', 'postgres providerless movie',
+             NULL, 'LOCAL_CONFIRMED', 1),
+            ($2, $3, 'MOVIE', 'Postgres Empty Provider Movie', 'postgres empty provider movie',
+             '{}', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&providerless_item_id)
+    .bind(&empty_provider_item_id)
+    .bind(library_id.to_string())
+    .execute(database.pool())
+    .await?;
+    let providerless_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_item_provider_ids
+         WHERE media_item_id IN ($1, $2)",
+    )
+    .bind(&providerless_item_id)
+    .bind(&empty_provider_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(providerless_index_rows, 0);
+    let providerless_search_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_search
+         WHERE item_id IN ($1, $2)",
+    )
+    .bind(&providerless_item_id)
+    .bind(&empty_provider_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(providerless_search_rows, 2);
     sqlx::query(
         "UPDATE media_items
          SET provider_ids_json = '{\"TMDB\":\"456\"}'
