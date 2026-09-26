@@ -625,3 +625,16 @@ LUX_PERF_DISABLE_LOCK_MONITOR=1 \
 "$PERFORMANCE_TEST_BINARY" \
   --ignored --nocapture --test-threads=1 lux_270_manifest_job_scan_benchmark
 ```
+
+### SQLite FTS5 移除未使用的 docsize 表 A/B
+
+2026-09-27 评估 SQLite migration `0148_fts_columnsize_zero.sql`。SQLite FTS5 默认维护 `media_search_docsize`，保存每行每列的 token 数；Lux 搜索只使用 `MATCH`，没有 `bm25()`、`rank`、`snippet()` 或 `highlight()` 调用。候选保持默认 `detail=full` 和现有 tokenizer，只设置 [`columnsize=0`](https://sqlite.org/fts5.html#the_columnsize_option)，并重建索引以移除该 shadow table；迁移时从 `media_items` 和 `item_aliases` 重建现存索引，并继续跳过与标题仅 ASCII 大小写等价的 sort title。既有表字段、标点短语搜索、多个 token 的 AND 语义不变。没有选择 [`detail=column`](https://sqlite.org/fts5.html#the_detail_option)：它不支持短语查询，而 Lux 把一个空格片段整体加引号，标点会被 tokenizer 拆成多个词。
+
+基线为 `ef403125`（含 0147），候选为其上的 0148 migration。在 Apple M4 / 16 GiB / ARM64、同 SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914` 的 60,000 文件 / 600 目录 fixture 上，对已固定的两版 release 测试二进制交错运行九轮；前六组候选先跑，后三组基线先跑。SQLite 使用 `synchronous=FULL`、关闭锁采样；每轮测索引首扫、120k target、无变化重扫与 50 个前台请求。
+
+| SQLite FTS5 | 首扫索引：九轮 / 中位数 | `movie_item_insert` 累计中位数 | `positive_index_apply` 累计中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | batch p95 中位数 | SQL / DML 中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 基线 | 2,271 / 2,279 / 2,242 / 2,199 / 2,200 / 2,160 / 2,462 / 2,197 / 2,176 ms；**2,200 ms** | 441.6 ms | 1,046.0 ms | 551 ms | 956 ms | 234 / 379 ms | 304 ms | 376 / 119 |
+| `columnsize=0` | 2,710 / 2,137 / 2,196 / 2,232 / 2,067 / 2,099 / 2,015 / 2,156 / 2,031 ms；**2,137 ms** | 428.0 ms | 1,044.1 ms | 552 ms | 972 ms | 238 / 374 ms | 295 ms | 376 / 119 |
+
+九轮首扫中位数快约 2.9%；`movie_item_insert` 累计中位数快约 3.1%。无变化重扫慢约 1.7%、前台 p95 慢约 1.7%，仍低于 5% 回退门；target 基本持平，目录列表 p95 和 batch p95 改善。反向运行的三组配对首扫都更快；九轮中候选有一轮 2,710 ms、基线有一轮 2,462 ms 明显偏慢，故保留原始分布并以中位数报告。SQLite DML 仍为 119，批次数不变。migration 会一次性重建现有 FTS 索引；升级回归确认 title、独立 sort title、original title、alias 均仍可搜索，且重建后没有 `media_search_docsize` 表。PostgreSQL 不使用此 migration；SQLite 中位数 2,137 ms 仍高于 LUX-270 的 2,018 ms 参考，LUX-275 阶段门继续开放。本机 ARM64 结果不外推 NAS/x86_64。

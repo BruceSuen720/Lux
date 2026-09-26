@@ -168,6 +168,16 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     assert_eq!(multi_word_body["total"], 1);
     assert_eq!(multi_word_body["items"][0]["id"], hidden_movie_id);
 
+    let punctuation = client
+        .get(format!("{base_url}/api/v1/search?q=Hidden.Movie"))
+        .header("Cookie", format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(punctuation.status(), reqwest::StatusCode::OK);
+    let punctuation_body = punctuation.json::<Value>().await?;
+    assert_eq!(punctuation_body["total"], 1);
+    assert_eq!(punctuation_body["items"][0]["id"], hidden_movie_id);
+
     let substring = client
         .get(format!("{base_url}/api/v1/search?q=idden"))
         .header("Cookie", format!("lux_session={session}"))
