@@ -600,3 +600,28 @@ PostgreSQL 代码路径未被这项 SQLite 优化修改；首扫中位数变化�
 | providerless JSON 快速路径 | 6.043 / 5.976 / 5.860 s；**5.976 s** | 1,793 ms | 4,433 ms | 2,453 ms | 3,165 ms | 268 ms | 374 ms | 800 ms | 344 / 95 | 221,833,274 bytes / 0 |
 
 三组配对首扫都变快，候选中位数快约 2.7%；`movie_item_insert` 和 `positive_index_apply` 累计中位数分别下降约 2.8% 和 2.1%。target、无变化重扫、前台 p95 与 batch p95 中位数均未回退超过 5%，最大锁 waiter 为 0。WAL 仅高约 0.4%，不视为确定性变化。候选保留为 PostgreSQL 写入优化；它不改变 SQLite 指标，LUX-275 的 SQLite 首扫门仍开放。结果只代表本机 ARM64 和临时 PostgreSQL 容器，不外推 NAS/x86_64。
+
+### SQLite sort-title FTS 重复 token 削减
+
+2026-09-27 对 SQLite migration `0147_skip_redundant_sort_title_fts_tokens.sql` 做同 fixture 交错三轮 A/B。扫描器新建电影条目的 `sort_title` 通常只是 `title` 的 ASCII 小写形式；FTS5 对 ASCII 大小写不敏感，因此 insert/update trigger 在两者仅有 ASCII 大小写差异时将 FTS 的 `sort_title` 列置空，避免为每个 token 再写一份重复倒排项。判定使用 SQLite `NOCASE`，只跳过可证明安全的 ASCII 大小写差异；其他语言字符或真正不同的排序标题仍完整写入。`title`、`original_title`、aliases 与媒体库排序字段均未改变，已有 FTS 行不重建。
+
+基线为 `5a3e1e5b`，在 Apple M4 / 16 GiB / ARM64 上，针对同一 SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914` 的 60,000 文件 / 600 目录 fixture 交错运行三轮。两版 release 测试二进制固定后复用同一 fixture；SQLite 使用 `synchronous=FULL`、关闭锁采样。每轮包括索引首扫、120k target 物化、无变化重扫和扫描期间 50 个前台请求。
+
+| SQLite FTS trigger | 首扫索引：三轮 / 中位数 | `movie_item_insert` 累计中位数 | `positive_index_apply` 累计中位数 | 120k target 中位数 | 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | batch p95 中位数 | SQL / DML 中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 基线 | 2,307 / 2,295 / 2,289 ms；**2,295 ms** | 454.0 ms | 1,074.5 ms | 573 ms | 981 ms | 244 / 375 ms | 312 ms | 376 / 119 |
+| 跳过重复 sort-title tokens | 2,163 / 2,247 / 2,285 ms；**2,247 ms** | 449.7 ms | 1,065.0 ms | 563 ms | 996 ms | 240 / 381 ms | 310 ms | 376 / 119 |
+
+三组配对首扫均未回退，中位数快约 2.1%；`movie_item_insert` 累计中位数快约 0.9%。target、前台 p95 和 batch p95 均改善，无变化重扫慢约 1.5%，目录列表 p95 慢约 1.6%，均在 5% 回退门内。SQL/DML、批次数和准备并发不变。测试覆盖扫描生成的大小写等价 sort title 仍能通过 title 搜索，以及 update 后真正不同的 sort title 仍能被 FTS 搜索。优化仅影响 SQLite，PostgreSQL 路径未改；小幅收益只代表本机 ARM64，不外推 NAS/x86_64，LUX-275 双后端阶段门继续开放。
+
+测量调用预先构建并固定基线/候选 release `performance` 测试二进制，之后按 `candidate, baseline` 顺序对同一 fixture 交错运行：
+
+```bash
+LUX_PERF_MEDIA_ROOT="$FIXTURE" \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_BACKEND=sqlite \
+LUX_PERF_SQLITE_SYNCHRONOUS=FULL \
+LUX_PERF_DISABLE_LOCK_MONITOR=1 \
+"$PERFORMANCE_TEST_BINARY" \
+  --ignored --nocapture --test-threads=1 lux_270_manifest_job_scan_benchmark
+```

@@ -156,14 +156,21 @@ pub(super) async fn remove_sqlite_title_year_unique(
              WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
-                VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
-                        '');
+                VALUES (
+                    NEW.id, NEW.title,
+                    CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE THEN '' ELSE NEW.sort_title END,
+                    COALESCE(NEW.original_title, ''), ''
+                );
             END",
             "CREATE TRIGGER media_items_search_au AFTER UPDATE OF title, sort_title, original_title ON media_items BEGIN
                 DELETE FROM media_search WHERE item_id = OLD.id;
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
-                VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),
-                        COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), ''));
+                VALUES (
+                    NEW.id, NEW.title,
+                    CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE THEN '' ELSE NEW.sort_title END,
+                    COALESCE(NEW.original_title, ''),
+                    COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), '')
+                );
             END",
             "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
                 DELETE FROM media_search WHERE item_id = OLD.id;

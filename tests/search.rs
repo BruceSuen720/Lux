@@ -53,6 +53,25 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
         sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Hidden Movie'")
             .fetch_one(database.pool())
             .await?;
+    let initial_fts_sort_title: String =
+        sqlx::query_scalar("SELECT sort_title FROM media_search WHERE item_id = ?")
+            .bind(&hidden_movie_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(initial_fts_sort_title, "");
+
+    sqlx::query("UPDATE media_items SET sort_title = 'Canonical Hidden' WHERE id = ?")
+        .bind(&hidden_movie_id)
+        .execute(database.pool())
+        .await?;
+    let canonical_sort_title_matches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_search
+         WHERE media_search MATCH 'Canonical' AND item_id = ?",
+    )
+    .bind(&hidden_movie_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(canonical_sort_title_matches, 1);
     let emby_chinese_id = emby_public_id(&chinese_id);
     sqlx::query(
         "INSERT INTO item_aliases (id, item_id, alias, language, alias_normalized)

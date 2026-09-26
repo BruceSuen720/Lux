@@ -147,6 +147,30 @@ fn postgres_provider_insert_refresh_filters_empty_provider_documents() {
 }
 
 #[test]
+fn sqlite_media_search_triggers_skip_only_ascii_case_equivalent_sort_titles() {
+    let migration = include_str!("../migrations/0147_skip_redundant_sort_title_fts_tokens.sql");
+    let legacy_rebuild = include_str!("../src/storage/migration.rs");
+
+    assert_eq!(
+        migration
+            .matches("NEW.sort_title = NEW.title COLLATE NOCASE")
+            .count(),
+        2,
+        "both insert and update triggers should omit only ASCII-case-equivalent sort titles"
+    );
+    assert!(migration.contains("ELSE NEW.sort_title"));
+    assert!(migration.contains("CREATE TRIGGER media_items_search_ai"));
+    assert!(migration.contains("CREATE TRIGGER media_items_search_au"));
+    assert_eq!(
+        legacy_rebuild
+            .matches("CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE THEN '' ELSE NEW.sort_title END")
+            .count(),
+        2,
+        "legacy table rebuild must keep insert and update triggers in sync"
+    );
+}
+
+#[test]
 fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     let migration =
         include_str!("../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");
@@ -322,7 +346,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -342,7 +366,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 146);
+    assert_eq!(second_database.schema_version().await?, 147);
     second_database.close().await;
     Ok(())
 }
@@ -560,7 +584,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
 
     database.close().await;
     Ok(())
@@ -1254,7 +1278,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
     Ok(())
 }
 
@@ -1426,7 +1450,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
     Ok(())
 }
 
@@ -1513,7 +1537,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
     database.close().await;
     Ok(())
 }
@@ -1644,7 +1668,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -1826,7 +1850,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 146);
+    assert_eq!(database.schema_version().await?, 147);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

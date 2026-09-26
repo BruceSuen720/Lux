@@ -6819,13 +6819,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 同日评估 SQLite provider-ID INSERT trigger 对 `provider_ids_json IS NULL` 的短路。该候选将 `movie_item_insert` 子阶段中位数降低约 2.1%，但 60k/600 全链路首扫中位数反而从 2.254 增至 2.280 秒，故撤回候选及 migration，性能日志保留否决数据。LUX-275 继续只保留有稳定端到端收益的改动。
 
+2026-09-27 增加 SQLite migration `0147_skip_redundant_sort_title_fts_tokens.sql`：当新条目的 `sort_title` 与 `title` 仅有 ASCII 大小写差异时，FTS trigger 不再索引重复的第二份 token；独立排序标题仍照常索引，现有 FTS 行不重建。固定二进制、同 fixture 交错三轮后，SQLite 首扫中位数 2.295 → 2.247 秒（约快 2.1%），无变化重扫慢约 1.5%，前台请求和 batch p95 未回退超过 5%；SQL/DML 未变。PostgreSQL 路径不变，SQLite 首扫仍高于 LUX-270 的 2.018 秒参考，LUX-275 阶段门保持开放，完整数据见 `docs/PERFORMANCE.md`。
+
 2026-09-27 评估 SQLite/PostgreSQL 两条层级索引前缀去重：移除 `(parent_id, removed_at)` 与 `(series_id, removed_at)`，保留含 `has_available_source` 的三列复合索引。SQLite schema/查询计划和 PostgreSQL 空库迁移测试通过，但同 fixture 交错三轮首扫中位数分别为 SQLite 2.277 → 2.330 秒、PostgreSQL 5.968 → 5.962 秒，没有形成稳定的双后端首扫收益；候选 migration、兼容重建调整和回归测试已撤回。target 阶段的轻微改善及 PG WAL 变化不能代替首扫门槛，LUX-275 继续开放，完整数据见 `docs/PERFORMANCE.md`。
 
 2026-09-27 保留 PostgreSQL provider 索引 INSERT trigger 的快速路径：在 transition table 的非空 `provider_ids_json` 过滤后才执行 `json_each_text`，搜索条目仍全部写入，NULL 与 `{}` 的 provider 索引语义不变。60k/600 同机交错三轮，PG 首扫中位数 6.143 → 5.976 秒（快约 2.7%），三组配对均改善；`positive_index_apply` 快约 2.1%，重扫、前台 p95、batch p95 和 WAL 均未超过回退门。SQLite 路径未改，LUX-275 的双后端门仍开放；完整数据见 `docs/PERFORMANCE.md`。
 
 依赖：LUX-273、LUX-274。
 
-实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 
