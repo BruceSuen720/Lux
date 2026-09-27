@@ -802,3 +802,37 @@ PostgreSQL 路径仍使用原 `RETURNING` 查询；五轮首扫中位数差约 1
 claim 子阶段约快 2.9%，但首扫中位数只快 10 ms（约 0.2%），五组配对有三组改善、两组回退；候选每批增加 savepoint 控制语句，SQL 中位数增加 16 条，DML 与提交批次不变。重扫约慢 1%，前台 p95 约慢 2.2%，都在 5% 观察门内。未得到稳定的端到端收益，因此 PostgreSQL 保留原 `RETURNING` 实现；SQLite 已验证有效的快路径继续保留。新增 PostgreSQL 并发占位回归测试验证竞态中已有的增量记录不会被覆盖，且该路径不会错误地为扫描项创建 media source。
 
 同一基线的 movie storage 阶段中位数为 `movie_folder_refresh` 77 ms、`movie_item_prefetch` 101 ms、`movie_item_insert` 1,807 ms。源代码确有多处重复目录切分与 identity-key 构造，但这些阶段计时含数据库操作，尚未单独测出字符串处理占比；当前证据不足以支持引入每批目录映射结构。目录 key 去重暂不实施，若后续继续优化，应先增加窄范围计时并证明它能带来超过噪声的全链路收益。以上只代表本机 ARM64 与本地 PostgreSQL 容器；LUX-275 阶段门仍开放。
+
+### LUX-275 数据库减负候选：generation lookup、PG search FK 与 availability trigger
+
+2026-09-27 对同一 Apple M4 / 16 GiB / ARM64 主机、PostgreSQL 16.15 本地容器、60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）评估三个 PG 路径。每轮都使用新空数据库，执行 `lux_270_manifest_job_scan_benchmark` release 基准。SQLite 不受 PG 外键与 trigger migration 影响。
+
+#### 移除 `media_search.item_id` 外键（保留）
+
+PostgreSQL bootstrap 原有 `media_search.item_id REFERENCES media_items(id) ON DELETE CASCADE`。新 migration `0147_drop_media_search_item_fk.sql` 移除它；`media_items` 的 INSERT/UPDATE/DELETE statement triggers 仍负责创建、刷新和删除派生搜索行。真实 PG 回归确认 FK 已不存在、插入媒体项仍创建搜索行、删除媒体项仍由 DELETE trigger 清掉搜索行。候选与基线使用固定 release 二进制，SHA-256 分别为 `0d9c51a2c890f3ad86343e08b5829dcb55b863d6ed0c2c530e0f6915e1ab5bbe` 与 `449401934b95952d41b7547822b78b21d900fca58803bc4db6626f97aeacbc3d`；三轮按基线/候选交错运行：
+
+| PostgreSQL 指标 | FK 保留：三轮 / 中位数 | FK 移除：三轮 / 中位数 |
+|---|---:|---:|
+| 首扫索引完成 | 5,851 / 5,820 / 5,811 ms；**5,820 ms** | 5,602 / 5,388 / 5,493 ms；**5,493 ms** |
+| `movie_item_insert` 累计时间 | 1,786 / 1,868 / 1,926 ms；**1,868 ms** | 1,552 / 1,482 / 1,593 ms；**1,552 ms** |
+| 120k target 物化 | 2,437 / 2,497 / 2,532 ms；**2,497 ms** | 2,429 / 2,415 / 2,444 ms；**2,429 ms** |
+| 无变化重扫 | 3,164 / 3,186 / 3,260 ms；**3,186 ms** | 3,174 / 3,114 / 3,207 ms；**3,174 ms** |
+| 前台 p95 / batch p95 | 271 / 797 ms | 277 / 721 ms |
+| SQL / DML / 正向提交批次 | 344 / 95 / 8 | 344 / 95 / 8 |
+| WAL 字节中位数 / 最大锁等待者 | 207,496,723 / 0 | 226,457,765 / 0 |
+
+首扫三组配对都更快，中位数约快 5.6%；`movie_item_insert` 快约 16.9%。target、无变化重扫和前台 p95 均在 5% 观察门内，DML、提交批次和锁等待没有增加。WAL 字节样本中位数增加约 9.1%；这里读取的是 PostgreSQL 集群级 `pg_stat_wal` delta，当前实验不能把它归因于 FK 删除，故保留该差异作为需持续观察的指标。综合全链路和触发器回归，保留 PG 外键移除；直接 SQL 写入 `media_search` 若绕过媒体项 trigger，仍可能留下孤儿行，这是这项派生索引设计的完整性边界。
+
+#### 跳过 `known_path_query` 与移除 generation lookup（未保留）
+
+四轮原始 PG 基线的 `known_path_query` 累计中位数约 126 ms、每轮扫描中调用 9 次。该查询还识别已在同一 generation 提交的路径，防止事务重放再次增加根目录观测计数。试验将 ADD claim 前移，再对本事务已 claim 的路径跳过 lookup；`streamed_manifest_add_does_not_claim_a_concurrent_filesystem_entry` 回归失败，因为 claim 越过了 root checkpoint 后到达的增量写入，改变了当前“增量赢家”竞态顺序。要保留这个顺序并延后计数，需拆开 root checkpoint 并增加事务更新，估计会抵消最多约 126 ms 的节省。故不改变查询或写入顺序；新增 `manifest_discovery_does_not_count_a_path_already_seen_in_the_generation` 特征测试固定重放计数语义。
+
+#### `media_sources_availability_ai` 额外早退（未保留）
+
+`new_rows` 是 `media_sources` transition table，本身没有 `has_available_source`；正确的 guard 必须再次 join 父 `media_items`。已有 migration `0142_filter_available_source_promotions.sql` 已先筛出 `candidate.has_available_source = 0`，再 join `filesystem_entries`。临时 guard 在现有 UPDATE 前重复了这次父项查找。相对已移除 FK、未加 guard 的三轮，增加 guard 后首扫中位数 5,636 → 5,957 ms（慢约 5.7%），`movie_source_insert` 累计中位数 1,209 → 1,652 ms（慢约 36.6%）；首扫三组均回退。临时 migration 和测试已撤回，不把其结论与保留的 FK migration 混为一项。
+
+#### SQLite `original_title == title`（未新增改动）
+
+本请求的严格相等条件是此前 SQLite migration 0149 已评估条件（ASCII 大小写等价）的子集。该 A/B 首扫仅快约 0.7%、仍落在运行噪声内，target 中位数还增加约 5.3%；既有测试已覆盖相同标题可搜索和独立 original title 搜索。未重复增加 migration 或改动 FTS trigger。
+
+以上 PG 数据仅代表本机 ARM64 和本地容器，不外推 NAS/x86_64；LUX-275 双后端阶段门仍开放。

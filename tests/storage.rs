@@ -311,6 +311,14 @@ fn postgres_media_search_insert_refresh_avoids_redundant_upsert() {
     assert!(!migration.contains("ON CONFLICT"));
 }
 
+#[test]
+fn postgres_media_search_drops_the_trigger_redundant_item_foreign_key() {
+    let migration = include_str!("../migrations-postgres/0147_drop_media_search_item_fk.sql");
+
+    assert!(migration.contains("ALTER TABLE media_search"));
+    assert!(migration.contains("DROP CONSTRAINT IF EXISTS media_search_item_id_fkey"));
+}
+
 #[tokio::test]
 async fn postgres_scan_job_migration_allows_one_active_job_per_type()
 -> Result<(), Box<dyn std::error::Error>> {

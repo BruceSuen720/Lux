@@ -10077,6 +10077,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_discovery_does_not_count_a_path_already_seen_in_the_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        let roots = [NewScanManifestRoot {
+            library_root_id: "root",
+        }];
+        let manifest = NewScanManifest {
+            id: "manifest",
+            job_id: "job",
+            library_id: "lib",
+            roots: &roots,
+        };
+        database
+            .create_full_scan_manifest_job("job", "generation", false, &manifest, None)
+            .await?;
+        assert!(database.claim_scan_job("job").await?);
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     fingerprint, last_seen_generation, is_missing
+                 ) VALUES ('seen-entry', 'root', 'Already.Seen.2024.mkv', 'FILE', 1, 1,
+                           ?, 'generation', 0)",
+            )
+            .bind(vec![1_u8; 32])
+            .execute(database.pool())
+            .await?;
+        let entries = [NewScanManifestEntry {
+            relative_path: "Already.Seen.2024.mkv".to_owned(),
+            entry_kind: "FILE".to_owned(),
+            size: 1,
+            modified_at: 1,
+            device: None,
+            inode: None,
+            fingerprint: vec![1_u8; 32],
+        }];
+        let chunk = NewScanManifestDiscoveryChunk {
+            manifest_id: "manifest",
+            job_id: "job",
+            library_root_id: "root",
+            child_directories: &[],
+            entries: &entries,
+            positive_indexes: &[],
+            unchanged_paths: &[],
+            seen_filesystem_entries: &[],
+            completed_directory: Some(""),
+        };
+
+        let committed = database
+            .commit_scan_manifest_discovery_chunk(&chunk)
+            .await?;
+        assert_eq!(committed, 0);
+        let stored_count: i64 = database
+            .query_scalar("SELECT observed_file_count FROM scan_manifests WHERE id = 'manifest'")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(stored_count, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn manifest_discovery_finalize_does_not_ignore_cancel_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;

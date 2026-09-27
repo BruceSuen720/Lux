@@ -6843,9 +6843,11 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 评估 PostgreSQL 文件系统 claim 无 `RETURNING` 快路径：同 fixture 五组交错后，首扫中位数 5.675 → 5.665 秒（约快 0.2%），claim 子阶段约快 2.9%，但配对结果有快有慢，且每批额外增加 savepoint SQL，未形成稳定全链路收益；因此保留 PostgreSQL 原 `RETURNING` 路径，SQLite 已验证的快路径不变。目录 key 去重也暂不采纳：PG `movie_folder_refresh` / `movie_item_prefetch` 中位数约 77 / 101 ms，而 `movie_item_insert` 约 1.807 秒；计时还包含数据库工作，尚不能证明重复路径处理值得增加映射复杂度。A 项混合库重复文件名解析复用已采纳；JoinSet 分块和双缓冲已有先前 A/B 结果且均未通过双后端门。详细数据见 `docs/PERFORMANCE.md`。LUX-275 阶段门继续开放。
 
+2026-09-27 评估四项数据库减负：新增 PG migration `0147_drop_media_search_item_fk.sql` 移除由 `media_items` statement trigger 冗余维护的 `media_search` 外键。60k fixture 三组交错 A/B，PostgreSQL 首扫中位数 5.820 → 5.493 秒（快约 5.6%），`movie_item_insert` 1.868 → 1.552 秒（快约 16.9%）；target、重扫、前台 p95 均在 5% 观察门内，DML 与提交批次不变，删除 trigger 清理回归通过。WAL 计数高约 9.1%，取自集群级 `pg_stat_wal`，尚不能归因于此 constraint migration，需继续观察。其余候选不采纳：跳过 generation lookup 的尝试改变 root checkpoint 与增量扫描竞态顺序，故保留重放检查并增加同 generation 计数测试；availability trigger 早退重复执行已有 `0142` 的父项过滤，三轮首扫慢约 5.7%、source insert 阶段慢约 36.6%；original-title 精确相等已被此前未保留的 0149 更宽条件 A/B 覆盖。完整数据见 `docs/PERFORMANCE.md`；LUX-275 阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
-实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`migrations-postgres/0147_drop_media_search_item_fk.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 
