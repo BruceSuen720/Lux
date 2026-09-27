@@ -2152,6 +2152,16 @@ services:
 | LUX-273 | src/application/scanner.rs、tests/scanning_jobs.rs、tests/performance.rs、docs/PERFORMANCE.md；滚动式双 reader 有界预读与准备流水线 |
 | LUX-274 | src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs、tests/performance.rs、docs/PERFORMANCE.md；SQLite/PostgreSQL 共同写入路径降本 |
 | LUX-275 | tests/performance.rs、docs/LUX-DEVELOPMENT.md、docs/PERFORMANCE.md、docs/COMPATIBILITY.md；全链路性能与阶段门 |
+| LUX-276 | src/library.rs、src/application/libraries.rs、src/api/emby_catalog.rs、src/application/library_covers.rs、tests/library.rs；HOMEVIDEOS 媒体库类型与配置能力 |
+| LUX-277 | src/storage/migration.rs、migrations-postgres/0150_homevideos_video_types.sql、tests/storage.rs、tests/postgres_database.rs；HOMEVIDEOS/VIDEO 双数据库迁移 |
+| LUX-278 | src/application/scanner.rs、src/storage/media.rs、tests/scanning_jobs.rs、tests/storage.rs；其他视频扫描与目录层级 |
+| LUX-279 | src/application/nfo.rs、src/storage/jobs.rs、tests/nfo_writer.rs、tests/scanning_jobs.rs；VIDEO 本地 NFO 与禁止自动匹配 |
+| LUX-280 | src/storage/catalog.rs、src/application/catalog.rs、src/application/home.rs、tests/catalog.rs、tests/resume_favorites.rs；VIDEO 搜索、播放状态与继续观看 |
+| LUX-281 | src/api/emby_catalog.rs、src/api/legacy.rs、tests/mixed_library_api.rs、docs/COMPATIBILITY.md；Emby homevideos/Video 契约 |
+| LUX-282 | web/src/features/auth/AdminSetupForm.tsx、web/src/lib/api/types.ts、web/src/app.mjs、web/tests/setup-page.test.tsx；初始化媒体库类型选择 |
+| LUX-283 | web/src/lib/api/types.ts、web/src/features/admin/AdminLibrariesPage.tsx、web/tests/admin-libraries.test.tsx；管理界面类型与刮削器配置 |
+| LUX-284 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts；其他视频目录浏览与搜索 |
+| LUX-285 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/home/media.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx；视频详情、手动编辑与播放 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6854,6 +6864,116 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`migrations-postgres/0147_drop_media_search_item_fk.sql`、`migrations-postgres/0148_drop_scan_job_targets_job_fk.sql`、`migrations-postgres/0149_statement_timestamp_unixepoch.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+### 阶段 23：HOMEVIDEOS「其他视频」媒体库
+
+阶段 22 的 LUX-275 严格性能门仍开放。本功能按项目所有者 2026-09-27 的明确指示在独立 `feature/homevideos` 分支并行实施；这项授权不代表 LUX-275 已通过，也不关闭阶段 22 门。HOMEVIDEOS 交付后仍须独立完成阶段 22 验收与确认。
+
+目标：增加内部库类型 `HOMEVIDEOS`，Lux Web 显示为“其他视频”，Emby 映射为 `CollectionType: homevideos`。该库只包含普通可播放 `VIDEO` 条目和表示磁盘目录的 `FOLDER` 条目；目录层级按原路径保留。视频文件名不参与电影/剧集分类，即使名称类似 `Movie (2024)` 或 `S01E01` 也不改类型、不创建待确认条目、不触发在线匹配。视频仍可搜索、浏览详情、播放和保存播放进度。
+
+边界：仅处理媒体库路径中的受支持视频文件（`.strm` 继续遵守现有安全和探测规则），不增加上传接口、照片、音乐或其他资源类型。视频的本地 NFO 可读；管理员可用现有元数据编辑器手动修改，写回媒体同名 NFO 并遵循当前 metadata 镜像策略。HOMEVIDEOS 不接受在线刮削器配置，不自动在线匹配。
+
+任务顺序与验收：
+
+#### LUX-276：HOMEVIDEOS 类型与库配置语义
+
+- [x] `LibraryKind` 支持 `HOMEVIDEOS` 的序列化、反序列化、数据库字符串转换；旧类型字符串和 MIXED 行为保持不变。
+- [x] HOMEVIDEOS 不支持刮削器或章节数据源；服务层创建/更新不会保存这些配置，已有库切换类型时也不会遗留刮削器。
+- [x] 增加类型解析、序列化和库配置拒绝/清理行为的回归测试。
+
+依赖：无。验证：`cargo test --locked --test library`、`cargo fmt --all -- --check`。
+
+预计文件：`src/library.rs`、`src/application/libraries.rs`、`src/api/emby_catalog.rs`、`src/application/library_covers.rs`、`tests/library.rs`。Emby exhaustive matches 仅提供空兼容分支，实际协议映射留到 LUX-281。
+
+结果（2026-09-27）：`cargo test --locked --test library` 13 项通过；库服务 scraper-settings 单测通过；`cargo clippy --locked --lib --all-features -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+#### LUX-277：SQLite 与 PostgreSQL 类型迁移
+
+- [ ] `libraries.kind` 接受 `HOMEVIDEOS`，`media_items.item_type` 接受 `VIDEO`；既有值与关联数据不变。
+- [ ] SQLite 空库启动和旧库升级都执行约束升级；PostgreSQL 空库与旧库迁移都可启动，并验证既有数据不变。
+- [ ] 回归验证 schema 约束、外键和已有库/媒体项读取。
+
+依赖：LUX-276。验证：`cargo test --locked --test storage`、`cargo test --locked --test postgres_database`。
+
+预计文件：`src/storage/migration.rs`、`migrations-postgres/0150_homevideos_video_types.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+#### LUX-278：其他视频扫描与目录层级
+
+- [ ] 全量、实时增量和重新调和扫描都为每个视频创建独立 `VIDEO`，并以 `FOLDER` 保留各级磁盘目录。
+- [ ] 文件名不运行电影/剧集解析；视频保持本地确认，不进入待确认队列。文件变更、移动、缺失、取消和重试沿用现有扫描安全语义。
+- [ ] `.strm` 使用已有目标校验与探测路径。
+
+依赖：LUX-277。验证：`cargo test --locked --test scanning_jobs`、`cargo test --locked --test storage`。
+
+预计文件：`src/application/scanner.rs`、`src/storage/media.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`。
+
+#### LUX-279：VIDEO 本地 NFO 与手动元数据
+
+- [ ] 扫描可把同名 NFO 投影到 VIDEO；NFO 内容不会把视频重新分类成电影或剧集。
+- [ ] 现有元数据编辑器可修改 VIDEO，并将修改原子写回媒体同目录同名 NFO；metadata 镜像启用时继续写镜像。
+- [ ] VIDEO 不进入在线刮削、自动识别或候选确认任务。
+
+依赖：LUX-278。验证：`cargo test --locked --test nfo_writer`、`cargo test --locked --test scanning_jobs`。
+
+预计文件：`src/application/nfo.rs`、`src/storage/jobs.rs`、`tests/nfo_writer.rs`、`tests/scanning_jobs.rs`。
+
+#### LUX-280：普通视频目录、搜索与播放状态
+
+- [ ] Lux API 可按库类型列出 VIDEO/FOLDER；全局搜索和统计将 VIDEO 视为普通可播放视频。
+- [ ] 播放进度、已看状态和继续观看对 VIDEO 生效，现有电影/剧集规则不变。
+- [ ] 覆盖分页、搜索、播放状态和继续观看查询。
+
+依赖：LUX-278。验证：`cargo test --locked --test catalog`、`cargo test --locked --test resume_favorites`。
+
+预计文件：`src/storage/catalog.rs`、`src/application/catalog.rs`、`src/application/home.rs`、`tests/catalog.rs`、`tests/resume_favorites.rs`。
+
+#### LUX-281：Emby homevideos 与 Video 契约
+
+- [ ] Emby 虚拟视图、根视图配置与库类型报告 `homevideos`；根计数只计算本库 VIDEO。
+- [ ] VIDEO 返回 `Type: Video`、`MediaType: Video`，支持 `IncludeItemTypes=Video`，并能按父目录返回 FOLDER/VIDEO 子项。
+- [ ] Emby 播放回调进度和 Resume 可见 VIDEO；更新兼容记录并保留现有 Emby DTO 边界。
+
+依赖：LUX-280。验证：`cargo test --locked --test mixed_library_api`、`cargo test --locked --test resume_favorites`。
+
+预计文件：`src/api/emby_catalog.rs`、`src/api/legacy.rs`、`tests/mixed_library_api.rs`、`docs/COMPATIBILITY.md`。
+
+#### LUX-282：初始化时选择其他视频库
+
+- [ ] 初始化的可选首个媒体库类型加入“其他视频”，提交 `HOMEVIDEOS`。
+- [ ] 初始化页面的其余默认行为保持不变。
+
+依赖：LUX-276。验证：`pnpm --dir web test -- setup-page`、`pnpm --dir web build`。
+
+预计文件：`web/src/features/auth/AdminSetupForm.tsx`、`web/src/lib/api/types.ts`、`web/src/app.mjs`、`web/tests/setup-page.test.tsx`。
+
+#### LUX-283：管理界面创建/编辑其他视频库
+
+- [ ] 创建和编辑媒体库类型选择器提供“其他视频”。
+- [ ] HOMEVIDEOS 隐藏刮削器配置并提交空配置；其他类型配置行为不变。
+
+依赖：LUX-276。验证：`pnpm --dir web test -- admin-libraries`、`pnpm --dir web build`。
+
+预计文件：`web/src/lib/api/types.ts`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/tests/admin-libraries.test.tsx`。
+
+#### LUX-284：Web 目录浏览与搜索
+
+- [ ] 其他视频库默认列出根目录条目；选择 FOLDER 进入下一层，并能返回父目录。
+- [ ] VIDEO 出现在库搜索结果中，文件夹不会作为可播放媒体显示。
+- [ ] 浏览列表保持现有分页、排序、空状态与权限行为。
+
+依赖：LUX-281、LUX-283。验证：`pnpm --dir web test -- library-page`、`pnpm --dir web build`。
+
+预计文件：`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/src/lib/api/client.ts`、`web/src/features/home/media.tsx`、`web/tests/library-page.test.ts`。
+
+#### LUX-285：VIDEO 详情、编辑与播放
+
+- [ ] VIDEO 详情明确显示普通视频信息，保留现有详情、元数据编辑与 NFO 入口。
+- [ ] 从其他视频库可播放 VIDEO；进度条和继续观看卡片按普通视频呈现。
+- [ ] 文件夹与普通视频有清晰且正确的交互，文件夹不显示播放/编辑动作。
+
+依赖：LUX-279、LUX-280、LUX-284。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web test -- media-action-menu`、`pnpm --dir web build`。
+
+预计文件：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/home/media.tsx`、`web/src/features/media/MediaActionMenu.tsx`、`web/tests/media-detail.test.tsx`、`web/tests/media-action-menu.test.tsx`。
 
 ## 26. 风险与缓解
 

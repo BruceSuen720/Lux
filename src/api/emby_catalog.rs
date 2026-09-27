@@ -865,6 +865,7 @@ pub(super) async fn emby_library_root_count(
         LibraryKind::Movie => vec!["MOVIE".to_owned()],
         LibraryKind::Series => vec!["SERIES".to_owned()],
         LibraryKind::Mixed => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+        _ => Vec::new(),
     };
     catalog
         .list_library_items_filtered(
@@ -893,6 +894,7 @@ fn library_root_count(counts: Option<&CatalogItemCounts>, kind: LibraryKind) -> 
         LibraryKind::Movie => counts.movie_count,
         LibraryKind::Series => counts.series_count,
         LibraryKind::Mixed => counts.movie_count + counts.series_count,
+        _ => 0,
     }
 }
 
@@ -4732,6 +4734,7 @@ pub(super) fn emby_virtual_folder_options_json(
             emby_library_type_options_json("Movie", media_strategy),
             emby_library_type_options_json("Series", media_strategy),
         ],
+        _ => Vec::new(),
     };
     json!({
         "EnableArchiveMediaFiles": false,
@@ -4868,6 +4871,7 @@ pub(super) fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {
         LibraryKind::Movie => Some("movies"),
         LibraryKind::Series => Some("tvshows"),
         LibraryKind::Mixed => None,
+        _ => None,
     }
 }
 
