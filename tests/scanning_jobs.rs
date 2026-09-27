@@ -10,7 +10,7 @@ use luxd::{
         libraries::LibraryService,
         nfo::LocalNfoMetadataStore,
         probe::{FfprobeRunner, MediaProbeService},
-        reidentify::MetadataReidentifyService,
+        reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{
             BACKGROUND_SCAN_BATCH_SIZE, IncrementalScanChange, ScanJobError, ScanJobService,
         },
@@ -250,6 +250,128 @@ async fn homevideos_manifest_scans_keep_folders_and_skip_filename_classification
     .fetch_one(database.pool())
     .await?;
     assert_eq!(removed_video, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideos_scan_imports_same_name_nfo_without_reclassifying_or_queueing_online_match()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Movie (2024).mkv"), b"home video").await?;
+    tokio::fs::write(
+        root.join("Movie (2024).nfo"),
+        "<movie><title>手动整理的视频</title><year>2024</year></movie>",
+    )
+    .await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let item: (String, String, Option<i64>, String, Option<String>) = sqlx::query_as(
+        "SELECT item_type, title, production_year, identification_status, metadata_scraper_id
+         FROM media_items WHERE library_id = ? AND item_type = 'VIDEO' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item.0, "VIDEO");
+    assert_eq!(item.1, "手动整理的视频");
+    assert_eq!(item.2, Some(2024));
+    assert_eq!(item.3, "LOCAL_CONFIRMED");
+    assert_eq!(item.4, None);
+
+    let video_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'VIDEO' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = 'tmdb', realtime_metadata_auto_match_enabled = 1
+         WHERE id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let scraper = TestScraper::new(TestScraperConfig::default())?;
+    let reidentify =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(scraper));
+
+    tokio::fs::write(
+        root.join("Movie (2024).nfo"),
+        "<tvshow><title>增量更新的普通视频</title><year>2025</year><season>1</season></tvshow>",
+    )
+    .await?;
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Movie (2024).nfo".to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion_with_metadata(&incremental.id, 100, None, Some(reidentify.clone()))
+        .await?;
+    let incremental_item: (String, String, Option<i64>) =
+        sqlx::query_as("SELECT item_type, title, production_year FROM media_items WHERE id = ?")
+            .bind(&video_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        incremental_item,
+        (
+            "VIDEO".to_owned(),
+            "增量更新的普通视频".to_owned(),
+            Some(2025)
+        )
+    );
+
+    let candidate_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+            .bind(&video_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(candidate_count, 0);
+    let metadata_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(metadata_jobs, 0);
+    let auto_match_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
+         WHERE job_id = ? AND event_code IN (
+             'METADATA_AUTO_MATCH_QUEUED', 'METADATA_AUTO_MATCH_QUEUE_FAILED'
+         )",
+    )
+    .bind(&incremental.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(auto_match_events, 0);
+
+    assert!(matches!(
+        reidentify
+            .create_fill_missing_job(vec![video_item_id])
+            .await,
+        Err(MetadataReidentifyError::InvalidItemCount)
+    ));
     Ok(())
 }
 

@@ -2723,6 +2723,56 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_home_video_metadata_sources_for_incremental_scan(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE mi.item_type = 'VIDEO'
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ?
+                     AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           sjp.relative_path = '.'
+                           OR
+                           fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                     )
+               )
+             ORDER BY ms.item_id, fe.relative_path",
+        )
+        .bind(scan_job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_danmaku_source_for_item(
         &self,
         item_id: &str,

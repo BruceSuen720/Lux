@@ -4921,7 +4921,7 @@ impl Database {
              SELECT DISTINCT target.id
              FROM metadata_targets targets
              JOIN media_items target ON target.id = targets.item_id
-             WHERE target.removed_at IS NULL
+             WHERE target.removed_at IS NULL AND target.item_type <> 'VIDEO'
              ORDER BY target.id",
         )
         .bind(job_id)
@@ -6435,6 +6435,57 @@ impl Database {
              WHERE t.job_id = ? AND t.target_type = 'ITEM'
                AND t.metadata_state = 'PENDING'
                AND mi.item_type = 'MOVIE'
+               AND fe.is_missing = 0
+             ORDER BY t.target_id
+             LIMIT ? OFFSET ?",
+        )
+        .bind(job_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_job_target_home_video_items_page(
+        &self,
+        job_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM scan_job_targets t
+             JOIN media_items mi ON mi.id = t.item_id
+             JOIN media_sources ms ON ms.id = (
+                 SELECT preferred.id FROM media_sources preferred
+                 JOIN filesystem_entries preferred_fe
+                   ON preferred_fe.id = preferred.filesystem_entry_id
+                 WHERE preferred.item_id = t.item_id
+                   AND preferred_fe.is_missing = 0
+                 ORDER BY preferred.is_default DESC, preferred.id
+                 LIMIT 1
+             )
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE t.job_id = ? AND t.target_type = 'ITEM'
+               AND t.metadata_state = 'PENDING'
+               AND mi.item_type = 'VIDEO'
                AND fe.is_missing = 0
              ORDER BY t.target_id
              LIMIT ? OFFSET ?",

@@ -303,6 +303,17 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let kind = self
+            .database
+            .find_media_item_kind(item_id)
+            .await
+            .map_err(MetadataCandidateError::Storage)?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        if kind.item_type == "VIDEO" {
+            return Err(MetadataCandidateError::Scraper(
+                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
+            ));
+        }
         let scrapers = self
             .providers_for_item(item_id, false)
             .await
@@ -435,6 +446,14 @@ impl MetadataReidentifyService {
             return Err(MetadataReidentifyError::InvalidItemCount);
         }
         for item_id in &unique_ids {
+            if self
+                .database
+                .find_media_item_kind(item_id)
+                .await?
+                .is_some_and(|kind| kind.item_type == "VIDEO")
+            {
+                return Err(MetadataReidentifyError::InvalidItemCount);
+            }
             if self
                 .database
                 .find_media_item_metadata(item_id)

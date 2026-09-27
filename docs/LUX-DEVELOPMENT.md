@@ -6913,13 +6913,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-279：VIDEO 本地 NFO 与手动元数据
 
-- [ ] 扫描可把同名 NFO 投影到 VIDEO；NFO 内容不会把视频重新分类成电影或剧集。
-- [ ] 现有元数据编辑器可修改 VIDEO，并将修改原子写回媒体同目录同名 NFO；metadata 镜像启用时继续写镜像。
-- [ ] VIDEO 不进入在线刮削、自动识别或候选确认任务。
+- [x] 扫描可把同名 NFO 投影到 VIDEO；NFO 内容不会把视频重新分类成电影或剧集。
+- [x] 现有元数据编辑器可修改 VIDEO，并将修改原子写回媒体同目录同名 NFO；metadata 镜像启用时继续写镜像。
+- [x] VIDEO 不进入在线刮削、自动识别或候选确认任务。
 
 依赖：LUX-278。验证：`cargo test --locked --test nfo_writer`、`cargo test --locked --test scanning_jobs`。
 
-预计文件：`src/application/nfo.rs`、`src/storage/jobs.rs`、`tests/nfo_writer.rs`、`tests/scanning_jobs.rs`。
+预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`src/application/reidentify.rs`、`src/storage/catalog.rs`、`src/storage/jobs.rs`、`tests/nfo_writer.rs`、`tests/scanning_jobs.rs`。
+
+结果（2026-09-28）：同名 NFO 全量/增量导入均保留 VIDEO 类型；即使 NFO 根节点为 `<movie>` 或 `<tvshow>`、文件名含年份，仍不会变成电影/剧集。编辑器原子写回视频同名 NFO，并按 metadata 策略写入镜像；视频自动匹配与显式补全任务均被排除。`cargo test --locked --test nfo_writer` 22 项、`--test scanning_jobs` 79 项、`--test reidentify` 12 项通过。`cargo build --locked`、`cargo test --locked --all-targets`（572 个单元测试通过、4 个忽略；集成目标零失败）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 通过。PostgreSQL 集成用例因本地无 PostgreSQL 服务按约定忽略。
 
 #### LUX-280：普通视频目录、搜索与播放状态
 

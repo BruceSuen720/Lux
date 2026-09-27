@@ -1,16 +1,16 @@
 use luxd::{
     application::{
         libraries::LibraryService,
-        metadata::{MetadataEnricher, NfoMetadata},
+        metadata::{MetadataEnricher, MetadataField, NfoMetadata},
         metadata_paths::library_item_directory,
         nfo::{
-            LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteService,
-            parse_local_nfo_actors, parse_local_nfo_details, parse_local_nfo_projection,
-            parse_movie_nfo_actors, parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo,
-            rewrite_series_nfo, write_nfo_atomically,
+            LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService, MovieNfoCredit,
+            MovieNfoMetadata, NfoWriteService, parse_local_nfo_actors, parse_local_nfo_details,
+            parse_local_nfo_projection, parse_movie_nfo_actors, parse_movie_nfo_details,
+            rewrite_movie_nfo, rewrite_nfo, rewrite_series_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
-        scanner::LibraryScanner,
+        scanner::{LibraryScanner, ScanJobService},
     },
     config::Config,
     library::LibraryKind,
@@ -595,6 +595,88 @@ async fn nfo_service_can_write_an_additional_metadata_copy()
     let media_copy = tokio::fs::read(&report.path).await?;
     let metadata_copy = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
     assert_eq!(tokio::fs::read(metadata_copy).await?, media_copy);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_editor_writes_home_video_same_name_nfo_and_metadata_mirror()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Holiday.S01E01.mkv"), b"home video").await?;
+    tokio::fs::write(
+        root.join("movie.nfo"),
+        "<movie><title>unrelated directory nfo</title></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'VIDEO' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "images": { "writeToMetadata": true }
+            })
+            .to_string(),
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    let editor =
+        MetadataWriteService::new_with_config_dir(database.clone(), config.config_dir.clone());
+    editor
+        .write_item_metadata(
+            &item_id,
+            MetadataWriteRequest {
+                title: "手动视频标题".to_owned(),
+                original_title: Some("Original clip".to_owned()),
+                overview: Some("手动维护的简介".to_owned()),
+                production_year: Some(2024),
+                locked_fields: [MetadataField::Title].into_iter().collect(),
+            },
+        )
+        .await?;
+
+    let same_name_nfo = root.join("Holiday.S01E01.nfo");
+    let output = tokio::fs::read_to_string(&same_name_nfo).await?;
+    assert!(output.contains("<title>手动视频标题</title>"));
+    assert!(output.contains("<year>2024</year>"));
+    assert_eq!(
+        tokio::fs::read_to_string(root.join("movie.nfo")).await?,
+        "<movie><title>unrelated directory nfo</title></movie>"
+    );
+    let metadata_copy =
+        library_item_directory(&config.config_dir, &item_id)?.join("Holiday.S01E01.nfo");
+    assert_eq!(
+        tokio::fs::read(metadata_copy).await?,
+        tokio::fs::read(same_name_nfo).await?
+    );
+    let item_type: String = sqlx::query_scalar("SELECT item_type FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(item_type, "VIDEO");
     Ok(())
 }
 

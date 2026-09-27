@@ -1643,7 +1643,7 @@ impl NfoWriteService {
             .await?
             .ok_or(NfoWriteError::ItemNotFound)?;
         let source = match kind.item_type.as_str() {
-            "MOVIE" | "EPISODE" => {
+            "MOVIE" | "EPISODE" | "VIDEO" => {
                 self.database
                     .find_metadata_writeback_source_path(item_id)
                     .await?
@@ -1680,6 +1680,7 @@ impl NfoWriteService {
                 .await
                 .unwrap_or_else(|| directory.join("movie.nfo")),
             "EPISODE" => find_episode_nfo_target(&media_path, &directory).await,
+            "VIDEO" => media_path.with_extension("nfo"),
             "SERIES" => {
                 let series_dir = series_directory(&root, &source.relative_path)
                     .ok_or_else(|| NfoWriteError::PathOutsideRoot(directory.clone()))?;
