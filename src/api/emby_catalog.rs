@@ -870,7 +870,7 @@ pub(super) async fn emby_library_root_count(
         LibraryKind::Movie => vec!["MOVIE".to_owned()],
         LibraryKind::Series => vec!["SERIES".to_owned()],
         LibraryKind::Mixed => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
-        LibraryKind::HomeVideos => vec!["FOLDER".to_owned(), "VIDEO".to_owned()],
+        LibraryKind::HomeVideos => vec!["VIDEO".to_owned()],
     };
     catalog
         .list_library_items_filtered(

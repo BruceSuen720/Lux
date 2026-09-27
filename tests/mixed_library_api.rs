@@ -216,7 +216,7 @@ async fn homevideos_emby_views_and_parent_browsing_use_video_items()
     assert_eq!(views["TotalRecordCount"], 1);
     assert_eq!(views["Items"][0]["Id"], emby_library_id);
     assert_eq!(views["Items"][0]["CollectionType"], "homevideos");
-    assert_eq!(views["Items"][0]["ChildCount"], 3);
+    assert_eq!(views["Items"][0]["ChildCount"], 2);
 
     let virtual_folders = client
         .get(format!("{base_url}/Library/VirtualFolders"))
