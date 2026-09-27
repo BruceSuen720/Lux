@@ -6829,6 +6829,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 评估 SQLite 每连接 cache 扩容、WAL 自动 checkpoint 阈值、`temp_store=MEMORY` 和 16k discovery/storage 批次。候选的首扫收益很小或不稳定，同时出现无变化重扫、目录查询或 batch p95 超过回退门的情况；没有保留任何运行时 PRAGMA 或 16k discovery 批次，正式 discovery/file/entry 上限维持 80 / 8,000 / 8,192。基准专用 PRAGMA 开关和详细对照留在 `docs/PERFORMANCE.md`；LUX-275 阶段门仍开放。
 
+2026-09-27 逐项评估目录 Provider ID 缓存、逐文件二次 stat、SQLite cache/temp/mmap PRAGMA、父电影目录 refresh 与 8k 粗粒度双缓冲。只保留每目录惰性解析 Provider ID 的 `OnceLock`：60k 首扫 SQLite 中位数 2.280 → 2.188 秒，PostgreSQL 6.075 → 6.111 秒（波动范围内），两个后端的正向准备累计耗时均下降；双缓冲三轮 A/B 没有稳定首扫收益，已撤回。二次 stat 继续保护文件变更竞态；不缓存跨事务“已验证目录”；PRAGMA 仅保留基准实验开关，不改变运行配置。复核测试、PRAGMA 数值及双缓冲分布见 `docs/PERFORMANCE.md`。本轮使用单个扫描作业的内部并发，不是多个扫描客户端并发；LUX-275 阶段门继续开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。

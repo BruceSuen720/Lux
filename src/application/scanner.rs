@@ -4,7 +4,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -204,6 +204,7 @@ struct ManifestFilePreparationContext {
     root_path: PathBuf,
     expected_root_device: Option<i64>,
     expected_root_inode: Option<i64>,
+    movie_folder_provider_ids_cache: Option<Arc<OnceLock<BTreeMap<String, String>>>>,
     verify_path_after_preparation: bool,
 }
 
@@ -1491,12 +1492,16 @@ async fn prepare_manifest_observation(
         root_path,
         expected_root_device,
         expected_root_inode,
+        movie_folder_provider_ids_cache,
         verify_path_after_preparation,
     } = context;
     if observed.entry_kind != "FILE" {
         return ManifestDeltaPreparation::Unstable { delta_id };
     }
     let path = root_path.join(&observed.relative_path);
+    let movie_folder_provider_ids = movie_folder_provider_ids_cache
+        .as_ref()
+        .map(|cache| cache.get_or_init(|| movie_folder_provider_ids(&path)));
     let is_media = is_supported_movie_file(Path::new(&observed.relative_path));
     let is_sidecar = is_supported_sidecar_file(Path::new(&observed.relative_path));
     if !is_media && !is_sidecar {
@@ -1527,7 +1532,12 @@ async fn prepare_manifest_observation(
         };
         let prepared = match classification {
             MixedClassification::Movie => scanner
-                .prepare_manifest_movie_file(&path, &observed, manifest_strm_target)
+                .prepare_manifest_movie_file(
+                    &path,
+                    &observed,
+                    manifest_strm_target,
+                    movie_folder_provider_ids.as_deref(),
+                )
                 .await
                 .map(|file| file.map(PreparedManifestFile::Movie)),
             MixedClassification::Episode => scanner
@@ -3668,9 +3678,15 @@ impl LibraryScanner {
         path: &Path,
         observation: &NewScanManifestEntry,
         strm_target: Option<StrmTarget>,
+        folder_provider_ids: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<NewMovieFile>, ScannerError> {
-        self.prepare_new_movie_file_with_manifest_observation(path, observation, strm_target)
-            .await
+        self.prepare_new_movie_file_with_manifest_observation(
+            path,
+            observation,
+            strm_target,
+            folder_provider_ids,
+        )
+        .await
     }
 
     async fn prepare_new_movie_file_with_manifest_observation(
@@ -3678,6 +3694,7 @@ impl LibraryScanner {
         path: &Path,
         observation: &NewScanManifestEntry,
         manifest_strm_target: Option<StrmTarget>,
+        folder_provider_ids: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<NewMovieFile>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
@@ -3685,7 +3702,12 @@ impl LibraryScanner {
         let Some(parsed_name) = parse_movie_filename(file_name) else {
             return Ok(None);
         };
-        let provider_ids = movie_provider_ids(path, &parsed_name.provider_ids);
+        let provider_ids = folder_provider_ids.map_or_else(
+            || movie_provider_ids(path, &parsed_name.provider_ids),
+            |folder_provider_ids| {
+                merge_movie_provider_ids(parsed_name.provider_ids.clone(), folder_provider_ids)
+            },
+        );
         let provider_ids_json = provider_ids_json(&provider_ids);
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
@@ -5593,6 +5615,8 @@ impl ScanJobService {
         // are re-statted through the secured directory handle below before they are committed,
         // so a second standalone stat(root) here only duplicates filesystem I/O.
         let mut classification_cache = MixedClassificationCache::default();
+        let mut directory_folder_provider_ids: Option<Arc<OnceLock<BTreeMap<String, String>>>> =
+            None;
         let mut unchanged_paths = Vec::new();
         let mut seen_filesystem_entries = Vec::new();
         let mut preparation_tasks = tokio::task::JoinSet::new();
@@ -5680,6 +5704,15 @@ impl ScanJobService {
                 classification_duration = classification_duration.saturating_add(started.elapsed());
             }
             classification_count = classification_count.saturating_add(1);
+            let movie_folder_provider_ids =
+                if matches!(classification, Some(MixedClassification::Movie)) {
+                    Some(Arc::clone(
+                        directory_folder_provider_ids
+                            .get_or_insert_with(|| Arc::new(OnceLock::new())),
+                    ))
+                } else {
+                    None
+                };
             let seed = ManifestPositiveIndexSeed {
                 relative_path: observation.relative_path.clone(),
                 delta_kind: delta_kind.to_owned(),
@@ -5700,6 +5733,7 @@ impl ScanJobService {
                         root_path: task_root_path,
                         expected_root_device,
                         expected_root_inode,
+                        movie_folder_provider_ids_cache: movie_folder_provider_ids,
                         verify_path_after_preparation: false,
                     },
                     observed,
@@ -7245,6 +7279,7 @@ impl ScanJobService {
                             root_path,
                             expected_root_device,
                             expected_root_inode,
+                            movie_folder_provider_ids_cache: None,
                             verify_path_after_preparation: true,
                         },
                         delta,
@@ -11506,24 +11541,35 @@ fn movie_provider_ids(
     path: &Path,
     file_provider_ids: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let mut provider_ids = file_provider_ids.clone();
-    for (provider, provider_id) in movie_folder_provider_ids(path) {
-        provider_ids.entry(provider).or_insert(provider_id);
-    }
-    provider_ids
+    merge_movie_provider_ids(file_provider_ids.clone(), &movie_folder_provider_ids(path))
 }
 
-fn movie_folder_provider_ids(path: &Path) -> BTreeMap<String, String> {
-    let Some(folder_name) = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-    else {
+fn merge_movie_provider_ids(
+    mut file_provider_ids: BTreeMap<String, String>,
+    folder_provider_ids: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    for (provider, provider_id) in folder_provider_ids {
+        file_provider_ids
+            .entry(provider.clone())
+            .or_insert_with(|| provider_id.clone());
+    }
+    file_provider_ids
+}
+
+fn movie_folder_provider_ids_for_directory(directory: &Path) -> BTreeMap<String, String> {
+    let Some(folder_name) = directory.file_name().and_then(|name| name.to_str()) else {
         return BTreeMap::new();
     };
     parse_media_name(folder_name, MediaKind::Movie)
         .map(|folder| folder.provider_ids)
         .unwrap_or_default()
+}
+
+fn movie_folder_provider_ids(path: &Path) -> BTreeMap<String, String> {
+    let Some(directory) = path.parent() else {
+        return BTreeMap::new();
+    };
+    movie_folder_provider_ids_for_directory(directory)
 }
 
 fn provider_ids_json(provider_ids: &BTreeMap<String, String>) -> Option<String> {
@@ -11901,10 +11947,11 @@ mod tests {
         ManifestRootDiscoveryContext, MixedClassification, MixedClassificationCache,
         NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
         ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
-        configured_scan_concurrency, is_lite_manifest_discovery, manifest_root_identity_matches,
-        media_source_folder, normalize_incremental_path, read_manifest_strm_target,
-        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
-        stat_manifest_relative_file_sync, stat_manifest_root_sync,
+        configured_scan_concurrency, is_lite_manifest_discovery, manifest_file_observation_matches,
+        manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
+        normalize_incremental_path, read_manifest_strm_target, safe_scan_activity_label,
+        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
+        stat_manifest_root_sync,
     };
 
     #[test]
@@ -11912,6 +11959,26 @@ mod tests {
         assert_eq!(configured_scan_concurrency(Some(8), Some(4), 16), 8);
         assert_eq!(configured_scan_concurrency(None, Some(4), 16), 4);
         assert_eq!(configured_scan_concurrency(None, None, 16), 16);
+    }
+
+    #[test]
+    fn movie_folder_provider_ids_fill_missing_values_without_overriding_file_tags() {
+        let file_provider_ids =
+            std::collections::BTreeMap::from([("Tmdb".to_owned(), "file-id".to_owned())]);
+        let folder_provider_ids = std::collections::BTreeMap::from([
+            ("Tmdb".to_owned(), "folder-id".to_owned()),
+            ("Imdb".to_owned(), "tt1234567".to_owned()),
+        ]);
+
+        let merged = merge_movie_provider_ids(file_provider_ids, &folder_provider_ids);
+
+        assert_eq!(
+            merged,
+            std::collections::BTreeMap::from([
+                ("Imdb".to_owned(), "tt1234567".to_owned()),
+                ("Tmdb".to_owned(), "file-id".to_owned()),
+            ])
+        );
     }
 
     #[test]
@@ -12228,6 +12295,50 @@ mod tests {
                 .iter()
                 .any(|entry| entry.relative_path.is_empty())
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_directory_batch_stat_detects_file_changes_without_directory_mtime_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temp_dir.path())?;
+        let bucket = root.join("Bucket");
+        std::fs::create_dir(&bucket)?;
+        let file_path = bucket.join("Example.Movie.2025.mkv");
+        std::fs::write(&file_path, b"original")?;
+
+        let reader = ManifestDirectoryReader::open(&root, "Bucket")?;
+        let root_observation = reader.root_observation.clone();
+        let directory_observation = reader.directory_observation.clone();
+        let (_reader, batch) = reader.next_batch(500)?;
+        let file_observation = batch
+            .entries
+            .into_iter()
+            .find(|entry| entry.entry_kind == "FILE")
+            .ok_or("file observation is missing")?;
+        let directory_modified_before = std::fs::metadata(&bucket)?.modified()?;
+
+        std::fs::write(&file_path, b"replacement content with another size")?;
+
+        let directory_modified_after = std::fs::metadata(&bucket)?.modified()?;
+        assert_eq!(directory_modified_before, directory_modified_after);
+        let current_files = stat_manifest_directory_file_batch_sync(
+            &root,
+            &root_observation,
+            &directory_observation,
+            &[file_observation.clone()],
+        )?;
+        let current_file = current_files
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or("changed file disappeared during the second stat")?;
+        assert!(!manifest_file_observation_matches(
+            &file_observation,
+            &current_file
+        ));
         Ok(())
     }
 

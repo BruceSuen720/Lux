@@ -26,6 +26,91 @@ use luxd::{
 };
 use tokio::sync::Semaphore;
 
+#[tokio::test]
+async fn lite_manifest_movie_provider_ids_are_inherited_and_file_tags_take_precedence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let folder = root.join("Provider Folder [tmdbid-123] [imdbid-tt1234567]");
+    tokio::fs::create_dir_all(&folder).await?;
+    tokio::fs::write(folder.join("Folder Inheritance 2020.mkv"), b"movie-a").await?;
+    tokio::fs::write(
+        folder.join("File Override 2021 [tmdbid-456].mkv"),
+        b"movie-b",
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let discovery_mode: String =
+        sqlx::query_scalar("SELECT discovery_mode FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovery_mode, "LITE");
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots WHERE library_id = ?")
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+    let inherited_provider_ids: String = sqlx::query_scalar(
+        "SELECT item.provider_ids_json
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.library_root_id = ?
+           AND entry.relative_path = ?
+           AND item.item_type = 'MOVIE'",
+    )
+    .bind(&root_id)
+    .bind("Provider Folder [tmdbid-123] [imdbid-tt1234567]/Folder Inheritance 2020.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    let overridden_provider_ids: String = sqlx::query_scalar(
+        "SELECT item.provider_ids_json
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.library_root_id = ?
+           AND entry.relative_path = ?
+           AND item.item_type = 'MOVIE'",
+    )
+    .bind(&root_id)
+    .bind("Provider Folder [tmdbid-123] [imdbid-tt1234567]/File Override 2021 [tmdbid-456].mkv")
+    .fetch_one(database.pool())
+    .await?;
+    let inherited_provider_ids = serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+        &inherited_provider_ids,
+    )?;
+    let overridden_provider_ids = serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+        &overridden_provider_ids,
+    )?;
+    assert_eq!(inherited_provider_ids.get("Tmdb"), Some(&"123".to_owned()));
+    assert_eq!(
+        inherited_provider_ids.get("Imdb"),
+        Some(&"tt1234567".to_owned())
+    );
+    assert_eq!(overridden_provider_ids.get("Tmdb"), Some(&"456".to_owned()));
+    assert_eq!(
+        overridden_provider_ids.get("Imdb"),
+        Some(&"tt1234567".to_owned())
+    );
+    Ok(())
+}
+
 async fn seed_legacy_reconciliation_work(
     database: &Database,
     job_id: &str,

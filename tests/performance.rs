@@ -1008,6 +1008,19 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         configure_sqlite_benchmark_pragma(&database, format!("PRAGMA temp_store = {temp_store}"))
             .await?;
     }
+    if backend == "sqlite"
+        && let Some(mmap_size) = env::var_os("LUX_PERF_SQLITE_MMAP_SIZE")
+    {
+        let mmap_size = mmap_size
+            .to_string_lossy()
+            .parse::<u64>()
+            .map_err(|_| "LUX_PERF_SQLITE_MMAP_SIZE must be an integer")?;
+        if mmap_size > 1_073_741_824 {
+            return Err("LUX_PERF_SQLITE_MMAP_SIZE must not exceed 1073741824".into());
+        }
+        configure_sqlite_benchmark_pragma(&database, format!("PRAGMA mmap_size = {mmap_size}"))
+            .await?;
+    }
     let sqlite_synchronous_level = if backend == "sqlite" {
         Some(
             sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
@@ -1038,6 +1051,15 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let sqlite_temp_store_mode = if backend == "sqlite" {
         Some(
             sqlx::query_scalar::<_, i64>("PRAGMA temp_store")
+                .fetch_one(database.pool())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let sqlite_mmap_size_bytes = if backend == "sqlite" {
+        Some(
+            sqlx::query_scalar::<_, i64>("PRAGMA mmap_size")
                 .fetch_one(database.pool())
                 .await?,
         )
@@ -1606,6 +1628,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "sqliteWalAutocheckpointPages": sqlite_wal_autocheckpoint_pages,
             "sqliteWalFileBytesAfterIndex": sqlite_wal_file_bytes_after_index,
             "sqliteTempStoreMode": sqlite_temp_store_mode,
+            "sqliteMmapSizeBytes": sqlite_mmap_size_bytes,
         }),
         json!({
             "foregroundDuringScan": scan_running_before_api,
