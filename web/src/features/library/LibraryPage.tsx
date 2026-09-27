@@ -20,6 +20,27 @@ const DEFAULT_LIBRARY_SORT_PREFERENCE: LibrarySortPreference = {
   sortOrder: "Ascending",
 };
 
+type HomeVideoFolderPathEntry = { id: string; title: string };
+
+function homeVideoFolderPath(value: string | null): HomeVideoFolderPathEntry[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is HomeVideoFolderPathEntry => Boolean(
+        entry
+        && typeof entry === "object"
+        && "id" in entry
+        && typeof entry.id === "string"
+        && entry.id
+        && "title" in entry
+        && typeof entry.title === "string",
+      ));
+  } catch {
+    return [];
+  }
+}
+
 export function libraryItemTypeFilter(kind?: Library["kind"]) {
   if (kind === "SERIES") return "SERIES";
   if (kind === "MOVIE") return "MOVIE";
@@ -112,6 +133,9 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const { sortBy, sortOrder } = sortPreference;
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
+  const isHomeVideos = library?.kind === "HOMEVIDEOS";
+  const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
+  const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
   const itemTypes = libraryItemTypeFilter(library?.kind);
   const confirmMetadata = useMutation({
@@ -149,7 +173,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     setSelectionMode(false);
     setMergeOpen(false);
     setMergePrimaryId(undefined);
-  }, [libraryId, metadataStatus, sortBy, sortOrder]);
+  }, [libraryId, metadataStatus, parentId, sortBy, sortOrder]);
 
   useEffect(() => {
     if (mergeOpen) mergeCloseButtonRef.current?.focus();
@@ -167,12 +191,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     };
   }, [library?.name, serverName]);
 
+  const libraryQueryKey = queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all");
   const pages = useInfiniteQuery({
-    queryKey: queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all"),
+    queryKey: parentId ? [...libraryQueryKey, parentId] : libraryQueryKey,
     queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, {
       sortBy,
       sortOrder,
       ...(metadataStatus ? { metadataStatus } : {}),
+      ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,
     enabled: Boolean(libraryId && library),
@@ -246,9 +272,28 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     setSearchParams(next);
   }
 
+  function folderHref(item: { id: string; title?: string | null; name?: string | null }) {
+    const next = new URLSearchParams(searchParams);
+    const nextPath = [...folderPath, { id: item.id, title: item.title || item.name || "未命名文件夹" }];
+    next.set("folderPath", JSON.stringify(nextPath));
+    return `?${next.toString()}`;
+  }
+
+  function goToParentFolder() {
+    const next = new URLSearchParams(searchParams);
+    const nextPath = folderPath.slice(0, -1);
+    if (nextPath.length) next.set("folderPath", JSON.stringify(nextPath));
+    else next.delete("folderPath");
+    setSearchParams(next);
+  }
+
   return (
     <section className="lux-page lux-page-narrow">
-      <div className="lux-page-heading"><h1>{library?.name || "媒体库"}</h1><p>{metadataStatus ? `${total} 项待确认内容` : `${total} 项内容`}</p></div>
+      {isHomeVideos && folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
+      <div className="lux-page-heading">
+        <h1>{library?.name || "媒体库"}</h1>
+        <p>{metadataStatus ? `${total} 项待确认内容` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${total} 项内容` : `${total} 项内容`}</p>
+      </div>
       <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
         <button
           className="lux-button lux-button-secondary"
@@ -277,7 +322,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div>
       <div className="lux-poster-grid">
-        {loadedItems.map((item) => <MediaCard item={item} key={item.id} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
+        {loadedItems.map((item) => <MediaCard item={item} key={item.id} folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
       </div>
       {mergeOpen ? (
         <div className="lux-library-dialog-backdrop" role="presentation">
@@ -325,7 +370,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           </section>
         </div>
       ) : null}
-      {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
+      {!loadedItems.length ? <div className="lux-empty-card"><span>{isHomeVideos && folderPath.length ? "此文件夹没有可浏览内容。" : "这个媒体库还没有内容。"}</span>{!(isHomeVideos && folderPath.length) ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />
       {pages.isFetchingNextPage ? <p className="lux-muted-copy" role="status">正在加载更多…</p> : null}
       {pages.isFetchNextPageError ? (

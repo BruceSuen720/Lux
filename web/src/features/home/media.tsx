@@ -1,7 +1,7 @@
-import { Database, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
+import { Database, Folder, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
-import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import type { Library, MediaItem } from "../../lib/api/types";
@@ -42,6 +42,8 @@ export function mediaTypeLabel(itemType?: string | null) {
     case "SEASON": return "季度";
     case "EPISODE": return "单集";
     case "BOX_SET": return "合集";
+    case "VIDEO": return "其他视频";
+    case "FOLDER": return "文件夹";
     default: return "媒体";
   }
 }
@@ -105,7 +107,7 @@ function MediaPlaceholder({ item }: { item: MediaItem }) {
   const pending = item.localMetadataPending === true;
   return (
     <div className="lux-media-placeholder">
-      {pending ? (
+      {item.itemType === "FOLDER" ? <Folder size={30} aria-hidden="true" /> : pending ? (
         <span className="lux-media-placeholder-status" role="status" aria-label="正在读取本地海报和元数据">
           <LoaderCircle className="lux-media-placeholder-spinner" size={24} aria-hidden="true" />
         </span>
@@ -115,7 +117,7 @@ function MediaPlaceholder({ item }: { item: MediaItem }) {
   );
 }
 
-export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; onSelectionChange?: (selected: boolean) => void }) {
+export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; onSelectionChange?: (selected: boolean) => void }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
@@ -158,12 +160,23 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
 
   if (deleted) return null;
   const detailHref = `/items/${item.id}${detailSearch ?? ""}`;
+  const isFolder = item.itemType === "FOLDER";
+  const folderLabel = `打开文件夹 ${mediaTitle(item)}`;
+
+  function mediaCardLink(children: ReactNode) {
+    if (isFolder) {
+      return folderHref
+        ? <Link className="lux-media-card-link" to={folderHref} aria-label={folderLabel}>{children}</Link>
+        : <div className="lux-media-card-link">{children}</div>;
+    }
+    return <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>{children}</Link>;
+  }
 
   return (
     <>
       <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
         <div className="lux-media-art-shell">
-          {selectionMode ? (
+          {selectionMode && !isFolder ? (
             <label className="lux-media-selection-control">
               <input
                 className="lux-media-selection-checkbox"
@@ -176,24 +189,24 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
               <span aria-hidden="true" />
             </label>
           ) : null}
-          <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>
+          {mediaCardLink(
             <div className="lux-media-art">
               {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
-              <Rating value={item.rating} placement="card" />
+              {!isFolder ? <Rating value={item.rating} placement="card" /> : null}
               <EpisodeCount item={item} />
-              <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
-              {progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
+              {!isFolder ? <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span> : null}
+              {!isFolder && progress > 0 && progress < 90 ? <span className="lux-progress"><span style={{ width: `${progress}%` }} /></span> : null}
             </div>
-          </Link>
-          <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+          )}
+          {!isFolder ? <MediaActionMenu item={item} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} /> : null}
         </div>
-        <Link className="lux-media-card-link" to={detailHref}>
+        {mediaCardLink(
           <div className="lux-media-copy">
             <strong>{mediaTitle(item)}</strong>
             <span>{[item.productionYear, mediaTypeLabel(item.itemType)].filter(Boolean).join(" · ")}</span>
-            {metadataAttention ? <span className="lux-metadata-attention-badge">待确认</span> : null}
+            {metadataAttention && !isFolder ? <span className="lux-metadata-attention-badge">待确认</span> : null}
           </div>
-        </Link>
+        )}
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>

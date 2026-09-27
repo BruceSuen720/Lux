@@ -34,8 +34,11 @@ describe("actor search and filmography", () => {
 
   it("shows actor results alongside media results and links to the person page", async () => {
     vi.spyOn(api, "search").mockResolvedValue({
-      items: [{ id: "movie-1", title: "演员甲电影", itemType: "MOVIE", rating: 7.5, ratingSource: "TMDb" }],
-      total: 1,
+      items: [
+        { id: "movie-1", title: "演员甲电影", itemType: "MOVIE", rating: 7.5, ratingSource: "TMDb" },
+        { id: "video-1", title: "家庭聚会", itemType: "VIDEO" },
+      ],
+      total: 2,
       page: 1,
       pageSize: 24,
     });
@@ -64,7 +67,10 @@ describe("actor search and filmography", () => {
     expect(personLink?.textContent).toContain("演员甲");
     expect(personLink?.getAttribute("href")).toBe("/people/42");
     expect(container?.textContent).toContain("演员甲电影");
+    expect(container?.textContent).toContain("家庭聚会");
     const mediaResults = container?.querySelector("section[aria-labelledby='media-search-heading']");
+    expect(mediaResults?.textContent).toContain("其他视频");
+    expect(mediaResults?.querySelector("a[href='/items/video-1']")).not.toBeNull();
     expect(mediaResults?.querySelector(".lux-rating")).not.toBeNull();
     expect(mediaResults?.querySelector(".lux-rating svg")).toBeNull();
   });

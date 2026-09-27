@@ -82,6 +82,7 @@ export type LibraryItemsOptions = {
   sortOrder?: LibrarySortOrder;
   metadataStatus?: "PENDING";
   pageSize?: number;
+  parentId?: string;
 };
 
 export type AdminDirectoryEntry = {
@@ -351,6 +352,7 @@ export class LuxApiClient {
     if (options.sortBy) params.set("sortBy", options.sortBy);
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
+    if (options.parentId) params.set("parentId", options.parentId);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );
