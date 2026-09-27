@@ -6960,12 +6960,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-283：管理界面创建/编辑其他视频库
 
-- [ ] 创建和编辑媒体库类型选择器提供“其他视频”。
-- [ ] HOMEVIDEOS 隐藏刮削器配置并提交空配置；其他类型配置行为不变。
+- [x] 创建和编辑媒体库类型选择器提供“其他视频”。
+- [x] HOMEVIDEOS 隐藏刮削器配置并提交空配置；其他类型配置行为不变。
 
 依赖：LUX-276。验证：`pnpm --dir web test -- admin-libraries`、`pnpm --dir web build`。
 
 预计文件：`web/src/lib/api/types.ts`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/tests/admin-libraries.test.tsx`。
+
+结果（2026-09-28）：`Library.kind` 使用 `LibraryKind` 联合类型；管理界面的创建/编辑选择器和媒体库卡片显示“其他视频”。HOMEVIDEOS 不显示刮削器列表和实时自动刮削开关；创建提交 `scrapers: []`、关闭实时自动刮削，编辑保存也清空刮削器并关闭该开关。电影、剧集和混合库沿用原配置行为。`pnpm --dir web test -- admin-libraries` 通过（75 个 Vitest 文件、519 项；Node 样式测试 107 项），`pnpm --dir web build` 通过；构建保留现有 HLS 大 chunk 提示。
 
 #### LUX-284：Web 目录浏览与搜索
 
