@@ -1475,6 +1475,7 @@ async fn prepare_manifest_delta(
         delta_kind == "ADD",
         delta_id,
         classification,
+        ManifestFilenameClassificationMode::Preclassified,
     )
     .await
 }
@@ -1485,6 +1486,7 @@ async fn prepare_manifest_observation(
     is_add: bool,
     delta_id: Option<String>,
     classification: Option<MixedClassification>,
+    filename_classification_mode: ManifestFilenameClassificationMode,
 ) -> ManifestDeltaPreparation {
     let ManifestFilePreparationContext {
         scanner,
@@ -1499,16 +1501,31 @@ async fn prepare_manifest_observation(
         return ManifestDeltaPreparation::Unstable { delta_id };
     }
     let path = root_path.join(&observed.relative_path);
-    let movie_folder_provider_ids = movie_folder_provider_ids_cache
-        .as_ref()
-        .map(|cache| cache.get_or_init(|| movie_folder_provider_ids(&path)));
     let is_media = is_supported_movie_file(Path::new(&observed.relative_path));
     let is_sidecar = is_supported_sidecar_file(Path::new(&observed.relative_path));
     if !is_media && !is_sidecar {
         return ManifestDeltaPreparation::Unstable { delta_id };
     }
+    let prepared_filename = if is_media {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return ManifestDeltaPreparation::Unstable { delta_id };
+        };
+        let Some(prepared_filename) =
+            prepare_manifest_filename(file_name, filename_classification_mode, classification)
+        else {
+            return ManifestDeltaPreparation::Unstable { delta_id };
+        };
+        Some(prepared_filename)
+    } else {
+        None
+    };
+    let movie_folder_provider_ids = prepared_filename
+        .as_ref()
+        .filter(|prepared| matches!(prepared, PreparedManifestFilename::Movie(_)))
+        .and_then(|_| movie_folder_provider_ids_cache.as_ref())
+        .map(|cache| cache.get_or_init(|| movie_folder_provider_ids(&path)));
     let prepared_file = if is_media {
-        let Some(classification) = classification else {
+        let Some(prepared_filename) = prepared_filename else {
             return ManifestDeltaPreparation::Unstable { delta_id };
         };
         let manifest_strm_target = if is_strm_file(&path) {
@@ -1530,21 +1547,28 @@ async fn prepare_manifest_observation(
         } else {
             None
         };
-        let prepared = match classification {
-            MixedClassification::Movie => scanner
+        let prepared = match prepared_filename {
+            PreparedManifestFilename::Movie(parsed_name) => scanner
                 .prepare_manifest_movie_file(
                     &path,
                     &observed,
                     manifest_strm_target,
+                    parsed_name,
                     movie_folder_provider_ids.as_deref(),
                 )
                 .await
                 .map(|file| file.map(PreparedManifestFile::Movie)),
-            MixedClassification::Episode => scanner
-                .prepare_manifest_episode_file(&root.id, &path, &observed, manifest_strm_target)
+            PreparedManifestFilename::Episode(parsed_name) => scanner
+                .prepare_manifest_episode_file(
+                    &root.id,
+                    &path,
+                    &observed,
+                    manifest_strm_target,
+                    parsed_name,
+                )
                 .await
                 .map(|file| file.map(PreparedManifestFile::Episode)),
-            MixedClassification::Unresolved => scanner
+            PreparedManifestFilename::Unresolved => scanner
                 .prepare_manifest_unresolved_file(&root, &path, &observed, manifest_strm_target)
                 .await
                 .map(|file| Some(PreparedManifestFile::Unresolved(file))),
@@ -3678,12 +3702,14 @@ impl LibraryScanner {
         path: &Path,
         observation: &NewScanManifestEntry,
         strm_target: Option<StrmTarget>,
+        parsed_name: ParsedMovieFilename,
         folder_provider_ids: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<NewMovieFile>, ScannerError> {
         self.prepare_new_movie_file_with_manifest_observation(
             path,
             observation,
             strm_target,
+            parsed_name,
             folder_provider_ids,
         )
         .await
@@ -3694,14 +3720,9 @@ impl LibraryScanner {
         path: &Path,
         observation: &NewScanManifestEntry,
         manifest_strm_target: Option<StrmTarget>,
+        parsed_name: ParsedMovieFilename,
         folder_provider_ids: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<NewMovieFile>, ScannerError> {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(None);
-        };
-        let Some(parsed_name) = parse_movie_filename(file_name) else {
-            return Ok(None);
-        };
         let provider_ids = folder_provider_ids.map_or_else(
             || movie_provider_ids(path, &parsed_name.provider_ids),
             |folder_provider_ids| {
@@ -3860,13 +3881,8 @@ impl LibraryScanner {
         path: &Path,
         observation: &NewScanManifestEntry,
         strm_target: Option<StrmTarget>,
+        parsed: ParsedEpisodeFilename,
     ) -> Result<Option<NewEpisodeFile>, ScannerError> {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(None);
-        };
-        let Some(parsed) = parse_episode_filename(file_name) else {
-            return Ok(None);
-        };
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
             Some(match strm_target {
@@ -5667,36 +5683,17 @@ impl ScanJobService {
                 Some(_) => "CHANGE",
             };
             let classification_started = measure_preparation.then(Instant::now);
-            let classification = if is_media {
-                Some(match library_kind {
-                    "MOVIE" => {
-                        if parse_movie_filename(
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or_default(),
-                        )
-                        .is_some()
-                        {
-                            MixedClassification::Movie
-                        } else {
-                            MixedClassification::Unresolved
-                        }
-                    }
-                    "SERIES" => {
-                        if parse_episode_filename(
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or_default(),
-                        )
-                        .is_some()
-                        {
-                            MixedClassification::Episode
-                        } else {
-                            MixedClassification::Unresolved
-                        }
-                    }
-                    _ => classify_mixed_file(&root_path, &path, &mut classification_cache).await,
-                })
+            let filename_classification_mode = match library_kind {
+                "MOVIE" => ManifestFilenameClassificationMode::MovieLibrary,
+                "SERIES" => ManifestFilenameClassificationMode::SeriesLibrary,
+                _ => ManifestFilenameClassificationMode::Preclassified,
+            };
+            let classification = if is_media
+                && matches!(
+                    filename_classification_mode,
+                    ManifestFilenameClassificationMode::Preclassified
+                ) {
+                Some(classify_mixed_file(&root_path, &path, &mut classification_cache).await)
             } else {
                 None
             };
@@ -5704,15 +5701,18 @@ impl ScanJobService {
                 classification_duration = classification_duration.saturating_add(started.elapsed());
             }
             classification_count = classification_count.saturating_add(1);
-            let movie_folder_provider_ids =
-                if matches!(classification, Some(MixedClassification::Movie)) {
-                    Some(Arc::clone(
-                        directory_folder_provider_ids
-                            .get_or_insert_with(|| Arc::new(OnceLock::new())),
-                    ))
-                } else {
-                    None
-                };
+            let movie_folder_provider_ids = if is_media
+                && (matches!(
+                    filename_classification_mode,
+                    ManifestFilenameClassificationMode::MovieLibrary
+                ) || matches!(classification, Some(MixedClassification::Movie)))
+            {
+                Some(Arc::clone(
+                    directory_folder_provider_ids.get_or_insert_with(|| Arc::new(OnceLock::new())),
+                ))
+            } else {
+                None
+            };
             let seed = ManifestPositiveIndexSeed {
                 relative_path: observation.relative_path.clone(),
                 delta_kind: delta_kind.to_owned(),
@@ -5740,6 +5740,7 @@ impl ScanJobService {
                     is_add,
                     None,
                     classification,
+                    filename_classification_mode,
                 )
                 .await;
                 let duration = preparation_started
@@ -11416,6 +11417,51 @@ enum MixedClassification {
     Unresolved,
 }
 
+#[derive(Clone, Copy)]
+enum ManifestFilenameClassificationMode {
+    MovieLibrary,
+    SeriesLibrary,
+    Preclassified,
+}
+
+enum PreparedManifestFilename {
+    Movie(ParsedMovieFilename),
+    Episode(ParsedEpisodeFilename),
+    Unresolved,
+}
+
+fn prepare_manifest_filename(
+    filename: &str,
+    mode: ManifestFilenameClassificationMode,
+    preclassified: Option<MixedClassification>,
+) -> Option<PreparedManifestFilename> {
+    match mode {
+        ManifestFilenameClassificationMode::MovieLibrary => {
+            let parsed_name = parse_movie_filename(filename);
+            Some(parsed_name.map_or(
+                PreparedManifestFilename::Unresolved,
+                PreparedManifestFilename::Movie,
+            ))
+        }
+        ManifestFilenameClassificationMode::SeriesLibrary => {
+            let parsed_name = parse_episode_filename(filename);
+            Some(parsed_name.map_or(
+                PreparedManifestFilename::Unresolved,
+                PreparedManifestFilename::Episode,
+            ))
+        }
+        ManifestFilenameClassificationMode::Preclassified => match preclassified? {
+            MixedClassification::Movie => {
+                parse_movie_filename(filename).map(PreparedManifestFilename::Movie)
+            }
+            MixedClassification::Episode => {
+                parse_episode_filename(filename).map(PreparedManifestFilename::Episode)
+            }
+            MixedClassification::Unresolved => Some(PreparedManifestFilename::Unresolved),
+        },
+    }
+}
+
 struct ReconciliationScanWork {
     entry: StoredReconciliationScanEntry,
     path: PathBuf,
@@ -11943,15 +11989,16 @@ fn configured_scan_concurrency(
 mod tests {
     use super::{
         MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader, ManifestRemovalOutcome,
-        ManifestRootDiscoveryContext, MixedClassification, MixedClassificationCache,
-        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
+        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader,
+        ManifestFilenameClassificationMode, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
+        MixedClassification, MixedClassificationCache, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
         ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
         configured_scan_concurrency, is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
-        normalize_incremental_path, read_manifest_strm_target, safe_scan_activity_label,
-        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
-        stat_manifest_root_sync,
+        normalize_incremental_path, prepare_manifest_filename, read_manifest_strm_target,
+        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
 
     #[test]
@@ -11978,6 +12025,45 @@ mod tests {
                 ("Imdb".to_owned(), "tt1234567".to_owned()),
                 ("Tmdb".to_owned(), "file-id".to_owned()),
             ])
+        );
+    }
+
+    #[test]
+    fn manifest_filename_preparation_classifies_and_retains_parsed_names() {
+        let movie = prepare_manifest_filename(
+            "Movie.Name.2020.1080p.mkv",
+            ManifestFilenameClassificationMode::MovieLibrary,
+            None,
+        )
+        .expect("movie-library classification");
+        assert!(matches!(
+            movie,
+            PreparedManifestFilename::Movie(parsed) if parsed.production_year == Some(2020)
+        ));
+
+        let unresolved =
+            prepare_manifest_filename("", ManifestFilenameClassificationMode::MovieLibrary, None)
+                .expect("unparseable movie becomes unresolved");
+        assert!(matches!(unresolved, PreparedManifestFilename::Unresolved));
+
+        let episode = prepare_manifest_filename(
+            "Example.Show.S01E02.mkv",
+            ManifestFilenameClassificationMode::SeriesLibrary,
+            None,
+        )
+        .expect("series-library classification");
+        assert!(matches!(
+            episode,
+            PreparedManifestFilename::Episode(parsed) if parsed.season == 1 && parsed.episode == 2
+        ));
+
+        assert!(
+            prepare_manifest_filename(
+                "",
+                ManifestFilenameClassificationMode::Preclassified,
+                Some(MixedClassification::Movie),
+            )
+            .is_none()
         );
     }
 

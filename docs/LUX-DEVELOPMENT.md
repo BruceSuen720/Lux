@@ -6831,6 +6831,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 逐项评估目录 Provider ID 缓存、逐文件二次 stat、SQLite cache/temp/mmap PRAGMA、父电影目录 refresh 与 8k 粗粒度双缓冲。只保留每目录惰性解析 Provider ID 的 `OnceLock`：60k 首扫 SQLite 中位数 2.280 → 2.188 秒，PostgreSQL 6.075 → 6.111 秒（波动范围内），两个后端的正向准备累计耗时均下降；双缓冲三轮 A/B 没有稳定首扫收益，已撤回。二次 stat 继续保护文件变更竞态；不缓存跨事务“已验证目录”；PRAGMA 仅保留基准实验开关，不改变运行配置。复核测试、PRAGMA 数值及双缓冲分布见 `docs/PERFORMANCE.md`。本轮使用单个扫描作业的内部并发，不是多个扫描客户端并发；LUX-275 阶段门继续开放。
 
+2026-09-27 将严格电影/剧集库的文件名分类解析移入有界准备任务，并复用解析结果构造索引记录，避免每个媒体文件在驱动循环和准备任务中各解析一次。60k/600 同机交错三轮，SQLite 首扫中位数 2.161 → 1.947 秒（快约 9.9%），PostgreSQL 5.839 → 5.767 秒（快约 1.2%）；SQLite 首扫加 120k target 合计快约 5.7%，PostgreSQL 合计快约 1.0%。无变化重扫、前台 p95 与 batch p95 未超过 5% 回退门，DML 与 8 个正向提交批次不变。最终互斥结果类型另做一组 release 配对复测；完整样本、target 单项波动和缓存较冷的离群轮见 `docs/PERFORMANCE.md`。LUX-275 完整阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
