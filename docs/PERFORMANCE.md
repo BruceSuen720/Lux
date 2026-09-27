@@ -710,3 +710,18 @@ SQLite 的原始中位数差约 0.5%，但三组配对中候选有两组略慢�
 把分类与解析结果改成互斥的 `Movie(parsed)` / `Episode(parsed)` / `Unresolved` 类型后，额外同机配对复测为 SQLite 2,219 → 2,033 ms、PostgreSQL 6,028 → 5,826 ms；这只是最终类型形态的单组确认，不代替上表三轮。另有一个文件系统缓存较冷的候选单轮为 2,415 ms，其 `directory_open` / `directory_readdir` 累计耗时为 253 / 182 ms；紧邻的基线与候选复测分别为 2,219 / 2,033 ms，因而保留这次偏慢样本并以三轮中位数作结论。
 
 这几项局部实验都不关闭 LUX-275：阶段门仍要求在完整最终路径上证明双后端稳定首扫收益，并满足安全回归与完整检查。
+
+### SQLite 跳过重复 original title FTS tokens（未保留）
+
+2026-09-27 评估候选 migration `0149_skip_redundant_original_title_fts_tokens.sql`：当 `original_title` 与 `title` 仅有 ASCII 大小写差异时，SQLite 搜索 trigger 不再重复写入同一组 FTS tokens；真正不同的原文标题仍索引。回归覆盖迁移升级、INSERT、UPDATE、相同标题仍可搜索及不同 original title 仍可搜索。PostgreSQL 路径未修改。
+
+基线从干净提交 `275fe6c9` 构建，候选与基线源码提交相同，仅额外包含 migration 0149。Apple M4 / 16 GiB / ARM64，fixture SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`，60,000 文件 / 600 目录；SQLite 使用 `synchronous=FULL` 并关闭锁采样，PostgreSQL 16 每轮使用一次性空库并保留锁采样。固定 release 二进制交错运行各三轮：
+
+| 后端/版本 | 首扫索引：三轮 / 中位数 | 120k target | 无变化重扫 | 前台 p95 / 目录列表 p95 | batch p95 | SQL / DML | WAL / 最大锁等待者 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SQLite 基线 | 2,488 / 1,955 / 1,942 ms；**1,955 ms** | 623 ms | 1,035 ms | 249 / 370 ms | 280 ms | 370 / 119 | 17,172,192 bytes |
+| SQLite 候选 0149 | 1,941 / 1,960 / 1,933 ms；**1,941 ms** | 656 ms | 1,028 ms | 239 / 363 ms | 268 ms | 372 / 119 | 16,541,832 bytes |
+| PostgreSQL 基线 | 5,732 / 5,735 / 5,871 ms；**5,735 ms** | 2,471 ms | 3,136 ms | 287 / 495 ms | 781 ms | 344 / 95 | 221,585,677 bytes / 0 |
+| PostgreSQL 候选 0149 | 5,635 / 5,760 / 5,603 ms；**5,635 ms** | 2,539 ms | 3,089 ms | 275 / 467 ms | 752 ms | 344 / 95 | 221,551,625 bytes / 0 |
+
+SQLite 首扫中位数只快 14 ms（约 0.7%）；两组暖缓存配对分别约慢 0.3% 和快 0.5%，不能证明端到端提速。候选 `movie_item_insert` 累计中位数快约 2.2%，`positive_index_apply` 累计中位数快约 1.3%，SQLite 首扫后 WAL 文件减少约 3.7%，但正向 DML 与批次未变；target 单项中位数增加约 5.3%。PostgreSQL 路径未改变，首扫差异处于运行波动范围。综合扫描耗时没有稳定收益，撤回 migration 0149 与兼容 trigger 修改；保留本节数据，LUX-275 性能门继续开放。本机结果不外推 NAS/x86_64。

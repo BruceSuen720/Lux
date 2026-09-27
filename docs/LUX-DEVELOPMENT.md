@@ -6833,6 +6833,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 将严格电影/剧集库的文件名分类解析移入有界准备任务，并复用解析结果构造索引记录，避免每个媒体文件在驱动循环和准备任务中各解析一次。60k/600 同机交错三轮，SQLite 首扫中位数 2.161 → 1.947 秒（快约 9.9%），PostgreSQL 5.839 → 5.767 秒（快约 1.2%）；SQLite 首扫加 120k target 合计快约 5.7%，PostgreSQL 合计快约 1.0%。无变化重扫、前台 p95 与 batch p95 未超过 5% 回退门，DML 与 8 个正向提交批次不变。最终互斥结果类型另做一组 release 配对复测；完整样本、target 单项波动和缓存较冷的离群轮见 `docs/PERFORMANCE.md`。LUX-275 完整阶段门仍开放。
 
+同日评估 SQLite migration `0149_skip_redundant_original_title_fts_tokens.sql`，只跳过与 title ASCII 大小写等价的重复 original-title FTS tokens，独立原文标题搜索保持不变。与干净 `275fe6c9` 基线交错三轮后，SQLite 首扫中位数 1.955 → 1.941 秒（约快 0.7%），暖缓存配对差异在 ±0.5% 内，无法证明超过运行噪声；PostgreSQL 路径未变化。SQLite WAL 文件约减少 3.7%，但没有形成稳定端到端提速，target 阶段中位数还增加约 5.3%，因此撤回 migration 和兼容 trigger 变更。完整数据见 `docs/PERFORMANCE.md`；LUX-275 继续开放。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
