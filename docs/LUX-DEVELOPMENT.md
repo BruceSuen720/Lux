@@ -2160,8 +2160,8 @@ services:
 | LUX-281 | src/api/emby_catalog.rs、src/application/catalog.rs、src/storage/catalog.rs、tests/mixed_library_api.rs、tests/resume_favorites.rs、docs/COMPATIBILITY.md；Emby homevideos/Video 契约 |
 | LUX-282 | web/src/features/auth/AdminSetupForm.tsx、web/src/lib/api/types.ts、web/src/app.mjs、web/tests/setup-page.test.tsx；初始化媒体库类型选择 |
 | LUX-283 | web/src/lib/api/types.ts、web/src/features/admin/AdminLibrariesPage.tsx、web/tests/admin-libraries.test.tsx；管理界面类型与刮削器配置 |
-| LUX-284 | src/application/catalog.rs、src/storage/repository.rs、src/storage/catalog.rs、src/storage/repository_tests.rs；目录范围查询过滤 |
-| LUX-285 | src/api/media.rs、tests/catalog.rs；Lux API 分页列出根目录和 FOLDER 子项 |
+| LUX-284 | src/application/catalog.rs、src/storage/repository.rs、src/storage/repository_tests.rs；目录范围查询过滤 |
+| LUX-285 | src/api/media.rs、src/storage/repository.rs、tests/catalog.rs；Lux API 分页列出根目录和 FOLDER 子项 |
 | LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts；其他视频目录浏览与搜索 |
 | LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/home/media.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx；视频详情、手动编辑与播放 |
 
@@ -6985,13 +6985,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-285：Lux API 按目录分页浏览
 
-- [ ] 库条目 API 支持根目录范围，只返回根目录 FOLDER 和 VIDEO。
-- [ ] 传入 FOLDER 的 `parentId` 时只返回该目录下的 FOLDER/VIDEO 子项。
-- [ ] 保留服务端分页、排序、媒体库 ACL；跨库或无权父条目不泄漏子项。
+- [x] 库条目 API 支持根目录范围，只返回根目录 FOLDER 和 VIDEO。
+- [x] 传入 FOLDER 的 `parentId` 时只返回该目录下的 FOLDER/VIDEO 子项。
+- [x] 目录浏览保留包含任意层级可播放 VIDEO 的父文件夹，空文件夹仍隐藏。
+- [x] 保留服务端分页、排序、媒体库 ACL；跨库或无权父条目不泄漏子项。
 
-依赖：LUX-281、LUX-284。验证：`cargo test --locked --test catalog homevideo_catalog_folders_are_browsable`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+依赖：LUX-281、LUX-284。验证：`cargo test --locked --test catalog`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
-预计文件：`src/api/media.rs`、`tests/catalog.rs`。
+文件：`src/api/media.rs`、`src/storage/repository.rs`、`tests/catalog.rs`。
+
+结果（2026-09-28）：`parentId=root` 和文件夹 ID 现在按目录范围分页，仅列 FOLDER/VIDEO。查询在媒体库 ACL 范围内验证父目录与子项属于同一库；因此错误或跨库父 ID 返回空页。目录范围查询递归保留有可用 VIDEO 后代的文件夹，并隐藏空文件夹；未带 `parentId` 的查询继续走原逻辑。集成用例覆盖根目录分页、两级嵌套浏览、电影/剧集样式命名的视频、空目录、跨库引用，以及旧的全库视频和文件夹查询。`cargo test --locked --test catalog` 的 3 项、`cargo fmt --all -- --check` 和全目标 Clippy 均通过。
 
 #### LUX-286：Web 目录浏览与搜索
 
