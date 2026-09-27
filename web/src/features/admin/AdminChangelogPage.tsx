@@ -16,12 +16,16 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.5.3",
-    date: "2026-09-26",
+    date: "2026-09-27",
     sections: [
       { kind: "changed", items: [
         "全量扫描新增轻量 Manifest 发现模式，减少目录 frontier 和逐文件状态写入；批量更新未变化文件，并通过 generation/fingerprint CAS 与删除前复核维持扫描安全。",
         "批量优化 PostgreSQL 媒体搜索、可用性与 Provider 索引刷新，减少扫描和入库时重复触发的数据库工作；补充扫描阶段耗时诊断信息。",
+        "进一步优化 Manifest 扫描的文件名解析复用、分批索引/后处理及 SQLite/PostgreSQL 写入路径；严格双后端性能阶段门仍开放，性能收益不外推至 NAS。",
         "已配置在线刮削器的媒体库在 SCRAPER_FIRST 模式下，会为缺失海报/缩略图安排首次尝试及 6 小时、24 小时后的重试；三次后仍缺少时才生成截图回退，重试状态在进程重启和媒体库重扫后保留。",
+      ] },
+      { kind: "fixed", items: [
+        "修复管理台未显示登录背景插件声明式下拉配置的问题；TMDb 背景许可确认项现在可显示、保存，必填项未选择时不能提交。",
       ] },
     ],
   },
