@@ -77,6 +77,7 @@ struct QueryStatementCounts {
     manifest_transaction_ms: AtomicUsize,
     manifest_apply_timing_batches: AtomicUsize,
     manifest_positive_commit_batches: AtomicUsize,
+    manifest_active_job_selects: AtomicUsize,
     manifest_preparation_concurrency: AtomicUsize,
     manifest_directory_read_concurrency: AtomicUsize,
     active_preparation_tasks_peak: AtomicUsize,
@@ -94,6 +95,7 @@ impl QueryStatementCounts {
             .store(0, Ordering::Relaxed);
         self.manifest_positive_commit_batches
             .store(0, Ordering::Relaxed);
+        self.manifest_active_job_selects.store(0, Ordering::Relaxed);
         self.manifest_preparation_concurrency
             .store(0, Ordering::Relaxed);
         self.manifest_directory_read_concurrency
@@ -134,6 +136,10 @@ impl QueryStatementCounts {
     fn manifest_positive_commit_batch_count(&self) -> usize {
         self.manifest_positive_commit_batches
             .load(Ordering::Relaxed)
+    }
+
+    fn manifest_active_job_select_count(&self) -> usize {
+        self.manifest_active_job_selects.load(Ordering::Relaxed)
     }
 
     fn manifest_directory_concurrency_snapshot(&self) -> (usize, usize) {
@@ -347,6 +353,15 @@ fn is_dml_statement_summary(summary: &str) -> bool {
         .any(|keyword| normalized.contains(keyword))
 }
 
+fn is_manifest_active_job_select(summary: &str) -> bool {
+    summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+        .starts_with("SELECT MANIFEST.LIBRARY_ID, JOB.GENERATION ")
+}
+
 #[test]
 fn query_counter_classifies_dml_statements_inside_common_table_expressions() {
     assert!(is_dml_statement_summary(
@@ -378,6 +393,16 @@ fn query_counter_classifies_dml_statements_inside_common_table_expressions() {
     ));
     assert!(is_dml_statement_summary(
         "WITH incoming_seen_paths(relative_path) AS (VALUES …"
+    ));
+}
+
+#[test]
+fn query_counter_recognizes_the_duplicate_manifest_active_job_select() {
+    assert!(is_manifest_active_job_select(
+        "SELECT manifest.library_id, job.generation FROM scan_manifests manifest"
+    ));
+    assert!(!is_manifest_active_job_select(
+        "SELECT manifest.workflow_version, manifest.discovery_format_version FROM scan_manifests manifest"
     ));
 }
 
@@ -497,6 +522,11 @@ where
             .unwrap_or_default()
             .trim()
             .to_ascii_uppercase();
+        if is_manifest_active_job_select(&summary) {
+            self.0
+                .manifest_active_job_selects
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if is_dml_statement_summary(&summary) {
             self.0.dml_statements.fetch_add(1, Ordering::Relaxed);
             *self
@@ -1297,6 +1327,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         (Vec::new(), 0)
     };
     let (raw_statement_count, dml_statement_count) = statement_counts.snapshot();
+    let manifest_active_job_select_count = statement_counts.manifest_active_job_select_count();
     let dml_summary_counts = statement_counts.dml_summary_snapshot();
     let unclassified_cte_summaries = statement_counts.unclassified_cte_summary_snapshot();
     let lite_root_directory_state_updates = statement_counts
@@ -1304,6 +1335,10 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     assert_eq!(
         lite_root_directory_state_updates, 1,
         "Lite discovery should mark its root directory complete once, after the in-memory frontier is empty"
+    );
+    assert_eq!(
+        manifest_active_job_select_count, 0,
+        "streamed positive commits should use the manifest state query for the active-job check"
     );
     let scan_statement_count = raw_statement_count.saturating_sub(postgres_lock_wait_samples);
     let scan_job_target_statement_count = dml_summary_counts
@@ -1601,6 +1636,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "manifestPositiveCommitMs": manifest_transaction_ms,
             "manifestPositiveTimingEventCount": manifest_apply_timing_batches,
             "manifestPositiveCommitBatchCount": positive_commit_batch_count,
+            "manifestActiveJobSelectCount": manifest_active_job_select_count,
             "manifestPreparationConcurrency": manifest_preparation_concurrency,
             "manifestDirectoryReadConcurrency": manifest_directory_read_concurrency,
             "postprocessingTargetMaterializationMs": postprocessing_target_materialization_ms,

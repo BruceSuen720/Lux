@@ -1838,15 +1838,19 @@ impl Database {
             child_directories.len(),
         );
         let manifest_state_started = Instant::now();
-        let (workflow_version, discovery_format_version, discovery_mode, generation): (
-            i64,
-            i64,
-            String,
-            String,
-        ) = self
+        let (
+            workflow_version,
+            discovery_format_version,
+            discovery_mode,
+            library_id,
+            generation,
+            job_status,
+            cancel_requested,
+        ): (i64, i64, String, String, String, String, i64) = self
             .query_as(
                 "SELECT manifest.workflow_version, manifest.discovery_format_version,
-                        manifest.discovery_mode, job.generation
+                        manifest.discovery_mode, manifest.library_id, job.generation,
+                        job.status, job.cancel_requested
                  FROM scan_manifests manifest
                  JOIN scan_jobs job ON job.id = manifest.job_id
                  WHERE manifest.id = ? AND manifest.state = 'DISCOVERING'
@@ -2274,27 +2278,11 @@ impl Database {
         let mut positive_result = ManifestDiscoveryPositiveIndexResult::default();
         let positive_index_started = Instant::now();
         if workflow_version == 2 && !positive_indexes.is_empty() {
-            let (library_id, generation): (String, String) = self
-                .query_as(
-                    "SELECT manifest.library_id, job.generation
-                     FROM scan_manifests manifest
-                     JOIN scan_jobs job ON job.id = manifest.job_id
-                     WHERE manifest.id = ? AND job.id = ?
-                       AND job.status = 'RUNNING' AND job.cancel_requested = 0",
-                )
-                .bind(chunk.manifest_id)
-                .bind(chunk.job_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .ok_or_else(|| {
-                    StorageError::Conflict(
-                        "streamed indexing requires an active manifest scan job".to_owned(),
-                    )
-                })?;
+            if job_status != "RUNNING" || cancel_requested != 0 {
+                return Err(StorageError::Conflict(
+                    "streamed indexing requires an active manifest scan job".to_owned(),
+                ));
+            }
             positive_result = self
                 .apply_scan_manifest_discovery_positive_indexes_in_transaction(
                     &mut transaction,
