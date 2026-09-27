@@ -79,7 +79,7 @@ export type AdminApiKey = {
 export type Library = {
   id: string;
   name: string;
-  kind: string;
+  kind: LibraryKind;
   coverImageUrl?: string | null;
   itemCount?: number;
   latest?: MediaItem[];

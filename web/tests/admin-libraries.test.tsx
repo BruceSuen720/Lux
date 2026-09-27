@@ -275,6 +275,46 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector("#new-library-title")).toBeNull();
   });
 
+  it("creates a HomeVideos library without scraper controls and submits an empty scraper config", async () => {
+    const createLibrary = vi.spyOn(api, "createAdminLibrary").mockResolvedValue({
+      library: { ...library, id: "library-homevideos", name: "其他视频", kind: "HOMEVIDEOS", roots: [] },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("新增媒体库"))
+        ?.click();
+    });
+
+    const dialog = container.querySelector('[role="dialog"]');
+    const kind = dialog?.querySelector<HTMLButtonElement>("[aria-label='媒体库类型']");
+    await act(async () => kind?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[data-value='HOMEVIDEOS']")?.click());
+
+    expect(dialog?.querySelector(".lux-admin-scraper-list-field")).toBeNull();
+    expect(dialog?.querySelector("[aria-label='新媒体库实时新增资源自动刮削']")).toBeNull();
+    const nameInput = dialog?.querySelector<HTMLInputElement>("#new-library-name");
+    await act(async () => {
+      if (!nameInput) throw new Error("new library name input missing");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(nameInput, "其他视频");
+      nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+      nameInput.dispatchEvent(new Event("change", { bubbles: true }));
+      [...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
+        .find((button) => button.textContent?.includes("创建媒体库"))
+        ?.click();
+      await vi.waitFor(() => expect(createLibrary).toHaveBeenCalled());
+    });
+
+    expect(createLibrary).toHaveBeenCalledWith({
+      name: "其他视频",
+      kind: "HOMEVIDEOS",
+      scrapers: [],
+      realtimeWatchEnabled: true,
+      realtimeMetadataAutoMatchEnabled: false,
+    });
+  });
+
   it("keeps only the directory picker beside the new root path input", async () => {
     await renderPage();
 
@@ -365,6 +405,14 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("01每日更新");
     expect(container.textContent).toContain("混合内容");
     expect(container.textContent).toContain("/media/strm/video/每日更新");
+  });
+
+  it("labels HomeVideos libraries as 其他视频", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValue({ libraries: [{ ...library, kind: "HOMEVIDEOS" }] });
+
+    await renderPage();
+
+    expect(container.querySelector(".lux-admin-library-copy")?.textContent).toContain("其他视频");
   });
 
   it("opens the edit dialog when the library cover is clicked", async () => {
@@ -506,6 +554,44 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("全量校验");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("元数据任务");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("实时索引完成后，仅为本次受影响的媒体条目提交元数据和图片补全任务。");
+  });
+
+  it("clears scraper configuration when changing a library to HomeVideos", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{
+        ...library,
+        realtimeMetadataAutoMatchEnabled: true,
+        scrapers: [{ scraperId: configuredScraper.id, position: 0, role: "PRIMARY" }],
+      }],
+    });
+    const updateLibrary = vi.spyOn(api, "updateAdminLibrary").mockResolvedValue({ library });
+    await renderPage();
+
+    await act(async () => container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("编辑"))?.click());
+
+    const dialog = container.querySelector('[role="dialog"]');
+    const kind = dialog?.querySelector<HTMLButtonElement>("[aria-label='01每日更新 媒体库类型']");
+    await act(async () => kind?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[data-value='HOMEVIDEOS']")?.click());
+
+    expect(dialog?.querySelector(".lux-admin-scraper-list-field")).toBeNull();
+    expect(dialog?.querySelector("[aria-label='01每日更新 实时新增资源自动刮削']")).toBeNull();
+    await act(async () => {
+      [...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
+        .find((button) => button.textContent?.includes("保存修改"))
+        ?.click();
+      await vi.waitFor(() => expect(updateLibrary).toHaveBeenCalled());
+    });
+
+    expect(updateLibrary).toHaveBeenCalledWith("library-1", {
+      name: "01每日更新",
+      kind: "HOMEVIDEOS",
+      chapterSourceId: null,
+      scrapers: [],
+      realtimeMetadataAutoMatchEnabled: false,
+    });
   });
 
   it("allows a mixed library to choose an intro and outro source", async () => {
