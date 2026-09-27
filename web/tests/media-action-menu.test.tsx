@@ -127,6 +127,52 @@ describe("MediaActionMenu", () => {
     expect(document.body.querySelector("[data-action=delete]")).not.toBeNull();
   });
 
+  it("keeps HomeVideos editable without exposing online metadata matching", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "video-1", title: "家庭录像", itemType: "VIDEO" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onIdentify={() => undefined}
+            onRefreshMetadata={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    expect(document.body.querySelector("[data-action=edit-metadata]")).not.toBeNull();
+    expect(document.body.querySelector("[data-action=identify]")).toBeNull();
+    expect(document.body.querySelector("[data-action=refresh-metadata]")).toBeNull();
+  });
+
+  it("does not render actions for folders", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "folder-1", title: "Trips", itemType: "FOLDER" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-media-actions-trigger")).toBeNull();
+  });
+
   it("keeps a menu opened from the first resource inside the viewport", () => {
     const position = positionMediaActionMenu(
       { top: 40, bottom: 74, left: 20, right: 54 },
