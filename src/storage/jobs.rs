@@ -9453,7 +9453,7 @@ impl Database {
                 "UPDATE media_items
                  SET removed_at = unixepoch(), updated_at = unixepoch()
                  WHERE library_id = ?
-                   AND item_type IN ('MOVIE', 'EPISODE', 'UNRESOLVED')
+                   AND item_type IN ('MOVIE', 'EPISODE', 'UNRESOLVED', 'VIDEO')
                    AND removed_at IS NULL
                    AND EXISTS (
                        SELECT 1

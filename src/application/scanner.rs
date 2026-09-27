@@ -167,6 +167,7 @@ enum PreparedManifestFile {
     Movie(NewMovieFile),
     Episode(NewEpisodeFile),
     Unresolved(NewScanManifestUnresolvedFile),
+    HomeVideo(NewScanManifestUnresolvedFile),
 }
 
 enum ManifestDeltaPreparation {
@@ -257,7 +258,8 @@ impl ManifestApplyPreparedFiles {
                     match *file {
                         PreparedManifestFile::Movie(file) => self.movie_files.push(file),
                         PreparedManifestFile::Episode(file) => self.episode_files.push(file),
-                        PreparedManifestFile::Unresolved(file) => self.unresolved_files.push(file),
+                        PreparedManifestFile::Unresolved(file)
+                        | PreparedManifestFile::HomeVideo(file) => self.unresolved_files.push(file),
                     }
                 }
                 if let Some(sidecar_entry) = sidecar_entry {
@@ -344,6 +346,13 @@ impl PreparedManifestFile {
                     && file.fingerprint == observation.fingerprint
             }
             Self::Unresolved(file) => {
+                file.relative_path == observation.relative_path
+                    && file.size == observation.size
+                    && file.modified_at == observation.modified_at
+                    && file.inode == observation.inode
+                    && file.fingerprint == observation.fingerprint
+            }
+            Self::HomeVideo(file) => {
                 file.relative_path == observation.relative_path
                     && file.size == observation.size
                     && file.modified_at == observation.modified_at
@@ -1410,6 +1419,9 @@ fn manifest_discovery_index_from_preparation(
                     PreparedManifestFile::Unresolved(file) => {
                         NewScanManifestIndexedFile::Unresolved(file)
                     }
+                    PreparedManifestFile::HomeVideo(file) => {
+                        NewScanManifestIndexedFile::Unresolved(file)
+                    }
                 }
             } else if let Some(sidecar_entry) = sidecar_entry {
                 NewScanManifestIndexedFile::Sidecar(sidecar_entry)
@@ -1442,6 +1454,7 @@ async fn prepare_manifest_delta(
     context: ManifestFilePreparationContext,
     delta: StoredScanManifestDelta,
     classification: Option<MixedClassification>,
+    library_kind: &str,
 ) -> ManifestDeltaPreparation {
     let StoredScanManifestDelta {
         id,
@@ -1470,12 +1483,17 @@ async fn prepare_manifest_delta(
         inode,
         fingerprint,
     };
+    let filename_input = if library_kind == "HOMEVIDEOS" {
+        ManifestFilenameInput::HomeVideos
+    } else {
+        ManifestFilenameInput::LegacyMixed(classification)
+    };
     prepare_manifest_observation(
         context,
         observed,
         delta_kind == "ADD",
         delta_id,
-        ManifestFilenameInput::LegacyMixed(classification),
+        filename_input,
     )
     .await
 }
@@ -1569,6 +1587,10 @@ async fn prepare_manifest_observation(
                 .prepare_manifest_unresolved_file(&root, &path, &observed, manifest_strm_target)
                 .await
                 .map(|file| Some(PreparedManifestFile::Unresolved(file))),
+            PreparedManifestFilename::HomeVideo => scanner
+                .prepare_manifest_home_video_file(&root, &path, &observed, manifest_strm_target)
+                .await
+                .map(|file| Some(PreparedManifestFile::HomeVideo(file))),
         };
         match prepared {
             Ok(Some(file)) if file.matches_observation(&observed) => Some(file),
@@ -2667,6 +2689,31 @@ impl LibraryScanner {
         path: &Path,
         generation: &str,
     ) -> Result<ScanReport, ScannerError> {
+        self.scan_plain_file(library_id_text, root, root_path, path, generation, false)
+            .await
+    }
+
+    async fn scan_home_video_file(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+    ) -> Result<ScanReport, ScannerError> {
+        self.scan_plain_file(library_id_text, root, root_path, path, generation, true)
+            .await
+    }
+
+    async fn scan_plain_file(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+        home_video: bool,
+    ) -> Result<ScanReport, ScannerError> {
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
             Some(read_strm_target(path).await?)
@@ -2769,21 +2816,30 @@ impl LibraryScanner {
         let file_name = path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("Unresolved");
+            .unwrap_or(if home_video { "Video" } else { "Unresolved" });
         let title = clean_hierarchy_title(file_name);
         let title = if title.is_empty() {
-            "Unresolved".to_owned()
+            if home_video {
+                "Video".to_owned()
+            } else {
+                "Unresolved".to_owned()
+            }
         } else {
             title
         };
         let sort_title = title.to_lowercase();
-        let identity_key = format!("unresolved:{}:{}", root.id, relative_path);
+        let identity_key = format!(
+            "{}:{}:{}",
+            if home_video { "video" } else { "unresolved" },
+            root.id,
+            relative_path
+        );
         let item_id = ItemId::new().to_string();
         self.database
             .insert_hierarchy_item(NewHierarchyItem {
                 id: &item_id,
                 library_id: library_id_text,
-                item_type: "UNRESOLVED",
+                item_type: if home_video { "VIDEO" } else { "UNRESOLVED" },
                 parent_id: None,
                 series_id: None,
                 season_number: None,
@@ -2794,7 +2850,11 @@ impl LibraryScanner {
                 original_title: Some(&title),
                 production_year: None,
                 provider_ids_json: None,
-                identification_status: "PENDING",
+                identification_status: if home_video {
+                    "LOCAL_CONFIRMED"
+                } else {
+                    "PENDING"
+                },
                 identity_key: &identity_key,
             })
             .await?;
@@ -4039,6 +4099,29 @@ impl LibraryScanner {
         observation: &NewScanManifestEntry,
         manifest_strm_target: Option<StrmTarget>,
     ) -> Result<NewScanManifestUnresolvedFile, ScannerError> {
+        self.prepare_manifest_plain_file(root, path, observation, manifest_strm_target, false)
+            .await
+    }
+
+    async fn prepare_manifest_home_video_file(
+        &self,
+        root: &StoredLibraryRoot,
+        path: &Path,
+        observation: &NewScanManifestEntry,
+        manifest_strm_target: Option<StrmTarget>,
+    ) -> Result<NewScanManifestUnresolvedFile, ScannerError> {
+        self.prepare_manifest_plain_file(root, path, observation, manifest_strm_target, true)
+            .await
+    }
+
+    async fn prepare_manifest_plain_file(
+        &self,
+        root: &StoredLibraryRoot,
+        path: &Path,
+        observation: &NewScanManifestEntry,
+        manifest_strm_target: Option<StrmTarget>,
+        home_video: bool,
+    ) -> Result<NewScanManifestUnresolvedFile, ScannerError> {
         let relative_path = observation.relative_path.clone();
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
@@ -4052,10 +4135,14 @@ impl LibraryScanner {
         let file_stem = path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("Unresolved");
+            .unwrap_or(if home_video { "Video" } else { "Unresolved" });
         let cleaned_title = clean_hierarchy_title(file_stem);
         let title = if cleaned_title.is_empty() {
-            "Unresolved".to_owned()
+            if home_video {
+                "Video".to_owned()
+            } else {
+                "Unresolved".to_owned()
+            }
         } else {
             cleaned_title
         };
@@ -4068,7 +4155,11 @@ impl LibraryScanner {
             item_id: ItemId::new().to_string(),
             filesystem_entry_id: FilesystemEntryId::new().to_string(),
             source_id: SourceId::new().to_string(),
-            identity_key: format!("unresolved:{}:{relative_path}", root.id),
+            identity_key: format!(
+                "{}:{}:{relative_path}",
+                if home_video { "video" } else { "unresolved" },
+                root.id
+            ),
             relative_path,
             size: observation.size,
             modified_at: observation.modified_at,
@@ -4086,6 +4177,7 @@ impl LibraryScanner {
                 .as_ref()
                 .map(strm_target_kind_name)
                 .map(str::to_owned),
+            home_video,
         })
     }
 
@@ -5691,6 +5783,7 @@ impl ScanJobService {
             let filename_input = match library_kind {
                 "MOVIE" => ManifestFilenameInput::MovieLibrary,
                 "SERIES" => ManifestFilenameInput::SeriesLibrary,
+                "HOMEVIDEOS" => ManifestFilenameInput::HomeVideos,
                 _ if is_media => ManifestFilenameInput::PreparedMixed(
                     classify_mixed_manifest_file(&root_path, &path, &mut classification_cache)
                         .await,
@@ -7248,6 +7341,7 @@ impl ScanJobService {
                                 MixedClassification::Unresolved
                             }
                         }
+                        "HOMEVIDEOS" => MixedClassification::Unresolved,
                         _ => classify_mixed_file(&root_path, &path, &mut mixed_cache).await,
                     })
                 } else {
@@ -7272,6 +7366,7 @@ impl ScanJobService {
                 let root = root.clone();
                 let root_path = root_path.clone();
                 let delta = delta.clone();
+                let library_kind = library.kind.clone();
                 preparation_tasks.spawn(async move {
                     prepare_manifest_delta(
                         ManifestFilePreparationContext {
@@ -7285,6 +7380,7 @@ impl ScanJobService {
                         },
                         delta,
                         classification,
+                        &library_kind,
                     )
                     .await
                 });
@@ -8222,6 +8318,7 @@ impl ScanJobService {
             }
             let classification = match library_kind {
                 "SERIES" => MixedClassification::Episode,
+                "HOMEVIDEOS" => MixedClassification::Unresolved,
                 "MIXED" => {
                     classify_mixed_file(
                         Path::new(&root.canonical_path),
@@ -8327,40 +8424,53 @@ impl ScanJobService {
             let root = work.root.clone();
             let path = work.path.clone();
             let classification = work.classification;
+            let is_home_videos = library_kind == "HOMEVIDEOS";
             regular_tasks.spawn(async move {
-                let report = match classification {
-                    MixedClassification::Movie => {
-                        scanner
-                            .scan_movie_file(
-                                &library_id,
-                                &root,
-                                Path::new(&root.canonical_path),
-                                &path,
-                                &generation,
-                            )
-                            .await?
-                    }
-                    MixedClassification::Episode => {
-                        scanner
-                            .scan_episode_file(
-                                &library_id,
-                                &root,
-                                Path::new(&root.canonical_path),
-                                &path,
-                                &generation,
-                            )
-                            .await?
-                    }
-                    MixedClassification::Unresolved => {
-                        scanner
-                            .scan_unresolved_file(
-                                &library_id,
-                                &root,
-                                Path::new(&root.canonical_path),
-                                &path,
-                                &generation,
-                            )
-                            .await?
+                let report = if is_home_videos {
+                    scanner
+                        .scan_home_video_file(
+                            &library_id,
+                            &root,
+                            Path::new(&root.canonical_path),
+                            &path,
+                            &generation,
+                        )
+                        .await?
+                } else {
+                    match classification {
+                        MixedClassification::Movie => {
+                            scanner
+                                .scan_movie_file(
+                                    &library_id,
+                                    &root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                        }
+                        MixedClassification::Episode => {
+                            scanner
+                                .scan_episode_file(
+                                    &library_id,
+                                    &root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                        }
+                        MixedClassification::Unresolved => {
+                            scanner
+                                .scan_unresolved_file(
+                                    &library_id,
+                                    &root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                        }
                     }
                 };
                 Ok((index, report))
@@ -9506,6 +9616,11 @@ impl ScanJobService {
             "SERIES" => {
                 self.scanner
                     .scan_episode_file(&job.library_id, root, root_path, file, generation)
+                    .await?
+            }
+            "HOMEVIDEOS" => {
+                self.scanner
+                    .scan_home_video_file(&job.library_id, root, root_path, file, generation)
                     .await?
             }
             "MIXED" => match classify_mixed_file(root_path, file, classification_cache).await {
@@ -11420,6 +11535,7 @@ enum MixedClassification {
 enum ManifestFilenameInput {
     MovieLibrary,
     SeriesLibrary,
+    HomeVideos,
     LegacyMixed(Option<MixedClassification>),
     PreparedMixed(MixedManifestClassification),
 }
@@ -11439,6 +11555,7 @@ enum PreparedManifestFilename {
     Movie(ParsedMovieFilename),
     Episode(ParsedEpisodeFilename),
     Unresolved,
+    HomeVideo,
 }
 
 enum MixedManifestClassification {
@@ -11466,6 +11583,7 @@ fn prepare_manifest_filename(
                 PreparedManifestFilename::Episode,
             ))
         }
+        ManifestFilenameInput::HomeVideos => Some(PreparedManifestFilename::HomeVideo),
         ManifestFilenameInput::LegacyMixed(preclassified) => match preclassified? {
             MixedClassification::Movie => {
                 parse_movie_filename(filename).map(PreparedManifestFilename::Movie)

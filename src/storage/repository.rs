@@ -1279,6 +1279,7 @@ pub(crate) struct NewScanManifestUnresolvedFile {
     pub(crate) container: String,
     pub(crate) external_url: Option<String>,
     pub(crate) strm_target_kind: Option<String>,
+    pub(crate) home_video: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

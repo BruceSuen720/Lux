@@ -6901,13 +6901,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-278：其他视频扫描与目录层级
 
-- [ ] 全量、实时增量和重新调和扫描都为每个视频创建独立 `VIDEO`，并以 `FOLDER` 保留各级磁盘目录。
-- [ ] 文件名不运行电影/剧集解析；视频保持本地确认，不进入待确认队列。文件变更、移动、缺失、取消和重试沿用现有扫描安全语义。
-- [ ] `.strm` 使用已有目标校验与探测路径。
+- [x] 全量、实时增量和重新调和扫描都为每个视频创建独立 `VIDEO`，并以 `FOLDER` 保留各级磁盘目录。
+- [x] 文件名不运行电影/剧集解析；视频保持本地确认，不进入待确认队列。文件变更、移动、缺失、取消和重试沿用现有扫描安全语义。
+- [x] `.strm` 使用已有目标校验与探测路径。
 
 依赖：LUX-277。验证：`cargo test --locked --test scanning_jobs`、`cargo test --locked --test storage`。
 
-预计文件：`src/application/scanner.rs`、`src/storage/media.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`。
+预计文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/media.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`。
+
+结果（2026-09-28）：`cargo test --locked --test scanning_jobs` 78 项通过，覆盖普通全量扫描、旧版持久 Manifest 重调和、实时增量创建、删除后 VIDEO 移除及 `.strm` 目标校验；`cargo test --locked --test storage` 40 项通过。`cargo fmt --all -- --check`、`cargo clippy --locked --lib --all-features -- -D warnings` 和 `git diff --check` 通过。
 
 #### LUX-279：VIDEO 本地 NFO 与手动元数据
 
