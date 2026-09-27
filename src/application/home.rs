@@ -1044,7 +1044,13 @@ mod tests {
             .list_continue_watching(principal, &user_id, 0, 10)
             .await
             .expect("Emby resume items");
-        assert_eq!(emby_resume.total, 6);
-        assert_eq!(emby_resume.items.len(), 6);
+        assert_eq!(emby_resume.total, 4);
+        assert_eq!(emby_resume.items.len(), 4);
+        assert!(emby_resume.items.iter().any(|item| item.id == item_ids[2]));
+        assert!(emby_resume.items.iter().any(|item| item.id == item_ids[3]));
+        assert!(emby_resume.items.iter().any(|item| item.id == item_ids[4]));
+        assert!(emby_resume.items.iter().any(|item| item.id == item_ids[5]));
+        assert!(!emby_resume.items.iter().any(|item| item.id == item_ids[0]));
+        assert!(!emby_resume.items.iter().any(|item| item.id == item_ids[1]));
     }
 }

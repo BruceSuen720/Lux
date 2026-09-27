@@ -583,6 +583,111 @@ async fn resume_page_does_not_materialize_unrelated_catalog_items()
     Ok(())
 }
 
+#[tokio::test]
+async fn emby_resume_keeps_only_latest_eligible_episode_per_series()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Series", LibraryKind::Series, false)
+        .await?;
+    let admin_id = admin.id.to_string();
+    let series_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'SERIES', 'Resume Series', 'resume series', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&series_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let episodes = [
+        (1_i64, 31_i64, "Resume Series S01E31", 300_i64),
+        (1, 32, "Resume Series S01E32", 400),
+        (2, 1, "Resume Series S02E01", 200),
+    ];
+    let mut episode_ids = Vec::new();
+    for (season_number, episode_number, title, last_played_at) in episodes {
+        let item_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, series_id, season_number,
+                 episode_number, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'EPISODE', ?, ?, ?, ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .bind(&series_id)
+        .bind(season_number)
+        .bind(episode_number)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, position_ticks, last_played_at
+             ) VALUES (?, ?, 6000000000, ?)",
+        )
+        .bind(&admin_id)
+        .bind(&item_id)
+        .bind(last_played_at)
+        .execute(database.pool())
+        .await?;
+        episode_ids.push(item_id);
+    }
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="ResumeTest", Device="Mac", DeviceId="resume-series", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
+
+    for path in [
+        format!("/Users/{admin_id}/Items/Resume"),
+        format!("/emby/Users/{admin_id}/Items/Resume"),
+    ] {
+        let response = client
+            .get(format!("{base_url}{path}"))
+            .query(&[("api_key", token.as_str()), ("Limit", "10")])
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.json::<Value>().await?;
+        assert_eq!(body["TotalRecordCount"], 1);
+        assert_eq!(body["Items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["Items"][0]["Id"], emby_public_id(&episode_ids[2]));
+    }
+
+    server.abort();
+    Ok(())
+}
+
 fn cookie_value(
     response: &reqwest::Response,
     name: &str,

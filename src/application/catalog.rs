@@ -795,7 +795,7 @@ impl CatalogService {
             user_id,
             offset,
             limit,
-            false,
+            true,
         )
         .await
     }
