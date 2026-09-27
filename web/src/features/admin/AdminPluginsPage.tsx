@@ -8,6 +8,15 @@ import { LuxSelect } from "../../components/LuxSelect";
 import { EmbyMigrationPluginConfig } from "./EmbyMigrationPluginConfig";
 import "./plugin-library.css";
 
+const CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY = new Set([
+  "apiBaseUrl",
+  "apiBaseUrlPreset",
+  "existingInfoPolicy",
+  "fallbackLanguages",
+  "libraryIds",
+  "preferredLanguage",
+]);
+
 export function AdminPluginsPage() {
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<"store" | "installed">("store");
@@ -138,6 +147,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [uninstallDialogOpen, setUninstallDialogOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [apiKeyDirty, setApiKeyDirty] = useState(false);
+  const [additionalSelectValues, setAdditionalSelectValues] = useState<Record<string, string | string[]>>({});
   const [danmakuProviderBaseUrl, setDanmakuProviderBaseUrl] = useState("");
   const [danmakuProviderBaseUrlDirty, setDanmakuProviderBaseUrlDirty] = useState(false);
   const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
@@ -168,6 +178,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const isDanmaku = plugin.id === "org.lux.danmaku";
   const isMediaInfo = plugin.id === "org.lux.strm-media-info";
   const isMigration = plugin.id === "org.lux.emby-migration";
+  const isLoginBackgroundProvider = plugin.capabilities?.includes("login_background.get") === true;
   const isChapterSource = plugin.capabilities?.some((capability) => capability === "chapters.detect" || capability === "chapters.lookup") === true;
   const configField = plugin.configFields.find((field) => field.key === "apiKey");
   const danmakuProviderField = plugin.configFields.find((field) => field.key === "providerBaseUrl");
@@ -194,6 +205,19 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const thumbnailPositionPercentField = plugin.configFields.find((field) => field.key === "thumbnailPositionPercent");
   const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
   const scheduleField = plugin.configFields.find((field) => field.key === "schedule");
+  const additionalSelectFields = plugin.configFields.filter((field) =>
+    field.type === "select" && !CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY.has(field.key));
+  const additionalSelectConfig = additionalSelectFields.reduce<Record<string, string | string[]>>((config, field) => {
+    const value = additionalSelectValues[field.key];
+    if (Array.isArray(value) || (typeof value === "string" && value !== "")) {
+      config[field.key] = value;
+    }
+    return config;
+  }, {});
+  const requiredSelectMissing = additionalSelectFields.some((field) => {
+    const value = additionalSelectValues[field.key];
+    return field.required && (Array.isArray(value) ? value.length === 0 : !value);
+  });
   const customApiBaseUrlOption = apiBaseUrlPresetField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
   const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
   const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
@@ -208,6 +232,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           matchEnglishTitle,
           concurrency,
           overwrite,
+          ...additionalSelectConfig,
         })
       : isMediaInfo
         ? api.updateAdminPluginConfig(plugin.id, {
@@ -219,6 +244,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           ...(thumbnailPositionPercentField ? { thumbnailPositionPercent } : {}),
           writeSidecars,
           ...(scheduleField ? { schedule: schedule.trim() } : {}),
+          ...additionalSelectConfig,
           })
         : isChapterSource
           ? api.updateAdminPluginConfig(plugin.id, {
@@ -227,7 +253,10 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
             ...(creditsWindowField ? { creditsWindowSeconds } : {}),
             ...(matchThresholdField ? { matchThreshold } : {}),
             ...(scheduleField ? { schedule: schedule.trim() } : {}),
+            ...additionalSelectConfig,
             })
+          : isLoginBackgroundProvider
+            ? api.updateAdminPluginConfig(plugin.id, additionalSelectConfig)
           : api.updateAdminPluginConfig(plugin.id, {
           ...(apiKeyDirty ? { apiKey } : {}),
           preferredLanguage,
@@ -253,6 +282,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                   : {}),
               }
               : {}),
+          ...additionalSelectConfig,
         }),
     onSuccess: () => {
       setApiKey("");
@@ -347,11 +377,25 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setThumbnailPositionPercent(configuredThumbnailPositionPercent);
     setWriteSidecars(values.writeSidecars !== false);
     setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "0 3 * * *"));
+    setAdditionalSelectValues(Object.fromEntries(additionalSelectFields.map((field) => {
+      const configuredValue = values[field.key];
+      const defaultValue = field.defaultValue;
+      const value = field.multiple
+        ? Array.isArray(configuredValue)
+          ? configuredValue.filter((item): item is string => typeof item === "string")
+          : Array.isArray(defaultValue)
+            ? defaultValue.filter((item): item is string => typeof item === "string")
+            : []
+        : typeof configuredValue === "string"
+          ? configuredValue
+          : typeof defaultValue === "string" ? defaultValue : "";
+      return [field.key, value];
+    })));
     setApiKey("");
     setApiKeyDirty(false);
     setDanmakuProviderBaseUrl("");
     setDanmakuProviderBaseUrlDirty(false);
-  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, originalLanguageField?.defaultValue, overwriteField?.defaultValue, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
+  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, originalLanguageField?.defaultValue, overwriteField?.defaultValue, plugin.configFields, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -390,7 +434,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
               <div><h2 id={`plugin-config-title-${plugin.id}`}>{plugin.name}</h2></div>
               <button ref={closeRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></button>
             </div>
-            {isMigration ? <EmbyMigrationPluginConfig plugin={plugin} /> : <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
+            {isMigration ? <EmbyMigrationPluginConfig plugin={plugin} /> : <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); if (!requiredSelectMissing) save.mutate(); }}>
               {isDanmaku ? <>
                 {danmakuProviderField ? <label htmlFor={"plugin-config-" + plugin.id + "-provider-base-url"}>{danmakuProviderField.label}<input id={"plugin-config-" + plugin.id + "-provider-base-url"} type="url" value={danmakuProviderBaseUrl} onChange={(event) => { setDanmakuProviderBaseUrl(event.target.value); setDanmakuProviderBaseUrlDirty(true); }} placeholder="留空保留已保存的地址" autoComplete="url" required={danmakuProviderField.required && !plugin.configured} /><small>{danmakuProviderField.description}</small></label> : null}
                 {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
@@ -428,10 +472,15 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                 {apiBaseUrlPresetField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlPresetField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} options={apiBaseUrlPresetField.options ?? []} disabled={!alternateApiEnabled} onChange={setApiBaseUrlChoice} aria-label={apiBaseUrlPresetField.label} /><small>{apiBaseUrlPresetField.description}</small></label> : null}
                 {customApiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>{customApiBaseUrlField.label}<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>{customApiBaseUrlField.description}</small></label> : null}
               </>}
+              {additionalSelectFields.map((field) => {
+                const id = `plugin-config-${plugin.id}-${field.key}`;
+                const value = additionalSelectValues[field.key];
+                return <label key={field.key} htmlFor={id}>{field.label}{field.multiple ? <LuxSelect id={id} multiple value={Array.isArray(value) ? value : []} options={field.options ?? []} onChange={(selected) => setAdditionalSelectValues((current) => ({ ...current, [field.key]: selected }))} aria-label={field.label} /> : <LuxSelect id={id} value={typeof value === "string" ? value : ""} options={field.options ?? []} placeholder={field.required ? "请选择" : "可选"} onChange={(selected) => setAdditionalSelectValues((current) => ({ ...current, [field.key]: selected }))} aria-label={field.label} />}{field.description ? <small>{field.description}</small> : null}</label>;
+              })}
               <p>{danmakuProviderField?.description ?? configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
               <div className="lux-admin-plugin-dialog-actions">
                 <button className="lux-button lux-button-secondary" type="button" onClick={closeDialog}>取消</button>
-                <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>
+                <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending || requiredSelectMissing}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>
               </div>
               {save.error ? <span className="lux-error-copy" role="alert">{save.error.message}</span> : null}
             </form>}
