@@ -597,7 +597,7 @@ async fn homevideo_playback_progress_and_played_state_flow_into_continue_watchin
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("admin", "Admin", "correct password").await?;
+    let admin = setup.complete("admin", "Admin", "correct password").await?;
     let library = LibraryService::new(database.clone())
         .create_library("Other videos", LibraryKind::HomeVideos, false)
         .await?;
@@ -641,6 +641,53 @@ async fn homevideo_playback_progress_and_played_state_flow_into_continue_watchin
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
+    let emby_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="ResumeTest", Device="Mac", DeviceId="resume-homevideos", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(emby_login.status(), reqwest::StatusCode::OK);
+    let emby_token = emby_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing Emby token")?
+        .to_owned();
+    let media_source_id: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&video_id)
+            .fetch_one(database.pool())
+            .await?;
+    let emby_progress = client
+        .post(format!("{base_url}/Sessions/Playing/Progress"))
+        .header("X-Emby-Token", &emby_token)
+        .json(&json!({
+            "ItemId": emby_public_id(&video_id),
+            "MediaSourceId": media_source_id,
+            "PlaySessionId": "homevideos-resume-session",
+            "PositionTicks": 1_000_000_000_i64,
+            "RunTimeTicks": 2_000_000_000_i64
+        }))
+        .send()
+        .await?;
+    assert_eq!(emby_progress.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let emby_resume = client
+        .get(format!("{base_url}/Users/{}/Items/Resume", admin.id))
+        .query(&[("api_key", emby_token.as_str()), ("Limit", "10")])
+        .send()
+        .await?;
+    assert_eq!(emby_resume.status(), reqwest::StatusCode::OK);
+    let emby_resume_body = emby_resume.json::<Value>().await?;
+    assert_eq!(emby_resume_body["TotalRecordCount"], 1);
+    assert_eq!(
+        emby_resume_body["Items"][0]["Id"],
+        emby_public_id(&video_id)
+    );
+    assert_eq!(emby_resume_body["Items"][0]["Type"], "Video");
+
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))

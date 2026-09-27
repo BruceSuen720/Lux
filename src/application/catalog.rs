@@ -796,7 +796,7 @@ impl CatalogService {
             offset,
             limit,
             false,
-            &["MOVIE", "EPISODE"],
+            &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await
     }
