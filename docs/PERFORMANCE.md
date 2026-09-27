@@ -752,3 +752,20 @@ SQLite 首扫中位数只快 14 ms（约 0.7%）；两组暖缓存配对分别�
 | PostgreSQL 分块候选 | 5,597 / 5,781 / 5,726 ms；**5,726 ms** | 2,477 ms | 3,075 / 3,114 / 3,012 ms；**3,075 ms** | 275 / 318 ms | 771 ms | 344 / 95 | 8 | 226,764,773 bytes / 0 |
 
 SQLite 首扫三组配对分别改善约 4.3%、6.2%、2.8%；PostgreSQL 三组分别回退约 0.5%、3.8%、2.4%。候选把 `positive_prepare_wall` 调用数从 601 降到 9，并记录到 120 个 CPU 分块覆盖 60,000 个文件，但 PostgreSQL 的索引中位数仍慢约 2.8%，batch p95 也从 737 增至 771 ms。重扫、前台 p95、DML 数量和 8 个正向批次未明显退化；SQLite 的稳定收益不足以抵消 PostgreSQL 的稳定回退，故撤回通用分块改动，不作正式采纳。候选实现的 `scanning_jobs` 测试两次均为 75 passed，release performance 测试成功编译；性能门未通过后已撤回候选代码。当前扫描代码继续使用有界逐文件 `JoinSet`；保留的 `275fe6c9` 仍是文件名重复解析优化。结果只代表本机 ARM64，不外推 NAS/x86_64；LUX-275 阶段门继续开放。
+
+### SQLite 文件系统 claim 无 RETURNING 快路径（保留；PostgreSQL 不启用）
+
+2026-09-27 针对首扫的 `claim_manifest_add_filesystem_entries_in_transaction` 做优化。SQLite 上先在 savepoint 内批量插入且不取回 `RETURNING` 行；如果每个 chunk 的 `rows_affected` 都等于输入行数，就直接以输入路径作为已 claim 集合。若任何 chunk 有部分冲突，则回滚整个试插并重跑原有精确 `RETURNING relative_path` 查询，只有真正插入的路径会继续建源和媒体条目。PostgreSQL 保持原 `RETURNING` 路径，因为同一快路径没有证明该后端有稳定收益。
+
+在同一 Apple M4 / 16 GiB / ARM64 主机和相同的确定性 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）上，使用固定 release 二进制交错运行五轮。SQLite 为 `synchronous=FULL`、锁采样关闭；PostgreSQL 16.15 每轮使用新的空数据库并采样锁。基线二进制 SHA-256 `a4f35bb380a369629bed454be86f210e626bf1d36eae4774e1f017ab8f01bc80`，候选 SHA-256 `7db1b2f3557aec073ff671f23b2b85ba096e4db826a25f40f22d7b5b0fa16d98`；两者源提交标记均为 `3b476d54`，候选含未提交的 SQLite 快路径。
+
+| 后端/版本 | 首扫索引：五轮 / 中位数 | 120k target 中位数 | 索引 + target 中位数 | 无变化重扫 | 前台 / 目录列表 p95 | batch p95 | SQL / DML | 正向批次 | WAL / 最大锁等待者 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite 基线 | 2,673 / 1,990 / 2,051 / 1,981 / 1,996 ms；**1,996 ms** | 597 ms | 2,604 ms | 1,037 ms | 238 / 373 ms | 284 ms | 376 / 119 | 8 | - |
+| SQLite 候选 | 1,915 / 1,938 / 1,920 / 1,877 / 1,877 ms；**1,915 ms** | 614 ms | 2,526 ms | 1,037 ms | 240 / 375 ms | 268 ms | 388 / 119 | 8 | - |
+| PostgreSQL 基线 | 5,662 / 6,043 / 5,794 / 5,661 / 5,765 ms；**5,765 ms** | 2,445 ms | 8,171 ms | 3,154 ms | 272 / 363 ms | 766 ms | 344 / 95 | 8 | 221,615,287 bytes / 0 |
+| PostgreSQL 候选 | 5,602 / 5,805 / 5,664 / 5,708 / 5,916 ms；**5,708 ms** | 2,441 ms | 8,164 ms | 3,206 ms | 281 / 325 ms | 763 ms | 344 / 95 | 8 | 221,715,426 bytes / 0 |
+
+SQLite 首扫中位数快约 4.1%，五组配对候选都更快；`positive_add_filesystem_claim` 累计中位数从 226 ms 降至 167 ms（快约 26%）。首扫加 120k target 的中位数快约 3.0%；无变化重扫相同，前台 p95 高约 0.8%，batch p95 更低。SQLite SQL 语句中位数多 12 条（savepoint/release 控制语句），DML 与正向批次不变。首轮基线有较冷的离群值，但五轮中位数及配对方向均支持保留。
+
+PostgreSQL 路径仍使用原 `RETURNING` 查询；五轮首扫中位数差约 1%，配对方向混合，按持平处理。无变化重扫回退约 1.6%，前台 p95 回退约 3.3%，均低于 5% 门槛；batch p95、DML、正向批次和 WAL 基本持平，最大锁等待者为 0。因此只在 SQLite 启用快路径，不给 PostgreSQL 增加 savepoint 开销。`scanning_jobs` 全套 75 项通过，候选 release performance 测试编译并实跑；本实验不关闭 LUX-275 整体阶段门，ARM64 数字不外推 NAS/x86_64。

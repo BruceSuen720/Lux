@@ -814,8 +814,119 @@ impl Database {
         generation: &str,
         entries: &[NewScanManifestFilesystemEntry<'_>],
     ) -> Result<HashSet<String>, StorageError> {
-        let mut inserted_paths = HashSet::with_capacity(entries.len());
+        if entries.is_empty() {
+            return Ok(HashSet::new());
+        }
         let batch_size = super::manifest_positive_index_insert_chunk_size(self.backend());
+        // The no-RETURNING fast path only improved SQLite in the measured scan workload.
+        if self.backend() == DatabaseBackend::Postgres {
+            return self
+                .claim_manifest_add_filesystem_entries_with_returning(
+                    transaction,
+                    library_root_id,
+                    generation,
+                    entries,
+                    batch_size,
+                )
+                .await;
+        }
+
+        // Most full-scan ADD batches contain only new paths. Avoid decoding one RETURNING row
+        // per file on that common path. If any path conflicts, roll back the speculative inserts
+        // and rerun the exact RETURNING query so only paths claimed by this transaction proceed.
+        sqlx::query("SAVEPOINT lux_manifest_add_fs_claim_fast_path")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut all_chunks_inserted = true;
+        for chunk in entries.chunks(batch_size) {
+            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO filesystem_entries (
+                    id, library_root_id, relative_path, entry_kind, size,
+                    modified_at, inode, fingerprint, last_seen_generation,
+                    last_seen_change_kind, is_missing
+                ) VALUES {values}
+                ON CONFLICT(library_root_id, relative_path) DO NOTHING"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for entry in chunk {
+                statement = statement
+                    .bind(entry.id)
+                    .bind(library_root_id)
+                    .bind(entry.relative_path)
+                    .bind(entry.size)
+                    .bind(entry.modified_at)
+                    .bind(entry.inode)
+                    .bind(entry.fingerprint)
+                    .bind(generation)
+                    .bind(entry.last_seen_change_kind);
+            }
+            let result = statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if usize::try_from(result.rows_affected()).unwrap_or(usize::MAX) != chunk.len() {
+                all_chunks_inserted = false;
+                break;
+            }
+        }
+
+        if all_chunks_inserted {
+            sqlx::query("RELEASE SAVEPOINT lux_manifest_add_fs_claim_fast_path")
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let mut inserted_paths = HashSet::with_capacity(entries.len());
+            inserted_paths.extend(entries.iter().map(|entry| entry.relative_path.to_owned()));
+            return Ok(inserted_paths);
+        }
+
+        sqlx::query("ROLLBACK TO SAVEPOINT lux_manifest_add_fs_claim_fast_path")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query("RELEASE SAVEPOINT lux_manifest_add_fs_claim_fast_path")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        self.claim_manifest_add_filesystem_entries_with_returning(
+            transaction,
+            library_root_id,
+            generation,
+            entries,
+            batch_size,
+        )
+        .await
+    }
+
+    async fn claim_manifest_add_filesystem_entries_with_returning(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_root_id: &str,
+        generation: &str,
+        entries: &[NewScanManifestFilesystemEntry<'_>],
+        batch_size: usize,
+    ) -> Result<HashSet<String>, StorageError> {
+        let mut inserted_paths = HashSet::with_capacity(entries.len());
         for chunk in entries.chunks(batch_size) {
             let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
                 .collect::<Vec<_>>()

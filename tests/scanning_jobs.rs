@@ -1805,6 +1805,7 @@ async fn streamed_manifest_add_does_not_claim_a_concurrent_filesystem_entry()
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(root.join("Raced.Movie.2024.mkv"), b"scanned version").await?;
+    tokio::fs::write(root.join("Clear.Movie.2023.mkv"), b"uncontested version").await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
@@ -1858,6 +1859,15 @@ async fn streamed_manifest_add_does_not_claim_a_concurrent_filesystem_entry()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(media_source_count, 0);
+    let uncontested_source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = 'Clear.Movie.2023.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(uncontested_source_count, 1);
     Ok(())
 }
 

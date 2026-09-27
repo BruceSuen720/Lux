@@ -6837,6 +6837,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 对 JoinSet→500 文件分块 `spawn_blocking` 做同 fixture 交错三轮 A/B。SQLite 首扫中位数 1.932 → 1.849 秒（快约 4.3%），PostgreSQL 5.570 → 5.726 秒（慢约 2.8%）；每轮 SQLite 都改善、每轮 PostgreSQL 都回退。无变化重扫、前台 p95、SQL/DML 和 8 个正向提交批次未明显退化，但双后端首扫门未通过，因此撤回候选，正式扫描仍使用有界逐文件 JoinSet。已采纳的 `275fe6c9` 是文件名只解析一次，不是任务分块。LUX-275 阶段门仍开放，详细数据见 `docs/PERFORMANCE.md`。
 
+同日继续优化首次扫描的 SQLite 文件系统 claim：全批插入成功时以 `rows_affected` 快速通过，不解码逐文件 `RETURNING`；部分冲突时 savepoint 回滚并使用原查询精确确定可 claim 路径。五轮同 fixture 后，SQLite 首扫中位数 1.996 → 1.915 秒（快约 4.1%），claim 阶段快约 26%；无变化重扫、前台 p95 和 DML 未明显回退。PostgreSQL 保持原 `RETURNING` 路径，五轮首扫中位数近乎持平，重扫和前台 p95 回退分别约 1.6% / 3.3%，仍在门槛内。该改动保留为 SQLite-only 快路径；LUX-275 整体门仍开放，详见 `docs/PERFORMANCE.md`。
+
 依赖：LUX-273、LUX-274。
 
 实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
