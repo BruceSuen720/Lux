@@ -999,6 +999,113 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_manifest_add_claim_preserves_incremental_race_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library(
+            &format!("PostgreSQL claim race {}", Uuid::now_v7()),
+            luxd::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("media");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("Raced.Movie.2024.mkv"), b"scanned version")?;
+    fs::write(root.join("Clear.Movie.2023.mkv"), b"uncontested version")?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 media root")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let function_sql = format!(
+        "CREATE FUNCTION claim_manifest_add_after_observation() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.state = 'SCANNING'
+               AND OLD.completed_directory_count = 0
+               AND NEW.completed_directory_count > 0
+               AND NEW.manifest_id = (
+                   SELECT id FROM scan_manifests WHERE job_id = '{}'
+               )
+             THEN
+                 INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     inode, fingerprint, last_seen_generation, is_missing
+                 ) VALUES (
+                     'incremental-entry', NEW.library_root_id, 'Raced.Movie.2024.mkv', 'FILE',
+                     777, 888, NULL, decode('09080706', 'hex'), 'incremental-generation', 0
+                 ) ON CONFLICT(library_root_id, relative_path) DO NOTHING;
+             END IF;
+             RETURN NEW;
+         END;
+         $$",
+        job.id
+    );
+    sqlx::query(sqlx::AssertSqlSafe(function_sql))
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER claim_manifest_add_after_observation
+         AFTER UPDATE ON scan_manifest_roots
+         FOR EACH ROW EXECUTE FUNCTION claim_manifest_add_after_observation()",
+    )
+    .execute(database.pool())
+    .await?;
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let filesystem_entry: (String, i64, Vec<u8>, String) = sqlx::query_as(
+        "SELECT id, size, fingerprint, last_seen_generation FROM filesystem_entries
+         WHERE library_root_id = $1 AND relative_path = 'Raced.Movie.2024.mkv'",
+    )
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        filesystem_entry,
+        (
+            "incremental-entry".to_owned(),
+            777,
+            vec![9, 8, 7, 6],
+            "incremental-generation".to_owned()
+        )
+    );
+    let raced_source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources WHERE filesystem_entry_id = 'incremental-entry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(raced_source_count, 0);
+    let uncontested_source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.library_root_id = $1 AND entry.relative_path = 'Clear.Movie.2023.mkv'",
+    )
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(uncontested_source_count, 1);
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

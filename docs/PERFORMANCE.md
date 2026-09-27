@@ -784,3 +784,21 @@ PostgreSQL 路径仍使用原 `RETURNING` 查询；五轮首扫中位数差约 1
 | PostgreSQL 候选 | 6,524 / 6,753 / 6,644 ms；**6,644 ms** | 955 ms | 223 ms | 3,134 ms | 271 ms | 881 ms | 344 / 95 / 8 |
 
 解析结果复用使 `positive_file_prepare` 累计工作时间在 SQLite / PostgreSQL 分别下降约 52% / 51%；首扫索引中位数改善约 1.2% / 1.8%。SQLite 三组配对都更快；PostgreSQL 两组更快、一组近乎持平。无变化重扫和前台 p95 差异均低于 5%，DML 与 8 个正向提交批次不变。总耗时收益有限，因为数据库阶段仍占主要时间，但准备阶段 CPU 工作稳定减少且没有后端回退，故保留。集成测试覆盖混合库电影、分集、NFO 分类与 unresolved 行为；LUX-275 整体阶段门仍开放。
+
+### PostgreSQL 文件系统 claim 无 RETURNING 快路径（未保留）与目录 key 去重评估
+
+2026-09-27 在 Apple M4 / 16 GiB / ARM64 上，以同一 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）对 PostgreSQL 16 做五组交错首扫。每轮使用新的空数据库；固定 release 二进制的源提交标记均为 `573de379`。基线 SHA-256 `ce831437d0374973077fb8de067e894c6eabfd838eea5bd60b5668ded90c2a6f`，候选 SHA-256 `e67ec90428667f1b2b9c2c958c156fbc4f36978539c7099c235de81099ea6643`；候选仅额外启用 PostgreSQL 无 `RETURNING` claim 快路径。
+
+| PostgreSQL 16 指标 | 基线：五轮 / 中位数 | 候选：五轮 / 中位数 |
+|---|---:|---:|
+| 首扫索引完成 | 5,675 / 6,036 / 5,750 / 5,674 / 5,602 ms；**5,675 ms** | 5,623 / 5,584 / 5,665 / 5,788 / 5,666 ms；**5,665 ms** |
+| 正向提交阶段 | **4,661 ms** | **4,614 ms** |
+| `positive_add_filesystem_claim` 累计工作时间 | **1,024.8 ms** | **994.8 ms** |
+| 无变化重扫 | **3,104 ms** | **3,135 ms** |
+| 前台 p95 / batch p95 | 272 / 774 ms | 278 / 751 ms |
+| SQL / DML / 正向提交批次 | 344 / 95 / 8 | 360 / 95 / 8 |
+| WAL 中位数 / 最大锁等待者 | 224,888,364 bytes / 0 | 221,608,151 bytes / 0 |
+
+claim 子阶段约快 2.9%，但首扫中位数只快 10 ms（约 0.2%），五组配对有三组改善、两组回退；候选每批增加 savepoint 控制语句，SQL 中位数增加 16 条，DML 与提交批次不变。重扫约慢 1%，前台 p95 约慢 2.2%，都在 5% 观察门内。未得到稳定的端到端收益，因此 PostgreSQL 保留原 `RETURNING` 实现；SQLite 已验证有效的快路径继续保留。新增 PostgreSQL 并发占位回归测试验证竞态中已有的增量记录不会被覆盖，且该路径不会错误地为扫描项创建 media source。
+
+同一基线的 movie storage 阶段中位数为 `movie_folder_refresh` 77 ms、`movie_item_prefetch` 101 ms、`movie_item_insert` 1,807 ms。源代码确有多处重复目录切分与 identity-key 构造，但这些阶段计时含数据库操作，尚未单独测出字符串处理占比；当前证据不足以支持引入每批目录映射结构。目录 key 去重暂不实施，若后续继续优化，应先增加窄范围计时并证明它能带来超过噪声的全链路收益。以上只代表本机 ARM64 与本地 PostgreSQL 容器；LUX-275 阶段门仍开放。
