@@ -914,6 +914,18 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
 
     let statement_counts = performance_query_statement_counts();
     let backend = env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    let library_kind_name =
+        env::var("LUX_PERF_LIBRARY_KIND").unwrap_or_else(|_| "movie".to_owned());
+    let library_kind = match library_kind_name.as_str() {
+        "movie" => LibraryKind::Movie,
+        "mixed" => LibraryKind::Mixed,
+        unsupported => {
+            return Err(format!(
+                "unsupported LUX_PERF_LIBRARY_KIND {unsupported:?}; expected movie or mixed"
+            )
+            .into());
+        }
+    };
     let database_configuration = match backend.as_str() {
         "sqlite" => DatabaseConfiguration::Sqlite,
         "postgres" => {
@@ -1072,7 +1084,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         .await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
-        .create_library("LUX-270 Manifest Performance", LibraryKind::Movie, false)
+        .create_library("LUX-270 Manifest Performance", library_kind, false)
         .await?;
     libraries
         .add_root(
@@ -1577,6 +1589,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "databaseBackend": backend,
             "scanDiscoveryStrategy": "lite_grouped",
             "derivedIndexTriggersDisabled": derived_index_triggers_disabled,
+            "libraryKind": library_kind_name,
             "fileCount": file_count,
             "manifestIndexMs": manifest_index_ms,
             "manifestFilesProcessed": first_scan_processed,

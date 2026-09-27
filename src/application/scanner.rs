@@ -1474,8 +1474,7 @@ async fn prepare_manifest_delta(
         observed,
         delta_kind == "ADD",
         delta_id,
-        classification,
-        ManifestFilenameClassificationMode::Preclassified,
+        ManifestFilenameInput::LegacyMixed(classification),
     )
     .await
 }
@@ -1485,8 +1484,7 @@ async fn prepare_manifest_observation(
     observed: NewScanManifestEntry,
     is_add: bool,
     delta_id: Option<String>,
-    classification: Option<MixedClassification>,
-    filename_classification_mode: ManifestFilenameClassificationMode,
+    filename_input: ManifestFilenameInput,
 ) -> ManifestDeltaPreparation {
     let ManifestFilePreparationContext {
         scanner,
@@ -1510,9 +1508,7 @@ async fn prepare_manifest_observation(
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return ManifestDeltaPreparation::Unstable { delta_id };
         };
-        let Some(prepared_filename) =
-            prepare_manifest_filename(file_name, filename_classification_mode, classification)
-        else {
+        let Some(prepared_filename) = prepare_manifest_filename(file_name, filename_input) else {
             return ManifestDeltaPreparation::Unstable { delta_id };
         };
         Some(prepared_filename)
@@ -5683,30 +5679,20 @@ impl ScanJobService {
                 Some(_) => "CHANGE",
             };
             let classification_started = measure_preparation.then(Instant::now);
-            let filename_classification_mode = match library_kind {
-                "MOVIE" => ManifestFilenameClassificationMode::MovieLibrary,
-                "SERIES" => ManifestFilenameClassificationMode::SeriesLibrary,
-                _ => ManifestFilenameClassificationMode::Preclassified,
-            };
-            let classification = if is_media
-                && matches!(
-                    filename_classification_mode,
-                    ManifestFilenameClassificationMode::Preclassified
-                ) {
-                Some(classify_mixed_file(&root_path, &path, &mut classification_cache).await)
-            } else {
-                None
+            let filename_input = match library_kind {
+                "MOVIE" => ManifestFilenameInput::MovieLibrary,
+                "SERIES" => ManifestFilenameInput::SeriesLibrary,
+                _ if is_media => ManifestFilenameInput::PreparedMixed(
+                    classify_mixed_manifest_file(&root_path, &path, &mut classification_cache)
+                        .await,
+                ),
+                _ => ManifestFilenameInput::LegacyMixed(None),
             };
             if let Some(started) = classification_started {
                 classification_duration = classification_duration.saturating_add(started.elapsed());
             }
             classification_count = classification_count.saturating_add(1);
-            let movie_folder_provider_ids = if is_media
-                && (matches!(
-                    filename_classification_mode,
-                    ManifestFilenameClassificationMode::MovieLibrary
-                ) || matches!(classification, Some(MixedClassification::Movie)))
-            {
+            let movie_folder_provider_ids = if is_media && filename_input.is_movie() {
                 Some(Arc::clone(
                     directory_folder_provider_ids.get_or_insert_with(|| Arc::new(OnceLock::new())),
                 ))
@@ -5739,8 +5725,7 @@ impl ScanJobService {
                     observed,
                     is_add,
                     None,
-                    classification,
-                    filename_classification_mode,
+                    filename_input,
                 )
                 .await;
                 let duration = preparation_started
@@ -11417,11 +11402,22 @@ enum MixedClassification {
     Unresolved,
 }
 
-#[derive(Clone, Copy)]
-enum ManifestFilenameClassificationMode {
+enum ManifestFilenameInput {
     MovieLibrary,
     SeriesLibrary,
-    Preclassified,
+    LegacyMixed(Option<MixedClassification>),
+    PreparedMixed(MixedManifestClassification),
+}
+
+impl ManifestFilenameInput {
+    fn is_movie(&self) -> bool {
+        matches!(
+            self,
+            Self::MovieLibrary
+                | Self::LegacyMixed(Some(MixedClassification::Movie))
+                | Self::PreparedMixed(MixedManifestClassification::Movie(_))
+        )
+    }
 }
 
 enum PreparedManifestFilename {
@@ -11430,27 +11426,32 @@ enum PreparedManifestFilename {
     Unresolved,
 }
 
+enum MixedManifestClassification {
+    Movie(Option<ParsedMovieFilename>),
+    Episode(Option<ParsedEpisodeFilename>),
+    Unresolved,
+}
+
 fn prepare_manifest_filename(
     filename: &str,
-    mode: ManifestFilenameClassificationMode,
-    preclassified: Option<MixedClassification>,
+    input: ManifestFilenameInput,
 ) -> Option<PreparedManifestFilename> {
-    match mode {
-        ManifestFilenameClassificationMode::MovieLibrary => {
+    match input {
+        ManifestFilenameInput::MovieLibrary => {
             let parsed_name = parse_movie_filename(filename);
             Some(parsed_name.map_or(
                 PreparedManifestFilename::Unresolved,
                 PreparedManifestFilename::Movie,
             ))
         }
-        ManifestFilenameClassificationMode::SeriesLibrary => {
+        ManifestFilenameInput::SeriesLibrary => {
             let parsed_name = parse_episode_filename(filename);
             Some(parsed_name.map_or(
                 PreparedManifestFilename::Unresolved,
                 PreparedManifestFilename::Episode,
             ))
         }
-        ManifestFilenameClassificationMode::Preclassified => match preclassified? {
+        ManifestFilenameInput::LegacyMixed(preclassified) => match preclassified? {
             MixedClassification::Movie => {
                 parse_movie_filename(filename).map(PreparedManifestFilename::Movie)
             }
@@ -11458,6 +11459,15 @@ fn prepare_manifest_filename(
                 parse_episode_filename(filename).map(PreparedManifestFilename::Episode)
             }
             MixedClassification::Unresolved => Some(PreparedManifestFilename::Unresolved),
+        },
+        ManifestFilenameInput::PreparedMixed(classification) => match classification {
+            MixedManifestClassification::Movie(parsed) => {
+                parsed.map(PreparedManifestFilename::Movie)
+            }
+            MixedManifestClassification::Episode(parsed) => {
+                parsed.map(PreparedManifestFilename::Episode)
+            }
+            MixedManifestClassification::Unresolved => Some(PreparedManifestFilename::Unresolved),
         },
     }
 }
@@ -11488,11 +11498,32 @@ async fn classify_mixed_file(
     path: &Path,
     cache: &mut MixedClassificationCache,
 ) -> MixedClassification {
+    match classify_mixed_file_with_parsed_name(root, path, cache, false).await {
+        MixedManifestClassification::Movie(_) => MixedClassification::Movie,
+        MixedManifestClassification::Episode(_) => MixedClassification::Episode,
+        MixedManifestClassification::Unresolved => MixedClassification::Unresolved,
+    }
+}
+
+async fn classify_mixed_manifest_file(
+    root: &Path,
+    path: &Path,
+    cache: &mut MixedClassificationCache,
+) -> MixedManifestClassification {
+    classify_mixed_file_with_parsed_name(root, path, cache, true).await
+}
+
+async fn classify_mixed_file_with_parsed_name(
+    root: &Path,
+    path: &Path,
+    cache: &mut MixedClassificationCache,
+    retain_parsed_name: bool,
+) -> MixedManifestClassification {
     let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-        return MixedClassification::Unresolved;
+        return MixedManifestClassification::Unresolved;
     };
-    if parse_episode_filename(file_name).is_some() {
-        return MixedClassification::Episode;
+    if let Some(parsed_name) = parse_episode_filename(file_name) {
+        return MixedManifestClassification::Episode(retain_parsed_name.then_some(parsed_name));
     }
     let series_nfo = path
         .strip_prefix(root)
@@ -11502,7 +11533,7 @@ async fn classify_mixed_file(
     if let Some(series_nfo) = series_nfo
         && cached_nfo_root_is(cache, &series_nfo, "tvshow").await
     {
-        return MixedClassification::Unresolved;
+        return MixedManifestClassification::Unresolved;
     }
     let movie_nfo = if let Some(candidate) =
         path.parent().map(|directory| directory.join("movie.nfo"))
@@ -11518,12 +11549,19 @@ async fn classify_mixed_file(
     if let Some(movie_nfo) = movie_nfo
         && cached_nfo_root_is(cache, &movie_nfo, "movie").await
     {
-        return MixedClassification::Movie;
+        let parsed_name = retain_parsed_name
+            .then(|| parse_movie_filename(file_name))
+            .flatten();
+        return MixedManifestClassification::Movie(parsed_name);
     }
-    if parse_movie_filename(file_name).is_some_and(|parsed| parsed.production_year.is_some()) {
-        MixedClassification::Movie
+    let parsed_name = parse_movie_filename(file_name);
+    if parsed_name
+        .as_ref()
+        .is_some_and(|parsed| parsed.production_year.is_some())
+    {
+        MixedManifestClassification::Movie(retain_parsed_name.then_some(parsed_name).flatten())
     } else {
-        MixedClassification::Unresolved
+        MixedManifestClassification::Unresolved
     }
 }
 
@@ -11989,16 +12027,17 @@ fn configured_scan_concurrency(
 mod tests {
     use super::{
         MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader,
-        ManifestFilenameClassificationMode, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
-        MixedClassification, MixedClassificationCache, NewScanManifestDiscoveryChunk,
+        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader, ManifestFilenameInput,
+        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
+        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
         NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
         ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
         configured_scan_concurrency, is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
-        normalize_incremental_path, prepare_manifest_filename, read_manifest_strm_target,
-        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
-        stat_manifest_relative_file_sync, stat_manifest_root_sync,
+        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
+        prepare_manifest_filename, read_manifest_strm_target, safe_scan_activity_label,
+        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
+        stat_manifest_root_sync,
     };
 
     #[test]
@@ -12029,11 +12068,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_filename_preparation_classifies_and_retains_parsed_names() {
+    fn manifest_filename_preparation_classifies_and_reuses_parsed_names() {
         let movie = prepare_manifest_filename(
             "Movie.Name.2020.1080p.mkv",
-            ManifestFilenameClassificationMode::MovieLibrary,
-            None,
+            ManifestFilenameInput::MovieLibrary,
         )
         .expect("movie-library classification");
         assert!(matches!(
@@ -12041,15 +12079,13 @@ mod tests {
             PreparedManifestFilename::Movie(parsed) if parsed.production_year == Some(2020)
         ));
 
-        let unresolved =
-            prepare_manifest_filename("", ManifestFilenameClassificationMode::MovieLibrary, None)
-                .expect("unparseable movie becomes unresolved");
+        let unresolved = prepare_manifest_filename("", ManifestFilenameInput::MovieLibrary)
+            .expect("unparseable movie becomes unresolved");
         assert!(matches!(unresolved, PreparedManifestFilename::Unresolved));
 
         let episode = prepare_manifest_filename(
             "Example.Show.S01E02.mkv",
-            ManifestFilenameClassificationMode::SeriesLibrary,
-            None,
+            ManifestFilenameInput::SeriesLibrary,
         )
         .expect("series-library classification");
         assert!(matches!(
@@ -12060,11 +12096,36 @@ mod tests {
         assert!(
             prepare_manifest_filename(
                 "",
-                ManifestFilenameClassificationMode::Preclassified,
-                Some(MixedClassification::Movie),
+                ManifestFilenameInput::LegacyMixed(Some(MixedClassification::Movie)),
             )
             .is_none()
         );
+
+        let carried_name =
+            parse_movie_filename("Movie.Name.2020.1080p.mkv").expect("known movie filename parses");
+        let mixed_movie = prepare_manifest_filename(
+            "not-a-movie.mkv",
+            ManifestFilenameInput::PreparedMixed(MixedManifestClassification::Movie(Some(
+                carried_name,
+            ))),
+        )
+        .expect("mixed classifier's parsed name is reused");
+        assert!(matches!(
+            mixed_movie,
+            PreparedManifestFilename::Movie(parsed) if parsed.production_year == Some(2020)
+        ));
+
+        let mixed_episode = prepare_manifest_filename(
+            "not-an-episode.mkv",
+            ManifestFilenameInput::PreparedMixed(MixedManifestClassification::Episode(
+                parse_episode_filename("Example.Show.S01E02.mkv"),
+            )),
+        )
+        .expect("mixed classifier's parsed episode is reused");
+        assert!(matches!(
+            mixed_episode,
+            PreparedManifestFilename::Episode(parsed) if parsed.season == 1 && parsed.episode == 2
+        ));
     }
 
     #[test]

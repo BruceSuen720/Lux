@@ -769,3 +769,18 @@ SQLite 首扫三组配对分别改善约 4.3%、6.2%、2.8%；PostgreSQL 三组�
 SQLite 首扫中位数快约 4.1%，五组配对候选都更快；`positive_add_filesystem_claim` 累计中位数从 226 ms 降至 167 ms（快约 26%）。首扫加 120k target 的中位数快约 3.0%；无变化重扫相同，前台 p95 高约 0.8%，batch p95 更低。SQLite SQL 语句中位数多 12 条（savepoint/release 控制语句），DML 与正向批次不变。首轮基线有较冷的离群值，但五轮中位数及配对方向均支持保留。
 
 PostgreSQL 路径仍使用原 `RETURNING` 查询；五轮首扫中位数差约 1%，配对方向混合，按持平处理。无变化重扫回退约 1.6%，前台 p95 回退约 3.3%，均低于 5% 门槛；batch p95、DML、正向批次和 WAL 基本持平，最大锁等待者为 0。因此只在 SQLite 启用快路径，不给 PostgreSQL 增加 savepoint 开销。`scanning_jobs` 全套 75 项通过，候选 release performance 测试编译并实跑；本实验不关闭 LUX-275 整体阶段门，ARM64 数字不外推 NAS/x86_64。
+
+### 混合库分类复用已解析文件名
+
+严格 `MOVIE` / `SERIES` 库此前已由 `275fe6c9` 把解析结果从分类模式交给准备阶段；混合库仍在分类时解析 episode/movie 以决定类型，随后准备阶段再次解析同一文件名。现在混合 Manifest 分类携带 `ParsedMovieFilename` / `ParsedEpisodeFilename`，准备阶段直接复用。旧 Manifest 恢复分类路径保持原逻辑；电影/剧集严格库路径、文件类型判定、NFO 优先级和未解析语义不变。
+
+为覆盖此路径，`lux_270_manifest_job_scan_benchmark` 增加 `LUX_PERF_LIBRARY_KIND=mixed` 选项，默认仍为 `movie`。在同一 Apple M4 / 16 GiB / ARM64 和确定性 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）上，固定 release 二进制交错跑三轮；每个样本都新建数据库，PG 用独立空库。基线二进制 SHA-256 `13726dfbd715245a92466725b83564a15078096e708f59c81b668c6d9e021f38`，候选 SHA-256 `b8d3908ae19a9029dc8266b47a7013554089170a4e976e608338e0681a51cf37`。fixture 全是可解析电影名，但扫描库类型设为 `MIXED`，用以测量混合分类路径。
+
+| 后端 | 首扫索引：交错三轮 / 中位数 | 分类累计工作时间 | 文件准备累计工作时间 | 无变化重扫 | 前台 p95 | batch p95 | SQL / DML / 正向批次 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SQLite 基线 | 3,240 / 2,835 / 2,839 ms；**2,839 ms** | 998 ms | 467 ms | 1,002 ms | 239 ms | 404 ms | 392 / 119 / 8 |
+| SQLite 候选 | 2,804 / 2,824 / 2,786 ms；**2,804 ms** | 968 ms | 223 ms | 987 ms | 244 ms | 385 ms | 392 / 119 / 8 |
+| PostgreSQL 基线 | 6,768 / 6,754 / 6,771 ms；**6,768 ms** | 980 ms | 458 ms | 3,094 ms | 269 ms | 957 ms | 346 / 95 / 8 |
+| PostgreSQL 候选 | 6,524 / 6,753 / 6,644 ms；**6,644 ms** | 955 ms | 223 ms | 3,134 ms | 271 ms | 881 ms | 344 / 95 / 8 |
+
+解析结果复用使 `positive_file_prepare` 累计工作时间在 SQLite / PostgreSQL 分别下降约 52% / 51%；首扫索引中位数改善约 1.2% / 1.8%。SQLite 三组配对都更快；PostgreSQL 两组更快、一组近乎持平。无变化重扫和前台 p95 差异均低于 5%，DML 与 8 个正向提交批次不变。总耗时收益有限，因为数据库阶段仍占主要时间，但准备阶段 CPU 工作稳定减少且没有后端回退，故保留。集成测试覆盖混合库电影、分集、NFO 分类与 unresolved 行为；LUX-275 整体阶段门仍开放。

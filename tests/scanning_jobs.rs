@@ -2755,6 +2755,7 @@ async fn mixed_reconciliation_batches_known_media_and_keeps_unresolved()
     tokio::fs::create_dir_all(&movie_dir).await?;
     tokio::fs::create_dir_all(&episode_dir).await?;
     tokio::fs::create_dir_all(&unresolved_dir).await?;
+    tokio::fs::write(movie_dir.join("movie.nfo"), "<movie />").await?;
     tokio::fs::write(movie_dir.join("Known.Movie.2020.mkv"), b"movie").await?;
     tokio::fs::write(episode_dir.join("Known.Show.S01E01.mkv"), b"episode").await?;
     tokio::fs::write(unresolved_dir.join("Mystery File.mkv"), b"unknown").await?;
@@ -2785,6 +2786,14 @@ async fn mixed_reconciliation_batches_known_media_and_keeps_unresolved()
             ("UNRESOLVED".to_owned(), 1),
         ]
     );
+    let movie_year: Option<i64> = sqlx::query_scalar(
+        "SELECT production_year FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(movie_year, Some(2020));
     let source_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_sources ms
          JOIN media_items mi ON mi.id = ms.item_id
