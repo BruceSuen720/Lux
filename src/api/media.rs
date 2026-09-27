@@ -1,5 +1,7 @@
 use super::*;
 
+const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
+
 #[derive(Deserialize, Default)]
 pub(super) struct LuxPageQuery {
     #[serde(default)]
@@ -60,10 +62,14 @@ pub(super) async fn lux_search(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match catalog
-        .search_items(
+        .search_items_with_types(
             AccessPrincipal::new(user.id, user.is_admin),
             &search_query,
             &like_query,
+            LUX_SEARCH_ITEM_TYPES
+                .iter()
+                .map(|item_type| (*item_type).to_owned())
+                .collect(),
             offset,
             limit,
         )
@@ -521,7 +527,7 @@ pub(super) async fn lux_list_library_items(
             .into_response();
         }
     };
-    let filter = catalog_filter_from_values(
+    let mut filter = catalog_filter_from_values(
         query.item_type.as_deref(),
         query.year.map(|year| year.to_string()).as_deref(),
         query.is_played,
@@ -530,6 +536,22 @@ pub(super) async fn lux_list_library_items(
         query.sort_order.as_deref(),
         metadata_pending,
     );
+    if query.item_type.as_deref().is_some_and(|item_types| {
+        item_types
+            .split(',')
+            .any(|item_type| item_type.trim().eq_ignore_ascii_case("VIDEO"))
+    }) {
+        filter
+            .item_types
+            .retain(|item_type| item_type != "__NO_MATCH__");
+        if !filter
+            .item_types
+            .iter()
+            .any(|item_type| item_type == "VIDEO")
+        {
+            filter.item_types.push("VIDEO".to_owned());
+        }
+    }
     match catalog
         .list_library_items_filtered(principal, &library_id, &filter, offset, limit)
         .await

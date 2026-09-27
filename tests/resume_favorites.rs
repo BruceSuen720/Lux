@@ -2,7 +2,11 @@ use std::time::Duration;
 
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService,
+        scanner::{LibraryScanner, ScanJobService},
+        setup::SetupService,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
     library::LibraryKind,
@@ -580,6 +584,129 @@ async fn resume_page_does_not_materialize_unrelated_catalog_items()
     assert_eq!(body["Items"][0]["Id"], "bulk-20000");
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideo_playback_progress_and_played_state_flow_into_continue_watching()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Clips")).await?;
+    tokio::fs::write(root.join("Clips/Family Trip.mkv"), b"video bytes").await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let video_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'VIDEO'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET runtime_ticks = 2000000000 WHERE id = ?")
+        .bind(&video_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('resume_min_ticks', '0')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session = cookie_value(&login, "lux_session")?;
+    let csrf = cookie_value(&login, "lux_csrf")?;
+    let cookie = format!("lux_session={session}; lux_csrf={csrf}");
+
+    let progress = client
+        .post(format!("{base_url}/api/v1/items/{video_id}/progress"))
+        .header(COOKIE, &cookie)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({
+            "positionTicks": 1_000_000_000_i64,
+            "durationTicks": 2_000_000_000_i64,
+            "state": "PLAYING"
+        }))
+        .send()
+        .await?;
+    assert_eq!(progress.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(home.status(), reqwest::StatusCode::OK);
+    let home_body = home.json::<Value>().await?;
+    assert_eq!(home_body["continueWatchingTotal"], 1);
+    assert_eq!(home_body["continueWatching"][0]["id"], video_id);
+    assert_eq!(home_body["continueWatching"][0]["itemType"], "VIDEO");
+
+    let played = client
+        .put(format!("{base_url}/api/v1/items/{video_id}/played"))
+        .header(COOKIE, &cookie)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "played": true }))
+        .send()
+        .await?;
+    assert_eq!(played.status(), reqwest::StatusCode::NO_CONTENT);
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{video_id}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    assert_eq!(detail.json::<Value>().await?["userData"]["isPlayed"], true);
+    let home_after_played = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(home_after_played.status(), reqwest::StatusCode::OK);
+    let home_after_played_body = home_after_played.json::<Value>().await?;
+    assert_eq!(home_after_played_body["continueWatchingTotal"], 0);
+    assert_eq!(
+        home_after_played_body["continueWatching"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    server.abort();
+    database.close().await;
     Ok(())
 }
 

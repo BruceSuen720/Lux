@@ -2156,7 +2156,7 @@ services:
 | LUX-277 | src/storage/migration.rs、migrations-postgres/0150_homevideos_video_types.sql、tests/storage.rs、tests/postgres_database.rs；HOMEVIDEOS/VIDEO 双数据库迁移 |
 | LUX-278 | src/application/scanner.rs、src/storage/media.rs、tests/scanning_jobs.rs、tests/storage.rs；其他视频扫描与目录层级 |
 | LUX-279 | src/application/nfo.rs、src/storage/jobs.rs、tests/nfo_writer.rs、tests/scanning_jobs.rs；VIDEO 本地 NFO 与禁止自动匹配 |
-| LUX-280 | src/storage/catalog.rs、src/application/catalog.rs、src/application/home.rs、tests/catalog.rs、tests/resume_favorites.rs；VIDEO 搜索、播放状态与继续观看 |
+| LUX-280 | src/api/media.rs、src/application/catalog.rs、tests/catalog.rs、tests/resume_favorites.rs；Lux VIDEO 搜索、目录过滤、统计与继续观看 |
 | LUX-281 | src/api/emby_catalog.rs、src/api/legacy.rs、tests/mixed_library_api.rs、docs/COMPATIBILITY.md；Emby homevideos/Video 契约 |
 | LUX-282 | web/src/features/auth/AdminSetupForm.tsx、web/src/lib/api/types.ts、web/src/app.mjs、web/tests/setup-page.test.tsx；初始化媒体库类型选择 |
 | LUX-283 | web/src/lib/api/types.ts、web/src/features/admin/AdminLibrariesPage.tsx、web/tests/admin-libraries.test.tsx；管理界面类型与刮削器配置 |
@@ -6925,13 +6925,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-280：普通视频目录、搜索与播放状态
 
-- [ ] Lux API 可按库类型列出 VIDEO/FOLDER；全局搜索和统计将 VIDEO 视为普通可播放视频。
-- [ ] 播放进度、已看状态和继续观看对 VIDEO 生效，现有电影/剧集规则不变。
-- [ ] 覆盖分页、搜索、播放状态和继续观看查询。
+- [x] Lux API 可按库类型列出 VIDEO/FOLDER；全局搜索和统计将 VIDEO 视为普通可播放视频。
+- [x] 播放进度、已看状态和继续观看对 VIDEO 生效，现有电影/剧集规则不变。
+- [x] 覆盖分页、搜索、播放状态和继续观看查询。
 
 依赖：LUX-278。验证：`cargo test --locked --test catalog`、`cargo test --locked --test resume_favorites`。
 
-预计文件：`src/storage/catalog.rs`、`src/application/catalog.rs`、`src/application/home.rs`、`tests/catalog.rs`、`tests/resume_favorites.rs`。
+预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/catalog.rs`、`tests/resume_favorites.rs`。
+
+结果（2026-09-28）：Lux 媒体库筛选支持 `VIDEO` 并保留 `FOLDER` 浏览，VIDEO 搜索限定在 Lux 全局搜索；VIDEO 计入普通 `itemCount`，不增加电影或剧集计数。Lux 播放进度和已看状态适用于 VIDEO，首页继续观看会显示未看完的视频，标记已看后会移除；Emby 默认搜索与 Resume 规则保持原样，留待 LUX-281 实现其协议映射。本机 `uname -m=arm64`。`cargo test --locked --test catalog --test resume_favorites` 6 项通过；`cargo build --locked`、`cargo test --locked --all-targets`（572 个单元测试通过、4 个忽略，集成目标通过；PostgreSQL 目标的 14 项因本机没有 PostgreSQL 服务而忽略）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `git diff --check` 均通过。
 
 #### LUX-281：Emby homevideos 与 Video 契约
 

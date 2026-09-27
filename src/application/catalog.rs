@@ -796,6 +796,7 @@ impl CatalogService {
             offset,
             limit,
             false,
+            &["MOVIE", "EPISODE"],
         )
         .await
     }
@@ -813,6 +814,7 @@ impl CatalogService {
             offset,
             limit,
             true,
+            &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await
     }
@@ -824,16 +826,16 @@ impl CatalogService {
         offset: i64,
         limit: i64,
         latest_episode_per_series: bool,
+        item_types: &[&str],
     ) -> Result<CatalogPage, CatalogError> {
         let played_percent = self.database.user_played_percent(user_id).await?;
         let (_, minimum_ticks) = self.database.resume_settings().await?;
-        let item_types = ["MOVIE", "EPISODE"];
         let total = self
             .database
             .count_resume_items(
                 user_id,
                 library_ids,
-                &item_types,
+                item_types,
                 played_percent,
                 minimum_ticks,
                 latest_episode_per_series,
@@ -845,7 +847,7 @@ impl CatalogService {
                 &ResumeItemsQuery {
                     user_id,
                     library_ids,
-                    item_types: &item_types,
+                    item_types,
                     played_percent,
                     minimum_ticks,
                     offset,

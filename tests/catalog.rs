@@ -1527,6 +1527,138 @@ async fn continue_watching_orders_recent_progress_before_legacy_null_dates()
     Ok(())
 }
 
+#[tokio::test]
+async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Trips/2024")).await?;
+    tokio::fs::create_dir_all(root.join("Trips/Season 01")).await?;
+    tokio::fs::write(
+        root.join("Trips/2024/Movie (2024).mkv"),
+        b"movie-shaped clip",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Trips/Season 01/Show S01E01.mkv"),
+        b"episode-shaped clip",
+    )
+    .await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let user_id = admin.id.to_string();
+    let counts = catalog
+        .count_item_types(AccessPrincipal::new(admin.id, true), &user_id, None)
+        .await?;
+    assert_eq!(counts.movie_count, 0);
+    assert_eq!(counts.series_count, 0);
+    assert_eq!(counts.item_count, 2);
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session = cookie_value(login.headers(), "lux_session");
+
+    let video_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=VIDEO&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(video_page.status(), reqwest::StatusCode::OK);
+    let video_page_body = video_page.json::<Value>().await?;
+    assert_eq!(video_page_body["total"], 2);
+    assert_eq!(video_page_body["pageSize"], 1);
+    assert_eq!(video_page_body["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(video_page_body["items"][0]["itemType"], "VIDEO");
+
+    let second_video_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=VIDEO&page=2&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(second_video_page.status(), reqwest::StatusCode::OK);
+    let second_video_page_body = second_video_page.json::<Value>().await?;
+    assert_eq!(second_video_page_body["page"], 2);
+    assert_eq!(
+        second_video_page_body["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_ne!(
+        second_video_page_body["items"][0]["id"],
+        video_page_body["items"][0]["id"]
+    );
+
+    let folder_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=FOLDER&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(folder_page.status(), reqwest::StatusCode::OK);
+    let folder_page_body = folder_page.json::<Value>().await?;
+    assert_eq!(folder_page_body["total"], 2);
+    assert!(
+        folder_page_body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["itemType"] == "FOLDER"))
+    );
+
+    let search = client
+        .get(format!("{base_url}/api/v1/search?q=Show"))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(search.status(), reqwest::StatusCode::OK);
+    let search_body = search.json::<Value>().await?;
+    assert_eq!(search_body["total"], 1);
+    assert_eq!(search_body["items"][0]["itemType"], "VIDEO");
+
+    server.abort();
+    database.close().await;
+    Ok(())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
