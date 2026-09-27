@@ -1060,9 +1060,7 @@ async fn emby_parent_library_kind(state: &AppState, parent_id: &str) -> Option<L
     let Ok(library_id) = internal_id.parse::<crate::domain::ids::LibraryId>() else {
         return None;
     };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return None;
-    };
+    let libraries = state.libraries.as_ref()?;
     match libraries.get_library(library_id).await {
         Ok(library) if library.is_enabled => Some(library.kind),
         _ => None,
