@@ -1300,17 +1300,32 @@ impl Database {
     pub(crate) async fn count_catalog_children(
         &self,
         parent_id: &str,
-        item_type: &str,
+        item_types: &str,
     ) -> Result<i64, StorageError> {
+        let item_types = item_types
+            .split(',')
+            .map(str::trim)
+            .filter(|item_type| !item_type.is_empty())
+            .collect::<Vec<_>>();
+        if item_types.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let query = format!(
             "SELECT COUNT(*) FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.parent_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
+             WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
                {CATALOG_VISIBLE_PREDICATE}"
         );
-        self.query_scalar::<i64>(sqlx::AssertSqlSafe(query))
-            .bind(parent_id)
-            .bind(item_type)
+        let mut statement = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(query))
+            .bind(parent_id);
+        for item_type in item_types {
+            statement = statement.bind(item_type);
+        }
+        statement
             .fetch_one(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -1438,10 +1453,21 @@ impl Database {
     pub(crate) async fn list_catalog_children(
         &self,
         parent_id: &str,
-        item_type: &str,
+        item_types: &str,
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        let item_types = item_types
+            .split(',')
+            .map(str::trim)
+            .filter(|item_type| !item_type.is_empty())
+            .collect::<Vec<_>>();
+        if item_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -1476,22 +1502,18 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE mi.parent_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
+             WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
                {CATALOG_VISIBLE_PREDICATE}
              ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id,
                       ms.id, mt.stream_index
              LIMIT ? OFFSET ?"
         );
-        self.fetch_catalog_rows(
-            &query,
-            &[
-                CatalogBind::Text(parent_id),
-                CatalogBind::Text(item_type),
-                CatalogBind::Integer(limit),
-                CatalogBind::Integer(offset),
-            ],
-        )
-        .await
+        let mut binds = Vec::with_capacity(item_types.len() + 3);
+        binds.push(CatalogBind::Text(parent_id));
+        binds.extend(item_types.into_iter().map(CatalogBind::Text));
+        binds.push(CatalogBind::Integer(limit));
+        binds.push(CatalogBind::Integer(offset));
+        self.fetch_catalog_rows(&query, &binds).await
     }
 
     pub(crate) async fn list_series_episode_ids(

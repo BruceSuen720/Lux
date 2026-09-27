@@ -224,6 +224,7 @@ pub(super) fn normalize_emby_item_type(value: &str) -> Option<String> {
         "episode" => Some("EPISODE".to_owned()),
         "boxset" | "box_set" => Some("BOX_SET".to_owned()),
         "folder" => Some("FOLDER".to_owned()),
+        "video" => Some("VIDEO".to_owned()),
         _ => None,
     }
 }
@@ -842,7 +843,11 @@ pub(super) async fn emby_visible_library_items(
     let mut items = Vec::new();
     for view in views {
         let library_id = view.library.id.to_string();
-        let child_count = library_root_count(child_counts.get(&library_id), view.library.kind);
+        let child_count = if view.library.kind == LibraryKind::HomeVideos {
+            emby_library_root_count(state, principal, &library_id, view.library.kind).await?
+        } else {
+            library_root_count(child_counts.get(&library_id), view.library.kind)
+        };
         items.push(emby_library_view_json(
             &view.library,
             &state.server_id,
@@ -865,7 +870,7 @@ pub(super) async fn emby_library_root_count(
         LibraryKind::Movie => vec!["MOVIE".to_owned()],
         LibraryKind::Series => vec!["SERIES".to_owned()],
         LibraryKind::Mixed => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
-        _ => Vec::new(),
+        LibraryKind::HomeVideos => vec!["FOLDER".to_owned(), "VIDEO".to_owned()],
     };
     catalog
         .list_library_items_filtered(
@@ -1047,17 +1052,21 @@ pub(super) async fn emby_user_favorites(
 }
 
 pub(super) async fn emby_parent_is_library(state: &AppState, parent_id: &str) -> bool {
+    emby_parent_library_kind(state, parent_id).await.is_some()
+}
+
+async fn emby_parent_library_kind(state: &AppState, parent_id: &str) -> Option<LibraryKind> {
     let internal_id = emby_internal_id(parent_id);
     let Ok(library_id) = internal_id.parse::<crate::domain::ids::LibraryId>() else {
-        return false;
+        return None;
     };
     let Some(libraries) = state.libraries.as_ref() else {
-        return false;
+        return None;
     };
-    matches!(
-        libraries.get_library(library_id).await,
-        Ok(library) if library.is_enabled
-    )
+    match libraries.get_library(library_id).await {
+        Ok(library) if library.is_enabled => Some(library.kind),
+        _ => None,
+    }
 }
 
 pub(super) fn emby_latest_groups_children(query: &EmbyItemsQuery) -> bool {
@@ -2114,6 +2123,11 @@ pub(super) async fn emby_catalog_page_from_query(
     let Some(catalog) = state.catalog.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
+    let parent_id = query.parent_id.as_deref().map(emby_internal_id);
+    let parent_library_kind = match parent_id.as_deref() {
+        Some(parent_id) => emby_parent_library_kind(state, parent_id).await,
+        None => None,
+    };
     if let Some(raw_query) = query.search_term.as_deref().map(str::trim)
         && !raw_query.is_empty()
     {
@@ -2133,7 +2147,10 @@ pub(super) async fn emby_catalog_page_from_query(
             .as_deref()
             .filter(|values| values.split(',').any(|value| !value.trim().is_empty()))
             .map(|_| catalog_filter_from_emby(query).item_types)
-            .unwrap_or_else(|| vec!["MOVIE".to_owned(), "SERIES".to_owned()]);
+            .unwrap_or_else(|| match parent_library_kind {
+                Some(LibraryKind::HomeVideos) => vec!["VIDEO".to_owned()],
+                _ => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+            });
         return catalog
             .search_items_with_types(
                 principal,
@@ -2147,13 +2164,12 @@ pub(super) async fn emby_catalog_page_from_query(
             .map_err(emby_catalog_error_status);
     }
     let mut filter = catalog_filter_from_emby(query);
-    let parent_id = query.parent_id.as_deref().map(emby_internal_id);
-    let root_scope = match parent_id.as_deref() {
-        Some(parent_id) => emby_parent_is_library(state, parent_id).await,
-        None => true,
-    };
+    let root_scope = parent_id.is_none() || parent_library_kind.is_some();
     if root_scope && !query.recursive.unwrap_or(false) && query.include_item_types.is_none() {
-        filter.item_types = vec!["MOVIE".to_owned(), "SERIES".to_owned()];
+        filter.item_types = match parent_library_kind {
+            Some(LibraryKind::HomeVideos) => vec!["FOLDER".to_owned(), "VIDEO".to_owned()],
+            _ => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+        };
     }
     let page = match parent_id.as_deref() {
         Some(parent_id) => {
@@ -2171,7 +2187,7 @@ pub(super) async fn emby_catalog_page_from_query(
                     Ok(page) => Ok(page),
                     Err(CatalogError::LibraryNotFound) => {
                         emby_catalog_page_for_item_parent(
-                            catalog, principal, parent_id, query, offset, limit,
+                            state, catalog, principal, parent_id, query, offset, limit,
                         )
                         .await
                     }
@@ -2179,7 +2195,7 @@ pub(super) async fn emby_catalog_page_from_query(
                 }
             } else {
                 emby_catalog_page_for_item_parent(
-                    catalog, principal, parent_id, query, offset, limit,
+                    state, catalog, principal, parent_id, query, offset, limit,
                 )
                 .await
             }
@@ -2197,6 +2213,7 @@ pub(super) async fn emby_catalog_page_from_query(
 }
 
 pub(super) async fn emby_catalog_page_for_item_parent(
+    state: &AppState,
     catalog: &CatalogService,
     principal: AccessPrincipal,
     parent_id: &str,
@@ -2223,11 +2240,25 @@ pub(super) async fn emby_catalog_page_for_item_parent(
             .list_collection_items(principal, parent_id, offset, limit)
             .await;
     }
-    let child_type = match (parent.item_type.as_str(), requested_type) {
-        (_, Some(item_type)) => item_type,
-        ("SERIES", _) => "SEASON",
-        ("SEASON", _) => "EPISODE",
-        _ => {
+    let child_types = if !requested_types.is_empty() {
+        requested_types.join(",")
+    } else if parent.item_type == "FOLDER" {
+        let is_home_videos = if let Some(libraries) = state.libraries.as_ref() {
+            libraries
+                .get_library(
+                    parent
+                        .library_id
+                        .parse::<crate::domain::ids::LibraryId>()
+                        .map_err(|_| CatalogError::LibraryNotFound)?,
+                )
+                .await
+                .is_ok_and(|library| library.kind == LibraryKind::HomeVideos)
+        } else {
+            false
+        };
+        if is_home_videos {
+            "FOLDER,VIDEO".to_owned()
+        } else {
             return Ok(CatalogPage {
                 items: Vec::new(),
                 total: 0,
@@ -2235,9 +2266,23 @@ pub(super) async fn emby_catalog_page_for_item_parent(
                 limit,
             });
         }
+    } else {
+        let child_type = match parent.item_type.as_str() {
+            "SERIES" => "SEASON",
+            "SEASON" => "EPISODE",
+            _ => {
+                return Ok(CatalogPage {
+                    items: Vec::new(),
+                    total: 0,
+                    offset,
+                    limit,
+                });
+            }
+        };
+        child_type.to_owned()
     };
     catalog
-        .list_children(principal, parent_id, child_type, offset, limit)
+        .list_children(principal, parent_id, &child_types, offset, limit)
         .await
 }
 
@@ -4871,7 +4916,7 @@ pub(super) fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {
         LibraryKind::Movie => Some("movies"),
         LibraryKind::Series => Some("tvshows"),
         LibraryKind::Mixed => None,
-        _ => None,
+        LibraryKind::HomeVideos => Some("homevideos"),
     }
 }
 
@@ -4882,6 +4927,7 @@ pub(super) fn emby_item_type(item_type: &str) -> &'static str {
         "SEASON" => "Season",
         "EPISODE" => "Episode",
         "BOX_SET" => "BoxSet",
+        "VIDEO" => "Video",
         _ => "Folder",
     }
 }

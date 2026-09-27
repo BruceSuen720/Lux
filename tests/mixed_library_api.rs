@@ -1,6 +1,6 @@
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, setup::SetupService},
+    application::{libraries::LibraryService, scanner::ScanJobService, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -163,5 +163,219 @@ async fn all_emby_clients_use_the_standard_mixed_library_shape()
     );
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideos_emby_views_and_parent_browsing_use_video_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Trips/2024")).await?;
+    tokio::fs::write(root.join("Root Clip.mkv"), b"root video").await?;
+    tokio::fs::write(root.join("Trips/2024/Family Trip.mkv"), b"nested video").await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let token = emby_login(&client, &base_url, "Emby").await?;
+    let emby_library_id = emby_public_id(&library.id.to_string());
+
+    let views = client
+        .get(format!("{base_url}/Users/{}/Views", admin.id))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(views["TotalRecordCount"], 1);
+    assert_eq!(views["Items"][0]["Id"], emby_library_id);
+    assert_eq!(views["Items"][0]["CollectionType"], "homevideos");
+    assert_eq!(views["Items"][0]["ChildCount"], 3);
+
+    let virtual_folders = client
+        .get(format!("{base_url}/Library/VirtualFolders"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(virtual_folders[0]["CollectionType"], "homevideos");
+    assert_eq!(
+        virtual_folders[0]["LibraryOptions"]["ContentType"],
+        "homevideos"
+    );
+
+    let root_items = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=10",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(root_items["TotalRecordCount"], 3);
+    assert!(root_items["Items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| item["Type"] == "Folder")
+            && items.iter().any(|item| item["Type"] == "Video")
+    }));
+
+    let video_filter = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&IncludeItemTypes=Video&Limit=10",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(video_filter["TotalRecordCount"], 2);
+    assert_eq!(video_filter["Items"][0]["Type"], "Video");
+
+    let searched_videos = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&SearchTerm=Root&Limit=10",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(searched_videos["TotalRecordCount"], 1);
+    assert_eq!(searched_videos["Items"][0]["Type"], "Video");
+
+    server.abort();
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_parent_folder_can_list_folder_and_video_children()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Trips/2024")).await?;
+    tokio::fs::write(root.join("Trips/2024/Family Trip.mkv"), b"nested video").await?;
+    tokio::fs::write(root.join("Trips/Neighborhood Clip.mkv"), b"trip video").await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let token = emby_login(&client, &base_url, "Emby").await?;
+
+    let trips_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'FOLDER' AND title = 'Trips'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let trips_items = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=10",
+            admin.id,
+            emby_public_id(&trips_id)
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(trips_items["TotalRecordCount"], 2);
+    assert!(trips_items["Items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| item["Type"] == "Folder")
+            && items.iter().any(|item| item["Type"] == "Video")
+    }));
+
+    let trips_items = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&IncludeItemTypes=Folder&Limit=10",
+            admin.id,
+            emby_public_id(&trips_id)
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(trips_items["TotalRecordCount"], 1);
+    assert_eq!(trips_items["Items"][0]["Type"], "Folder");
+
+    let year_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'FOLDER' AND title = '2024'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let year_items = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&IncludeItemTypes=Video&Limit=10",
+            admin.id,
+            emby_public_id(&year_id)
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(year_items["TotalRecordCount"], 1);
+    assert_eq!(year_items["Items"][0]["Type"], "Video");
+    assert_eq!(year_items["Items"][0]["MediaType"], "Video");
+
+    server.abort();
+    database.close().await;
     Ok(())
 }
