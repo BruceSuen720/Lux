@@ -823,7 +823,7 @@ impl CatalogService {
             user_id,
             offset,
             limit,
-            false,
+            true,
             &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await

@@ -72,6 +72,7 @@ export function LoginPage() {
   const singlePosterItem = backgroundFailed ? undefined : pluginSinglePosterItem;
   const singleImageItem = backgroundFailed ? undefined : pluginSingleImageItem;
   const tmdbSource = background?.source === "PLUGIN:org.lux.tmdb-trending-background";
+  const showStaticPosterWall = background !== undefined || loginBackground.isError;
   const markBackgroundFailed = () => setFailedBackgroundKey(backgroundKey);
   const posterColumns = posterImages.reduce<Array<Array<{ image: string; index: number }>>>(
     (columns, image, index) => {
@@ -158,14 +159,14 @@ export function LoginPage() {
               </div>
             ))}
           </div>
-        ) : (
+        ) : showStaticPosterWall ? (
           <img
             className="lux-auth-poster-wall"
             src="/lux-poster-wall.jpg"
             alt=""
             loading="eager"
           />
-        )}
+        ) : null}
         {singlePosterItem || singleImageItem ? null : <div className="lux-auth-visual-fade" />}
       </section>
 

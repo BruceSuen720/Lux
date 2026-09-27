@@ -15,6 +15,21 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.4",
+    date: "2026-09-28",
+    sections: [
+      { kind: "added", items: [
+        "新增“其他视频”媒体库，支持目录层级浏览、视频扫描与媒体详情/播放；可在 Lux Web 和 Emby 兼容接口中访问，并支持本地 NFO 与手动元数据维护。",
+      ] },
+      { kind: "changed", items: [
+        "首页与 Emby Resume 的剧集续看条目按剧集收敛，只展示该剧集最近的未完成集；电影仍按单条媒体展示。",
+      ] },
+      { kind: "fixed", items: [
+        "修复登录页动态背景加载期间短暂闪现默认海报墙的问题；仅在动态背景不可用时显示回退背景。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.3",
     date: "2026-09-27",
     sections: [

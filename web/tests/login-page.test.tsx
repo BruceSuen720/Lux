@@ -27,6 +27,41 @@ describe("LoginPage session state", () => {
     vi.restoreAllMocks();
   });
 
+  it("does not flash the fixed poster wall while the selected background is loading", async () => {
+    let resolveBackground!: (value: Awaited<ReturnType<typeof api.loginBackground>>) => void;
+    vi.mocked(api.loginBackground).mockImplementation(
+      () => new Promise((resolve) => { resolveBackground = resolve; }),
+    );
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
+    expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
+
+    await act(async () => {
+      resolveBackground({
+        source: "PLUGIN:org.lux.wikimedia-potd-background",
+        contentKind: "SINGLE_IMAGE",
+        sourceName: "Wikimedia Commons · Picture of the Day",
+        items: [{ imageUrl: "https://thumb.wikimedia.org/potd.jpg", title: "今日图片" }],
+      });
+      await vi.waitFor(() => {
+        expect(container.querySelector(".lux-auth-single-image")).not.toBeNull();
+      });
+    });
+    expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
+  });
+
   it("renders real recently added posters when the server provides them", async () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "RECENTLY_ADDED",
