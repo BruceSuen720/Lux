@@ -2486,14 +2486,24 @@ fn catalog_filter_where_clause<'a>(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    if item_types.is_empty() {
-        where_clause.push_str(" AND mi.item_type <> 'FOLDER'");
-    }
-    where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
     let mut binds = library_ids
         .iter()
         .map(|library_id| CatalogBind::Text(library_id.as_str()))
         .collect::<Vec<_>>();
+    match filter.parent_id_scope {
+        Some(Some(parent_id)) => {
+            where_clause.push_str(" AND mi.parent_id = ?");
+            binds.push(CatalogBind::Text(parent_id));
+        }
+        Some(None) => {
+            where_clause.push_str(" AND (mi.parent_id IS NULL OR mi.parent_id = mi.library_id)")
+        }
+        None => {}
+    }
+    if item_types.is_empty() {
+        where_clause.push_str(" AND mi.item_type <> 'FOLDER'");
+    }
+    where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
     let mut id_predicates = Vec::new();
     if let Some(item_ids) = item_ids
         && !item_ids.is_empty()
@@ -2825,6 +2835,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) is_favorite: Option<bool>,
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
+    pub(crate) parent_id_scope: Option<Option<&'a str>>,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,
