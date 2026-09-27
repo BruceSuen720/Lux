@@ -111,6 +111,77 @@ async fn lite_manifest_movie_provider_ids_are_inherited_and_file_tags_take_prece
     Ok(())
 }
 
+#[tokio::test]
+async fn lite_manifest_duplicate_movie_sources_keep_last_folder_and_merge_provider_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let first_folder = root.join("A");
+    let last_folder = root.join("B");
+    tokio::fs::create_dir_all(&first_folder).await?;
+    tokio::fs::create_dir_all(&last_folder).await?;
+    tokio::fs::write(
+        first_folder.join("Duplicate.Movie.2020.1080p.mkv"),
+        b"first source",
+    )
+    .await?;
+    tokio::fs::write(
+        last_folder.join("Duplicate.Movie.2020.2160p.[tmdbid-123].mkv"),
+        b"second source",
+    )
+    .await?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let movie: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT item.id, item.parent_id, item.provider_ids_json
+         FROM media_items item
+         WHERE item.library_id = ? AND item.item_type = 'MOVIE'
+           AND item.sort_title = 'duplicate movie' AND item.production_year = 2020",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let expected_parent: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE identity_key = ? AND item_type = 'FOLDER'",
+    )
+    .bind(format!("folder:{root_id}:B"))
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(movie.1.as_deref(), Some(expected_parent.as_str()));
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = ?")
+            .bind(&movie.0)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(source_count, 2);
+    let provider_ids = serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+        movie
+            .2
+            .as_deref()
+            .ok_or("movie provider IDs were not stored")?,
+    )?;
+    assert_eq!(provider_ids.get("Tmdb"), Some(&"123".to_owned()));
+    Ok(())
+}
+
 async fn seed_legacy_reconciliation_work(
     database: &Database,
     job_id: &str,

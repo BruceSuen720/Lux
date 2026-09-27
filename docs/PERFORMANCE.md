@@ -836,3 +836,45 @@ PostgreSQL bootstrap 原有 `media_search.item_id REFERENCES media_items(id) ON 
 本请求的严格相等条件是此前 SQLite migration 0149 已评估条件（ASCII 大小写等价）的子集。该 A/B 首扫仅快约 0.7%、仍落在运行噪声内，target 中位数还增加约 5.3%；既有测试已覆盖相同标题可搜索和独立 original title 搜索。未重复增加 migration 或改动 FTS trigger。
 
 以上 PG 数据仅代表本机 ARM64 和本地容器，不外推 NAS/x86_64；LUX-275 双后端阶段门仍开放。
+
+### LUX-275 空 baseline 快路径、状态查询合并与电影批次分配评估
+
+2026-09-27 在 Apple M4 / 16 GiB / ARM64 上，以同一 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）评估首次扫描的空 baseline 查询和 manifest/job 状态读取。SQLite 使用 FULL synchronous；PostgreSQL 为本机 PostgreSQL 16 临时容器。每组固定 release 基准三轮，包含 120k targets、无变化重扫和扫描期间的 50 个并发前台 API 请求。以下是顺序 A/B 中位数，不是交错运行；结果仅代表这台 ARM64 主机与本地数据库。
+
+#### 空 root 跳过文件 baseline 查询（保留）
+
+Lite session 初始化时为每个 root 执行一次 `SELECT 1 ... LIMIT 1`。若当时没有 `filesystem_entries`，该 root 的本次发现不再为每批文件执行大参数 `IN (...)` baseline 查询；root 有历史条目时仍走原路径。ADD claim、generation CAS 和事务内文件状态保护保持不变。SQLite root 探测、空/非空结果单测及全量扫描回归通过。
+
+| 后端 | 指标 | 原实现中位数 | 空 baseline 快路径中位数 |
+|---|---|---:|---:|
+| SQLite | 首扫索引 / 无变化重扫 | 1,959 / 1,049 ms | 1,903 / 1,026 ms |
+| SQLite | baseline 查询累计 / SQL / DML | 约 34 ms / 388 / 119 | 0 ms / 364 / 119 |
+| SQLite | 前台 p95 / batch p95 | 254 / 269 ms | 251 / 264 ms |
+| PostgreSQL | 首扫索引 / 无变化重扫 | 5,533 / 3,244 ms | 5,463 / 3,319 ms |
+| PostgreSQL | baseline 查询累计 / SQL / DML | 约 99–103 ms / 344 / 95 | 0 ms / 330 / 95 |
+| PostgreSQL | 前台 p95 / batch p95 | 289 / 749 ms | 297 / 739 ms |
+
+空 root 的批次 baseline 阶段归零；全链路中位数 SQLite 快约 2.9%、PostgreSQL 快约 1.3%，SQL 分别减少 24 / 14 条，DML 不变。样本不是交错运行，PG 无变化重扫和前台 p95 也有小幅波动，因此把它视为低风险的确定性查询削减，不把轻微端到端差异单独宣称为稳定性能收益。新扫描仍是一个扫描作业；“50 并发”指另行施加的前台 API 请求，不是 50 个扫描客户端。
+
+#### 合并事务内重复的 active-job 状态查询（保留）
+
+discovery chunk 事务开头的 manifest 查询现在同时读取 `library_id`、`generation`、job `status` 和 `cancel_requested`，供后续正向应用校验使用，移除同一事务中重复的 active-job JOIN SELECT。事务末尾仍用 `UPDATE ... WHERE status = 'RUNNING' AND cancel_requested = 0` 检查任务是否仍接受发现；更新行数不为 1 时整笔事务回滚，因此取消或状态竞争的原子保护保留。性能计数器回归确认重复 SELECT 为 0。
+
+| 后端 | 指标 | 合并前中位数 | 合并后中位数 |
+|---|---|---:|---:|
+| SQLite | 首扫索引 / SQL / DML | 1,903 ms / 364 / 119 | 1,886 ms / 358 / 119 |
+| SQLite | 无变化重扫 / 前台 p95 / batch p95 | 1,026 / 251 / 264 ms | 1,020 / 245 / 261 ms |
+| PostgreSQL | 首扫索引 / SQL / DML | 5,463 ms / 330 / 95 | 5,387 ms / 322 / 95 |
+| PostgreSQL | 无变化重扫 / 前台 p95 / batch p95 | 3,319 / 297 / 739 ms | 3,180 / 274 / 713 ms |
+
+该查询从每个正向提交批次一次降为零（本 fixture 为 8 次），DML 与 8 个提交批次不变。索引中位数变化分别约 −0.9% / −1.4%，幅度有限；保留的主要依据是移除确定冗余的事务内往返，并由最终有条件更新维持取消/状态边界。
+
+#### 跨批次缓存已刷新的电影父目录（暂缓）
+
+当前 `movie_folder_refresh` 整阶段计时约为 SQLite 46.5 ms、PostgreSQL 69.8 ms；该计时包含数据库工作，不能把它全部算作跨批次重复 CTE 的可省时间。把“本次扫描已验证”的 folder ID 缓存在事务之间，还需要证明不会跳过其他并发写入造成的 parent/provider 修复。当前没有单独量出无效果 UPDATE 的实际成本，也没有足够收益覆盖额外状态及其一致性边界，因此暂不引入跨批次缓存。
+
+#### 合并新条目过滤前的临时 map/set（未保留）
+
+试验仅对电影批次准备循环调整临时集合构造：新条目不再先进入 `parent_updates` / `provider_updates`，再由 `new_item_ids` 过滤。与前一候选相比，SQLite `movie_item_insert` 阶段中位数约从 437.1 降至 426.1 ms（省约 11 ms），但全链路首扫从 1,886 增至 1,932 ms（慢约 2.4%），batch p95 从 261 增至 302 ms。PostgreSQL `movie_item_insert` 基本不变（1,534.5 → 1,534.3 ms），首扫 5,387 → 5,338 ms 的约 0.9% 差异不足以排除运行噪声。候选已撤回；保留回归测试固定相同身份多来源仍合并 provider IDs，并按既有顺序确定 parent folder。
+
+结论：生产路径保留空 baseline 快路径和 active-job SELECT 合并；父目录跨批次缓存暂缓；临时 map/set 改动未通过全链路与尾延迟观察门而撤回。性能对照为顺序 A/B，硬件、fixture 和数据库限定见本节开头；不外推到 NAS/x86_64。LUX-275 双后端阶段门仍开放。
