@@ -10,6 +10,8 @@ pub(super) struct LuxPageQuery {
     page_size: Option<i64>,
     #[serde(rename = "itemType", default)]
     item_type: Option<String>,
+    #[serde(rename = "parentId", default)]
+    parent_id: Option<String>,
     #[serde(default)]
     year: Option<i64>,
     #[serde(default)]
@@ -536,6 +538,27 @@ pub(super) async fn lux_list_library_items(
         query.sort_order.as_deref(),
         metadata_pending,
     );
+    let parent_scope = match query.parent_id.as_deref() {
+        None => None,
+        Some(parent_id) if parent_id.eq_ignore_ascii_case("root") => {
+            Some(crate::application::catalog::CatalogParentScope::Root)
+        }
+        Some(parent_id) => Some(crate::application::catalog::CatalogParentScope::Item(
+            parent_id.to_owned(),
+        )),
+    };
+    if parent_scope.is_some() {
+        if filter.item_types.is_empty() {
+            filter.item_types = vec!["FOLDER".to_owned(), "VIDEO".to_owned()];
+        } else {
+            filter
+                .item_types
+                .retain(|item_type| matches!(item_type.as_str(), "FOLDER" | "VIDEO"));
+            if filter.item_types.is_empty() {
+                filter.item_types.push("__NO_MATCH__".to_owned());
+            }
+        }
+    }
     if query.item_type.as_deref().is_some_and(|item_types| {
         item_types
             .split(',')
@@ -553,7 +576,7 @@ pub(super) async fn lux_list_library_items(
         }
     }
     match catalog
-        .list_library_items_filtered(principal, &library_id, &filter, offset, limit)
+        .list_library_items_in_scope(principal, &library_id, &filter, parent_scope, offset, limit)
         .await
     {
         Ok(page) => {

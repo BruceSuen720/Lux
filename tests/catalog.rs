@@ -1528,8 +1528,7 @@ async fn continue_watching_orders_recent_progress_before_legacy_null_dates()
 }
 
 #[tokio::test]
-async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
--> Result<(), Box<dyn std::error::Error>> {
+async fn homevideo_catalog_folders_are_browsable() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -1544,6 +1543,7 @@ async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
     let root = temp_dir.path().join("Other videos");
     tokio::fs::create_dir_all(root.join("Trips/2024")).await?;
     tokio::fs::create_dir_all(root.join("Trips/Season 01")).await?;
+    tokio::fs::write(root.join("Movie (2024).mkv"), b"root video").await?;
     tokio::fs::write(
         root.join("Trips/2024/Movie (2024).mkv"),
         b"movie-shaped clip",
@@ -1560,6 +1560,15 @@ async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, parent_id, title, sort_title, identification_status
+         ) VALUES ('empty-folder', ?, 'FOLDER', ?, 'Empty folder', 'empty folder', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
 
     let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
     let user_id = admin.id.to_string();
@@ -1568,7 +1577,7 @@ async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
         .await?;
     assert_eq!(counts.movie_count, 0);
     assert_eq!(counts.series_count, 0);
-    assert_eq!(counts.item_count, 2);
+    assert_eq!(counts.item_count, 3);
 
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -1592,6 +1601,94 @@ async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
     assert_eq!(login.status(), reqwest::StatusCode::OK);
     let session = cookie_value(login.headers(), "lux_session");
 
+    let root_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId=root&itemType=FOLDER,VIDEO&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(root_page.status(), reqwest::StatusCode::OK);
+    let root_page_body = root_page.json::<Value>().await?;
+    assert_eq!(root_page_body["total"], 2);
+    assert_eq!(root_page_body["pageSize"], 1);
+    let second_root_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId=root&itemType=FOLDER,VIDEO&page=2&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(second_root_page.status(), reqwest::StatusCode::OK);
+    let second_root_page_body = second_root_page.json::<Value>().await?;
+    assert_eq!(second_root_page_body["total"], 2);
+    assert_eq!(second_root_page_body["page"], 2);
+    assert_ne!(
+        root_page_body["items"][0]["id"],
+        second_root_page_body["items"][0]["id"]
+    );
+    let root_items = [
+        root_page_body["items"][0].clone(),
+        second_root_page_body["items"][0].clone(),
+    ];
+    assert!(root_items.iter().any(|item| item["itemType"] == "FOLDER"));
+    assert!(root_items.iter().any(|item| item["itemType"] == "VIDEO"));
+    let trips_id = root_items
+        .iter()
+        .find(|item| item["itemType"] == "FOLDER")
+        .and_then(|item| item["id"].as_str())
+        .ok_or("root Trips folder should be present")?
+        .to_owned();
+    let movie_only_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId=root&itemType=MOVIE&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(movie_only_page.status(), reqwest::StatusCode::OK);
+    let movie_only_page_body = movie_only_page.json::<Value>().await?;
+    assert_eq!(movie_only_page_body["total"], 0);
+
+    let trips_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId={trips_id}&itemType=FOLDER,VIDEO&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(trips_page.status(), reqwest::StatusCode::OK);
+    let trips_page_body = trips_page.json::<Value>().await?;
+    assert_eq!(trips_page_body["total"], 2);
+    assert!(trips_page_body["items"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .all(|item| item["itemType"] == "FOLDER" && item["parentId"] == trips_id)
+    }));
+    let year_folder_id = trips_page_body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["title"] == "2024"))
+        .and_then(|item| item["id"].as_str())
+        .ok_or("Trips/2024 folder should be present")?
+        .to_owned();
+    let year_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId={year_folder_id}&itemType=FOLDER,VIDEO&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(year_page.status(), reqwest::StatusCode::OK);
+    let year_page_body = year_page.json::<Value>().await?;
+    assert_eq!(year_page_body["total"], 1);
+    assert_eq!(year_page_body["items"][0]["itemType"], "VIDEO");
+    assert_eq!(year_page_body["items"][0]["parentId"], year_folder_id);
+
     let video_page = client
         .get(format!(
             "{base_url}/api/v1/libraries/{}/items?itemType=VIDEO&pageSize=1",
@@ -1602,7 +1699,7 @@ async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
         .await?;
     assert_eq!(video_page.status(), reqwest::StatusCode::OK);
     let video_page_body = video_page.json::<Value>().await?;
-    assert_eq!(video_page_body["total"], 2);
+    assert_eq!(video_page_body["total"], 3);
     assert_eq!(video_page_body["pageSize"], 1);
     assert_eq!(video_page_body["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(video_page_body["items"][0]["itemType"], "VIDEO");
@@ -1653,6 +1750,53 @@ async fn homevideo_catalog_filters_search_and_counts_plain_video_items()
     let search_body = search.json::<Value>().await?;
     assert_eq!(search_body["total"], 1);
     assert_eq!(search_body["items"][0]["itemType"], "VIDEO");
+
+    let foreign_library = LibraryService::new(database.clone())
+        .create_library("Foreign videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let foreign_root = temp_dir.path().join("Foreign videos");
+    tokio::fs::create_dir_all(foreign_root.join("Elsewhere")).await?;
+    tokio::fs::write(foreign_root.join("Elsewhere/Foreign clip.mkv"), b"foreign").await?;
+    LibraryService::new(database.clone())
+        .add_root(
+            foreign_library.id,
+            foreign_root.to_str().ok_or("non-utf8 foreign root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(foreign_library.id)
+        .await?;
+    let foreign_folder_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'FOLDER' AND title = 'Elsewhere'",
+    )
+    .bind(foreign_library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET parent_id = ?
+         WHERE library_id = ? AND item_type = 'VIDEO' AND parent_id IS NULL",
+    )
+    .bind(&foreign_folder_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let cross_library_children = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId={foreign_folder_id}&itemType=FOLDER,VIDEO&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(cross_library_children.status(), reqwest::StatusCode::OK);
+    let cross_library_children_body = cross_library_children.json::<Value>().await?;
+    assert_eq!(cross_library_children_body["total"], 0);
+    assert_eq!(
+        cross_library_children_body["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
 
     server.abort();
     database.close().await;

@@ -2492,7 +2492,18 @@ fn catalog_filter_where_clause<'a>(
         .collect::<Vec<_>>();
     match filter.parent_id_scope {
         Some(Some(parent_id)) => {
-            where_clause.push_str(" AND mi.parent_id = ?");
+            where_clause.push_str(
+                " AND mi.parent_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM media_items parent
+                      WHERE parent.id = ?
+                        AND parent.library_id = mi.library_id
+                        AND parent.item_type = 'FOLDER'
+                        AND parent.removed_at IS NULL
+                        AND parent.merged_into_item_id IS NULL
+                  )",
+            );
+            binds.push(CatalogBind::Text(parent_id));
             binds.push(CatalogBind::Text(parent_id));
         }
         Some(None) => {
@@ -2503,7 +2514,11 @@ fn catalog_filter_where_clause<'a>(
     if item_types.is_empty() {
         where_clause.push_str(" AND mi.item_type <> 'FOLDER'");
     }
-    where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
+    if filter.parent_id_scope.is_some() {
+        where_clause.push_str(CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE);
+    } else {
+        where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
+    }
     let mut id_predicates = Vec::new();
     if let Some(item_ids) = item_ids
         && !item_ids.is_empty()
@@ -2754,6 +2769,39 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
               AND visible_child.removed_at IS NULL
               AND visible_child.merged_into_item_id IS NULL
               AND visible_child.has_available_source = 1
+        )
+    )
+)";
+
+const CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
+ AND (
+    (mi.item_type = 'VIDEO' AND mi.has_available_source = 1)
+    OR (
+        mi.item_type = 'FOLDER'
+        AND EXISTS (
+            WITH RECURSIVE folder_descendants(id) AS (
+                SELECT child.id
+                FROM media_items child
+                WHERE child.parent_id = mi.id
+                  AND child.item_type = 'FOLDER'
+                  AND child.removed_at IS NULL
+                  AND child.merged_into_item_id IS NULL
+                UNION
+                SELECT child.id
+                FROM media_items child
+                JOIN folder_descendants parent ON child.parent_id = parent.id
+                WHERE child.item_type = 'FOLDER'
+                  AND child.removed_at IS NULL
+                  AND child.merged_into_item_id IS NULL
+            )
+            SELECT 1
+            FROM media_items visible_descendant
+            WHERE (visible_descendant.parent_id = mi.id
+                   OR visible_descendant.parent_id IN (SELECT id FROM folder_descendants))
+              AND visible_descendant.item_type = 'VIDEO'
+              AND visible_descendant.removed_at IS NULL
+              AND visible_descendant.merged_into_item_id IS NULL
+              AND visible_descendant.has_available_source = 1
         )
     )
 )";
