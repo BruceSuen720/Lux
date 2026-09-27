@@ -920,3 +920,37 @@ target 阶段三组都更快，中位数快约 20.0%；首扫、重扫、前台 
 附件提出的 `UPDATE OF is_missing` 不能与 transition table 同时用于 PostgreSQL statement trigger：`CREATE TRIGGER` 文档明确禁止在请求 transition relations 时指定 update 列表。[PostgreSQL 16 CREATE TRIGGER 文档](https://www.postgresql.org/docs/16/sql-createtrigger.html)。因此继续使用现有 statement trigger 和 transition table；若后续仍需跳过 generation-only 更新，应从更新语句形态或独立触发器设计入手，并单独测量。
 
 以上测试只代表本机 ARM64 和 PostgreSQL 16 容器。LUX-275 首扫严格门仍开放；本轮 target 外键优化针对 target 阶段，不能替代 SQLite/PostgreSQL 的完整阶段门，也不能外推 NAS/x86_64。
+
+### PostgreSQL `unixepoch()` 时钟调用与触发器候选
+
+2026-09-27 在 Apple M4 / 16 GiB ARM64、本机 PostgreSQL 16 容器和相同 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）评估 PostgreSQL 时间函数、可用性触发器及 provider 索引触发器。每轮都用全新数据库运行 release `lux_270_manifest_job_scan_benchmark`。基线组先运行，候选组随后运行，因此这些结果是分组 A/B，而非交错 A/B。
+
+#### `unixepoch()` 改用语句时间（保留）
+
+PostgreSQL `unixepoch()` 原先在每次求值时调用 `clock_timestamp()`。migration `0149_statement_timestamp_unixepoch.sql` 将实现改为 `FLOOR(EXTRACT(EPOCH FROM statement_timestamp()))::BIGINT`，并标记 `PARALLEL SAFE`。保留 `FLOOR`，避免 BIGINT 转换四舍五入；使用 `statement_timestamp()`，避免 `CURRENT_TIMESTAMP` 把较长写事务里的后续 `updated_at` 固定到事务启动时刻。PostgreSQL 文档区分了事务起始时间、语句起始时间与调用时钟值。[PostgreSQL 16 日期与时间函数](https://www.postgresql.org/docs/16/functions-datetime.html)。SQLite 路径没有改变。PostgreSQL 集成测试确认了函数 volatility/parallel 属性、语句时间匹配，以及同一事务中跨语句时间可以前进。
+
+| PostgreSQL 指标 | 原 `clock_timestamp()`：三轮 / 中位数 | `statement_timestamp()`：三轮 / 中位数 |
+|---|---:|---:|
+| 首扫索引完成 | 5,852 / 5,695 / 6,138 ms；**5,852 ms** | 5,505 / 5,384 / 5,275 ms；**5,384 ms** |
+| 无变化重扫 | 3,255 / 2,966 / 2,996 ms；**2,996 ms** | 3,127 / 2,999 / 2,872 ms；**2,999 ms** |
+| 120k target 物化 | 2,070 / 2,059 / 2,188 ms；**2,070 ms** | 1,828 / 1,900 / 1,996 ms；**1,900 ms** |
+| 前台 p95 | 297 / 278 / 286 ms；中位数 **286 ms** | 357 / 279 / 272 ms；中位数 **279 ms** |
+| batch p95 | 960 / 875 / 851 ms；中位数 **875 ms** | 761 / 739 / 720 ms；中位数 **739 ms** |
+| SQL / DML | 322 / 95（中位数） | 322 / 95（中位数） |
+| WAL 字节 | 221,591,746（中位数） | 222,426,002（中位数） |
+
+首扫索引中位数快约 8.0%，target 物化快约 8.2%；无变化重扫持平，前台 p95、batch p95 与 WAL 未见回退。当前结果支持保留此 PG-only migration。收益比“百万次函数调用快 6.6 倍”的微基准比例小得多；对 Lux 的实际全链路结论以这里的端到端 fixture 为准。
+
+#### 文件可用性 row trigger（未保留）
+
+把带 transition table 的 statement trigger 换成 `AFTER UPDATE OF is_missing ... FOR EACH ROW WHEN (OLD.is_missing IS DISTINCT FROM NEW.is_missing)`，确实可避免 generation-only UPDATE 收集 transition table。但相同 60,000 条文件记录上的缺失/恢复压力测试显示，当前 statement trigger 将 `is_missing` 置 1 / 复原至 0 分别用时 3,226 / 3,285 ms；历史 row function 的候选在 120 秒 statement timeout 内仍未完成，最后整条语句回滚。逐文件函数重算 source availability，并对每个条目单独 UPDATE `media_items`，把 set-based 批处理退化为逐行派生索引工作。由于根移除可以一次影响大批条目，不能只按无变化重扫的收益决定改成 row trigger，因此没有迁移。
+
+#### provider 空结果 guard（未保留）
+
+候选 migration 在 `0146` 的 provider 索引 INSERT 周围增加 `IF EXISTS`，先检查 `new_rows` 是否含 provider IDs。与只含 `0149` 时的三轮全新数据库基线相比，guard 候选首扫索引中位数为 5,469 ms（基线 5,384 ms，慢约 1.6%），target 中位数 1,922 ms（基线 1,900 ms）；无变化重扫和尾延迟变化方向不一致。SQL 计数在 322–324 间波动、DML 均为 95，没有稳定减少。额外检查 transition table 没有带来可复现的全链路收益，临时 `0150` migration 已撤回；保留现有 materialized/filter 方案。
+
+#### 合并路径 target INSERT（当前全量主路径已合并）
+
+`insert_scan_manifest_postprocessing_targets_in_transaction` 已把当前 Manifest 全量扫描的 SOURCE / ITEM target 物化合并为一个 bounded-page CTE 和一条 INSERT。附件指出的两条重复 JOIN 位于通用 `record_scan_job_targets_in_transaction`，主要服务 reconciliation/path target 写入；本轮 60k Manifest 首扫的主 target 路径不走这两个重复 SELECT。没有为不影响该首扫瓶颈的兼容/增量路径改写 SQL；如后续以 path/reconciliation 批处理为目标，应单独量测该调用链并覆盖多 source 同 item 的去重语义。
+
+LUX-275 双后端严格阶段门仍开放。以上数据库结果仅代表本机 ARM64 与 PostgreSQL 16 容器，不外推到 NAS/x86_64。

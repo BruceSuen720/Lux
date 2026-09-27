@@ -6849,9 +6849,11 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 2026-09-27 继续评估 PostgreSQL 扫描写入：把 `presence_ledger` 更新改成 PG 专用 `UPDATE ... FROM incoming`，使该阶段累计工作时间快约 12.4%、无变化重扫快约 4.5%；首扫中位数慢约 1.7%，因此只作为 PG 重扫优化保留，SQLite 继续用原 SQL。新增 PG migration `0148_drop_scan_job_targets_job_fk.sql` 后，target 物化三轮中位数 2.392→1.914 秒（快约 20%）；首扫、重扫、前台 p95 和 batch p95 均在 5% 观察门内。为补偿外键原有的级联清理，删除媒体库时在同一事务中先删其任务 target，并有 PostgreSQL 集成回归。强制物化 availability 候选没有改善 source insert；PG 未用的 `media_search.sort_title` 虽有 WAL 下降迹象，但没有稳定端到端收益，均撤回。PostgreSQL 不允许 `UPDATE OF` 与 transition table 同用，继续采用 statement trigger。阶段 22 / LUX-275 严格双后端性能门仍开放，详细 A/B 和限制见 `docs/PERFORMANCE.md`。
 
+2026-09-27 将 PostgreSQL `unixepoch()` 从逐次 `clock_timestamp()` 改为向下取整的 `statement_timestamp()`，并标记 `PARALLEL SAFE`。同 fixture 三轮分组 A/B 首扫中位数 5.852→5.384 秒（快约 8.0%），120k target 快约 8.2%，无变化重扫持平，前台与 batch p95 未回退；SQLite 不变。没有采用 `CURRENT_TIMESTAMP`，避免长事务内更新时间退回事务启动时刻。行级可用性触发器候选在 60k 条目批量缺失变更上超过 120 秒，原 statement trigger 正反向都约 3.2 秒，故保留 set-based trigger。空 provider INSERT 的 `IF EXISTS` 候选首扫慢约 1.6%、无稳定收益，撤回。全量 Manifest target 主路径已使用合并 CTE；另一通用 path/reconciliation helper 保持不变，因为不在本轮 60k 首扫主路径。详细结果见 `docs/PERFORMANCE.md`；LUX-275 阶段门仍开放。
+
 依赖：LUX-273、LUX-274。
 
-实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`migrations-postgres/0147_drop_media_search_item_fk.sql`、`migrations-postgres/0148_drop_scan_job_targets_job_fk.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+实现文件（含首轮未过门后的有界 discovery/storage 批次跟进；Jellyfin 对照实现已移除）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`src/storage/migration.rs`、`migrations/0147_skip_redundant_sort_title_fts_tokens.sql`、`migrations/0148_fts_columnsize_zero.sql`、`migrations-postgres/0146_skip_empty_provider_index_expansion.sql`、`migrations-postgres/0147_drop_media_search_item_fk.sql`、`migrations-postgres/0148_drop_scan_job_targets_job_fk.sql`、`migrations-postgres/0149_statement_timestamp_unixepoch.sql`、`tests/storage.rs`、`tests/search.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 

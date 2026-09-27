@@ -134,7 +134,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 149);
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -672,7 +672,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 149);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -1846,5 +1846,54 @@ async fn postgres_statement_triggers_refresh_search_and_availability_sets()
 
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_unixepoch_uses_statement_time_and_is_parallel_safe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    let function_properties: (String, String) = sqlx::query_as(
+        "SELECT p.provolatile::text, p.proparallel::text
+         FROM pg_proc p
+         WHERE p.oid = 'unixepoch()'::regprocedure",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    let mut transaction = database.pool().begin().await?;
+    let first: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(&mut *transaction)
+        .await?;
+    sqlx::query("SELECT pg_sleep(1.2)")
+        .execute(&mut *transaction)
+        .await?;
+    let second: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let advances_between_statements = second > first;
+    let matches_statement_time: bool = sqlx::query_scalar(
+        "SELECT unixepoch() = floor(extract(epoch FROM statement_timestamp()))::BIGINT",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.rollback().await?;
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    assert_eq!(function_properties, ("s".to_owned(), "s".to_owned()));
+    assert!(
+        advances_between_statements,
+        "unixepoch should advance between statements in one transaction"
+    );
+    assert!(matches_statement_time);
     Ok(())
 }
