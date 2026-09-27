@@ -134,7 +134,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 147);
+    assert_eq!(database.schema_version().await?, 148);
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -672,7 +672,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 147);
+    assert_eq!(database.schema_version().await?, 148);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -1260,6 +1260,72 @@ async fn postgres_postprocessing_targets_preserve_changed_and_new_item_kinds()
     .fetch_all(database.pool())
     .await?;
     assert_eq!(item_kinds, vec!["CHANGED", "NEW"]);
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_scan_targets_drop_job_fk_and_library_delete_cleans_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library(
+            &format!("PostgreSQL target FK {}", Uuid::now_v7()),
+            luxd::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let job_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ($1, $2, 'RECONCILE_LIBRARY', 'COMPLETED', $3)",
+    )
+    .bind(&job_id)
+    .bind(library.id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind
+         ) VALUES ($1, 'ITEM', 'target-item', 'target-item', 'NEW')",
+    )
+    .bind(&job_id)
+    .execute(database.pool())
+    .await?;
+
+    let job_foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_constraint constraint_row
+         JOIN pg_class table_row ON table_row.oid = constraint_row.conrelid
+         JOIN pg_attribute column_row
+           ON column_row.attrelid = table_row.oid
+          AND column_row.attnum = ANY(constraint_row.conkey)
+         WHERE table_row.relname = 'scan_job_targets'
+           AND constraint_row.contype = 'f'
+           AND column_row.attname = 'job_id'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(job_foreign_keys, 0);
+
+    libraries.delete_library(library.id).await?;
+    let remaining_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_targets, 0);
 
     database.close().await;
     drop_postgres_test_database(&database_name).await?;

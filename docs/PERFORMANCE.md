@@ -878,3 +878,45 @@ discovery chunk 事务开头的 manifest 查询现在同时读取 `library_id`�
 试验仅对电影批次准备循环调整临时集合构造：新条目不再先进入 `parent_updates` / `provider_updates`，再由 `new_item_ids` 过滤。与前一候选相比，SQLite `movie_item_insert` 阶段中位数约从 437.1 降至 426.1 ms（省约 11 ms），但全链路首扫从 1,886 增至 1,932 ms（慢约 2.4%），batch p95 从 261 增至 302 ms。PostgreSQL `movie_item_insert` 基本不变（1,534.5 → 1,534.3 ms），首扫 5,387 → 5,338 ms 的约 0.9% 差异不足以排除运行噪声。候选已撤回；保留回归测试固定相同身份多来源仍合并 provider IDs，并按既有顺序确定 parent folder。
 
 结论：生产路径保留空 baseline 快路径和 active-job SELECT 合并；父目录跨批次缓存暂缓；临时 map/set 改动未通过全链路与尾延迟观察门而撤回。性能对照为顺序 A/B，硬件、fixture 和数据库限定见本节开头；不外推到 NAS/x86_64。LUX-275 双后端阶段门仍开放。
+
+### PostgreSQL presence ledger 与 target 外键优化
+
+2026-09-27 在 Apple M4 / 16 GiB ARM64、本机 PostgreSQL 16.15 容器上，以相同 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）验证 PG 专属写路径。每轮使用新的空数据库；SQLite 未改变。
+
+#### Presence ledger 单阶段更新（PG 保留，SQLite 保持原 SQL）
+
+PG 的 `presence_ledger` 从 `matching` CTE 加 `id IN` 改为 `UPDATE ... FROM incoming`，把 ID、路径、指纹和 generation 条件放到同一更新连接中。三轮结果如下：
+
+| PostgreSQL 指标 | 基线：三轮 / 中位数 | PG `UPDATE ... FROM`：三轮 / 中位数 |
+|---|---:|---:|
+| 首扫索引完成 | 5,143 / 5,154 / 5,166 ms；**5,154 ms** | 6,659 / 5,166 / 5,241 ms；**5,241 ms** |
+| `presence_ledger` 累计工作时间 | **1,762 ms** | **1,544 ms** |
+| 无变化重扫 | 3,056 / 3,081 / 3,151 ms；**3,081 ms** | 3,103 / 2,928 / 2,941 ms；**2,941 ms** |
+| target / 前台 p95 / batch p95 | 2,348 / 280 / 688 ms | 2,428 / 288 / 721 ms |
+| SQL / DML / PG 锁等待者 | 322 / 95 / 0 | 322 / 95 / 0 |
+
+该 SQL 让 `presence_ledger` 累计时间下降约 12.4%，无变化重扫快约 4.5%；首扫中位数慢约 1.7%，batch p95 慢约 4.8%（接近观察门），均未越过 5% 门槛。保留它作为 PostgreSQL 的无变化重扫优化，不宣称首扫加速。把同一 `UPDATE ... FROM` 语句无条件用于 SQLite 曾使无变化重扫达到约 47.4 秒，因此实现按后端选择 SQL，SQLite 继续使用原查询。
+
+#### 移除 `scan_job_targets.job_id` 外键（保留）
+
+Migration `0148_drop_scan_job_targets_job_fk.sql` 删除批量 target 插入中逐行执行的父键探查。按之前的首轮 A/B，120k target 物化中位数从 2,454 ms 降至 1,960 ms。为排除当时前台 p95 的运行顺序干扰，又以独立新库交替做了三组配对：
+
+| PostgreSQL 指标 | FK 保留：三轮 / 中位数 | FK 移除：三轮 / 中位数 |
+|---|---:|---:|
+| 首扫索引完成 | 5,182 / 5,239 / 5,238 ms；**5,238 ms** | 5,172 / 5,151 / 5,305 ms；**5,172 ms** |
+| 120k target 物化 | 2,319 / 2,418 / 2,392 ms；**2,392 ms** | 1,914 / 1,882 / 2,005 ms；**1,914 ms** |
+| 无变化重扫 | **2,832 ms** | **2,788 ms** |
+| 前台 p95 / batch p95 | 279 / 694 ms | 280 / 698 ms |
+| SQL / DML / 最大锁等待者 | 322 / 95 / 0 | 322 / 95 / 0 |
+
+target 阶段三组都更快，中位数快约 20.0%；首扫、重扫、前台 p95 和 batch p95 中位数差异均小于 5%，SQL/DML 和 target 批次数不变。迁移移除的是数据库 FK，因此媒体库删除路径已在同一事务里显式清理对应 `scan_job_targets`；PostgreSQL 集成测试确认删库后没有孤儿 target。其他 target 清理仍走既有应用批量清理入口。
+
+#### 未采纳：availability CTE 强制物化、unused `sort_title`
+
+`unavailable_candidates AS MATERIALIZED` 候选相对现有 `0142` 过滤路径做三轮 A/B，试图强制先过滤 `has_available_source = 0` 的媒体项。针对性 `movie_source_insert` 阶段中位数从 1,177 ms 变为 1,211 ms（慢约 2.9%）；首扫仅快约 0.9%，重扫、尾延迟与 WAL 没有形成稳定改善，临时 migration 已撤回。现有 `0142` 已在连接 `filesystem_entries` 前表达父媒体项可用性过滤，不能仅凭 SQL 写法推断优化器一定做了额外探测。
+
+`media_search.sort_title` 虽然不参与 PostgreSQL 搜索或排序，但把该列置空并绕过 sort-title-only upsert 的三轮对照，首扫中位数为 5,288 → 5,322 ms（候选慢约 0.6%），无变化重扫慢约 1.1%，target 快约 1.2%；WAL 集群计数较低但波动较大。没有可重复的端到端收益，PostgreSQL 0149 候选及相关测试已撤回。
+
+附件提出的 `UPDATE OF is_missing` 不能与 transition table 同时用于 PostgreSQL statement trigger：`CREATE TRIGGER` 文档明确禁止在请求 transition relations 时指定 update 列表。[PostgreSQL 16 CREATE TRIGGER 文档](https://www.postgresql.org/docs/16/sql-createtrigger.html)。因此继续使用现有 statement trigger 和 transition table；若后续仍需跳过 generation-only 更新，应从更新语句形态或独立触发器设计入手，并单独测量。
+
+以上测试只代表本机 ARM64 和 PostgreSQL 16 容器。LUX-275 首扫严格门仍开放；本轮 target 外键优化针对 target 阶段，不能替代 SQLite/PostgreSQL 的完整阶段门，也不能外推 NAS/x86_64。
