@@ -440,7 +440,7 @@ impl Database {
             return Err(StorageError::Migration { path, source });
         }
         if backend == DatabaseBackend::Sqlite {
-            migration::remove_sqlite_title_year_unique(&pool, &path).await?;
+            migration::migrate_sqlite_catalog_constraints(&pool, &path).await?;
         }
         let server_id = migration::ensure_server_id(&pool, backend)
             .await

@@ -6889,13 +6889,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-277：SQLite 与 PostgreSQL 类型迁移
 
-- [ ] `libraries.kind` 接受 `HOMEVIDEOS`，`media_items.item_type` 接受 `VIDEO`；既有值与关联数据不变。
-- [ ] SQLite 空库启动和旧库升级都执行约束升级；PostgreSQL 空库与旧库迁移都可启动，并验证既有数据不变。
-- [ ] 回归验证 schema 约束、外键和已有库/媒体项读取。
+- [x] `libraries.kind` 接受 `HOMEVIDEOS`，`media_items.item_type` 接受 `VIDEO`；既有值与关联数据不变。
+- [x] SQLite 空库启动和旧库升级都执行约束升级；PostgreSQL 空库与旧库迁移都可启动，并验证既有数据不变。
+- [x] 回归验证 schema 约束、外键和已有库/媒体项读取。
 
 依赖：LUX-276。验证：`cargo test --locked --test storage`、`cargo test --locked --test postgres_database`。
 
 预计文件：`src/storage/migration.rs`、`migrations-postgres/0150_homevideos_video_types.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+结果（2026-09-27）：`cargo test --locked --test storage` 40 项通过；PostgreSQL 数据库目标中与新功能相关的空库启动和 149→150 升级测试使用 `--ignored --exact` 在本机 PostgreSQL 实际运行，2 项通过；未加 `--ignored` 的完整 PostgreSQL 目标显示 14 项因需本地 PostgreSQL 而忽略。回归测试也确认 SQLite 重建保留 5 个首页、目录和时间排序索引。迁移 SQL 支持检查、`cargo fmt --all -- --check`、`cargo clippy --locked --lib --all-features -- -D warnings` 和 `git diff --check` 通过。
 
 #### LUX-278：其他视频扫描与目录层级
 
