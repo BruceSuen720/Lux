@@ -558,6 +558,47 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(payload).not.toHaveProperty("originalLanguageEnabled");
   });
 
+  it("renders and saves required select fields declared by a login background manifest", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.tmdb-trending-background",
+      name: "TMDb 日榜横幅背景",
+      capabilities: ["login_background.get"],
+      configured: false,
+      available: false,
+      configValues: {},
+      configFields: [{
+        key: "licenseReviewed",
+        label: "我已核对 TMDb 非商业使用许可",
+        type: "select",
+        required: true,
+        sensitive: false,
+        description: "请确认当前部署符合许可。",
+        options: [{ value: "reviewed", label: "我已核对并确认符合许可" }],
+      }],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 TMDb 日榜横幅背景"]')?.click();
+    });
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("我已核对 TMDb 非商业使用许可");
+    expect(dialog?.textContent).toContain("请确认当前部署符合许可。");
+    expect(dialog?.querySelector<HTMLButtonElement>("[role='combobox']")?.textContent).toContain("请选择");
+    expect(dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(true);
+
+    await act(async () => dialog?.querySelector<HTMLButtonElement>("[role='combobox']")?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[role='option'][data-value='reviewed']")?.click());
+    expect(dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(false);
+
+    await act(async () => dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.tmdb-trending-background", {
+      licenseReviewed: "reviewed",
+    });
+  });
+
   it("keeps the install action in the top-right corner for store items", async () => {
     currentPlugin = {
       ...configuredPlugin,
