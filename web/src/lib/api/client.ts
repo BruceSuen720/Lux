@@ -42,6 +42,7 @@ import type {
   ChapterSource,
   ApiErrorBody,
   DatabaseSetupInput,
+  LibraryKind,
   HomeResponse,
   UserLibraryOrder,
   Library,
@@ -242,7 +243,7 @@ export class LuxApiClient {
     displayName?: string;
     password: string;
     libraryName?: string;
-    libraryKind?: string;
+    libraryKind?: LibraryKind;
     libraryRoot?: string;
   }) {
     return this.request<{ user: LuxUser }>("/api/v1/setup/complete", {
