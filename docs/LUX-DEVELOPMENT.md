@@ -6835,7 +6835,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 同日评估 SQLite migration `0149_skip_redundant_original_title_fts_tokens.sql`，只跳过与 title ASCII 大小写等价的重复 original-title FTS tokens，独立原文标题搜索保持不变。与干净 `275fe6c9` 基线交错三轮后，SQLite 首扫中位数 1.955 → 1.941 秒（约快 0.7%），暖缓存配对差异在 ±0.5% 内，无法证明超过运行噪声；PostgreSQL 路径未变化。SQLite WAL 文件约减少 3.7%，但没有形成稳定端到端提速，target 阶段中位数还增加约 5.3%，因此撤回 migration 和兼容 trigger 变更。完整数据见 `docs/PERFORMANCE.md`；LUX-275 继续开放。
 
-2026-09-27 继续评估逐文件准备任务的上下文复制和 path 复用，Arc 共享上下文与 path 单项没有双后端稳定首扫收益；path 加文件类型布尔值的组合还使 SQLite 前台 p95 回退 5.7%，均未保留。更早提出的 JoinSet→分块 `spawn_blocking`/Rayon 方案没有直接 A/B，当前仍为每个待处理文件提交一个有界 JoinSet 任务。已采纳的 `275fe6c9` 只消除严格媒体文件名的重复解析并复用解析结果，不是任务分块。LUX-275 阶段门仍开放，详细数据见 `docs/PERFORMANCE.md`。
+2026-09-27 对 JoinSet→500 文件分块 `spawn_blocking` 做同 fixture 交错三轮 A/B。SQLite 首扫中位数 1.932 → 1.849 秒（快约 4.3%），PostgreSQL 5.570 → 5.726 秒（慢约 2.8%）；每轮 SQLite 都改善、每轮 PostgreSQL 都回退。无变化重扫、前台 p95、SQL/DML 和 8 个正向提交批次未明显退化，但双后端首扫门未通过，因此撤回候选，正式扫描仍使用有界逐文件 JoinSet。已采纳的 `275fe6c9` 是文件名只解析一次，不是任务分块。LUX-275 阶段门仍开放，详细数据见 `docs/PERFORMANCE.md`。
 
 依赖：LUX-273、LUX-274。
 
