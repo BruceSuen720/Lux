@@ -2157,7 +2157,7 @@ services:
 | LUX-278 | src/application/scanner.rs、src/storage/media.rs、tests/scanning_jobs.rs、tests/storage.rs；其他视频扫描与目录层级 |
 | LUX-279 | src/application/nfo.rs、src/storage/jobs.rs、tests/nfo_writer.rs、tests/scanning_jobs.rs；VIDEO 本地 NFO 与禁止自动匹配 |
 | LUX-280 | src/api/media.rs、src/application/catalog.rs、tests/catalog.rs、tests/resume_favorites.rs；Lux VIDEO 搜索、目录过滤、统计与继续观看 |
-| LUX-281 | src/api/emby_catalog.rs、src/api/legacy.rs、tests/mixed_library_api.rs、docs/COMPATIBILITY.md；Emby homevideos/Video 契约 |
+| LUX-281 | src/api/emby_catalog.rs、src/application/catalog.rs、src/storage/catalog.rs、tests/mixed_library_api.rs、tests/resume_favorites.rs、docs/COMPATIBILITY.md；Emby homevideos/Video 契约 |
 | LUX-282 | web/src/features/auth/AdminSetupForm.tsx、web/src/lib/api/types.ts、web/src/app.mjs、web/tests/setup-page.test.tsx；初始化媒体库类型选择 |
 | LUX-283 | web/src/lib/api/types.ts、web/src/features/admin/AdminLibrariesPage.tsx、web/tests/admin-libraries.test.tsx；管理界面类型与刮削器配置 |
 | LUX-284 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts；其他视频目录浏览与搜索 |
@@ -6937,13 +6937,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-281：Emby homevideos 与 Video 契约
 
-- [ ] Emby 虚拟视图、根视图配置与库类型报告 `homevideos`；根计数只计算本库 VIDEO。
-- [ ] VIDEO 返回 `Type: Video`、`MediaType: Video`，支持 `IncludeItemTypes=Video`，并能按父目录返回 FOLDER/VIDEO 子项。
-- [ ] Emby 播放回调进度和 Resume 可见 VIDEO；更新兼容记录并保留现有 Emby DTO 边界。
+- [x] Emby 虚拟视图、根视图配置与库类型报告 `homevideos`；根计数只计算本库 VIDEO。
+- [x] VIDEO 返回 `Type: Video`、`MediaType: Video`，支持 `IncludeItemTypes=Video`，并能按父目录返回 FOLDER/VIDEO 子项。
+- [x] Emby 播放回调进度和 Resume 可见 VIDEO；更新兼容记录并保留现有 Emby DTO 边界。
 
 依赖：LUX-280。验证：`cargo test --locked --test mixed_library_api`、`cargo test --locked --test resume_favorites`。
 
-预计文件：`src/api/emby_catalog.rs`、`src/api/legacy.rs`、`tests/mixed_library_api.rs`、`docs/COMPATIBILITY.md`。
+预计文件：`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`tests/mixed_library_api.rs`、`tests/resume_favorites.rs`、`docs/COMPATIBILITY.md`。
+
+结果（2026-09-28）：Emby Views/VirtualFolders 报告 `homevideos`，视图 ChildCount 只计 VIDEO；视频 DTO 映射为 `Type: Video`、`MediaType: Video`，支持按 Video 筛选和 HomeVideos 默认搜索。HOMEVIDEOS 根及其目录默认返回 FOLDER/VIDEO 子项；Emby 播放进度回调后，Resume 能读回 VIDEO。`cargo build --locked`、`cargo test --locked --all-targets`（572 个单元测试通过、4 个忽略，集成目标全部通过；14 个 PostgreSQL 用例因本机无 PostgreSQL 服务而忽略，4 个手动性能基准按设计忽略）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 均通过；针对性 `mixed_library_api` 和 `resume_favorites` 各 3 项通过。本机 `uname -m=arm64`。尚未用第三方客户端真实 UI 单独复测 HomeVideos。阶段 22 / LUX-275 仍开放。
 
 #### LUX-282：初始化时选择其他视频库
 
