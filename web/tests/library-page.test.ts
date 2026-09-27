@@ -40,6 +40,98 @@ describe("LibraryPage infinite scroll", () => {
     triggerIntersection = undefined;
   });
 
+  it("browses HomeVideos folders and keeps videos as playable media", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "home-videos", name: "其他视频", kind: "HOMEVIDEOS" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockImplementation(async (_libraryId, _page, _itemTypes, options) => {
+      const parentId = (options as typeof options & { parentId?: string }).parentId;
+      const items = parentId === "root"
+        ? [
+          { id: "folder-trips", title: "Trips", itemType: "FOLDER", parentId: "home-videos" },
+          { id: "root-video", title: "家庭聚会", itemType: "VIDEO" },
+        ]
+        : parentId === "folder-trips"
+          ? [
+            { id: "folder-2024", title: "2024", itemType: "FOLDER", parentId: "folder-trips" },
+            { id: "episode-shaped-video", title: "Show S01E01", itemType: "VIDEO", parentId: "folder-trips" },
+          ]
+          : [{ id: "movie-shaped-video", title: "Movie (2024)", itemType: "VIDEO", parentId: "folder-2024" }];
+      return { items, total: items.length, page: 1, pageSize: 24 };
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/home-videos"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("a[aria-label='打开文件夹 Trips']")).toBeTruthy());
+    });
+
+    expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      parentId: "root",
+    });
+    const tripsLink = container.querySelector<HTMLAnchorElement>("a[aria-label='打开文件夹 Trips']");
+    expect(tripsLink?.getAttribute("href")).toContain("folderPath=");
+    expect(tripsLink?.getAttribute("href")).not.toBe("/items/folder-trips");
+    expect(tripsLink?.closest(".lux-media-card")?.querySelector(".lux-media-actions")).toBeNull();
+    expect(tripsLink?.closest(".lux-media-card")?.querySelector(".lux-media-hover-play")).toBeNull();
+    expect(container.textContent).toContain("家庭聚会");
+    expect(container.textContent).toContain("其他视频");
+
+    await act(async () => tripsLink?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.textContent).toContain("Show S01E01"));
+    });
+    expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      parentId: "folder-trips",
+    });
+
+    const yearFolder = container.querySelector<HTMLAnchorElement>("a[aria-label='打开文件夹 2024']");
+    expect(yearFolder).toBeTruthy();
+    await act(async () => yearFolder?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.textContent).toContain("Movie (2024)"));
+    });
+    expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      parentId: "folder-2024",
+    });
+
+    const backButton = container.querySelector<HTMLButtonElement>("button[aria-label='返回上一级']");
+    expect(backButton).toBeTruthy();
+    await act(async () => backButton?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.textContent).toContain("Show S01E01"));
+    });
+    const backToRoot = container.querySelector<HTMLButtonElement>("button[aria-label='返回上一级']");
+    await act(async () => backToRoot?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelector("a[aria-label='打开文件夹 Trips']")).toBeTruthy());
+    });
+  });
+
   it("shows the library name in the browser tab title", async () => {
     vi.spyOn(api, "libraries").mockResolvedValue({
       libraries: [{ id: "library-1", name: "电影收藏", kind: "MOVIE" }],

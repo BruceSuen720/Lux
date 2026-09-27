@@ -1772,6 +1772,7 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         is_favorite: Some(true),
         min_date_last_saved: None,
         metadata_pending: false,
+        parent_id_scope: None,
         sort_by: CatalogSort::DateCreated,
         descending: true,
         offset: 0,
@@ -3051,6 +3052,7 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             is_favorite: None,
             min_date_last_saved: None,
             metadata_pending: false,
+            parent_id_scope: None,
             sort_by,
             descending,
             offset: 0,
@@ -3065,6 +3067,104 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
         assert_eq!(total, 2);
         assert_eq!(titles, expected, "descending={descending}");
     }
+}
+
+#[tokio::test]
+async fn catalog_filter_parent_scope_applies_before_pagination() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Home videos", LibraryKind::HomeVideos, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, parent_id, title, sort_title,
+            identification_status, has_available_source
+         ) VALUES
+            ('root-video', ?, 'VIDEO', NULL, 'Root video', 'root video', 'LOCAL_CONFIRMED', 1),
+            ('root-folder', ?, 'FOLDER', ?, 'Root folder', 'root folder', 'LOCAL_CONFIRMED', 0),
+            ('nested-video', ?, 'VIDEO', 'root-folder', 'Nested video', 'nested video', 'LOCAL_CONFIRMED', 1),
+            ('nested-folder', ?, 'FOLDER', 'root-folder', 'Nested folder', 'nested folder', 'LOCAL_CONFIRMED', 0),
+            ('deep-video', ?, 'VIDEO', 'nested-folder', 'Deep video', 'deep video', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("home video entries");
+
+    let library_ids = vec![library_id];
+    let item_types = vec!["FOLDER".to_owned(), "VIDEO".to_owned()];
+    let empty = Vec::new();
+    let empty_years = Vec::<i64>::new();
+    let mut filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "test-user",
+        item_types: &item_types,
+        excluded_item_types: &empty,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &empty_years,
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset: 0,
+        limit: 1,
+        parent_id_scope: Some(None),
+    };
+
+    let (root_page, root_total) = database
+        .list_filtered_catalog_rows(&filter)
+        .await
+        .expect("root catalog page");
+    assert_eq!(root_total, 2);
+    assert_eq!(root_page.len(), 1);
+    assert_eq!(root_page[0].title, "Root folder");
+
+    filter.offset = 1;
+    let (second_root_page, _) = database
+        .list_filtered_catalog_rows(&filter)
+        .await
+        .expect("second root catalog page");
+    assert_eq!(second_root_page.len(), 1);
+    assert_eq!(second_root_page[0].title, "Root video");
+
+    filter.parent_id_scope = Some(Some("root-folder"));
+    filter.offset = 0;
+    filter.limit = 10;
+    let (nested_page, nested_total) = database
+        .list_filtered_catalog_rows(&filter)
+        .await
+        .expect("nested catalog page");
+    assert_eq!(nested_total, 2);
+    assert_eq!(nested_page.len(), 2);
+    assert!(
+        nested_page
+            .iter()
+            .all(|item| item.parent_id.as_deref() == Some("root-folder"))
+    );
+
+    filter.parent_id_scope = None;
+    let (_, unfiltered_total) = database
+        .list_filtered_catalog_rows(&filter)
+        .await
+        .expect("unfiltered catalog page");
+    assert_eq!(unfiltered_total, 5);
 }
 
 #[tokio::test]
@@ -3186,6 +3286,7 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             is_favorite: None,
             min_date_last_saved: None,
             metadata_pending: false,
+            parent_id_scope: None,
             sort_by: CatalogSort::PremiereDate,
             descending,
             offset: 0,

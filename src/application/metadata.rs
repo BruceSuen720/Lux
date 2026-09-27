@@ -607,6 +607,13 @@ impl MetadataEnricher {
             .await?;
         self.enrich_movie_sources(movie_sources, &mut report).await;
 
+        let home_video_sources = self
+            .database
+            .list_home_video_metadata_sources_for_incremental_scan(scan_job_id)
+            .await?;
+        self.enrich_home_video_sources(home_video_sources, &mut report)
+            .await;
+
         let series_sources = self
             .database
             .list_series_metadata_sources_for_incremental_scan(scan_job_id)
@@ -650,6 +657,51 @@ impl MetadataEnricher {
                 .collect::<Vec<_>>();
             let mut batch_report = MetadataReport::default();
             self.enrich_movie_sources(sources, &mut batch_report).await;
+            let failed_item_ids = batch_report.failed_item_ids.clone();
+            report.merge(batch_report);
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &failed_item_ids,
+                    "METADATA",
+                    "FAILED",
+                )
+                .await?;
+            let completed_item_ids = item_ids
+                .into_iter()
+                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                .collect::<Vec<_>>();
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &completed_item_ids,
+                    "METADATA",
+                    "DONE",
+                )
+                .await?;
+        }
+
+        loop {
+            let sources = self
+                .database
+                .list_scan_job_target_home_video_items_page(
+                    scan_job_id,
+                    LIBRARY_SOURCE_PAGE_SIZE as i64,
+                    0,
+                )
+                .await?;
+            if sources.is_empty() {
+                break;
+            }
+            let item_ids = sources
+                .iter()
+                .map(|source| source.item_id.clone())
+                .collect::<Vec<_>>();
+            let mut batch_report = MetadataReport::default();
+            self.enrich_home_video_sources(sources, &mut batch_report)
+                .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
             report.merge(batch_report);
             self.database
@@ -777,6 +829,45 @@ impl MetadataEnricher {
                 .collect::<Vec<_>>();
             let mut batch_report = MetadataReport::default();
             self.enrich_movie_sources(movie_sources, &mut batch_report)
+                .await;
+            let failed_item_ids = batch_report.failed_item_ids.clone();
+            report.merge(batch_report);
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &failed_item_ids,
+                    "METADATA",
+                    "FAILED",
+                )
+                .await?;
+            let completed_item_ids = item_ids
+                .into_iter()
+                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                .collect::<Vec<_>>();
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &completed_item_ids,
+                    "METADATA",
+                    "DONE",
+                )
+                .await?;
+            return Ok(report);
+        }
+
+        let home_video_sources = self
+            .database
+            .list_scan_job_target_home_video_items_page(scan_job_id, limit, 0)
+            .await?;
+        if !home_video_sources.is_empty() {
+            let item_ids = home_video_sources
+                .iter()
+                .map(|source| source.item_id.clone())
+                .collect::<Vec<_>>();
+            let mut batch_report = MetadataReport::default();
+            self.enrich_home_video_sources(home_video_sources, &mut batch_report)
                 .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
             report.merge(batch_report);
@@ -956,6 +1047,38 @@ impl MetadataEnricher {
         }
     }
 
+    async fn enrich_home_video_sources(
+        &self,
+        sources: Vec<StoredMediaSourcePath>,
+        report: &mut MetadataReport,
+    ) {
+        for source in sources {
+            report.items_processed += 1;
+            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
+            match self
+                .enrich_home_video_nfo(&source.item_id, &media_path)
+                .await
+            {
+                Ok(nfo_report) => {
+                    let failed = nfo_report.nfo_failed > 0;
+                    report.merge(nfo_report);
+                    if failed {
+                        report.mark_item_failed(&source.item_id);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %source.item_id,
+                        %error,
+                        "local home video NFO failed; continuing with remaining items"
+                    );
+                    report.nfo_failed += 1;
+                    report.mark_item_failed(&source.item_id);
+                }
+            }
+        }
+    }
+
     pub async fn enrich_mixed_library(
         &self,
         library_id: LibraryId,
@@ -973,6 +1096,24 @@ impl MetadataEnricher {
         let Some(nfo_path) = find_nfo_path(media_path).await else {
             return Ok(MetadataReport::default());
         };
+        self.enrich_nfo_item(item_id, &nfo_path).await
+    }
+
+    async fn enrich_home_video_nfo(
+        &self,
+        item_id: &str,
+        media_path: &Path,
+    ) -> Result<MetadataReport, MetadataError> {
+        let nfo_path = media_path.with_extension("nfo");
+        let exists = fs::try_exists(&nfo_path)
+            .await
+            .map_err(|source| MetadataError::Io {
+                path: nfo_path.clone(),
+                source,
+            })?;
+        if !exists {
+            return Ok(MetadataReport::default());
+        }
         self.enrich_nfo_item(item_id, &nfo_path).await
     }
 

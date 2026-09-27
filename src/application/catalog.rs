@@ -40,6 +40,12 @@ pub struct CatalogFilter {
     pub descending: bool,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CatalogParentScope {
+    Root,
+    Item(String),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum CatalogSort {
     #[default]
@@ -165,6 +171,7 @@ struct LibraryPageCacheKey {
     is_admin: bool,
     library_id: String,
     filter: CatalogFilter,
+    parent_scope: Option<CatalogParentScope>,
     offset: i64,
     limit: i64,
 }
@@ -174,6 +181,7 @@ struct LibraryPageRequest {
     principal: AccessPrincipal,
     library_id: String,
     filter: CatalogFilter,
+    parent_scope: Option<CatalogParentScope>,
     offset: i64,
     limit: i64,
 }
@@ -280,6 +288,7 @@ impl LibraryPageCache {
             is_admin: request.principal.is_admin,
             library_id: request.library_id.clone(),
             filter: request.filter.clone(),
+            parent_scope: request.parent_scope.clone(),
             offset: request.offset,
             limit: request.limit,
         };
@@ -493,6 +502,19 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.list_library_items_in_scope(principal, library_id, filter, None, offset, limit)
+            .await
+    }
+
+    pub async fn list_library_items_in_scope(
+        &self,
+        principal: AccessPrincipal,
+        library_id: &str,
+        filter: &CatalogFilter,
+        parent_scope: Option<CatalogParentScope>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
         let Some(library) = self.database.find_library(library_id).await? else {
             return Err(CatalogError::LibraryNotFound);
         };
@@ -506,6 +528,7 @@ impl CatalogService {
             principal,
             library_id: library_id.to_owned(),
             filter: filter.clone(),
+            parent_scope,
             offset,
             limit,
         };
@@ -533,6 +556,10 @@ impl CatalogService {
             is_favorite: filter.is_favorite,
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
+            parent_id_scope: request.parent_scope.as_ref().map(|scope| match scope {
+                CatalogParentScope::Root => None,
+                CatalogParentScope::Item(item_id) => Some(item_id.as_str()),
+            }),
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
@@ -578,6 +605,7 @@ impl CatalogService {
             is_favorite: filter.is_favorite,
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
+            parent_id_scope: None,
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
@@ -796,6 +824,7 @@ impl CatalogService {
             offset,
             limit,
             false,
+            &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await
     }
@@ -813,6 +842,7 @@ impl CatalogService {
             offset,
             limit,
             true,
+            &["MOVIE", "EPISODE", "VIDEO"],
         )
         .await
     }
@@ -824,16 +854,16 @@ impl CatalogService {
         offset: i64,
         limit: i64,
         latest_episode_per_series: bool,
+        item_types: &[&str],
     ) -> Result<CatalogPage, CatalogError> {
         let played_percent = self.database.user_played_percent(user_id).await?;
         let (_, minimum_ticks) = self.database.resume_settings().await?;
-        let item_types = ["MOVIE", "EPISODE"];
         let total = self
             .database
             .count_resume_items(
                 user_id,
                 library_ids,
-                &item_types,
+                item_types,
                 played_percent,
                 minimum_ticks,
                 latest_episode_per_series,
@@ -845,7 +875,7 @@ impl CatalogService {
                 &ResumeItemsQuery {
                     user_id,
                     library_ids,
-                    item_types: &item_types,
+                    item_types,
                     played_percent,
                     minimum_ticks,
                     offset,

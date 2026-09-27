@@ -479,6 +479,136 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 }
 
 #[tokio::test]
+async fn sqlite_homevideos_and_video_types_migrate_from_empty_and_existing_databases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let old_config_dir = temp_dir.path().join("old-config");
+    fs::create_dir(&old_config_dir)?;
+    let old_database_path = old_config_dir.join("lux.db");
+    let old_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&old_database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&old_pool)
+        .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind, scraper_id) VALUES ('old-library', 'Old', 'MIXED', 'tmdb')")
+        .execute(&old_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+         VALUES ('old-library', 'tmdb', 0, 'PRIMARY')",
+    )
+    .execute(&old_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('old-root', 'old-library', '/media', '/media', 1, 1)",
+    )
+    .execute(&old_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('old-item', 'old-library', 'MOVIE', 'Old Movie', 'old movie', 'LOCAL_CONFIRMED')",
+    )
+    .execute(&old_pool)
+    .await?;
+    old_pool.close().await;
+
+    let old_database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: old_config_dir,
+    })
+    .await?;
+    let old_library_kind: String =
+        sqlx::query_scalar("SELECT kind FROM libraries WHERE id = 'old-library'")
+            .fetch_one(old_database.pool())
+            .await?;
+    let old_item_type: String =
+        sqlx::query_scalar("SELECT item_type FROM media_items WHERE id = 'old-item'")
+            .fetch_one(old_database.pool())
+            .await?;
+    let old_root_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM library_roots WHERE id = 'old-root'")
+            .fetch_one(old_database.pool())
+            .await?;
+    let old_scraper_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM library_scrapers WHERE library_id = 'old-library'",
+    )
+    .fetch_one(old_database.pool())
+    .await?;
+    assert_eq!(old_library_kind, "MIXED");
+    assert_eq!(old_item_type, "MOVIE");
+    assert_eq!(old_root_count, 1);
+    assert_eq!(old_scraper_count, 1);
+    assert_homevideos_video_types_are_accepted(&old_database, "upgraded").await?;
+    let old_foreign_key_violations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(old_database.pool())
+            .await?;
+    assert_eq!(old_foreign_key_violations, 0);
+    old_database.close().await;
+
+    let fresh_database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("fresh-config"),
+    })
+    .await?;
+    assert_homevideos_video_types_are_accepted(&fresh_database, "fresh").await?;
+    let fresh_foreign_key_violations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(fresh_database.pool())
+            .await?;
+    assert_eq!(fresh_foreign_key_violations, 0);
+    fresh_database.close().await;
+    Ok(())
+}
+
+async fn assert_homevideos_video_types_are_accepted(
+    database: &Database,
+    id_prefix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_id = format!("{id_prefix}-library");
+    let item_id = format!("{id_prefix}-video");
+    let preserved_media_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_media_items_library_added_visible',
+             'idx_media_items_parent_available',
+             'idx_media_items_series_available',
+             'idx_media_items_home_unavailable_series',
+             'idx_media_items_updated_at'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preserved_media_indexes, 5);
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'HOMEVIDEOS')")
+        .bind(&library_id)
+        .bind(format!("{id_prefix} home videos"))
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'VIDEO', 'Clip', 'clip', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

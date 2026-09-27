@@ -10,7 +10,7 @@ use luxd::{
         libraries::LibraryService,
         nfo::LocalNfoMetadataStore,
         probe::{FfprobeRunner, MediaProbeService},
-        reidentify::MetadataReidentifyService,
+        reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{
             BACKGROUND_SCAN_BATCH_SIZE, IncrementalScanChange, ScanJobError, ScanJobService,
         },
@@ -107,6 +107,346 @@ async fn lite_manifest_movie_provider_ids_are_inherited_and_file_tags_take_prece
     assert_eq!(
         overridden_provider_ids.get("Imdb"),
         Some(&"tt1234567".to_owned())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideos_manifest_scans_keep_folders_and_skip_filename_classification()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Trips/2024")).await?;
+    tokio::fs::create_dir_all(root.join("Trips/Season 01")).await?;
+    tokio::fs::write(
+        root.join("Trips/2024/Movie (2024).mkv"),
+        b"movie-shaped clip",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Trips/Season 01/Show S01E01.mkv"),
+        b"episode-shaped clip",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Trips/2024/External clip.strm"),
+        "https://example.invalid/media.mkv\n",
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let videos: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND item_type = 'VIDEO'
+           AND identification_status = 'LOCAL_CONFIRMED'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let folders: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = 'FOLDER'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let unresolved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = 'UNRESOLVED'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(videos, 3);
+    assert_eq!(folders, 3);
+    assert_eq!(unresolved, 0);
+    let unclassified_video_metadata: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND item_type = 'VIDEO'
+           AND identification_status = 'LOCAL_CONFIRMED'
+           AND production_year IS NULL AND season_number IS NULL
+           AND episode_number IS NULL AND provider_ids_json IS NULL
+           AND metadata_scraper_id IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unclassified_video_metadata, 3);
+
+    let hierarchy: (String, String, String, String) = sqlx::query_as(
+        "SELECT parent.item_type, parent.title, grandparent.item_type, grandparent.title
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         JOIN media_items parent ON parent.id = item.parent_id
+         JOIN media_items grandparent ON grandparent.id = parent.parent_id
+         WHERE entry.relative_path = 'Trips/2024/Movie (2024).mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        hierarchy,
+        (
+            "FOLDER".to_owned(),
+            "2024".to_owned(),
+            "FOLDER".to_owned(),
+            "Trips".to_owned()
+        )
+    );
+
+    let strm: (String, String, String, String) = sqlx::query_as(
+        "SELECT item.item_type, source.source_kind, source.external_url,
+                source.strm_target_kind
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = 'Trips/2024/External clip.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        strm,
+        (
+            "VIDEO".to_owned(),
+            "STRM_URL".to_owned(),
+            "https://example.invalid/media.mkv".to_owned(),
+            "URL".to_owned(),
+        )
+    );
+
+    tokio::fs::remove_file(root.join("Trips/Season 01/Show S01E01.mkv")).await?;
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &reconciliation.id, 2).await?;
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+    let after_reconciliation: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND item_type = 'VIDEO' AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after_reconciliation, 2);
+    let removed_video: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = 'Trips/Season 01/Show S01E01.mkv'
+           AND item.item_type = 'VIDEO' AND item.removed_at IS NOT NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_video, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideos_scan_imports_same_name_nfo_without_reclassifying_or_queueing_online_match()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Movie (2024).mkv"), b"home video").await?;
+    tokio::fs::write(
+        root.join("Movie (2024).nfo"),
+        "<movie><title>手动整理的视频</title><year>2024</year></movie>",
+    )
+    .await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let item: (String, String, Option<i64>, String, Option<String>) = sqlx::query_as(
+        "SELECT item_type, title, production_year, identification_status, metadata_scraper_id
+         FROM media_items WHERE library_id = ? AND item_type = 'VIDEO' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item.0, "VIDEO");
+    assert_eq!(item.1, "手动整理的视频");
+    assert_eq!(item.2, Some(2024));
+    assert_eq!(item.3, "LOCAL_CONFIRMED");
+    assert_eq!(item.4, None);
+
+    let video_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'VIDEO' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = 'tmdb', realtime_metadata_auto_match_enabled = 1
+         WHERE id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let scraper = TestScraper::new(TestScraperConfig::default())?;
+    let reidentify =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(scraper));
+
+    tokio::fs::write(
+        root.join("Movie (2024).nfo"),
+        "<tvshow><title>增量更新的普通视频</title><year>2025</year><season>1</season></tvshow>",
+    )
+    .await?;
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Movie (2024).nfo".to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion_with_metadata(&incremental.id, 100, None, Some(reidentify.clone()))
+        .await?;
+    let incremental_item: (String, String, Option<i64>) =
+        sqlx::query_as("SELECT item_type, title, production_year FROM media_items WHERE id = ?")
+            .bind(&video_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        incremental_item,
+        (
+            "VIDEO".to_owned(),
+            "增量更新的普通视频".to_owned(),
+            Some(2025)
+        )
+    );
+
+    let candidate_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+            .bind(&video_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(candidate_count, 0);
+    let metadata_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(metadata_jobs, 0);
+    let auto_match_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
+         WHERE job_id = ? AND event_code IN (
+             'METADATA_AUTO_MATCH_QUEUED', 'METADATA_AUTO_MATCH_QUEUE_FAILED'
+         )",
+    )
+    .bind(&incremental.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(auto_match_events, 0);
+
+    assert!(matches!(
+        reidentify
+            .create_fill_missing_job(vec![video_item_id])
+            .await,
+        Err(MetadataReidentifyError::InvalidItemCount)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideos_incremental_scan_creates_plain_videos_and_validates_strm_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Family/Trips")).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let video_path = "Family/Trips/S01E01.mkv";
+    tokio::fs::write(root.join(video_path), b"first clip").await?;
+    let strm_path = "Family/Trips/Remote clip.strm";
+    tokio::fs::write(
+        root.join(strm_path),
+        "https://example.invalid/private-video.mkv\n",
+    )
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![video_path, strm_path]
+                .into_iter()
+                .map(|relative_path| IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: relative_path.to_owned(),
+                    kind: ChangeKind::Create,
+                })
+                .collect(),
+        )
+        .await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let indexed_types: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             SUM(CASE WHEN item.item_type = 'VIDEO' THEN 1 ELSE 0 END),
+             SUM(CASE WHEN item.item_type = 'UNRESOLVED' THEN 1 ELSE 0 END),
+             SUM(CASE WHEN item.item_type = 'FOLDER' THEN 1 ELSE 0 END)
+         FROM media_items item
+         WHERE item.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_types, (2, 0, 2));
+    let strm_target: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT source.source_kind, source.external_url, source.strm_target_kind
+         FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.relative_path = ?",
+    )
+    .bind(strm_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        strm_target,
+        (
+            "STRM_URL".to_owned(),
+            Some("https://example.invalid/private-video.mkv".to_owned()),
+            Some("URL".to_owned()),
+        )
     );
     Ok(())
 }

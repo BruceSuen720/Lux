@@ -15,6 +15,25 @@ use luxd::{
     storage::Database,
 };
 
+#[test]
+fn homevideos_library_kind_uses_the_emby_compatible_wire_name() {
+    let kind = "HOMEVIDEOS"
+        .parse::<LibraryKind>()
+        .expect("HOMEVIDEOS is a supported library kind");
+
+    assert_eq!(kind.as_str(), "HOMEVIDEOS");
+    assert_eq!(
+        serde_json::to_string(&kind).expect("serialize library kind"),
+        "\"HOMEVIDEOS\""
+    );
+    assert_eq!(
+        serde_json::from_str::<LibraryKind>("\"HOMEVIDEOS\"").expect("deserialize library kind"),
+        kind
+    );
+    assert!(!kind.supports_chapter_source());
+    assert!(!kind.supports_scrapers());
+}
+
 #[tokio::test]
 async fn inspect_root_path_reports_canonical_readable_and_writable_directory()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -274,6 +293,36 @@ async fn ordered_library_scrapers_persist_roles_and_legacy_primary_id()
     .fetch_optional(database.pool())
     .await?;
     assert_eq!(stored_scraper.as_deref(), Some("imdb"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideos_library_rejects_scraper_configuration() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let service = LibraryService::new(database.clone());
+    let error = service
+        .create_library_with_scrapers(
+            "Home videos",
+            "HOMEVIDEOS".parse()?,
+            false,
+            &[LibraryScraper {
+                scraper_id: "org.lux.tmdb".to_owned(),
+                position: 0,
+                role: LibraryScraperRole::Primary,
+            }],
+            true,
+        )
+        .await
+        .expect_err("home videos libraries cannot configure online scrapers");
+
+    assert!(matches!(error, LibraryServiceError::InvalidScraperId));
+    database.close().await;
     Ok(())
 }
 

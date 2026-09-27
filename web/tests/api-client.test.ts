@@ -315,6 +315,20 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("sends the selected HomeVideos parent folder to the server", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("home-videos", 1, undefined, {
+      parentId: "folder-trips",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/home-videos/items?page=1&pageSize=24&parentId=folder-trips",
+    );
+  });
+
   it("sends the selected library sort and order to the server", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),

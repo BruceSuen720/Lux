@@ -1020,6 +1020,16 @@ impl Database {
         library_root_id: &str,
         file: &NewScanManifestUnresolvedFile,
     ) -> Result<(), StorageError> {
+        let item_type = if file.home_video {
+            "VIDEO"
+        } else {
+            "UNRESOLVED"
+        };
+        let identification_status = if file.home_video {
+            "LOCAL_CONFIRMED"
+        } else {
+            "PENDING"
+        };
         let parent_id = self
             .ensure_movie_parent_folder_in_transaction(
                 &mut *transaction,
@@ -1044,15 +1054,17 @@ impl Database {
         let item_id = if let Some(item_id) = existing_item_id {
             self.query(
                 "UPDATE media_items
-                 SET item_type = 'UNRESOLVED', parent_id = ?, title = ?, sort_title = ?,
-                     original_title = ?, identification_status = 'PENDING', removed_at = NULL,
+                 SET item_type = ?, parent_id = ?, title = ?, sort_title = ?,
+                     original_title = ?, identification_status = ?, removed_at = NULL,
                      updated_at = unixepoch()
                  WHERE id = ?",
             )
+            .bind(item_type)
             .bind(parent_id.as_deref())
             .bind(&file.title)
             .bind(file.title.to_lowercase())
             .bind(&file.title)
+            .bind(identification_status)
             .bind(&item_id)
             .execute(&mut **transaction)
             .await
@@ -1067,14 +1079,16 @@ impl Database {
                      id, library_id, item_type, parent_id, title, sort_title,
                      original_title, identification_status, identity_key,
                      has_available_source
-                 ) VALUES (?, ?, 'UNRESOLVED', ?, ?, ?, ?, 'PENDING', ?, 1)",
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             )
             .bind(&file.item_id)
             .bind(library_id)
+            .bind(item_type)
             .bind(parent_id.as_deref())
             .bind(&file.title)
             .bind(file.title.to_lowercase())
             .bind(&file.title)
+            .bind(identification_status)
             .bind(&file.identity_key)
             .execute(&mut **transaction)
             .await

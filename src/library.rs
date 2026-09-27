@@ -15,6 +15,8 @@ pub enum LibraryKind {
     Movie,
     Series,
     Mixed,
+    #[serde(rename = "HOMEVIDEOS")]
+    HomeVideos,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -113,11 +115,16 @@ impl LibraryKind {
             Self::Movie => "MOVIE",
             Self::Series => "SERIES",
             Self::Mixed => "MIXED",
+            Self::HomeVideos => "HOMEVIDEOS",
         }
     }
 
     pub const fn supports_chapter_source(self) -> bool {
         matches!(self, Self::Series | Self::Mixed)
+    }
+
+    pub const fn supports_scrapers(self) -> bool {
+        !matches!(self, Self::HomeVideos)
     }
 }
 
@@ -129,6 +136,7 @@ impl FromStr for LibraryKind {
             "MOVIE" => Ok(Self::Movie),
             "SERIES" => Ok(Self::Series),
             "MIXED" => Ok(Self::Mixed),
+            "HOMEVIDEOS" => Ok(Self::HomeVideos),
             _ => Err(LibraryKindError(value.to_owned())),
         }
     }

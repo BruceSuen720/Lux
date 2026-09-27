@@ -440,7 +440,7 @@ impl Database {
             return Err(StorageError::Migration { path, source });
         }
         if backend == DatabaseBackend::Sqlite {
-            migration::remove_sqlite_title_year_unique(&pool, &path).await?;
+            migration::migrate_sqlite_catalog_constraints(&pool, &path).await?;
         }
         let server_id = migration::ensure_server_id(&pool, backend)
             .await
@@ -1279,6 +1279,7 @@ pub(crate) struct NewScanManifestUnresolvedFile {
     pub(crate) container: String,
     pub(crate) external_url: Option<String>,
     pub(crate) strm_target_kind: Option<String>,
+    pub(crate) home_video: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2485,14 +2486,39 @@ fn catalog_filter_where_clause<'a>(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    if item_types.is_empty() {
-        where_clause.push_str(" AND mi.item_type <> 'FOLDER'");
-    }
-    where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
     let mut binds = library_ids
         .iter()
         .map(|library_id| CatalogBind::Text(library_id.as_str()))
         .collect::<Vec<_>>();
+    match filter.parent_id_scope {
+        Some(Some(parent_id)) => {
+            where_clause.push_str(
+                " AND mi.parent_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM media_items parent
+                      WHERE parent.id = ?
+                        AND parent.library_id = mi.library_id
+                        AND parent.item_type = 'FOLDER'
+                        AND parent.removed_at IS NULL
+                        AND parent.merged_into_item_id IS NULL
+                  )",
+            );
+            binds.push(CatalogBind::Text(parent_id));
+            binds.push(CatalogBind::Text(parent_id));
+        }
+        Some(None) => {
+            where_clause.push_str(" AND (mi.parent_id IS NULL OR mi.parent_id = mi.library_id)")
+        }
+        None => {}
+    }
+    if item_types.is_empty() {
+        where_clause.push_str(" AND mi.item_type <> 'FOLDER'");
+    }
+    if filter.parent_id_scope.is_some() {
+        where_clause.push_str(CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE);
+    } else {
+        where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
+    }
     let mut id_predicates = Vec::new();
     if let Some(item_ids) = item_ids
         && !item_ids.is_empty()
@@ -2747,6 +2773,39 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
     )
 )";
 
+const CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
+ AND (
+    (mi.item_type = 'VIDEO' AND mi.has_available_source = 1)
+    OR (
+        mi.item_type = 'FOLDER'
+        AND EXISTS (
+            WITH RECURSIVE folder_descendants(id) AS (
+                SELECT child.id
+                FROM media_items child
+                WHERE child.parent_id = mi.id
+                  AND child.item_type = 'FOLDER'
+                  AND child.removed_at IS NULL
+                  AND child.merged_into_item_id IS NULL
+                UNION
+                SELECT child.id
+                FROM media_items child
+                JOIN folder_descendants parent ON child.parent_id = parent.id
+                WHERE child.item_type = 'FOLDER'
+                  AND child.removed_at IS NULL
+                  AND child.merged_into_item_id IS NULL
+            )
+            SELECT 1
+            FROM media_items visible_descendant
+            WHERE (visible_descendant.parent_id = mi.id
+                   OR visible_descendant.parent_id IN (SELECT id FROM folder_descendants))
+              AND visible_descendant.item_type = 'VIDEO'
+              AND visible_descendant.removed_at IS NULL
+              AND visible_descendant.merged_into_item_id IS NULL
+              AND visible_descendant.has_available_source = 1
+        )
+    )
+)";
+
 fn resume_runtime_ticks_sql() -> &'static str {
     "COALESCE(
         NULLIF(mi.runtime_ticks, 0),
@@ -2824,6 +2883,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) is_favorite: Option<bool>,
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
+    pub(crate) parent_id_scope: Option<Option<&'a str>>,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,

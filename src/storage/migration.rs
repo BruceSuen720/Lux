@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) async fn remove_sqlite_title_year_unique(
+pub(super) async fn migrate_sqlite_catalog_constraints(
     pool: &AnyPool,
     path: &Path,
 ) -> Result<(), StorageError> {
@@ -23,7 +23,31 @@ pub(super) async fn remove_sqlite_title_year_unique(
         path: path.to_path_buf(),
         source,
     })?;
-    if has_legacy_unique == 0 {
+    let library_schema = sqlx::query_scalar::<_, String>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'libraries'",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let media_item_schema = sqlx::query_scalar::<_, String>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_items'",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let needs_library_type_upgrade = library_schema
+        .as_deref()
+        .is_some_and(|schema| !schema.contains("'HOMEVIDEOS'"));
+    let needs_media_item_type_upgrade = media_item_schema
+        .as_deref()
+        .is_some_and(|schema| !schema.contains("'VIDEO'"));
+    if has_legacy_unique == 0 && !needs_library_type_upgrade && !needs_media_item_type_upgrade {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_media_items_people_visible
              ON media_items(library_id, id)
@@ -65,6 +89,45 @@ pub(super) async fn remove_sqlite_title_year_unique(
                 source,
             })?;
         let statements = [
+            "CREATE TABLE libraries_new (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('MOVIE', 'SERIES', 'MIXED', 'HOMEVIDEOS')),
+                is_enabled INTEGER NOT NULL DEFAULT 1 CHECK (is_enabled IN (0, 1)),
+                realtime_watch_enabled INTEGER NOT NULL DEFAULT 0 CHECK (realtime_watch_enabled IN (0, 1)),
+                incremental_schedule TEXT,
+                reconciliation_schedule TEXT,
+                metadata_schedule TEXT,
+                scan_concurrency INTEGER NOT NULL DEFAULT 2 CHECK (scan_concurrency > 0),
+                probe_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (probe_concurrency > 0),
+                last_scan_at INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                scraper_id TEXT,
+                cover_image_path TEXT,
+                cover_image_content_type TEXT,
+                cover_image_size INTEGER,
+                cover_image_tag TEXT,
+                media_strategy_json TEXT,
+                realtime_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 0 CHECK (realtime_metadata_auto_match_enabled IN (0, 1)),
+                chapter_source_id TEXT
+            )",
+            "INSERT INTO libraries_new (
+                id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
+                reconciliation_schedule, metadata_schedule, scan_concurrency, probe_concurrency,
+                last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
+                cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
+                realtime_metadata_auto_match_enabled, chapter_source_id
+             )
+             SELECT
+                id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
+                reconciliation_schedule, metadata_schedule, scan_concurrency, probe_concurrency,
+                last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
+                cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
+                realtime_metadata_auto_match_enabled, chapter_source_id
+             FROM libraries",
+            "DROP TABLE libraries",
+            "ALTER TABLE libraries_new RENAME TO libraries",
             "DROP TRIGGER IF EXISTS media_items_search_ai",
             "DROP TRIGGER IF EXISTS media_items_search_au",
             "DROP TRIGGER IF EXISTS media_items_search_ad",
@@ -77,7 +140,7 @@ pub(super) async fn remove_sqlite_title_year_unique(
             "CREATE TABLE media_items_new (
                 id TEXT PRIMARY KEY NOT NULL,
                 library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
-                item_type TEXT NOT NULL CHECK (item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'BOX_SET', 'FOLDER', 'UNRESOLVED')),
+                item_type TEXT NOT NULL CHECK (item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'BOX_SET', 'FOLDER', 'UNRESOLVED', 'VIDEO')),
                 parent_id TEXT,
                 series_id TEXT,
                 season_number INTEGER,
@@ -146,14 +209,30 @@ pub(super) async fn remove_sqlite_title_year_unique(
             "CREATE INDEX idx_media_items_library_type_visible
              ON media_items(library_id, item_type, id)
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_added_visible
+             ON media_items(library_id, added_at DESC, sort_title, id)
+             WHERE removed_at IS NULL
+               AND item_type <> 'FOLDER'
+               AND has_available_source = 1",
+            "CREATE INDEX idx_media_items_parent_available
+             ON media_items(parent_id, removed_at, has_available_source)",
+            "CREATE INDEX idx_media_items_series_available
+             ON media_items(series_id, removed_at, has_available_source)",
             "CREATE INDEX idx_media_items_people_visible
              ON media_items(library_id, id)
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_home_unavailable_series
+             ON media_items(library_id, added_at DESC, sort_title, id)
+             WHERE removed_at IS NULL
+               AND item_type = 'SERIES'
+               AND has_available_source = 0",
             "CREATE INDEX idx_media_items_merged_into
              ON media_items(merged_into_item_id)",
             "CREATE INDEX idx_media_items_migration_title
              ON media_items(item_type, sort_title, production_year, library_id, id)
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_updated_at
+             ON media_items(updated_at, id)",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
                 VALUES (

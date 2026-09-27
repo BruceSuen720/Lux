@@ -23,6 +23,8 @@ export type DatabaseSetupInput =
       sslMode: "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
     };
 
+export type LibraryKind = "MOVIE" | "SERIES" | "MIXED" | "HOMEVIDEOS";
+
 export type LuxUser = {
   id: string;
   usernameNormalized: string;
@@ -77,7 +79,7 @@ export type AdminApiKey = {
 export type Library = {
   id: string;
   name: string;
-  kind: "MOVIE" | "SERIES" | "MIXED" | string;
+  kind: LibraryKind;
   coverImageUrl?: string | null;
   itemCount?: number;
   latest?: MediaItem[];

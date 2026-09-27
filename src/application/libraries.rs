@@ -31,6 +31,12 @@ const MAX_PROBE_CONCURRENCY: i64 = MAX_EFFECTIVE_PROBE_CONCURRENCY as i64;
 const MAX_SCHEDULE_LENGTH: usize = 128;
 const MAX_LIBRARY_SCRAPERS: usize = 16;
 
+#[derive(Debug)]
+struct NormalizedScraperSettings {
+    scraper_id: Option<Option<String>>,
+    scrapers: Option<Vec<LibraryScraper>>,
+}
+
 #[derive(Clone)]
 pub struct LibraryChangeNotifier {
     sender: watch::Sender<u64>,
@@ -170,6 +176,9 @@ impl LibraryService {
             return Err(LibraryServiceError::InvalidName);
         }
         let scrapers = normalize_scrapers(requested_scrapers)?;
+        if !kind.supports_scrapers() && !scrapers.is_empty() {
+            return Err(LibraryServiceError::InvalidScraperId);
+        }
         let scraper_id = scrapers.first().map(|scraper| scraper.scraper_id.as_str());
         let chapter_source_id = normalize_chapter_source_id(chapter_source_id)?;
         if chapter_source_id.is_some() && !kind.supports_chapter_source() {
@@ -366,12 +375,6 @@ impl LibraryService {
             .transpose()?;
         let requested_kind = settings.kind;
         let kind = requested_kind.map(LibraryKind::as_str);
-        let scraper_id = normalize_scraper_patch(settings.scraper_id)?;
-        let scrapers = settings
-            .scrapers
-            .as_deref()
-            .map(normalize_scrapers)
-            .transpose()?;
         let mut chapter_source_id = normalize_chapter_source_patch(settings.chapter_source_id)?;
         let current = self
             .database
@@ -383,6 +386,16 @@ impl LibraryService {
             .parse::<LibraryKind>()
             .map_err(|error| LibraryServiceError::InvalidKind(error.to_string()))?;
         let effective_kind = requested_kind.unwrap_or(current_kind);
+        let scraper_id = normalize_scraper_patch(settings.scraper_id)?;
+        let scrapers = settings
+            .scrapers
+            .as_deref()
+            .map(normalize_scrapers)
+            .transpose()?;
+        let NormalizedScraperSettings {
+            scraper_id,
+            scrapers,
+        } = normalize_scraper_settings_for_kind(effective_kind, scraper_id, scrapers)?;
         if chapter_source_id
             .as_ref()
             .is_some_and(|value| value.is_some())
@@ -796,6 +809,28 @@ fn normalize_scrapers(
     Ok(normalized)
 }
 
+fn normalize_scraper_settings_for_kind(
+    kind: LibraryKind,
+    scraper_id: Option<Option<String>>,
+    scrapers: Option<Vec<LibraryScraper>>,
+) -> Result<NormalizedScraperSettings, LibraryServiceError> {
+    if kind.supports_scrapers() {
+        return Ok(NormalizedScraperSettings {
+            scraper_id,
+            scrapers,
+        });
+    }
+    if scraper_id.as_ref().is_some_and(Option::is_some)
+        || scrapers.as_ref().is_some_and(|values| !values.is_empty())
+    {
+        return Err(LibraryServiceError::InvalidScraperId);
+    }
+    Ok(NormalizedScraperSettings {
+        scraper_id: Some(None),
+        scrapers: Some(Vec::new()),
+    })
+}
+
 fn normalize_chapter_source_id(value: Option<&str>) -> Result<Option<String>, LibraryServiceError> {
     value
         .map(str::trim)
@@ -932,4 +967,32 @@ fn stored_library_root(
         unavailable_since: stored.unavailable_since,
         scan_cursor: stored.scan_cursor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LibraryKind, LibraryScraper, LibraryScraperRole, LibraryServiceError,
+        normalize_scraper_settings_for_kind,
+    };
+
+    #[test]
+    fn homevideos_library_settings_clear_old_scrapers_and_reject_new_ones() {
+        let settings = normalize_scraper_settings_for_kind(LibraryKind::HomeVideos, None, None)
+            .expect("changing to HOMEVIDEOS clears existing scraper settings");
+        assert_eq!(settings.scraper_id, Some(None));
+        assert_eq!(settings.scrapers, Some(Vec::new()));
+
+        let error = normalize_scraper_settings_for_kind(
+            LibraryKind::HomeVideos,
+            None,
+            Some(vec![LibraryScraper {
+                scraper_id: "tmdb".to_owned(),
+                position: 0,
+                role: LibraryScraperRole::Primary,
+            }]),
+        )
+        .expect_err("HOMEVIDEOS cannot accept a scraper");
+        assert!(matches!(error, LibraryServiceError::InvalidScraperId));
+    }
 }

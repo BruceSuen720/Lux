@@ -60,6 +60,7 @@ export function MediaDetailPage() {
   const isSeries = item.data?.itemType === "SERIES";
   const isSeason = item.data?.itemType === "SEASON";
   const isEpisode = item.data?.itemType === "EPISODE";
+  const isVideo = item.data?.itemType === "VIDEO";
   const seasons = useQuery({
     queryKey: queryKeys.children(itemId, "SEASON"),
     queryFn: () => api.children(itemId, { itemType: "SEASON" }),
@@ -131,7 +132,7 @@ export function MediaDetailPage() {
     ?? imageUrl(media)
     ?? (seriesImageFallback ? imageUrl(seriesImageFallback, "fanart") ?? imageUrl(seriesImageFallback) : undefined);
   const poster = posterUrlWithFallback(media, seriesImageFallback);
-  const detailKind = isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
+  const detailKind = isVideo ? "video" : isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
   const detailTitle = isSeries || (!isSeason && !isEpisode)
     ? mediaTitle(media)
     : mediaTitle(seriesContext.data ?? media);
@@ -287,6 +288,7 @@ export function MediaDetailPage() {
               {detailSubtitle ? <p className="lux-detail-subtitle">{detailSubtitle}</p> : null}
             </div>
             <div className="lux-detail-meta">
+              {isVideo ? <span>其他视频</span> : null}
               {premiereDate
                 ? <span>首播 {premiereDate}</span>
                 : media.productionYear

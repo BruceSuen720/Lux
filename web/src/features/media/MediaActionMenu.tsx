@@ -63,6 +63,8 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const title = item.title || item.name || "媒体";
+  const isFolder = item.itemType === "FOLDER";
+  const isVideo = item.itemType === "VIDEO";
   const posterUrl = item.imageTags?.poster
     ? `/api/v1/items/${encodeURIComponent(item.id)}/images/poster`
     : undefined;
@@ -107,6 +109,8 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
       window.removeEventListener("scroll", updatePosition, true);
     };
   }, [open]);
+
+  if (isFolder) return null;
 
   return (
     <div ref={rootRef} className={`lux-media-actions ${className}`.trim()}>
@@ -199,7 +203,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               <span>删除</span>
             </button>
           ) : null}
-          {onIdentify ? (
+          {onIdentify && !isVideo ? (
             <button
               className="lux-media-action"
               data-action="identify"
@@ -214,7 +218,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               <span>元数据匹配</span>
             </button>
           ) : null}
-          {onRefreshMetadata ? (
+          {onRefreshMetadata && !isVideo ? (
             <button
               className="lux-media-action"
               data-action="refresh-metadata"

@@ -43,6 +43,53 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.restoreAllMocks();
   });
 
+  it("presents HomeVideos entries as regular videos with playback, NFO, and manual metadata editing", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "video-1",
+      title: "家庭聚会",
+      itemType: "VIDEO",
+      overview: "本地视频简介",
+      nfo: { tagline: "家庭录像" },
+      mediaSources: [{ id: "source-1", sourceKind: "LOCAL_FILE", container: "mp4", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "itemMetadata").mockResolvedValue({ title: "家庭聚会", lockedFields: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/video-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-detail-page-video")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("家庭聚会");
+    expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("其他视频");
+    expect(container.querySelector(".lux-hero-actions a")?.getAttribute("href")).toBe("/watch/video-1?sourceId=source-1");
+    expect(container.querySelector(".lux-media-nfo-tagline")?.textContent).toContain("家庭录像");
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-detail-inline-menu .lux-media-actions-trigger")?.click());
+    expect(document.body.querySelector("[data-action=edit-metadata]")).not.toBeNull();
+    await act(async () => document.body.querySelector<HTMLElement>("[data-action=edit-metadata]")?.click());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector(".lux-metadata-editor[role=dialog]")).not.toBeNull();
+  });
+
   it("shows portrait season cards on a multi-season detail", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "series-1",

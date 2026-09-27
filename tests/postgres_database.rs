@@ -134,7 +134,8 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 149);
+    assert_eq!(database.schema_version().await?, 150);
+    insert_postgres_homevideos_video(&database).await?;
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -672,7 +673,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 149);
+    assert_eq!(database.schema_version().await?, 150);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -1895,5 +1896,127 @@ async fn postgres_unixepoch_uses_statement_time_and_is_parallel_safe()
         "unixepoch should advance between statements in one transaction"
     );
     assert!(matches_statement_time);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_homevideos_video_type_migration_preserves_existing_data()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let source_migrations =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    let old_migrations = temp_dir.path().join("migrations-v149");
+    fs::create_dir(&old_migrations)?;
+    for entry in fs::read_dir(source_migrations)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let migration_name = name.to_str().ok_or("migration name is not UTF-8")?;
+        let version = migration_name
+            .split_once('_')
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration name has no version")?;
+        if version <= 149 {
+            fs::copy(entry.path(), old_migrations.join(name))?;
+        }
+    }
+
+    let migration_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    sqlx::migrate::Migrator::new(old_migrations.as_path())
+        .await?
+        .run(&migration_pool)
+        .await?;
+    let library_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind, scraper_id)
+         VALUES ($1, 'Existing Mixed', 'MIXED', 'tmdb')",
+    )
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+         VALUES ($1, 'tmdb', 0, 'PRIMARY')",
+    )
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ($1, $2, '/media', '/media', 1, 1)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    let old_item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ($1, $2, 'MOVIE', 'Existing Movie', 'existing movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&old_item_id)
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    migration_pool.close().await;
+
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    assert_eq!(database.schema_version().await?, 150);
+    let existing_library_kind: String =
+        sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await?;
+    let existing_item_type: String =
+        sqlx::query_scalar("SELECT item_type FROM media_items WHERE id = $1")
+            .bind(&old_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let existing_scrapers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM library_scrapers WHERE library_id = $1 AND scraper_id = 'tmdb'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(existing_library_kind, "MIXED");
+    assert_eq!(existing_item_type, "MOVIE");
+    assert_eq!(existing_scrapers, 1);
+    insert_postgres_homevideos_video(&database).await?;
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+async fn insert_postgres_homevideos_video(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_id = Uuid::now_v7().to_string();
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ($1, 'Home videos', 'HOMEVIDEOS')")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ($1, $2, 'VIDEO', 'Clip', 'clip', 'LOCAL_CONFIRMED')",
+    )
+    .bind(item_id)
+    .bind(library_id)
+    .execute(database.pool())
+    .await?;
     Ok(())
 }

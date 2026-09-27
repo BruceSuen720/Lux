@@ -831,7 +831,7 @@ fn library_kind_subtitle(kind: &str) -> &'static str {
         Ok(LibraryKind::Movie) => "Movies",
         Ok(LibraryKind::Series) => "Series",
         Ok(LibraryKind::Mixed) => "Mixed",
-        Err(_) => "Media",
+        _ => "Media",
     }
 }
 

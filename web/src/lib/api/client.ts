@@ -42,6 +42,7 @@ import type {
   ChapterSource,
   ApiErrorBody,
   DatabaseSetupInput,
+  LibraryKind,
   HomeResponse,
   UserLibraryOrder,
   Library,
@@ -81,6 +82,7 @@ export type LibraryItemsOptions = {
   sortOrder?: LibrarySortOrder;
   metadataStatus?: "PENDING";
   pageSize?: number;
+  parentId?: string;
 };
 
 export type AdminDirectoryEntry = {
@@ -242,7 +244,7 @@ export class LuxApiClient {
     displayName?: string;
     password: string;
     libraryName?: string;
-    libraryKind?: string;
+    libraryKind?: LibraryKind;
     libraryRoot?: string;
   }) {
     return this.request<{ user: LuxUser }>("/api/v1/setup/complete", {
@@ -350,6 +352,7 @@ export class LuxApiClient {
     if (options.sortBy) params.set("sortBy", options.sortBy);
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
+    if (options.parentId) params.set("parentId", options.parentId);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );

@@ -103,6 +103,31 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector(".lux-continue-copy small")?.textContent).toBe("示例剧集");
   });
 
+  it("shows HomeVideos progress and opens the video player from continue watching", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <ContinueWatchingRail items={[{
+            id: "video-continue",
+            title: "家庭录像",
+            itemType: "VIDEO",
+            runtimeTicks: 6_000_000_000,
+            userData: { positionTicks: 2_400_000_000 },
+          }]} />
+        </MemoryRouter>,
+      );
+    });
+
+    const card = container.querySelector<HTMLAnchorElement>(".lux-continue-card");
+    expect(card?.getAttribute("href")).toBe("/watch/video-continue");
+    expect(card?.querySelector(".lux-continue-copy small")?.textContent).toBe("其他视频");
+    expect(card?.querySelector(".lux-progress span")?.getAttribute("style")).toContain("width: 40%");
+  });
+
   it("shows latest media ratings as numeric TMDb-blue pills", () => {
     container = document.createElement("div");
     document.body.append(container);

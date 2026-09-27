@@ -11,11 +11,17 @@ export function prefetchLibraryPage(queryClient: QueryClient, library: Library) 
       : library.kind === "MIXED"
         ? "MOVIE,SERIES"
         : undefined;
+  const parentId = library.kind === "HOMEVIDEOS" ? "root" : undefined;
   const sortBy: LibrarySortBy = "Name";
   const sortOrder: LibrarySortOrder = "Ascending";
+  const libraryQueryKey = queryKeys.library(library.id, 1, itemTypes, sortBy, sortOrder, "all");
   return queryClient.prefetchInfiniteQuery({
-    queryKey: queryKeys.library(library.id, 1, itemTypes, sortBy, sortOrder, "all"),
-    queryFn: ({ pageParam }) => api.libraryItems(library.id, pageParam, itemTypes, { sortBy, sortOrder }),
+    queryKey: parentId ? [...libraryQueryKey, parentId] : libraryQueryKey,
+    queryFn: ({ pageParam }) => api.libraryItems(library.id, pageParam, itemTypes, {
+      sortBy,
+      sortOrder,
+      ...(parentId ? { parentId } : {}),
+    }),
     initialPageParam: 1,
     getNextPageParam: (lastPage: PageResponse<MediaItem>) => {
       const page = lastPage.page ?? 1;
