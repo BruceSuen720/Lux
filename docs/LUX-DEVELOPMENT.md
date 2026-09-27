@@ -2163,7 +2163,7 @@ services:
 | LUX-284 | src/application/catalog.rs、src/storage/repository.rs、src/storage/repository_tests.rs；目录范围查询过滤 |
 | LUX-285 | src/api/media.rs、src/storage/repository.rs、tests/catalog.rs；Lux API 分页列出根目录和 FOLDER 子项 |
 | LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts、web/tests/api-client.test.ts、web/tests/search-and-filmography.test.tsx；其他视频目录浏览与搜索 |
-| LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/home/media.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx；视频详情、手动编辑与播放 |
+| LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx、web/tests/home-media.test.tsx；视频详情、手动编辑与播放 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7010,13 +7010,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-287：VIDEO 详情、编辑与播放
 
-- [ ] VIDEO 详情明确显示普通视频信息，保留现有详情、元数据编辑与 NFO 入口。
-- [ ] 从其他视频库可播放 VIDEO；进度条和继续观看卡片按普通视频呈现。
-- [ ] 文件夹与普通视频有清晰且正确的交互，文件夹不显示播放/编辑动作。
+- [x] VIDEO 详情明确显示普通视频信息，保留现有详情、元数据编辑与 NFO 入口。
+- [x] 从其他视频库可播放 VIDEO；进度条和继续观看卡片按普通视频呈现。
+- [x] 文件夹与普通视频有清晰且正确的交互，文件夹不显示播放/编辑动作。
 
 依赖：LUX-279、LUX-280、LUX-286。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web test -- media-action-menu`、`pnpm --dir web build`。
 
-预计文件：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/home/media.tsx`、`web/src/features/media/MediaActionMenu.tsx`、`web/tests/media-detail.test.tsx`、`web/tests/media-action-menu.test.tsx`。
+预计文件：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/media/MediaActionMenu.tsx`、`web/tests/media-detail.test.tsx`、`web/tests/media-action-menu.test.tsx`、`web/tests/home-media.test.tsx`。
+
+结果（2026-09-28）：VIDEO 详情显示“其他视频”类型并使用普通详情布局，现有播放、手动元数据编辑和 NFO 面板均可用。动作菜单保留普通编辑和文件操作，同时隐藏在线匹配/刷新；FOLDER 不渲染动作菜单。继续观看卡片覆盖 VIDEO 的普通播放器链接、类型标签和 40% 进度条。定向测试 44 项通过；`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`（75 个 Vitest 文件、525 项；Node 样式测试 107 项）及 `pnpm --dir web build` 均通过。测试输出包含现有 jsdom `HTMLMediaElement.load/pause` 告警；构建保留 Vite 对现有 HLS 大 chunk 的提示。
 
 ## 26. 风险与缓解
 
