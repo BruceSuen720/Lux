@@ -2162,7 +2162,7 @@ services:
 | LUX-283 | web/src/lib/api/types.ts、web/src/features/admin/AdminLibrariesPage.tsx、web/tests/admin-libraries.test.tsx；管理界面类型与刮削器配置 |
 | LUX-284 | src/application/catalog.rs、src/storage/repository.rs、src/storage/repository_tests.rs；目录范围查询过滤 |
 | LUX-285 | src/api/media.rs、src/storage/repository.rs、tests/catalog.rs；Lux API 分页列出根目录和 FOLDER 子项 |
-| LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts；其他视频目录浏览与搜索 |
+| LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts、web/tests/api-client.test.ts、web/tests/search-and-filmography.test.tsx；其他视频目录浏览与搜索 |
 | LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/home/media.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx；视频详情、手动编辑与播放 |
 
 ### 阶段 0：仓库和工程纪律
@@ -6998,13 +6998,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-286：Web 目录浏览与搜索
 
-- [ ] 其他视频库默认列出根目录条目；选择 FOLDER 进入下一层，并能返回父目录。
-- [ ] VIDEO 出现在库搜索结果中，文件夹不会作为可播放媒体显示。
-- [ ] 浏览列表保持现有分页、排序、空状态与权限行为。
+- [x] 其他视频库默认列出根目录条目；选择 FOLDER 进入下一层，并能返回父目录。
+- [x] VIDEO 出现在库搜索结果中，文件夹不会作为可播放媒体显示。
+- [x] 浏览列表保持现有分页、排序、空状态与权限行为。
 
 依赖：LUX-281、LUX-283、LUX-285。验证：`pnpm --dir web test -- library-page`、`pnpm --dir web build`。
 
-预计文件：`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/src/lib/api/client.ts`、`web/src/features/home/media.tsx`、`web/tests/library-page.test.ts`。
+预计文件：`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/src/lib/api/client.ts`、`web/src/features/home/media.tsx`、`web/tests/library-page.test.ts`、`web/tests/api-client.test.ts`、`web/tests/search-and-filmography.test.tsx`。
+
+结果（2026-09-28）：HOMEVIDEOS 初始查询 `parentId=root`，目录链接通过 URL 保存目录路径，支持多层进入和逐级返回；父目录参与 TanStack Query 缓存键，避免目录间缓存串用。目录卡片使用文件夹图标且没有播放、编辑和待确认操作；VIDEO 继续链接到详情并在全局搜索标为“其他视频”。`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test -- library-page`（75 个 Vitest 文件、521 项；Node 样式测试 107 项）及 `pnpm --dir web build` 均通过。构建保留 Vite 对现有 HLS 大 chunk 的提示。
 
 #### LUX-287：VIDEO 详情、编辑与播放
 
