@@ -6949,12 +6949,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-282：初始化时选择其他视频库
 
-- [ ] 初始化的可选首个媒体库类型加入“其他视频”，提交 `HOMEVIDEOS`。
-- [ ] 初始化页面的其余默认行为保持不变。
+- [x] 初始化的可选首个媒体库类型加入“其他视频”，提交 `HOMEVIDEOS`。
+- [x] 初始化页面的其余默认行为保持不变。
 
 依赖：LUX-276。验证：`pnpm --dir web test -- setup-page`、`pnpm --dir web build`。
 
-预计文件：`web/src/features/auth/AdminSetupForm.tsx`、`web/src/lib/api/types.ts`、`web/src/app.mjs`、`web/tests/setup-page.test.tsx`。
+预计文件：`web/src/features/auth/AdminSetupForm.tsx`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/app.mjs`、`web/tests/setup-page.test.tsx`。
+
+结果（2026-09-28）：React 初始化表单和旧版初始化表单都提供“其他视频”，默认类型仍为 `MIXED`；API 输入使用 `LibraryKind` 联合类型，并将选择值提交为 `HOMEVIDEOS`。`pnpm --dir web test -- setup-page` 与 `pnpm --dir web test` 均通过（75 个 Vitest 文件、516 项；Node 样式测试 107 项），`pnpm --dir web build` 通过。构建保留 Vite 对现有 HLS 产物超过 500 kB 的提示。
 
 #### LUX-283：管理界面创建/编辑其他视频库
 
