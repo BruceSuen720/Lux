@@ -160,7 +160,7 @@ struct ManifestDiscoveryDirectoryResult {
 
 #[derive(Default)]
 struct LiteManifestDiscoverySession {
-    directories: VecDeque<(String, String)>,
+    directories: VecDeque<(String, String, bool)>,
 }
 
 enum PreparedManifestFile {
@@ -215,6 +215,7 @@ struct ManifestRootDiscoveryContext<'a> {
     root: &'a StoredLibraryRoot,
     cancellation: &'a AtomicBool,
     stream_files_during_discovery: bool,
+    skip_baseline_queries: bool,
     library_kind: &'a str,
     preparation_concurrency: usize,
     expected_root_identity: Option<(i64, i64)>,
@@ -4625,7 +4626,13 @@ impl ScanJobService {
             if matches!(state.as_deref(), Some("COMPLETE" | "UNAVAILABLE")) {
                 continue;
             }
-            session.directories.push_back((root_id, String::new()));
+            let has_filesystem_entries = self
+                .database
+                .scan_manifest_root_has_filesystem_entries(&root_id)
+                .await?;
+            session
+                .directories
+                .push_back((root_id, String::new(), has_filesystem_entries));
         }
         let mut sessions = match self.lite_manifest_discovery.lock() {
             Ok(sessions) => sessions,
@@ -4639,7 +4646,7 @@ impl ScanJobService {
         &self,
         manifest_id: &str,
         limit: usize,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<(String, String, bool)> {
         let mut sessions = match self.lite_manifest_discovery.lock() {
             Ok(sessions) => sessions,
             Err(poisoned) => poisoned.into_inner(),
@@ -4661,6 +4668,7 @@ impl ScanJobService {
         &self,
         manifest_id: &str,
         root_id: &str,
+        has_filesystem_entries: bool,
         directories: impl IntoIterator<Item = String>,
     ) {
         let mut sessions = match self.lite_manifest_discovery.lock() {
@@ -4673,7 +4681,7 @@ impl ScanJobService {
         session.directories.extend(
             directories
                 .into_iter()
-                .map(|directory| (root_id.to_owned(), directory)),
+                .map(|directory| (root_id.to_owned(), directory, has_filesystem_entries)),
         );
     }
 
@@ -4685,7 +4693,7 @@ impl ScanJobService {
         if let Some(session) = sessions.get_mut(manifest_id) {
             session
                 .directories
-                .retain(|(queued_root_id, _)| queued_root_id != root_id);
+                .retain(|(queued_root_id, _, _)| queued_root_id != root_id);
         }
     }
 
@@ -5387,6 +5395,7 @@ impl ScanJobService {
             library_kind,
             preparation_concurrency,
             expected_root_identity,
+            ..
         } = context;
         if cancellation.load(Ordering::Acquire) {
             return Ok(None);
@@ -6078,6 +6087,7 @@ impl ScanJobService {
             root,
             cancellation,
             stream_files_during_discovery,
+            skip_baseline_queries,
             library_kind,
             preparation_concurrency,
             expected_root_identity,
@@ -6089,13 +6099,14 @@ impl ScanJobService {
             .map(|entry| entry.relative_path.clone())
             .collect::<Vec<_>>();
         let baseline_started = Instant::now();
-        let baselines = if stream_files_during_discovery && !file_paths.is_empty() {
-            self.database
-                .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
-                .await?
-        } else {
-            HashMap::new()
-        };
+        let baselines =
+            if stream_files_during_discovery && !skip_baseline_queries && !file_paths.is_empty() {
+                self.database
+                    .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
+                    .await?
+            } else {
+                HashMap::new()
+            };
         record_manifest_scan_stage(
             "baseline_query",
             baseline_started,
@@ -6309,11 +6320,12 @@ impl ScanJobService {
             ))
             .await
             .max(1);
-        let mut directories_by_root = BTreeMap::<String, Vec<String>>::new();
-        for (root_id, relative_directory) in directories {
+        let mut directories_by_root = BTreeMap::<String, (bool, Vec<String>)>::new();
+        for (root_id, relative_directory, has_filesystem_entries) in directories {
             directories_by_root
                 .entry(root_id)
-                .or_default()
+                .or_insert_with(|| (has_filesystem_entries, Vec::new()))
+                .1
                 .push(relative_directory);
         }
         let roots_by_id = self
@@ -6323,7 +6335,7 @@ impl ScanJobService {
         let mut discovered_count = job.total_count;
         let mut created_items = 0_usize;
 
-        for (root_id, relative_directories) in directories_by_root {
+        for (root_id, (has_filesystem_entries, relative_directories)) in directories_by_root {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;
             }
@@ -6345,6 +6357,7 @@ impl ScanJobService {
                 root: &root,
                 cancellation,
                 stream_files_during_discovery: true,
+                skip_baseline_queries: !has_filesystem_entries,
                 library_kind: &library.kind,
                 preparation_concurrency,
                 expected_root_identity,
@@ -6361,6 +6374,7 @@ impl ScanJobService {
                     self.push_lite_manifest_directories(
                         manifest_id,
                         &root_id,
+                        has_filesystem_entries,
                         discovered.child_directories,
                     );
                     if !root.is_available {
@@ -6529,6 +6543,7 @@ impl ScanJobService {
                 root: &root,
                 cancellation,
                 stream_files_during_discovery,
+                skip_baseline_queries: false,
                 library_kind: &library_kind,
                 preparation_concurrency,
                 expected_root_identity,
@@ -12207,6 +12222,7 @@ mod tests {
                     root: &root,
                     cancellation: &cancellation,
                     stream_files_during_discovery: true,
+                    skip_baseline_queries: false,
                     library_kind: "MOVIE",
                     preparation_concurrency: 1,
                     expected_root_identity: root_observation.device.zip(root_observation.inode),
@@ -12235,6 +12251,7 @@ mod tests {
                     root: &root,
                     cancellation: &cancellation,
                     stream_files_during_discovery: true,
+                    skip_baseline_queries: false,
                     library_kind: "MOVIE",
                     preparation_concurrency: 1,
                     expected_root_identity: root_observation.device.zip(root_observation.inode),

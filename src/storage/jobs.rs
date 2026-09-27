@@ -3349,6 +3349,21 @@ impl Database {
         Ok(baselines)
     }
 
+    pub(crate) async fn scan_manifest_root_has_filesystem_entries(
+        &self,
+        library_root_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query("SELECT 1 FROM filesystem_entries WHERE library_root_id = ? LIMIT 1")
+            .bind(library_root_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.is_some())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn list_scan_manifest_removal_candidates(
         &self,
         manifest_id: &str,
@@ -9782,6 +9797,50 @@ mod tests {
         NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
+
+    #[tokio::test]
+    async fn scan_manifest_root_baseline_probe_detects_first_file_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        assert!(
+            !database
+                .scan_manifest_root_has_filesystem_entries("root")
+                .await?
+        );
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES ('entry', 'root', 'Movie.2024.mkv', 'FILE', 1, 1, 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .scan_manifest_root_has_filesystem_entries("root")
+                .await?
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn scan_manifest_creation_is_atomic_and_idempotent()
