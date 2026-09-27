@@ -2160,8 +2160,10 @@ services:
 | LUX-281 | src/api/emby_catalog.rs、src/application/catalog.rs、src/storage/catalog.rs、tests/mixed_library_api.rs、tests/resume_favorites.rs、docs/COMPATIBILITY.md；Emby homevideos/Video 契约 |
 | LUX-282 | web/src/features/auth/AdminSetupForm.tsx、web/src/lib/api/types.ts、web/src/app.mjs、web/tests/setup-page.test.tsx；初始化媒体库类型选择 |
 | LUX-283 | web/src/lib/api/types.ts、web/src/features/admin/AdminLibrariesPage.tsx、web/tests/admin-libraries.test.tsx；管理界面类型与刮削器配置 |
-| LUX-284 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts；其他视频目录浏览与搜索 |
-| LUX-285 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/home/media.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx；视频详情、手动编辑与播放 |
+| LUX-284 | src/application/catalog.rs、src/storage/repository.rs、src/storage/catalog.rs、src/storage/repository_tests.rs；目录范围查询过滤 |
+| LUX-285 | src/api/media.rs、tests/catalog.rs；Lux API 分页列出根目录和 FOLDER 子项 |
+| LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts；其他视频目录浏览与搜索 |
+| LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/home/media.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx；视频详情、手动编辑与播放 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6969,23 +6971,45 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：`Library.kind` 使用 `LibraryKind` 联合类型；管理界面的创建/编辑选择器和媒体库卡片显示“其他视频”。HOMEVIDEOS 不显示刮削器列表和实时自动刮削开关；创建提交 `scrapers: []`、关闭实时自动刮削，编辑保存也清空刮削器并关闭该开关。电影、剧集和混合库沿用原配置行为。`pnpm --dir web test -- admin-libraries` 通过（75 个 Vitest 文件、519 项；Node 样式测试 107 项），`pnpm --dir web build` 通过；构建保留现有 HLS 大 chunk 提示。
 
-#### LUX-284：Web 目录浏览与搜索
+#### LUX-284：媒体目录范围过滤
+
+- [x] Catalog 查询支持“不限目录”“根目录”“指定父条目”三种范围，并在数据库分页前过滤。
+- [x] 根目录查询包含 `parent_id IS NULL` 的根文件和 `parent_id = library_id` 的根文件夹。
+- [x] 现有不指定目录范围的查询保持原行为。
+
+依赖：LUX-280。验证：`cargo test --locked --lib catalog_filter_parent_scope`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+文件：`src/application/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+结果（2026-09-28）：Catalog 服务新增可选根目录/父条目范围，并把范围纳入分页缓存键；存储查询在分页前应用条件。测试覆盖根目录分页、嵌套目录结果和未指定范围时的既有全库结果。定向 Rust 测试、格式检查和全目标 Clippy 均通过。实现未修改 `src/storage/catalog.rs`，因为现有仓储查询路径已能承载条件。
+
+#### LUX-285：Lux API 按目录分页浏览
+
+- [ ] 库条目 API 支持根目录范围，只返回根目录 FOLDER 和 VIDEO。
+- [ ] 传入 FOLDER 的 `parentId` 时只返回该目录下的 FOLDER/VIDEO 子项。
+- [ ] 保留服务端分页、排序、媒体库 ACL；跨库或无权父条目不泄漏子项。
+
+依赖：LUX-281、LUX-284。验证：`cargo test --locked --test catalog homevideo_catalog_folders_are_browsable`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/api/media.rs`、`tests/catalog.rs`。
+
+#### LUX-286：Web 目录浏览与搜索
 
 - [ ] 其他视频库默认列出根目录条目；选择 FOLDER 进入下一层，并能返回父目录。
 - [ ] VIDEO 出现在库搜索结果中，文件夹不会作为可播放媒体显示。
 - [ ] 浏览列表保持现有分页、排序、空状态与权限行为。
 
-依赖：LUX-281、LUX-283。验证：`pnpm --dir web test -- library-page`、`pnpm --dir web build`。
+依赖：LUX-281、LUX-283、LUX-285。验证：`pnpm --dir web test -- library-page`、`pnpm --dir web build`。
 
 预计文件：`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/src/lib/api/client.ts`、`web/src/features/home/media.tsx`、`web/tests/library-page.test.ts`。
 
-#### LUX-285：VIDEO 详情、编辑与播放
+#### LUX-287：VIDEO 详情、编辑与播放
 
 - [ ] VIDEO 详情明确显示普通视频信息，保留现有详情、元数据编辑与 NFO 入口。
 - [ ] 从其他视频库可播放 VIDEO；进度条和继续观看卡片按普通视频呈现。
 - [ ] 文件夹与普通视频有清晰且正确的交互，文件夹不显示播放/编辑动作。
 
-依赖：LUX-279、LUX-280、LUX-284。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web test -- media-action-menu`、`pnpm --dir web build`。
+依赖：LUX-279、LUX-280、LUX-286。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web test -- media-action-menu`、`pnpm --dir web build`。
 
 预计文件：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/home/media.tsx`、`web/src/features/media/MediaActionMenu.tsx`、`web/tests/media-detail.test.tsx`、`web/tests/media-action-menu.test.tsx`。
 
