@@ -1518,7 +1518,7 @@ async fn prepare_manifest_observation(
     let movie_folder_provider_ids = prepared_filename
         .as_ref()
         .filter(|prepared| matches!(prepared, PreparedManifestFilename::Movie(_)))
-        .and_then(|_| movie_folder_provider_ids_cache.as_ref())
+        .and(movie_folder_provider_ids_cache.as_ref())
         .map(|cache| cache.get_or_init(|| movie_folder_provider_ids(&path)));
     let prepared_file = if is_media {
         let Some(prepared_filename) = prepared_filename else {
@@ -1550,7 +1550,7 @@ async fn prepare_manifest_observation(
                     &observed,
                     manifest_strm_target,
                     parsed_name,
-                    movie_folder_provider_ids.as_deref(),
+                    movie_folder_provider_ids,
                 )
                 .await
                 .map(|file| file.map(PreparedManifestFile::Movie)),
@@ -12475,7 +12475,7 @@ mod tests {
             &root,
             &root_observation,
             &directory_observation,
-            &[file_observation.clone()],
+            std::slice::from_ref(&file_observation),
         )?;
         let current_file = current_files
             .into_iter()
