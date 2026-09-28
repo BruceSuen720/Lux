@@ -7152,7 +7152,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-291。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`、`cargo test --locked --lib storage::repository::repository_tests::postgres_progressive_scan_metadata_storage_contract -- --ignored`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
-预计文件：`src/storage/metadata.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-09-28）：SQLite 用例覆盖指纹换代时清除旧缺失、RUNNING 重启恢复、拒绝旧 worker CAS、READY missing 双页读取、失败/可用/取消状态过滤；真实 PostgreSQL 用例覆盖 bytea 指纹换代与恢复、旧结果 CAS、缺失读取及 LUX-291 outbox 操作。两个定向用例各 1 项通过；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。应用 worker 尚未接入，按后续任务实施。
 
