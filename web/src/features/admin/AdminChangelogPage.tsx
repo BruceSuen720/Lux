@@ -23,6 +23,8 @@ export const changelogReleases: ChangelogRelease[] = [
       ] },
       { kind: "changed", items: [
         "首页与 Emby Resume 的剧集续看条目按剧集收敛，只展示该剧集最近的未完成集；电影仍按单条媒体展示。",
+        "登录背景可选择 Bing 每日图片；TMDb 日榜图片以铺满登录页左侧的横幅形式展示。",
+        "PostgreSQL 扫描写事务使用事务局部异步提交，降低扫描提交等待；普通元数据事务和 SQLite 不变。异常退出可能丢失最近已确认的整笔扫描事务，需重新发起扫描。",
       ] },
       { kind: "fixed", items: [
         "修复登录页动态背景加载期间短暂闪现默认海报墙的问题；仅在动态背景不可用时显示回退背景。",
