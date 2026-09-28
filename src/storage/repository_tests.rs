@@ -1495,7 +1495,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .map(|(item_id, fingerprint)| NewItemMetadataCompletenessResult {
             item_id,
             capability: "STILL",
-            input_fingerprint: &fingerprint,
+            input_fingerprint: fingerprint,
             is_missing: true,
             checked_at: 12,
         })
