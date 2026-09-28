@@ -7302,15 +7302,17 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 生产 `ScanJobService` 获得现有 MetadataSelectionService；两类本地队列成功后均写能力状态，unsupported 类型安全跳过。
-- [ ] 图片/NFO 任一失败时不产生该页的 READY/missing 结果；完整输入版本变化时旧结果不能覆盖新检查。
-- [ ] poster 已有标为 available、仅 poster 缺失标为 missing；媒体字段按本地 NFO 与锁定规则判定，重复扫描不重置同版本 READY。
-- [ ] 本地缺失记录不会直接创建在线 job，worker 本身不调用 scraper。
-- [ ] SQLite 测试覆盖新 outbox 与 old-item backfill；PostgreSQL 存储合同复用 LUX-299 批量 claim/CAS。
+- [x] 生产 `ScanJobService` 获得现有 MetadataSelectionService；两类本地队列成功后均写能力状态，unsupported 类型安全跳过。
+- [x] 图片/NFO 任一失败时不产生该页的 READY/missing 结果；完整输入版本变化时旧结果不能覆盖新检查。
+- [x] poster 已有标为 available、仅 poster 缺失标为 missing；媒体字段按本地 NFO 与锁定规则判定，重复扫描不重置同版本 READY。
+- [x] 本地缺失记录不会直接创建在线 job，worker 本身不调用 scraper。
+- [x] SQLite 测试覆盖新 outbox 与 old-item backfill；PostgreSQL 存储合同复用 LUX-299 批量 claim/CAS。
 
 依赖：LUX-295、LUX-297、LUX-299、LUX-300。验证：`cargo test --locked --lib application::scanner::tests::local_metadata_worker_persists_capability_missing`、`cargo test --locked --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
 预计文件：`src/application/scanner.rs`、`src/api/legacy.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：生产 API startup 将现有 MetadataSelectionService 注入 local metadata worker；图片与 NFO 全部成功后，为每个支持条目批量 prepare/claim capability，再用 LUX-293 事务保存 READY/available 或 READY/missing，自动入队候选仍留空。真实旧资源 backfill 与 workflow 3 outbox 都有用例：poster 存在记为 available、METADATA 缺失写入 missing；NFO 故障期间没有 completeness READY，重试成功后才写入；未产生 FILL_MISSING job。`scanned_metadata` 11 项、`scanned_series_metadata` 2 项、scanner completeness 集成单测 1 项通过；`cargo build --locked`、fmt 与 all-target clippy 通过。P6 的独立自动调度由下一任务接线。
 
 #### 阶段 23 总体验收与阶段门
 

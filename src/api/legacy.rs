@@ -338,6 +338,10 @@ impl AppState {
                 .with_strm_probe(strm_probe.clone())
                 .with_people(people.clone())
                 .with_nfo_store(local_nfo.clone());
+            let service = match metadata_selection.clone() {
+                Some(selection) => service.with_metadata_selection(selection),
+                None => service,
+            };
             match webhooks.clone() {
                 Some(webhooks) => service.with_webhooks(webhooks),
                 None => service,
