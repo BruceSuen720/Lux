@@ -50,6 +50,7 @@ pub enum CatalogParentScope {
 pub enum CatalogSort {
     #[default]
     Name,
+    SortName,
     DateCreated,
     PremiereDate,
     Rating,
@@ -562,6 +563,7 @@ impl CatalogService {
             }),
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
+                CatalogSort::SortName => StorageCatalogSort::SortName,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
                 CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
                 CatalogSort::Rating => StorageCatalogSort::Rating,
@@ -608,6 +610,7 @@ impl CatalogService {
             parent_id_scope: None,
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
+                CatalogSort::SortName => StorageCatalogSort::SortName,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
                 CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
                 CatalogSort::Rating => StorageCatalogSort::Rating,
@@ -632,7 +635,33 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         parent_id: &str,
-        item_type: &str,
+        item_types: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.list_children_ordered(principal, parent_id, item_types, None, offset, limit)
+            .await
+    }
+
+    pub async fn list_children_with_sort(
+        &self,
+        principal: AccessPrincipal,
+        parent_id: &str,
+        item_types: &str,
+        sort: (CatalogSort, bool),
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.list_children_ordered(principal, parent_id, item_types, Some(sort), offset, limit)
+            .await
+    }
+
+    async fn list_children_ordered(
+        &self,
+        principal: AccessPrincipal,
+        parent_id: &str,
+        item_types: &str,
+        sort: Option<(CatalogSort, bool)>,
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
@@ -641,14 +670,24 @@ impl CatalogService {
         }
         let total = self
             .database
-            .count_catalog_children(parent_id, item_type)
+            .count_catalog_children(parent_id, item_types)
             .await?;
+        let storage_sort = sort.map(|(sort_by, descending)| {
+            let sort_by = match sort_by {
+                CatalogSort::Name => StorageCatalogSort::Name,
+                CatalogSort::SortName => StorageCatalogSort::SortName,
+                CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
+                CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
+                CatalogSort::Rating => StorageCatalogSort::Rating,
+            };
+            (sort_by, descending)
+        });
         let rows = self
             .database
-            .list_catalog_children(parent_id, item_type, offset, limit)
+            .list_catalog_children(parent_id, item_types, storage_sort, offset, limit)
             .await?;
         let mut items = assemble_items(rows);
-        if matches!(item_type, "SEASON" | "EPISODE") {
+        if matches!(item_types, "SEASON" | "EPISODE") {
             self.populate_item_details_and_episode_counts(&mut items)
                 .await?;
         } else {

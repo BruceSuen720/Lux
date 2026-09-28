@@ -190,6 +190,39 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
     format!("WITH selected AS (\n             {libraries}\n             )")
 }
 
+fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> &'static str {
+    match (sort_by, descending) {
+        (CatalogSort::DateCreated, true) => {
+            "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::DateCreated, false) => {
+            "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::PremiereDate, true) => {
+            "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
+             COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') DESC,
+             LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::PremiereDate, false) => {
+            "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
+             COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') ASC,
+             LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::Rating, true) => {
+            "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
+             mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::Rating, false) => {
+            "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
+             mi.rating ASC, LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::SortName, true) => "LOWER(mi.sort_title) DESC, mi.id DESC",
+        (CatalogSort::SortName, false) => "LOWER(mi.sort_title) ASC, mi.id ASC",
+        (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC",
+        (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC",
+    }
+}
+
 impl Database {
     pub(crate) async fn ensure_thumbnail_scraper_retry(
         &self,
@@ -1454,6 +1487,7 @@ impl Database {
         &self,
         parent_id: &str,
         item_types: &str,
+        sort: Option<(CatalogSort, bool)>,
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
@@ -1468,6 +1502,9 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", item_types.len())
             .collect::<Vec<_>>()
             .join(", ");
+        let item_order = sort
+            .map(|(sort_by, descending)| catalog_item_order(sort_by, descending))
+            .unwrap_or("mi.season_number, mi.episode_number, mi.sort_title, mi.id");
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -1504,8 +1541,7 @@ impl Database {
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
                {CATALOG_VISIBLE_PREDICATE}
-             ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id,
-                      ms.id, mt.stream_index
+             ORDER BY {item_order}, ms.id, mt.stream_index
              LIMIT ? OFFSET ?"
         );
         let mut binds = Vec::with_capacity(item_types.len() + 3);
@@ -1896,30 +1932,7 @@ impl Database {
                 CatalogBind::Real(value) => count_statement.bind(*value),
             };
         }
-        let item_order = match (filter.sort_by, filter.descending) {
-            (CatalogSort::DateCreated, true) => "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC",
-            (CatalogSort::DateCreated, false) => "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC",
-            (CatalogSort::PremiereDate, true) => {
-                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
-                 COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') DESC,
-                 LOWER(mi.title) ASC, mi.id ASC"
-            }
-            (CatalogSort::PremiereDate, false) => {
-                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
-                 COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') ASC,
-                 LOWER(mi.title) ASC, mi.id ASC"
-            }
-            (CatalogSort::Rating, true) => {
-                "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC"
-            }
-            (CatalogSort::Rating, false) => {
-                "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.rating ASC, LOWER(mi.title) ASC, mi.id ASC"
-            }
-            (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC",
-            (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC",
-        };
+        let item_order = catalog_item_order(filter.sort_by, filter.descending);
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
