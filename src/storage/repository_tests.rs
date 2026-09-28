@@ -30,6 +30,86 @@ async fn refresh_recommendation_stats(database: &Database) {
 }
 
 #[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_scan_write_transaction_uses_local_async_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER DATABASE {database_name} SET synchronous_commit = on"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(connection),
+    )
+    .await?;
+    let mut metadata_transaction = database.begin_metadata_write_transaction().await?;
+    let metadata_setting: String = sqlx::query_scalar("SHOW synchronous_commit")
+        .fetch_one(&mut *metadata_transaction)
+        .await?;
+    metadata_transaction.commit().await?;
+
+    let mut transaction = database.begin_scan_write_transaction().await?;
+    let transaction_setting: String = sqlx::query_scalar("SHOW synchronous_commit")
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    let session_setting: String = sqlx::query_scalar("SHOW synchronous_commit")
+        .fetch_one(database.pool())
+        .await?;
+
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+
+    assert_eq!(transaction_setting, "off");
+    assert_eq!(metadata_setting, "on");
+    assert_eq!(session_setting, "on");
+    Ok(())
+}
+
+#[tokio::test]
 async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

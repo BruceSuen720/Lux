@@ -498,10 +498,21 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        transaction.map_err(|source| StorageError::Sqlx {
+        let mut transaction = transaction.map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        if self.backend == DatabaseBackend::Postgres {
+            // Keep the reduced commit durability limited to this rebuildable scan transaction.
+            sqlx::query("SET LOCAL synchronous_commit = off")
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(transaction)
     }
 
     pub async fn test_configuration(
