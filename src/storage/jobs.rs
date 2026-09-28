@@ -4,6 +4,9 @@ use std::time::Instant;
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
+const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
+const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
+const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 
 fn escape_sql_like_pattern(value: &str) -> String {
     value
@@ -76,6 +79,343 @@ fn manifest_positive_file_filesystem_entry_id(file: &NewScanManifestIndexedFile)
 impl Database {
     pub(crate) const LEGACY_SCAN_REQUIRES_NEW_MANIFEST: &'static str =
         "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
+}
+
+#[allow(dead_code)] // The outbox primitives are wired into scanner workers by the next P3 task.
+impl Database {
+    pub(crate) async fn enqueue_scan_local_metadata_batch(
+        &self,
+        batch: NewScanLocalMetadataBatch<'_>,
+    ) -> Result<bool, StorageError> {
+        if batch.id.trim().is_empty()
+            || batch.job_id.trim().is_empty()
+            || batch.library_root_id.trim().is_empty()
+            || batch.batch_sequence < 0
+            || batch.source_ids.is_empty()
+            || batch.source_ids.len() > MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES
+        {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch has invalid identity, sequence, or source count".into(),
+            ));
+        }
+        let mut unique_sources = std::collections::HashSet::with_capacity(batch.source_ids.len());
+        if batch
+            .source_ids
+            .iter()
+            .any(|source_id| source_id.trim().is_empty() || !unique_sources.insert(source_id))
+        {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch contains an empty or duplicate source".into(),
+            ));
+        }
+        let source_refs_json = serde_json::to_string(batch.source_ids)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        let source_count = i64::try_from(batch.source_ids.len()).map_err(|_| {
+            StorageError::Conflict("scan local metadata source count overflow".into())
+        })?;
+
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let inserted = self
+            .query(
+                "INSERT INTO scan_local_metadata_batches (
+                     id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(job_id, library_root_id, batch_sequence) DO NOTHING
+                 RETURNING id",
+            )
+            .bind(batch.id)
+            .bind(batch.job_id)
+            .bind(batch.library_root_id)
+            .bind(batch.batch_sequence)
+            .bind(&source_refs_json)
+            .bind(source_count)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted.is_some() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(true);
+        }
+
+        let existing = self
+            .query_as::<(String, String, i64)>(
+                "SELECT id, source_refs_json, source_count
+                 FROM scan_local_metadata_batches
+                 WHERE job_id = ? AND library_root_id = ? AND batch_sequence = ?",
+            )
+            .bind(batch.job_id)
+            .bind(batch.library_root_id)
+            .bind(batch.batch_sequence)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((existing_id, existing_sources, existing_count)) = existing else {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch id already belongs to another batch".into(),
+            ));
+        };
+        if existing_id != batch.id
+            || existing_sources != source_refs_json
+            || existing_count != source_count
+        {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch sequence already has different input".into(),
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(false)
+    }
+
+    pub(crate) async fn list_scan_local_metadata_batches(
+        &self,
+        after_created_at: Option<i64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredScanLocalMetadataBatch>, StorageError> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| StorageError::Conflict("invalid scan metadata page size".into()))?;
+        if !(1..=MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE).contains(&limit)
+            || after_created_at.is_some() != after_id.is_some()
+        {
+            return Err(StorageError::Conflict(
+                "invalid scan metadata page size or cursor".into(),
+            ));
+        }
+        let rows = match (after_created_at, after_id) {
+            (None, None) => {
+                self.query(
+                    "SELECT * FROM scan_local_metadata_batches
+                     ORDER BY created_at, id LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (Some(created_at), Some(id)) => {
+                self.query(
+                    "SELECT * FROM scan_local_metadata_batches
+                     WHERE created_at > ? OR (created_at = ? AND id > ?)
+                     ORDER BY created_at, id LIMIT ?",
+                )
+                .bind(created_at)
+                .bind(created_at)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            _ => {
+                return Err(StorageError::Conflict(
+                    "invalid scan metadata page cursor".into(),
+                ));
+            }
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(stored_scan_local_metadata_batch)
+            .collect())
+    }
+
+    pub(crate) async fn claim_next_scan_local_metadata_batch(
+        &self,
+    ) -> Result<Option<StoredScanLocalMetadataBatch>, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let next_id = self
+            .query_scalar::<String>(
+                "SELECT id FROM scan_local_metadata_batches
+                 WHERE status IN ('PENDING', 'FAILED')
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
+                 ORDER BY created_at, id LIMIT 1",
+            )
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(next_id) = next_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(None);
+        };
+        let claimed = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'RUNNING', attempts = attempts + 1, next_attempt_at = NULL,
+                     error = NULL, updated_at = unixepoch()
+                 WHERE id = ? AND status IN ('PENDING', 'FAILED')
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
+                 RETURNING *",
+            )
+            .bind(next_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(claimed.map(stored_scan_local_metadata_batch))
+    }
+
+    pub(crate) async fn complete_scan_local_metadata_batch(
+        &self,
+        batch_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.transition_scan_local_metadata_batch(batch_id, None, None)
+            .await
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_batch(
+        &self,
+        batch_id: &str,
+        error: &str,
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
+            return Err(StorageError::Conflict(
+                "scan local metadata error exceeds the storage limit".into(),
+            ));
+        }
+        self.transition_scan_local_metadata_batch(batch_id, next_attempt_at, Some(error))
+            .await
+    }
+
+    async fn transition_scan_local_metadata_batch(
+        &self,
+        batch_id: &str,
+        next_attempt_at: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = if let Some(error) = error {
+            self.query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'FAILED', next_attempt_at = ?, error = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(next_attempt_at)
+            .bind(error)
+            .bind(batch_id)
+            .execute(&mut *transaction)
+            .await
+        } else {
+            self.query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'COMPLETED', next_attempt_at = NULL, error = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(batch_id)
+            .execute(&mut *transaction)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn cancel_scan_local_metadata_batches(
+        &self,
+        job_id: &str,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'CANCELLED', next_attempt_at = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND status IN ('PENDING', 'FAILED', 'RUNNING')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    /// Call once during startup, before outbox workers begin claiming work.
+    pub(crate) async fn requeue_interrupted_scan_local_metadata_batches(
+        &self,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'PENDING', next_attempt_at = NULL, updated_at = unixepoch()
+                 WHERE status = 'RUNNING'",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {

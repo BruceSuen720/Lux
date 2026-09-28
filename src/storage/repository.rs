@@ -1203,6 +1203,33 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
+#[allow(dead_code)] // Scanner wiring follows the isolated storage task.
+#[derive(Clone, Copy)]
+pub(crate) struct NewScanLocalMetadataBatch<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) batch_sequence: i64,
+    pub(crate) source_ids: &'a [String],
+}
+
+#[allow(dead_code)] // Fields are consumed by the later local metadata worker.
+#[derive(Debug)]
+pub(crate) struct StoredScanLocalMetadataBatch {
+    pub(crate) id: String,
+    pub(crate) job_id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) batch_sequence: i64,
+    pub(crate) source_refs_json: String,
+    pub(crate) source_count: i64,
+    pub(crate) status: String,
+    pub(crate) attempts: i64,
+    pub(crate) next_attempt_at: Option<i64>,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewScanManifestRoot<'a> {
     pub(crate) library_root_id: &'a str,
@@ -1624,6 +1651,23 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
         current_item: row.get("current_item"),
         scan_phase: row.get("scan_phase"),
+    }
+}
+
+fn stored_scan_local_metadata_batch(row: sqlx::any::AnyRow) -> StoredScanLocalMetadataBatch {
+    StoredScanLocalMetadataBatch {
+        id: row.get("id"),
+        job_id: row.get("job_id"),
+        library_root_id: row.get("library_root_id"),
+        batch_sequence: row.get("batch_sequence"),
+        source_refs_json: row.get("source_refs_json"),
+        source_count: row.get("source_count"),
+        status: row.get("status"),
+        attempts: row.get("attempts"),
+        next_attempt_at: row.get("next_attempt_at"),
+        error: row.get("error"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }
 }
 

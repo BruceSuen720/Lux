@@ -2167,6 +2167,9 @@ services:
 | LUX-288 | docs/LUX-DEVELOPMENT.md、docs/decisions/046-progressive-scan-and-missing-metadata.md、docs/COMPATIBILITY.md、docs/PROGRESSIVE-SCAN-METADATA-PROPOSAL.md；渐进扫描与独立在线补缺规格 |
 | LUX-289 | migrations/0151_progressive_scan_metadata.sql、migrations-postgres/0151_progressive_scan_metadata.sql、tests/storage.rs、docs/LUX-DEVELOPMENT.md；渐进扫描本地队列与完整性 schema |
 | LUX-290 | src/storage/migration.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；SQLite catalog 重建兼容与 PostgreSQL 升级合同 |
+| LUX-291 | src/storage/jobs.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；渐进扫描本地 metadata outbox 操作 |
+| LUX-292 | src/storage/metadata.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；能力级本地完整性存储 |
+| LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/repository.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7114,6 +7117,53 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 文件：`src/storage/migration.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-09-28）：SQLite 旧库经启动时 catalog 重建后仍保留扫描补缺策略及 0/1 配置；SQLite `storage` 43 项通过。PostgreSQL bootstrap、0150→0151 策略/队列迁移、既有 HomeVideos 迁移用例在本机 PostgreSQL 服务上各 1 项通过。`cargo fmt --all -- --check`、`cargo clippy --locked --test storage -- -D warnings`、`cargo clippy --locked --test postgres_database -- -D warnings` 通过。
+
+#### LUX-291：渐进扫描本地 metadata outbox 操作
+
+范围：为 `scan_local_metadata_batches` 增加应用层可复用的内部存储类型和有界操作：最多 256 个 source 的幂等入队、稳定游标分页、并发安全的原子领取、RUNNING 状态 CAS 完成/失败、按扫描 job 取消尚未完成批次，以及进程启动时恢复遗留 RUNNING 批次。不得在本任务连接 scanner，也不做本地文件检查或在线请求。
+
+验收：
+
+- [x] 空批次、超限批次和重复 source 被拒绝；同一 job/root/sequence 的相同输入幂等返回，不同输入报冲突。
+- [x] 领取只选择到期 PENDING/FAILED 项，事务内 CAS 为 RUNNING 并递增 attempts；并发领取不会返回同一批次。
+- [x] 只有 RUNNING 批次能完成或失败；重复终结不会覆盖已有状态。失败重试时间生效。
+- [x] 取消按 job 原子终结所有未完成项（包括 RUNNING），遗留 RUNNING 项可在启动恢复时重新入队；分页大小有服务端上限且排序稳定。
+- [x] 存储行为测试覆盖 SQLite；相同合同在真实 PostgreSQL 上由后续 P2 双后端门验证。
+
+依赖：LUX-290。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_batches`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：SQLite outbox 单测覆盖 256 来源边界、非法/重复输入、幂等冲突、稳定分页、并发领取、到期退避、终态 CAS、job 取消和重启恢复；`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_batches` 1 项通过，`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。PostgreSQL 运行时合同留到 P2 双后端验证；本任务未接入 scanner。
+
+#### LUX-292：能力级本地完整性与在线补缺意向原子存储
+
+范围：以 item+capability+输入版本记录本地检查 PENDING/RUNNING/READY/FAILED/CANCELLED 与已确认 missing；提供输入指纹条件更新和缺失能力的有界分页读取。本任务不接入本地检查 worker 或扫描入口。
+
+验收：
+
+- [ ] 非 READY 不能持久化 missing；fingerprint 变化时旧确认不能被当作当前版本结果。
+- [ ] item+capability 唯一记录支持有限状态转换；只有输入 fingerprint 仍匹配时才能接受 READY/missing 结果。
+- [ ] READY 缺失能力分页按稳定游标返回并有服务端上限；失败/未确认能力不会进入缺失列表。
+- [ ] SQLite 与 PostgreSQL 使用同一合同通过自动化覆盖。
+
+依赖：LUX-291。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`，并运行真实 PostgreSQL 存储合同用例。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-293：缺失结果与独立 FILL_MISSING 调度意向原子提交
+
+范围：复用现有 metadata reidentify job，将已确认缺失结果和符合当前媒体库策略的 FILL_MISSING 调度意向放入一个事务；回滚时不遗留单边状态，不建立第二套在线队列。本任务不接入本地检查 worker 或扫描入口。
+
+验收：
+
+- [ ] 确认结果和可调度的缺失请求同事务提交，回滚不留下单边状态；重复提交按 item/能力/输入版本去重。
+- [ ] 同一 item 已有可复用活跃 FILL_MISSING 作业时不创建重复在线工作；策略关闭或不可执行缺失仍保留结果但不排队。
+- [ ] SQLite 与 PostgreSQL 使用同一合同通过自动化覆盖。
+
+依赖：LUX-292。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_dispatch`，并运行真实 PostgreSQL 存储合同用例。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 #### 阶段 23 总体验收与阶段门
 

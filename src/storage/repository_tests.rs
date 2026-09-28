@@ -645,6 +645,293 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
 }
 
 #[tokio::test]
+async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverable() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Progressive metadata", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    let root_id = root.root.id.to_string();
+    let sources = vec!["source-a".to_owned()];
+
+    for invalid_sources in [
+        Vec::new(),
+        vec!["".to_owned()],
+        vec!["same".to_owned(), "same".to_owned()],
+    ] {
+        let invalid = NewScanLocalMetadataBatch {
+            id: "invalid-batch",
+            job_id: "scan-job",
+            library_root_id: &root_id,
+            batch_sequence: 0,
+            source_ids: &invalid_sources,
+        };
+        assert!(
+            database
+                .enqueue_scan_local_metadata_batch(invalid)
+                .await
+                .is_err()
+        );
+    }
+    let oversized_sources = (0..257)
+        .map(|index| format!("source-{index}"))
+        .collect::<Vec<_>>();
+    let maximum_sources = (0..256)
+        .map(|index| format!("max-source-{index}"))
+        .collect::<Vec<_>>();
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id: "oversized-batch",
+                job_id: "scan-job",
+                library_root_id: &root_id,
+                batch_sequence: 0,
+                source_ids: &oversized_sources,
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id: "max-size-batch",
+                job_id: "limit-job",
+                library_root_id: &root_id,
+                batch_sequence: 0,
+                source_ids: &maximum_sources,
+            })
+            .await
+            .expect("256 sources are within the limit")
+    );
+    assert_eq!(
+        database
+            .cancel_scan_local_metadata_batches("limit-job")
+            .await
+            .expect("clean up boundary batch"),
+        1
+    );
+
+    let first = NewScanLocalMetadataBatch {
+        id: "batch-a",
+        job_id: "scan-job",
+        library_root_id: &root_id,
+        batch_sequence: 0,
+        source_ids: &sources,
+    };
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(first)
+            .await
+            .expect("enqueue")
+    );
+    assert!(
+        !database
+            .enqueue_scan_local_metadata_batch(first)
+            .await
+            .expect("idempotent enqueue")
+    );
+    let changed_payload = vec!["source-b".to_owned()];
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id: "batch-a",
+                job_id: "scan-job",
+                library_root_id: &root_id,
+                batch_sequence: 0,
+                source_ids: &changed_payload,
+            })
+            .await
+            .is_err()
+    );
+    for (id, sequence) in [("batch-b", 1), ("batch-c", 2), ("batch-d", 3)] {
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id,
+                job_id: "scan-job",
+                library_root_id: &root_id,
+                batch_sequence: sequence,
+                source_ids: &sources,
+            })
+            .await
+            .expect("enqueue batch");
+    }
+
+    let page = database
+        .list_scan_local_metadata_batches(None, None, 1)
+        .await
+        .expect("first page");
+    assert_eq!(page.len(), 1);
+    assert!(
+        database
+            .list_scan_local_metadata_batches(None, None, 101)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .list_scan_local_metadata_batches(Some(page[0].created_at), None, 1)
+            .await
+            .is_err(),
+        "a cursor must provide both timestamp and id"
+    );
+    let second_page = database
+        .list_scan_local_metadata_batches(Some(page[0].created_at), Some(&page[0].id), 1)
+        .await
+        .expect("second page");
+    assert_eq!(second_page.len(), 1);
+    assert_ne!(page[0].id, second_page[0].id);
+
+    let (claimed_a, claimed_b) = tokio::join!(
+        database.claim_next_scan_local_metadata_batch(),
+        database.claim_next_scan_local_metadata_batch(),
+    );
+    let claimed_a = claimed_a.expect("claim a").expect("batch a");
+    let claimed_b = claimed_b.expect("claim b").expect("batch b");
+    assert_ne!(
+        claimed_a.id, claimed_b.id,
+        "concurrent claims must be distinct"
+    );
+    assert_eq!(claimed_a.status, "RUNNING");
+    assert_eq!(claimed_a.attempts, 1);
+    assert_eq!(claimed_a.job_id, "scan-job");
+    assert_eq!(claimed_a.library_root_id, root_id);
+    assert_eq!(claimed_a.source_count, 1);
+    assert_eq!(claimed_a.source_refs_json, r#"["source-a"]"#);
+    assert_eq!(claimed_a.batch_sequence, 0);
+    assert_eq!(claimed_a.next_attempt_at, None);
+    assert_eq!(claimed_a.error, None);
+    assert!(claimed_a.updated_at >= claimed_a.created_at);
+    assert!(
+        database
+            .complete_scan_local_metadata_batch(&claimed_a.id)
+            .await
+            .expect("complete")
+    );
+    assert!(
+        !database
+            .complete_scan_local_metadata_batch(&claimed_a.id)
+            .await
+            .expect("CAS complete")
+    );
+
+    let cancel_count = database
+        .cancel_scan_local_metadata_batches("scan-job")
+        .await
+        .expect("cancel pending and running batches");
+    assert_eq!(cancel_count, 3);
+    assert!(
+        !database
+            .fail_scan_local_metadata_batch(&claimed_b.id, "temporary failure", Some(i64::MAX),)
+            .await
+            .expect("cancelled batch failure CAS"),
+        "a cancelled running batch must reject later completion"
+    );
+    database
+        .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+            id: "retry-batch",
+            job_id: "retry-job",
+            library_root_id: &root_id,
+            batch_sequence: 0,
+            source_ids: &sources,
+        })
+        .await
+        .expect("enqueue retry batch");
+    let retryable = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim retryable batch")
+        .expect("retryable batch");
+    assert_eq!(retryable.id, "retry-batch");
+    assert!(
+        database
+            .fail_scan_local_metadata_batch(&retryable.id, "temporary failure", Some(i64::MAX))
+            .await
+            .expect("fail with delayed retry")
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_batch()
+            .await
+            .expect("deferred retry check")
+            .is_none(),
+        "a retry must not be claimable before next_attempt_at"
+    );
+    sqlx::query("UPDATE scan_local_metadata_batches SET next_attempt_at = 0 WHERE id = ?")
+        .bind(&retryable.id)
+        .execute(database.pool())
+        .await
+        .expect("make delayed retry due");
+    let retried = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim retry")
+        .expect("due retry");
+    assert_eq!(retried.id, retryable.id);
+    assert_eq!(retried.attempts, 2);
+    assert!(
+        database
+            .complete_scan_local_metadata_batch(&retried.id)
+            .await
+            .expect("complete retry")
+    );
+
+    assert_eq!(
+        database
+            .cancel_scan_local_metadata_batches("retry-job")
+            .await
+            .expect("cancel completed job remainder"),
+        0
+    );
+    let interrupted = database
+        .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+            id: "batch-e",
+            job_id: "interrupted-job",
+            library_root_id: &root_id,
+            batch_sequence: 0,
+            source_ids: &sources,
+        })
+        .await
+        .expect("enqueue interrupted batch");
+    assert!(interrupted);
+    let running = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim interrupted batch")
+        .expect("running batch");
+    assert_eq!(running.id, "batch-e");
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_batches()
+            .await
+            .expect("recover interrupted batch"),
+        1
+    );
+    let recovered = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim recovered batch")
+        .expect("recovered batch");
+    assert_eq!(recovered.id, "batch-e");
+    assert_eq!(recovered.attempts, 2);
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn marking_seen_visible_media_does_not_rewrite_item_state() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
