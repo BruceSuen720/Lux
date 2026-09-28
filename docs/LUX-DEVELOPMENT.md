@@ -7152,7 +7152,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-291。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`、`cargo test --locked --lib storage::repository::repository_tests::postgres_progressive_scan_metadata_storage_contract -- --ignored`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
-预计文件：`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/storage/metadata.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-09-28）：SQLite 用例覆盖指纹换代时清除旧缺失、RUNNING 重启恢复、拒绝旧 worker CAS、READY missing 双页读取、失败/可用/取消状态过滤；真实 PostgreSQL 用例覆盖 bytea 指纹换代与恢复、旧结果 CAS、缺失读取及 LUX-291 outbox 操作。两个定向用例各 1 项通过；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。应用 worker 尚未接入，按后续任务实施。
 
@@ -7267,14 +7267,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 一批检查有硬上限、拒绝空/超限 fingerprint 与重复 item+capability；新/变化/可重试能力原子进入 RUNNING。
-- [ ] 同版本 READY 不重置，已经 RUNNING 的同版本能力不会被第二 worker 重领；旧 fingerprint 结果仍被完成 CAS 拒绝。
-- [ ] 返回本次实际领取的输入位置，使调用者只为领取成功的检查提交结果。
-- [ ] SQLite 与真实 PostgreSQL 合同覆盖批量 prepare/claim、版本替换、重复/并发 claim、失败恢复及完成 CAS。
+- [x] 一批检查有硬上限、拒绝空/超限 fingerprint 与重复 item+capability；新/变化/可重试能力原子进入 RUNNING。
+- [x] 同版本 READY 不重置，已经 RUNNING 的同版本能力不会被第二 worker 重领；旧 fingerprint 结果仍被完成 CAS 拒绝。
+- [x] 返回本次实际领取的输入位置，使调用者只为领取成功的检查提交结果。
+- [x] SQLite 与真实 PostgreSQL 合同覆盖批量 prepare/claim、版本替换、重复/并发 claim、失败恢复及完成 CAS。
 
 依赖：LUX-292、LUX-293。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`、真实 PostgreSQL 对应 ignored 存储合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
-预计文件：`src/storage/metadata.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：新增最多 512 项的单事务 completeness prepare/claim 操作，按输入位置返回本 worker 实际领取的检查；相同 READY/RUNNING fingerprint 不重领，新版本和 FAILED/CANCELLED 可重置后领取。SQLite 定向存储用例与真实 PostgreSQL storage contract 各 1 项通过，覆盖并发双领取、同版本去重、版本换代、失败恢复和旧 fingerprint 拒写；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。能力判定与扫描 worker 接线继续由后续任务实现。
 
 #### 阶段 23 总体验收与阶段门
 

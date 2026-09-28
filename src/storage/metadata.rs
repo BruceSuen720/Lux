@@ -1,10 +1,14 @@
 use super::*;
-use crate::storage::{ItemMetadataCompletenessCommit, NewItemMetadataCompletenessResult};
+use crate::storage::{
+    ItemMetadataCompletenessCommit, NewItemMetadataCompletenessCheck,
+    NewItemMetadataCompletenessResult,
+};
 
 const MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH: usize = 64;
 const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
 const MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES: usize = 4096;
 const MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE: i64 = 100;
+const MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE: usize = 512;
 
 fn validate_item_metadata_completeness_key(
     item_id: &str,
@@ -26,6 +30,90 @@ fn validate_item_metadata_completeness_key(
 
 #[allow(dead_code)] // The local scan worker consumes these transitions in the next phase task.
 impl Database {
+    pub(crate) async fn prepare_and_claim_item_metadata_completeness_checks(
+        &self,
+        checks: &[NewItemMetadataCompletenessCheck<'_>],
+    ) -> Result<Vec<usize>, StorageError> {
+        if checks.len() > MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE {
+            return Err(StorageError::Conflict(
+                "metadata completeness check batch exceeds the storage limit".into(),
+            ));
+        }
+        let mut unique_checks = HashSet::with_capacity(checks.len());
+        for check in checks {
+            validate_item_metadata_completeness_key(
+                check.item_id,
+                check.capability,
+                check.input_fingerprint,
+            )?;
+            if !unique_checks.insert((check.item_id, check.capability.trim())) {
+                return Err(StorageError::Conflict(
+                    "metadata completeness check batch contains a duplicate item capability".into(),
+                ));
+            }
+        }
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let mut claimed_indices = Vec::with_capacity(checks.len());
+        for (index, check) in checks.iter().enumerate() {
+            self.query(
+                "INSERT INTO item_metadata_completeness (
+                     item_id, capability, local_state, is_missing, input_fingerprint
+                 ) VALUES (?, ?, 'PENDING', NULL, ?)
+                 ON CONFLICT(item_id, capability) DO UPDATE SET
+                     local_state = 'PENDING', is_missing = NULL,
+                     input_fingerprint = excluded.input_fingerprint,
+                     checked_at = NULL, retry_after = NULL, error = NULL,
+                     updated_at = unixepoch()
+                 WHERE item_metadata_completeness.input_fingerprint IS NULL
+                    OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
+                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')",
+            )
+            .bind(check.item_id)
+            .bind(check.capability.trim())
+            .bind(check.input_fingerprint.to_vec())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            let claimed = self
+                .query_scalar::<String>(
+                    "UPDATE item_metadata_completeness
+                     SET local_state = 'RUNNING', is_missing = NULL, checked_at = NULL,
+                         retry_after = NULL, error = NULL, updated_at = unixepoch()
+                     WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
+                       AND local_state = 'PENDING'
+                     RETURNING item_id",
+                )
+                .bind(check.item_id)
+                .bind(check.capability.trim())
+                .bind(check.input_fingerprint.to_vec())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if claimed.is_some() {
+                claimed_indices.push(index);
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(claimed_indices)
+    }
+
     pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing(
         &self,
         library_id: &str,

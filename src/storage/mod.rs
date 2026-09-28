@@ -9,6 +9,13 @@ pub(crate) struct NewItemMetadataCompletenessResult<'a> {
     pub(crate) checked_at: i64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct NewItemMetadataCompletenessCheck<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) capability: &'a str,
+    pub(crate) input_fingerprint: &'a [u8],
+}
+
 #[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
 #[derive(Debug, Default)]
 pub(crate) struct ItemMetadataCompletenessCommit {

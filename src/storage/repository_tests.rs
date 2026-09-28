@@ -10,7 +10,7 @@ use crate::{
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
-    storage::NewItemMetadataCompletenessResult,
+    storage::{NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult},
 };
 
 async fn refresh_recommendation_stats(database: &Database) {
@@ -1695,6 +1695,229 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
 }
 
 #[tokio::test]
+async fn progressive_scan_metadata_completeness_batches_are_atomic_and_versioned() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Batch Claims (2024)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Batch.Claims.2024.mkv"), b"movie")
+        .await
+        .expect("movie file");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Completeness claims", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index item");
+    let item_id = database
+        .query_scalar::<String>(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("movie item");
+    let fingerprint_v1 = b"batch-input-v1";
+    let checks = [
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: fingerprint_v1,
+        },
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: fingerprint_v1,
+        },
+    ];
+
+    let (claimed_a, claimed_b) = tokio::join!(
+        database.prepare_and_claim_item_metadata_completeness_checks(&checks),
+        database.prepare_and_claim_item_metadata_completeness_checks(&checks),
+    );
+    let claimed_a = claimed_a.expect("first batch claim");
+    let claimed_b = claimed_b.expect("concurrent batch claim");
+    assert_eq!(claimed_a.len() + claimed_b.len(), 2);
+    assert!(
+        claimed_a.is_empty() || claimed_b.is_empty(),
+        "concurrent workers cannot claim one input twice"
+    );
+
+    let library_id = library.id.to_string();
+    let ready_results = [
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: fingerprint_v1,
+            is_missing: true,
+            checked_at: 1_000,
+        },
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: fingerprint_v1,
+            is_missing: false,
+            checked_at: 1_000,
+        },
+    ];
+    let completed = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &ready_results, &[])
+        .await
+        .expect("save local results without dispatch");
+    assert_eq!(completed.updated_count, 2);
+    assert!(completed.scheduled_job_ids.is_empty());
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&checks)
+            .await
+            .expect("same completed input stays ready")
+            .is_empty()
+    );
+
+    let fingerprint_v2 = b"batch-input-v2";
+    let replacement = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint_v2,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&replacement)
+            .await
+            .expect("replace changed input version"),
+        vec![0]
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                fingerprint_v1,
+                true,
+                1_001,
+            )
+            .await
+            .expect("reject stale worker result")
+    );
+    let replacement_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint_v2,
+        is_missing: false,
+        checked_at: 1_002,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(&library_id, &replacement_result, &[])
+            .await
+            .expect("complete replacement version")
+            .updated_count,
+        1
+    );
+
+    let retry_fingerprint = b"batch-retry-input";
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await
+            .expect("claim retry check"),
+        vec![0]
+    );
+    assert!(
+        database
+            .fail_item_metadata_completeness_check(
+                &item_id,
+                "BACKDROP",
+                retry_fingerprint,
+                Some(2_000),
+                "temporary local error",
+            )
+            .await
+            .expect("fail local capability")
+    );
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await
+            .expect("retry failed check"),
+        vec![0]
+    );
+    let retry_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+        is_missing: false,
+        checked_at: 2_001,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(&library_id, &retry_result, &[])
+            .await
+            .expect("complete failed check retry")
+            .updated_count,
+        1
+    );
+
+    let duplicate_checks = [checks[0], checks[0]];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&duplicate_checks)
+            .await
+            .is_err()
+    );
+    let empty_fingerprint = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: &[],
+    }];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&empty_fingerprint)
+            .await
+            .is_err()
+    );
+    let oversized_fingerprint = vec![0; 257];
+    let oversized_fingerprint_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: &oversized_fingerprint,
+    }];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&oversized_fingerprint_check)
+            .await
+            .is_err()
+    );
+    let oversized_checks = vec![checks[0]; 513];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&oversized_checks)
+            .await
+            .is_err()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -2022,6 +2245,131 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .bind(library.id.to_string())
         .fetch_one(database.pool())
         .await?;
+
+    let completeness_fingerprint_v1 = b"postgres-batch-input-v1";
+    let completeness_checks = [
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: completeness_fingerprint_v1,
+        },
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: completeness_fingerprint_v1,
+        },
+    ];
+    let (check_a, check_b) = tokio::join!(
+        database.prepare_and_claim_item_metadata_completeness_checks(&completeness_checks),
+        database.prepare_and_claim_item_metadata_completeness_checks(&completeness_checks),
+    );
+    let check_a = check_a?;
+    let check_b = check_b?;
+    assert_eq!(check_a.len() + check_b.len(), 2);
+    assert!(check_a.is_empty() || check_b.is_empty());
+    let completeness_results = [
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: completeness_fingerprint_v1,
+            is_missing: true,
+            checked_at: 1_000,
+        },
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: completeness_fingerprint_v1,
+            is_missing: false,
+            checked_at: 1_000,
+        },
+    ];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library.id.to_string(),
+                &completeness_results,
+                &[],
+            )
+            .await?
+            .updated_count,
+        2
+    );
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&completeness_checks)
+            .await?
+            .is_empty()
+    );
+    let completeness_fingerprint_v2 = b"postgres-batch-input-v2";
+    let replacement_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: completeness_fingerprint_v2,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&replacement_check)
+            .await?,
+        vec![0]
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                completeness_fingerprint_v1,
+                true,
+                1_001,
+            )
+            .await?
+    );
+    let retry_fingerprint = b"postgres-batch-retry";
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await?,
+        vec![0]
+    );
+    assert!(
+        database
+            .fail_item_metadata_completeness_check(
+                &item_id,
+                "BACKDROP",
+                retry_fingerprint,
+                Some(2_000),
+                "temporary local error",
+            )
+            .await?
+    );
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await?,
+        vec![0]
+    );
+    let retry_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+        is_missing: false,
+        checked_at: 2_001,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library.id.to_string(),
+                &retry_result,
+                &[],
+            )
+            .await?
+            .updated_count,
+        1
+    );
 
     assert_eq!(
         database.ensure_scan_local_metadata_backfill_roots().await?,
