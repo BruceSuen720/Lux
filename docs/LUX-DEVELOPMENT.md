@@ -2164,6 +2164,7 @@ services:
 | LUX-285 | src/api/media.rs、src/storage/repository.rs、tests/catalog.rs；Lux API 分页列出根目录和 FOLDER 子项 |
 | LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts、web/tests/api-client.test.ts、web/tests/search-and-filmography.test.tsx；其他视频目录浏览与搜索 |
 | LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx、web/tests/home-media.test.tsx；视频详情、手动编辑与播放 |
+| LUX-288 | docs/LUX-DEVELOPMENT.md、docs/decisions/046-progressive-scan-and-missing-metadata.md、docs/COMPATIBILITY.md、docs/PROGRESSIVE-SCAN-METADATA-PROPOSAL.md；渐进扫描与独立在线补缺规格 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5575,6 +5576,8 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 - 不在本任务实现在线元数据匹配、缺失图片下载、刮削器请求或 TMDb 调用。
 - 不把旁车读取放回用户请求路径，不因旁车处理而串行暂停全量扫描。
 
+后续规格演进：本任务勾选项记录 LUX-230 当时的验收结果。新建扫描的前台可见时点、本地旁车工作启动时点和在线补缺边界由阶段 23 / LUX-288 另行规定；既有 workflow 1/2 的恢复语义不因新合同改变。
+
 #### LUX-231：LuxPlayer 剧集集间导航
 
 范围：为 Lux Web 播放器增加剧集单集的“上一集”和“下一集”控制。播放器只在当前条目是单集时，复用已有剧集单集查询合同读取同一季度的可播放单集并按服务端顺序定位相邻条目；电影和其他媒体类型不显示这两个控件。
@@ -6597,6 +6600,8 @@ Bing 图片由原作者/权利人持有。上游项目将接口限于个人学�
 
 全量扫描使用 Manifest 表达目录发现、不可变根路径观察和根路径覆盖状态。新建扫描固定使用 `workflow_version=2`、`discovery_format_version=3`、`discovery_mode=LITE`：目录 frontier 在进程内按有界批次推进，子目录不写入 `scan_manifest_directories`；同一事务仍提交 CAS 保护的正向文件/媒体索引、`last_seen_generation`、紧凑 presence ledger、根状态和进度。旧 workflow 或显式 `PERSISTED` 任务继续使用持久目录 frontier 恢复。扫描不再为每个新增/变化文件持久化并二次应用正向 delta。正向索引使用 `last_seen_generation` 和 change kind 作为持久检查点，`scan_job_targets` 在索引完成后按根路径游标分批物化，且必须在 probe/NFO/缩略图 worker 启动前完成。只有根路径完整可用后才生成缺失候选，并在二次文件状态确认及基线 CAS 后删除。所有可用根路径完成索引与缺失确认后，成功扫描刷新首页稳定快照并发布 `home` 事件及 `ScanCompleted`；target 物化和其余后处理继续后台执行。升级前已存在的旧版 Manifest 任务由带版本号的旧执行器继续恢复。详见 `docs/decisions/044-compact-manifest-seen-paths.md` 与 `docs/decisions/045-manifest-lite-discovery.md`。
 
+本段记录阶段 21 完成时的 workflow 2 合同，供已有任务兼容和历史验证使用。新建扫描的前向行为由阶段 23 / LUX-288 改为 workflow 3；后续修改不得改变已创建 workflow 2 任务的恢复语义。
+
 本阶段不增加公开扫描状态或 webhook。现有 `ScanCompleted` 与 `JOB_COMPLETED` 表示索引完成；任务在 `POSTPROCESSING` 时仍可通过现有任务阶段字段观察后处理，完成后进入 `IDLE`。升级仅新增结构，不在 migration 中遍历文件系统或转换旧队列；启动时将没有 Manifest 的旧版活动全量任务安全取消，并保留任务诊断记录，管理员重试会创建新 Manifest 扫描。
 
 Manifest observation 一经写入不可原地修改；新 Lite 只保留 root/directory identity observation，文件 stat/fingerprint 在 discovery 内存中用于二次安全校验，稳定文件通过 generation/seen-path 状态记录。应用新增或变化条目前进行二次 stat/fingerprint 校验，必要时追加 observation。差异应用对 `filesystem_entries` 的基线 ID/fingerprint 做 CAS，防止全量任务覆盖后完成的增量扫描。只有完整可用根路径允许生成缺失删除；删除前再次确认文件状态。SQLite 与 PostgreSQL 共用 SQL 行为和一致性语义，禁止在核心路径依赖 PostgreSQL 专属批量导入/更新语法或长事务。
@@ -6617,6 +6622,8 @@ Manifest observation 一经写入不可原地修改；新 Lite 只保留 root/di
 依赖：LUX-154、LUX-187、LUX-230、LUX-246。
 
 实现文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/043-full-scan-manifest.md`。
+
+后续规格演进：LUX-264 的勾选项记录 Manifest 阶段完成时的合同。阶段 23 仅为新建 workflow 3 定义渐进显示与早期本地旁车工作；workflow 1/2 以及已持久化任务继续沿用原首页、targets-ready 和完成事件语义。
 
 #### LUX-265：Manifest schema 与跨数据库存储合同
 
@@ -7025,6 +7032,58 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/media/MediaActionMenu.tsx`、`web/tests/media-detail.test.tsx`、`web/tests/media-action-menu.test.tsx`、`web/tests/home-media.test.tsx`。
 
 结果（2026-09-28）：VIDEO 详情显示“其他视频”类型并使用普通详情布局，现有播放、手动元数据编辑和 NFO 面板均可用。动作菜单保留普通编辑和文件操作，同时隐藏在线匹配/刷新；FOLDER 不渲染动作菜单。继续观看卡片覆盖 VIDEO 的普通播放器链接、类型标签和 40% 进度条。定向测试 44 项通过；`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`（75 个 Vitest 文件、525 项；Node 样式测试 107 项）及 `pnpm --dir web build` 均通过。测试输出包含现有 jsdom `HTMLMediaElement.load/pause` 告警；构建保留 Vite 对现有 HLS 大 chunk 的提示。
+
+### 阶段 23：渐进扫描展示、本地优先处理与独立在线补缺
+
+本阶段为新建扫描启用 `workflow_version=3`，发现仍使用 `discovery_format_version=3` 与 Lite frontier。workflow 1/2、已持久化任务和升级恢复继续执行其创建时的完成语义；新 workflow 的变化通过版本号选择，不能在恢复旧任务时混用新规则。详见 ADR-046。
+
+新 workflow 每个成功提交的正向索引批次立即可被分页目录查询读取；Lux Web 在扫描期间合并失效通知并刷新当前目录/首页投影。旧条目继续显示，只有根路径完整可用、缺失经过二次文件状态确认且基线 CAS 成功后才移除。扫描进度、删除安全门和 Manifest 索引完成语义保持可区分。
+
+每个正向批次在提交媒体索引的同一事务中登记有界的本地 NFO/图片工作意向。独立本地 worker 可以在全库遍历和最终 target 物化完成前开始处理，扫描 worker 不等待它而继续后续路径。已有 `scan_job_targets`/targets-ready barrier 仍保护必须等待全量目标的 probe、缩略图和旧 workflow worker；新旁车意向有自己的持久状态、版本校验和恢复合同。图片与 NFO 能力分别记录 PENDING/RUNNING/READY/FAILED 等本地检查状态；海报可先登记和显示，但某项能力只有在本地检查成功后才能确认为缺失。I/O 错误、根路径不可用或任务仍在处理时只能重试，不能推断缺失。
+
+本地检查不发起网络请求。对检查成功且确实缺失的能力，应用层复用 `MetadataRequestPlan`、字段锁定、本地图片、继承图片、provider 能力与冷却规则判断是否可请求；缺失事实与可请求状态分开保存。保存缺失结果和独立调度意向必须原子完成，由现有 FILL_MISSING worker 异步领取，领取时再次检查当前数据。在线刮削不计入扫描进度，也不阻塞索引完成或本地旁车状态；一项扫描的取消不得取消已独立提交的在线任务。
+
+自动补缺入口策略如下：
+
+| 入口或情形 | 本地检查 | 在线补缺 |
+| --- | --- | --- |
+| 新建全量扫描 | 正向批次提交后立即排队 | 成功确认缺失且策略允许时排入独立 FILL_MISSING |
+| 手动全量/局部扫描 | 只处理对应范围 | 使用独立扫描补缺设置；不得扩大为整库刷新 |
+| 实时增量扫描 | 只处理本次变化条目 | 继续尊重 `realtime_metadata_auto_match_enabled` |
+| 升级后的既有媒体库 | 正常处理 | 新扫描补缺开关初值沿用既有实时自动匹配开关；明确关闭状态不得被 migration 打开 |
+| 无可用 provider、策略关闭或 VIDEO/HOMEVIDEOS | 正常适用的本地规则 | 记录原因或保持禁止，不发起网络请求 |
+| 本地检查失败或根不可用 | 记录可重试异常 | 不标记为已确认缺失，不提交在线请求 |
+
+对新建媒体库，新扫描缺失自动补全默认开启；管理员可以单独关闭。缺失任务按现有最多 100 项的定向 FILL_MISSING 作业合并，同一条目/输入版本的活跃工作去重，并在执行时重新评估缺失，只补空值且不覆盖本地或锁定数据。升级不得在 migration 中扫描文件、访问 provider 或为历史全库一次性创建刮削任务。
+
+`ScanCompleted` webhook 和 `JOB_COMPLETED` 继续表示 Manifest 索引及缺失确认完成；`POSTPROCESSING`/`IDLE` 继续描述本地扫描后处理阶段。在线补缺保持独立任务与自己的状态、尝试和取消入口。前端刷新按批次合并，图片使用更新后的 image tag，列表仍有分页与服务端上限，不等待浏览器逐项确认，也不为 10,000 条目逐条构造请求。
+
+#### LUX-288：渐进扫描与独立在线补缺规格
+
+范围：只更新正式产品/兼容性规格和 ADR，明确新扫描 workflow 3 的可见性、本地任务、缺失分类、独立 FILL_MISSING 调度、升级兼容及性能验收合同。本任务不改变运行时代码或数据库。
+
+验收：
+
+- [x] 新旧 workflow 合同清晰：新 workflow 3 的正向批次可见且早期本地旁车可运行；workflow 1/2 和已有任务保留原语义。
+- [x] 本地检查未完成/失败与已确认缺失清晰分离；在线补缺仅由本地确认和策略触发，执行时重新检查且只补缺。
+- [x] 全量、局部、实时增量、升级、关闭策略、无 provider 以及 VIDEO/HOMEVIDEOS 的入口行为一致；既有关闭配置不会被升级打开。
+- [x] 删除安全、`ScanCompleted`/`JOB_COMPLETED`、任务进度和 Emby DTO 边界无冲突；目录分页与通知合并要求明确。
+- [x] ADR、开发规格、兼容性记录与方案稿一致；`git diff --check` 通过。
+
+依赖：LUX-230、LUX-264。LUX-275 的双后端性能门仍开放；阶段 23 必须提供新增并发下的同 fixture A/B，不能据本机 ARM 数据宣称 NAS/x86 性能。
+
+文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/046-progressive-scan-and-missing-metadata.md`、`docs/COMPATIBILITY.md`、`docs/PROGRESSIVE-SCAN-METADATA-PROPOSAL.md`。
+
+结果（2026-09-28）：正式规格与 ADR-046 已确定 workflow 3 的渐进可见、本地旁车提前消费、能力级缺失确认和独立 FILL_MISSING 调度；旧 workflow 1/2、删除 CAS、ScanCompleted 及 Emby 边界保留。`git diff --check` 通过；本任务只改文档，未运行运行时代码测试。
+
+#### 阶段 23 总体验收与阶段门
+
+- [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
+- [ ] 人为阻塞首项图片、后段海报、慢 NFO、权限错误、不可用根、取消/重试、全量/增量竞态和扫描期间本地补图均有自动化覆盖。
+- [ ] 缺失分类、自动补缺策略、队列去重、provider 无候选/失败冷却、执行前重新检查和禁止覆盖本地/锁定数据均有回归覆盖。
+- [ ] SQLite 与 PostgreSQL 同 fixture A/B 分开报告索引完成耗时、首批可见、首张海报、local queue、在线 queue、前台 p95、事务/队列规模和内存；稳定索引或前台 p95 回退超过 5% 时先调度/并发并重测。
+- [ ] 扫描索引耗时与本地/在线处理耗时分别呈现；不以任务仍有后台工作为由把索引时间混入扫描性能结论。
+- [ ] 完成相关 Rust/Web 全量质量门、兼容性和性能记录、本机架构记录，并由项目所有者确认后结束阶段。
 
 ## 26. 风险与缓解
 

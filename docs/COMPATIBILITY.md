@@ -176,6 +176,12 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 
 验证：0136 完成后 `cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（8/8），包括 PostgreSQL format 3 根目录恢复、checkpoint 重试和升级扫描；SQLite `scanning_jobs` 69/69、`scanner` 16/16、`storage` 28/28。`cargo test --locked --test webhooks --test catalog` 为 8/8。首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1；阶段门 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo test --locked --all-targets` 均通过，机器 `uname -m=arm64`、Rust 1.97.1。两后端 60,000 文件 release 指标见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。PostgreSQL 测试使用本机 ARM64 临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
 
+## LUX-288 渐进扫描与在线补缺兼容边界（规格）
+
+新建扫描 workflow 3 的目标行为是：已提交的正向索引按批次向 Lux Web 目录/首页可见；本地 NFO/图片读取由独立有界 worker 早于全库遍历结束启动；本地检查确认的缺失才进入独立 FILL_MISSING 作业。`ScanCompleted` 与 `JOB_COMPLETED` 仍表示索引完成，不等待在线补缺；Emby 路由、DTO、图片标签与授权合同不变。删除仍要求根路径完整、二次文件状态确认和基线 CAS。
+
+这条记录是产品兼容性决策，当前不证明 workflow 3、增量事件或在线补缺队列已在运行时实现。实现结果和 SQLite/PostgreSQL A/B 数据须在阶段 23 相关 LUX 任务完成后追加；既有 workflow 1/2 继续按其原合同恢复。
+
 ## 目标矩阵
 
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |
