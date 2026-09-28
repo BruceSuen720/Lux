@@ -3204,7 +3204,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert!(!pagination_job_item_ids.contains(unsupported_item_id));
     assert!(!pagination_job_item_ids.contains(removed_item_id));
     let removed_completeness = database
-        .find_item_metadata_completeness(&removed_item_id, "POSTER")
+        .find_item_metadata_completeness(removed_item_id, "POSTER")
         .await?
         .ok_or("missing removed item completeness row")?;
     assert_eq!(removed_completeness.local_state, "RUNNING");
