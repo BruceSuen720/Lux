@@ -7284,15 +7284,17 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 无 provider 网络调用时能对支持类型返回每项实际缺失状态；关闭的图片能力不会生成可自动请求项，poster/fanart 等分别标记。
-- [ ] 实际缺失独立于 UNAVAILABLE/冷却记录；requestable 视图尊重这些记录，并复用手动 FILL_MISSING 请求规则。
-- [ ] 字段锁定、继承/回退图片与本地 NFO projection 沿用现有 selection 判断；不适用的媒体类型不伪造完整请求计划。
-- [ ] 输入 fingerprint 随当前元数据、有效图像能力与策略变化而变化；一致输入产生稳定指纹。
-- [ ] 单测覆盖缺少/已有/关闭图像类型、锁定字段、NFO、Unavailable 和不支持类型。
+- [x] 无 provider 网络调用时能对支持类型返回每项实际缺失状态；关闭的图片能力不会生成可自动请求项，poster/fanart 等分别标记。
+- [x] 实际缺失独立于 UNAVAILABLE/冷却记录；requestable 视图尊重这些记录，并复用手动 FILL_MISSING 请求规则。
+- [x] 字段锁定、继承/回退图片与本地 NFO projection 沿用现有 selection 判断；不适用的媒体类型不伪造完整请求计划。
+- [x] 输入 fingerprint 随当前元数据、有效图像能力与策略变化而变化；一致输入产生稳定指纹。
+- [x] 单测覆盖缺少/已有/关闭图像类型、锁定字段、NFO、Unavailable 和不支持类型。
 
 依赖：LUX-299。验证：`cargo test --locked --lib application::candidates::tests::<本地完整性计划用例>`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
 预计文件：`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：`MetadataRequestPlan` 额外保留每种图像类型的 missing mask；`MetadataSelectionService` 现在可将当前本地值拆成 METADATA、单图能力、CREDITS、EXTERNAL_IDS、TRAILERS，并分别给出实际缺失与按已有 attempt history 仍可请求的计划。fingerprint 由当前本地投影与两类计划的稳定摘要生成。纯计划用例覆盖单图策略、Unavailable、fingerprint 换代、锁定字段/NFO 现有逻辑和 VIDEO 排除；不发请求、不写数据库。定向 candidates 单测 1 项、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。扫描 worker 尚未调用该计划，留给下一项接线任务。
 
 #### 阶段 23 总体验收与阶段门
 
