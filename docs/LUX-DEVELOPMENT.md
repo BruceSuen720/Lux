@@ -7208,6 +7208,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：服务启动时恢复中断批次并运行一个持久 outbox worker；图片阶段先于 NFO，发现提交后唤醒 worker，扫描索引不等待 NFO/图片队列。图片写库错误或批次图片失败不会设置图片完成标记，worker 保留失败批次并退避重试。SQLite 定向目标 `scanned_metadata`（9）、`scanned_series_metadata`（2）、`scanning_jobs`（81）、`storage`（43）、`thumbnails`（17）共 152 项通过；真实 PostgreSQL 迁移合同 1 项通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。在线缺失标记/补刮、既有 unchanged 项目回填和 Web 实时刷新按范围留给阶段 23 后续任务；阶段 23 总体验收尚未完成。
 
+#### LUX-296：既有资源本地元数据回填游标存储
+
+范围：为已有媒体根路径建立一次性的、持久化且可恢复的本地元数据回填游标。存储层按 filesystem entry ID 稳定分页，每页有硬上限；提交游标使用当前值 CAS，失败重试不得跳页，根路径删除时级联清理。服务启动和 workflow 3 扫描可幂等登记需要回填的根路径。本任务只实现 schema 与存储合同，不领取页面、不读 NFO/图片、不确认缺失、不调度在线任务，也不改变扫描索引路径。
+
+验收：
+
+- [ ] SQLite/PostgreSQL migration 均可从空库升级；回填状态约束、根路径级联与 claim 索引一致。
+- [ ] 同一根路径重复登记幂等；分页稳定有界；只有当前游标匹配时才能推进，失败/重启保留当前页。
+- [ ] 没有可处理来源时可持久完成；已删除/缺失或无媒体 source 的条目不产生回填候选。
+- [ ] SQLite 与真实 PostgreSQL 存储合同覆盖登记、领取、推进、失败恢复、完成和根删除。
+
+依赖：LUX-295。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_backfill`、真实 PostgreSQL 对应 ignored 存储合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`migrations/0154_scan_local_metadata_backfill.sql`、`migrations-postgres/0154_scan_local_metadata_backfill.sql`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
