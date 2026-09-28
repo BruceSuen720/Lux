@@ -2165,6 +2165,8 @@ services:
 | LUX-286 | web/src/features/library/LibraryPage.tsx、web/src/features/library/prefetchLibrary.ts、web/src/lib/api/client.ts、web/src/features/home/media.tsx、web/tests/library-page.test.ts、web/tests/api-client.test.ts、web/tests/search-and-filmography.test.tsx；其他视频目录浏览与搜索 |
 | LUX-287 | web/src/features/detail/MediaDetailPage.tsx、web/src/features/media/MediaActionMenu.tsx、web/tests/media-detail.test.tsx、web/tests/media-action-menu.test.tsx、web/tests/home-media.test.tsx；视频详情、手动编辑与播放 |
 | LUX-288 | docs/LUX-DEVELOPMENT.md、docs/decisions/046-progressive-scan-and-missing-metadata.md、docs/COMPATIBILITY.md、docs/PROGRESSIVE-SCAN-METADATA-PROPOSAL.md；渐进扫描与独立在线补缺规格 |
+| LUX-289 | migrations/0151_progressive_scan_metadata.sql、migrations-postgres/0151_progressive_scan_metadata.sql、tests/storage.rs、docs/LUX-DEVELOPMENT.md；渐进扫描本地队列与完整性 schema |
+| LUX-290 | src/storage/migration.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；SQLite catalog 重建兼容与 PostgreSQL 升级合同 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7075,6 +7077,41 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/046-progressive-scan-and-missing-metadata.md`、`docs/COMPATIBILITY.md`、`docs/PROGRESSIVE-SCAN-METADATA-PROPOSAL.md`。
 
 结果（2026-09-28）：正式规格与 ADR-046 已确定 workflow 3 的渐进可见、本地旁车提前消费、能力级缺失确认和独立 FILL_MISSING 调度；旧 workflow 1/2、删除 CAS、ScanCompleted 及 Emby 边界保留。`git diff --check` 通过；本任务只改文档，未运行运行时代码测试。
+
+#### LUX-289：渐进扫描本地队列与完整性 schema
+
+范围：以 SQLite/PostgreSQL 同版本 additive migration 建立 `scan_local_metadata_batches` 本地处理 outbox、`item_metadata_completeness` 能力级本地检查/缺失记录，以及媒体库 `scan_missing_metadata_auto_match_enabled` 策略列。只改变 schema，不在本任务加入 Rust 领域/API 字段或运行时写入。
+
+数据合同：本地批次最多含 256 个 source 引用，带 root、来源 workflow job、序号、状态、尝试/下次重试与诊断信息；`job_id` 作为来源标识保留但不设外键，使未完成 outbox 不随扫描任务历史清理丢失，library root 删除则级联清除其工作。完整性以 `item_id + capability` 唯一标识，记录本地状态、输入 fingerprint、检查时间、错误和 nullable `is_missing`；只有 `READY` 可写入已知 missing/available，FAILED/RUNNING 等不能表示缺失。
+
+升级策略：新建媒体库列默认开启扫描触发的补缺；迁移对已有媒体库逐行复制 `realtime_metadata_auto_match_enabled`，保留管理员已关闭的配置。migration 不遍历文件系统或访问 provider。
+
+验收：
+
+- [x] SQLite 的 SQLx 空库和从 0148 升级都建立两张表、策略列、状态约束、唯一索引和领取索引。
+- [x] SQLite 迁移升级验证既有开关从 realtime 设置回填、新行默认开启、批次不依赖 scan job 外键，以及 root/item 删除级联。
+- [x] 无效状态、READY 与 nullable `is_missing` 不一致、空/超限批次、重复 item+capability 和重复 root batch sequence 均被拒绝。
+- [x] migration 不改变既有媒体表数据及 workflow 1/2 行为。
+
+依赖：LUX-288。验证：`cargo test --locked --test storage progressive_scan_metadata`；PostgreSQL runtime 验证见 LUX-290。
+
+文件：`migrations/0151_progressive_scan_metadata.sql`、`migrations-postgres/0151_progressive_scan_metadata.sql`、`tests/storage.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：SQLite 0151 空库与 0148 升级回归覆盖开关默认/回填、outbox 与完整性表、超限/空批次、重复键、状态与缺失值一致性，以及 root/item 级联；`cargo test --locked --test storage` 42 项通过。PostgreSQL migration 的真实升级和 SQLite 启动后的 catalog rebuild 由 LUX-290 验证。
+
+#### LUX-290：SQLite catalog 重建兼容与 PostgreSQL 升级合同
+
+范围：SQLite `migrate_sqlite_catalog_constraints` 会在 SQLx migration 后重建 `libraries`；必须保留新策略列和值。补充真实 PostgreSQL 从 0150 升级到 0151 的回归，包括已有开关回填、默认值、表约束和级联关系。本任务不增加运行时 Rust 配置读写。
+
+验收：
+
+- [ ] SQLite 新库启动后，catalog rebuild 前后均保留 `scan_missing_metadata_auto_match_enabled` 列与回填值；已有普通 catalog 列不丢失。
+- [ ] PostgreSQL 0150→0151 升级保留关闭/开启设置，新库行默认开启；批次与完整性约束、唯一索引和级联语义有效。
+- [ ] 未连接 PostgreSQL 时明确记录受限；完成验收需在 PostgreSQL 服务上实际运行 `postgres_database` 用例，忽略状态不算通过。
+
+依赖：LUX-289。验证：`cargo test --locked --test storage progressive_scan_metadata`；`cargo test --locked --test postgres_database` 与定向 ignored PostgreSQL migration 用例。
+
+文件：`src/storage/migration.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 #### 阶段 23 总体验收与阶段门
 

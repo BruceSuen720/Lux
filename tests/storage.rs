@@ -453,7 +453,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -473,8 +473,253 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 148);
+    assert_eq!(second_database.schema_version().await?, 151);
     second_database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database_path = temp_dir.path().join("progressive-empty.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    sqlx::migrate::Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+
+    let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(schema_version, 151);
+    for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(table_count, 1, "missing progressive metadata table {table}");
+    }
+
+    let policy_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('libraries')
+         WHERE name = 'scan_missing_metadata_auto_match_enabled'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(policy_column, 1);
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('progressive-new', 'New', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    let default_policy: i64 = sqlx::query_scalar(
+        "SELECT scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE id = 'progressive-new'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(default_policy, 1);
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn progressive_scan_metadata_upgrade_preserves_existing_policy_intent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 148 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing name")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("progressive-upgrade.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind, realtime_metadata_auto_match_enabled)
+         VALUES ('progressive-off', 'Progressive off', 'MOVIE', 0),
+                ('progressive-on', 'Progressive on', 'MOVIE', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await?;
+
+    let migration = source_dir.join("0151_progressive_scan_metadata.sql");
+    fs::copy(
+        &migration,
+        migration_dir.join("0151_progressive_scan_metadata.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+
+    let existing_policy: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE id IN ('progressive-off', 'progressive-on') ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        existing_policy,
+        vec![
+            ("progressive-off".to_owned(), 0),
+            ("progressive-on".to_owned(), 1)
+        ]
+    );
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('progressive-new', 'New', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    let new_policy: i64 = sqlx::query_scalar(
+        "SELECT scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE id = 'progressive-new'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(new_policy, 1);
+
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('progressive-root', 'progressive-off', '/off', '/off', 1, 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (
+             'progressive-item', 'progressive-on', 'MOVIE', 'Progressive', 'progressive',
+             'LOCAL_CONFIRMED'
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_batches (
+             id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+         ) VALUES ('progressive-batch', 'cleaned-scan-job', 'progressive-root', 0, '[\"source-1\"]', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_metadata_completeness (
+             item_id, capability, local_state, is_missing
+         ) VALUES ('progressive-item', 'POSTER', 'READY', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing
+             ) VALUES ('progressive-item', 'POSTER', 'READY', 0)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing
+             ) VALUES ('progressive-item', 'BACKDROP', 'FAILED', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+             ) VALUES ('progressive-empty', 'cleaned-scan-job', 'progressive-root', 2, '[\"source-1\"]', 0)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+             ) VALUES ('progressive-oversized', 'cleaned-scan-job', 'progressive-root', 1, '[]', 257)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+             ) VALUES ('progressive-duplicate', 'cleaned-scan-job', 'progressive-root', 0, '[]', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+
+    sqlx::query("DELETE FROM libraries WHERE id = 'progressive-off'")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM media_items WHERE id = 'progressive-item'")
+        .execute(&pool)
+        .await?;
+    let remaining_batches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_local_metadata_batches WHERE id = 'progressive-batch'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let remaining_completeness: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness WHERE item_id = 'progressive-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(remaining_batches, 0);
+    assert_eq!(remaining_completeness, 0);
+    pool.close().await;
     Ok(())
 }
 
@@ -821,7 +1066,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
 
     database.close().await;
     Ok(())
@@ -1515,7 +1760,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
     Ok(())
 }
 
@@ -1687,7 +1932,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
     Ok(())
 }
 
@@ -1774,7 +2019,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
     database.close().await;
     Ok(())
 }
@@ -1905,7 +2150,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -2087,7 +2332,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 151);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
