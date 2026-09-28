@@ -66,7 +66,8 @@ use crate::{
         NewScanManifestPositiveIndex, NewScanManifestRoot, NewScanManifestSeenFilesystemEntry,
         NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile, ReconciliationBatchCommit,
         StorageError, StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
-        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath, StoredScanManifestDelta,
+        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
+        StoredScanLocalMetadataBatch, StoredScanManifestDelta,
         StoredScanManifestFilesystemBaseline, is_lite_manifest_discovery,
         movie_parent_folder_identity,
     },
@@ -1852,6 +1853,10 @@ impl ManifestDirectoryReader {
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
+const SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK: Duration = Duration::from_millis(250);
+const SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS: i64 = 30;
+const MAX_SCAN_LOCAL_METADATA_SOURCE_IDS: usize = 256;
+const MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT: usize = 4;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -4571,6 +4576,8 @@ pub struct ScanJobService {
     scan_concurrency_override: Option<usize>,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    local_metadata_outbox_worker_started: Arc<AtomicBool>,
+    local_metadata_outbox_notify: Arc<Notify>,
     lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
 }
 
@@ -4579,6 +4586,126 @@ struct LocalMetadataWorkerHandle {
     task: JoinHandle<()>,
     job_id: String,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
+
+async fn process_scan_local_metadata_batch(
+    database: &Database,
+    enricher: &MetadataEnricher,
+    home: Option<&HomeService>,
+    batch: StoredScanLocalMetadataBatch,
+) -> Option<(String, Vec<String>)> {
+    let batch_id = batch.id.clone();
+    let source_ids = match serde_json::from_str::<Vec<String>>(&batch.source_refs_json) {
+        Ok(source_ids)
+            if source_ids.len() == usize::try_from(batch.source_count).unwrap_or(usize::MAX)
+                && !source_ids.is_empty()
+                && source_ids.len() <= MAX_SCAN_LOCAL_METADATA_SOURCE_IDS
+                && source_ids
+                    .iter()
+                    .all(|source_id| !source_id.trim().is_empty())
+                && source_ids.iter().collect::<HashSet<_>>().len() == source_ids.len() =>
+        {
+            source_ids
+        }
+        _ => {
+            fail_scan_local_metadata_batch(database, &batch_id, "invalid source reference batch")
+                .await;
+            return None;
+        }
+    };
+
+    let result = match enricher
+        .index_scan_local_metadata_batch_images(&source_ids)
+        .await
+    {
+        Ok(report) if !report.failed_item_ids.is_empty() => Err(format!(
+            "{} local image item(s) failed",
+            report.failed_item_ids.len()
+        )),
+        Ok(_) => match database
+            .mark_scan_local_metadata_images_complete(&batch_id)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+            Err(error) => Err(error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    if let Some(home) = home {
+        home.invalidate_scan_batch().await;
+    }
+
+    match result {
+        Ok(()) => Some((batch_id, source_ids)),
+        Err(error) => {
+            tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
+            fail_scan_local_metadata_batch(database, &batch_id, &error).await;
+            None
+        }
+    }
+}
+
+async fn finish_scan_local_metadata_batch(
+    database: &Database,
+    enricher: &MetadataEnricher,
+    home: Option<&HomeService>,
+    batch_id: &str,
+    source_ids: &[String],
+) {
+    let result = enricher
+        .enrich_scan_local_metadata_batch_nfo(source_ids)
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|report| {
+            if report.failed_item_ids.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} local NFO item(s) failed",
+                    report.failed_item_ids.len()
+                ))
+            }
+        });
+    if let Some(home) = home {
+        home.invalidate_scan_batch().await;
+    }
+
+    match result {
+        Ok(()) => match database.complete_scan_local_metadata_batch(batch_id).await {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(batch_id, "local metadata batch was already terminal"),
+            Err(error) => {
+                tracing::warn!(batch_id, %error, "local metadata batch completion could not be saved");
+                fail_scan_local_metadata_batch(
+                    database,
+                    batch_id,
+                    "local metadata completion failed",
+                )
+                .await;
+            }
+        },
+        Err(error) => {
+            tracing::warn!(batch_id, %error, "local NFO batch failed and will be retried");
+            fail_scan_local_metadata_batch(database, batch_id, &error).await;
+        }
+    }
+}
+
+async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, error: &str) {
+    let retry_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
+        .unwrap_or(i64::MAX);
+    if let Err(storage_error) = database
+        .fail_scan_local_metadata_batch(batch_id, error, Some(retry_at))
+        .await
+    {
+        tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4613,6 +4740,8 @@ impl ScanJobService {
                 .and_then(|value| usize::try_from(value).ok()),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
+            local_metadata_outbox_worker_started: Arc::new(AtomicBool::new(false)),
+            local_metadata_outbox_notify: Arc::new(Notify::new()),
             lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -6311,6 +6440,9 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
+                if result.local_metadata_batches_changed {
+                    self.notify_local_metadata_outbox_worker();
+                }
                 if result.metadata_targets_changed {
                     self.notify_local_metadata_worker(job_id);
                 }
@@ -6367,6 +6499,9 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
+                if result.local_metadata_batches_changed {
+                    self.notify_local_metadata_outbox_worker();
+                }
                 if result.metadata_targets_changed {
                     self.notify_local_metadata_worker(chunk.job_id);
                 }
@@ -9698,6 +9833,100 @@ impl ScanJobService {
         Ok(())
     }
 
+    pub async fn start_local_metadata_outbox_worker(&self) -> Result<(), ScanJobError> {
+        if self
+            .local_metadata_outbox_worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .database
+            .requeue_interrupted_scan_local_metadata_batches()
+            .await
+        {
+            self.local_metadata_outbox_worker_started
+                .store(false, Ordering::Release);
+            return Err(error.into());
+        }
+
+        let database = self.database.clone();
+        let local_nfo = self.local_nfo.clone();
+        let home = self.home.clone();
+        let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
+        tokio::spawn(async move {
+            let enricher = MetadataEnricher::new(database.clone());
+            let enricher = match local_nfo {
+                Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+                None => enricher,
+            };
+            let mut nfo_tasks = JoinSet::new();
+            loop {
+                if nfo_tasks.len() >= MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT {
+                    if let Some(Err(error)) = nfo_tasks.join_next().await {
+                        tracing::error!(%error, "local metadata NFO worker task panicked");
+                    }
+                    continue;
+                }
+                match database.claim_next_scan_local_metadata_batch().await {
+                    Ok(Some(batch)) => {
+                        if let Some((batch_id, source_ids)) = process_scan_local_metadata_batch(
+                            &database,
+                            &enricher,
+                            home.as_ref(),
+                            batch,
+                        )
+                        .await
+                        {
+                            let database = database.clone();
+                            let enricher = enricher.clone();
+                            let home = home.clone();
+                            nfo_tasks.spawn(async move {
+                                finish_scan_local_metadata_batch(
+                                    &database,
+                                    &enricher,
+                                    home.as_ref(),
+                                    &batch_id,
+                                    &source_ids,
+                                )
+                                .await;
+                                batch_id
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        if nfo_tasks.is_empty() {
+                            tokio::select! {
+                                _ = outbox_notify.notified() => {}
+                                _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+                            }
+                        } else {
+                            tokio::select! {
+                                result = nfo_tasks.join_next() => {
+                                    if let Some(Err(error)) = result {
+                                        tracing::error!(%error, "local metadata NFO worker task panicked");
+                                    }
+                                }
+                                _ = outbox_notify.notified() => {}
+                                _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "local metadata outbox claim failed; retrying");
+                        tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn notify_local_metadata_outbox_worker(&self) {
+        self.local_metadata_outbox_notify.notify_one();
+    }
+
     fn start_local_metadata_worker(&self, scan_job_id: &str) -> LocalMetadataWorkerHandle {
         let (stop, mut stop_receiver) = watch::channel(false);
         let database = self.database.clone();
@@ -9897,6 +10126,17 @@ impl ScanJobService {
         Ok(())
     }
 
+    async fn wait_for_local_metadata_images(&self, scan_job_id: &str) -> Result<(), ScanJobError> {
+        while self
+            .database
+            .has_pending_scan_local_metadata_images(scan_job_id)
+            .await?
+        {
+            tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+        }
+        Ok(())
+    }
+
     async fn stop_local_metadata_worker(worker: &mut Option<LocalMetadataWorkerHandle>) {
         let Some(worker) = worker.take() else {
             return;
@@ -9978,13 +10218,19 @@ impl ScanJobService {
         metadata: Option<MetadataReidentifyService>,
         thumbnails: Option<ThumbnailService>,
     ) -> Result<(), ScanJobError> {
-        let defer_local_metadata_worker = self
+        let manifest_workflow_version = self
             .database
             .get_scan_manifest_by_job(job_id)
             .await?
-            .is_some_and(|manifest| {
-                matches!(manifest.workflow_version, 2 | 3) && manifest.discovery_format_version == 3
-            });
+            .filter(|manifest| manifest.discovery_format_version == 3)
+            .map(|manifest| manifest.workflow_version);
+        let uses_local_metadata_outbox = manifest_workflow_version == Some(3);
+        let defer_local_metadata_worker = matches!(manifest_workflow_version, Some(2 | 3));
+        if uses_local_metadata_outbox
+            && let Err(error) = self.start_local_metadata_outbox_worker().await
+        {
+            tracing::warn!(job_id, %error, "local metadata outbox worker did not start");
+        }
         let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let mut local_metadata_worker =
             (!defer_local_metadata_worker).then(|| self.start_local_metadata_worker(job_id));
@@ -10041,7 +10287,9 @@ impl ScanJobService {
                         Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                         return Err(error);
                     }
-                    local_metadata_worker = Some(self.start_local_metadata_worker(job_id));
+                    if !uses_local_metadata_outbox {
+                        local_metadata_worker = Some(self.start_local_metadata_worker(job_id));
+                    }
                 }
                 drop(scan_permit);
                 if self.cancellation_requested_in_memory(job_id) {
@@ -10097,6 +10345,13 @@ impl ScanJobService {
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     return Err(error.into());
                 }
+                if uses_local_metadata_outbox {
+                    for target_type in ["SOURCE", "ITEM"] {
+                        self.database
+                            .skip_pending_scan_job_target_stage(job_id, target_type, "METADATA")
+                            .await?;
+                    }
+                }
                 if let Err(error) = self.wait_for_local_metadata(job_id).await {
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     return Err(error);
@@ -10124,6 +10379,9 @@ impl ScanJobService {
                 if defer_local_metadata_worker {
                     self.verify_manifest_postprocessing_target_roots(job_id)
                         .await?;
+                }
+                if uses_local_metadata_outbox && thumbnails.is_some() {
+                    self.wait_for_local_metadata_images(job_id).await?;
                 }
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
                 self.database
@@ -10617,6 +10875,14 @@ impl ScanJobService {
     }
 
     async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
+        if self
+            .database
+            .get_scan_manifest_by_job(job_id)
+            .await?
+            .is_some_and(|manifest| manifest.workflow_version == 3)
+        {
+            return Ok(());
+        }
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Ok(());
         };

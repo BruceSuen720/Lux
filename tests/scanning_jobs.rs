@@ -26,6 +26,35 @@ use luxd::{
 };
 use tokio::sync::Semaphore;
 
+async fn wait_for_local_metadata_batches(
+    database: &Database,
+    job_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (pending, failed): (i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*) FILTER (WHERE status IN ('PENDING', 'RUNNING')),
+                        COUNT(*) FILTER (WHERE status = 'FAILED')
+                 FROM scan_local_metadata_batches WHERE job_id = ?",
+            )
+            .bind(job_id)
+            .fetch_one(database.pool())
+            .await?;
+            if failed > 0 {
+                return Err(sqlx::Error::Protocol(format!(
+                    "{failed} local metadata batch(es) failed"
+                )));
+            }
+            if pending == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn lite_manifest_movie_provider_ids_are_inherited_and_file_tags_take_precedence()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -279,9 +308,18 @@ async fn homevideos_scan_imports_same_name_nfo_without_reclassifying_or_queueing
         .await?
         .root;
 
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = 'tmdb', realtime_metadata_auto_match_enabled = 1
+         WHERE id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
+    wait_for_local_metadata_batches(&database, &job.id).await?;
 
     let item: (String, String, Option<i64>, String, Option<String>) = sqlx::query_as(
         "SELECT item_type, title, production_year, identification_status, metadata_scraper_id
@@ -290,6 +328,12 @@ async fn homevideos_scan_imports_same_name_nfo_without_reclassifying_or_queueing
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
+
+    let initial_metadata_jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(initial_metadata_jobs, 0);
     assert_eq!(item.0, "VIDEO");
     assert_eq!(item.1, "手动整理的视频");
     assert_eq!(item.2, Some(2024));
@@ -301,14 +345,6 @@ async fn homevideos_scan_imports_same_name_nfo_without_reclassifying_or_queueing
     )
     .bind(library.id.to_string())
     .fetch_one(database.pool())
-    .await?;
-    sqlx::query(
-        "UPDATE libraries
-         SET scraper_id = 'tmdb', realtime_metadata_auto_match_enabled = 1
-         WHERE id = ?",
-    )
-    .bind(library.id.to_string())
-    .execute(database.pool())
     .await?;
     let scraper = TestScraper::new(TestScraperConfig::default())?;
     let reidentify =
@@ -2265,7 +2301,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -6195,6 +6231,10 @@ async fn pending_postprocessing_targets_make_scan_retryable()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 2 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
     loop {
         if jobs.run_batch(&job.id, 100).await?.completed {
             break;
@@ -6262,6 +6302,10 @@ async fn metadata_and_thumbnail_failures_are_persisted_per_target()
     let thumbnails =
         ThumbnailService::with_runner(database.clone(), "false", Duration::from_secs(5));
     let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 2 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
     jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
         .await?;
 

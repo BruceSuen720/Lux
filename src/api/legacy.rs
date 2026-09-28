@@ -566,6 +566,14 @@ impl AppState {
         }
     }
 
+    pub async fn start_local_metadata_worker(&self) {
+        if let Some(scan_jobs) = self.scan_jobs.as_ref()
+            && let Err(error) = scan_jobs.start_local_metadata_outbox_worker().await
+        {
+            tracing::error!(%error, "failed to start the local metadata outbox worker");
+        }
+    }
+
     pub fn require_database_selection(mut self) -> Self {
         self.database_selection_required = true;
         self

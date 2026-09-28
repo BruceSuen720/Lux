@@ -453,7 +453,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -473,7 +473,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 152);
+    assert_eq!(second_database.schema_version().await?, 153);
     second_database.close().await;
     Ok(())
 }
@@ -500,7 +500,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 152);
+    assert_eq!(schema_version, 153);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -518,6 +518,13 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     .fetch_one(&pool)
     .await?;
     assert_eq!(policy_column, 1);
+    let image_stage_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_local_metadata_batches')
+         WHERE name = 'images_completed_at'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(image_stage_column, 1);
     sqlx::query(
         "INSERT INTO libraries (id, name, kind) VALUES ('progressive-new', 'New', 'MOVIE')",
     )
@@ -613,6 +620,27 @@ async fn progressive_scan_metadata_upgrade_preserves_existing_policy_intent()
         source_dir.join("0152_scan_manifest_workflow_three.sql"),
         migration_dir.join("0152_scan_manifest_workflow_three.sql"),
     )?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('progressive-root', 'progressive-off', '/off', '/off', 1, 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_batches (
+             id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+         ) VALUES (
+             'progressive-batch-before-image-stage', 'workflow-two-job', 'progressive-root', 0,
+             '[\"old-source\"]', 1
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0153_scan_local_metadata_image_stage.sql"),
+        migration_dir.join("0153_scan_local_metadata_image_stage.sql"),
+    )?;
     sqlx::migrate::Migrator::new(migration_dir)
         .await?
         .run(&pool)
@@ -625,6 +653,13 @@ async fn progressive_scan_metadata_upgrade_preserves_existing_policy_intent()
     .fetch_one(&pool)
     .await?;
     assert_eq!(legacy_manifest, (2, Some("DISCOVERING".to_owned())));
+    let old_batch_image_stage: Option<i64> = sqlx::query_scalar(
+        "SELECT images_completed_at FROM scan_local_metadata_batches
+         WHERE id = 'progressive-batch-before-image-stage'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(old_batch_image_stage, None);
     sqlx::query(
         "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
          VALUES ('workflow-three-job', 'progressive-off', 'RECONCILE_LIBRARY', 'PENDING', 'g3')",
@@ -665,13 +700,6 @@ async fn progressive_scan_metadata_upgrade_preserves_existing_policy_intent()
     .await?;
     assert_eq!(new_policy, 1);
 
-    sqlx::query(
-        "INSERT INTO library_roots (
-             id, library_id, canonical_path, display_path, is_available, is_writable
-         ) VALUES ('progressive-root', 'progressive-off', '/off', '/off', 1, 1)",
-    )
-    .execute(&pool)
-    .await?;
     sqlx::query(
         "INSERT INTO media_items (
              id, library_id, item_type, title, sort_title, identification_status
@@ -833,7 +861,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 152);
+    assert_eq!(schema_version, 153);
     database.close().await;
     Ok(())
 }
@@ -1181,7 +1209,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
 
     database.close().await;
     Ok(())
@@ -1875,7 +1903,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     Ok(())
 }
 
@@ -2047,7 +2075,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     Ok(())
 }
 
@@ -2134,7 +2162,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     database.close().await;
     Ok(())
 }
@@ -2265,7 +2293,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -2447,7 +2475,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 152);
+    assert_eq!(database.schema_version().await?, 153);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

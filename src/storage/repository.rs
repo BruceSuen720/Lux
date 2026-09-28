@@ -1230,6 +1230,19 @@ pub(crate) struct StoredScanLocalMetadataBatch {
     pub(crate) updated_at: i64,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredScanLocalMetadataSource {
+    pub(crate) source_id: String,
+    pub(crate) item_id: String,
+    pub(crate) item_type: String,
+    pub(crate) probe_status: String,
+    pub(crate) series_id: Option<String>,
+    pub(crate) season_id: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewScanManifestRoot<'a> {
     pub(crate) library_root_id: &'a str,
@@ -1499,6 +1512,7 @@ pub(crate) struct ManifestDiscoveryCommitResult {
     pub(crate) observed_file_count: i64,
     pub(crate) created_items: usize,
     pub(crate) metadata_targets_changed: bool,
+    pub(crate) local_metadata_batches_changed: bool,
 }
 
 #[derive(Debug)]

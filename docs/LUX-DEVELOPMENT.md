@@ -2171,6 +2171,7 @@ services:
 | LUX-292 | src/storage/metadata.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；能力级本地完整性存储 |
 | LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
 | LUX-294 | migrations/0152_scan_manifest_workflow_three.sql、migrations-postgres/0152_scan_manifest_workflow_three.sql、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、tests/admin_health.rs、tests/ready_version.rs、tests/scanner.rs、tests/danmaku.rs、docs/LUX-DEVELOPMENT.md；workflow 3 正向索引与本地 outbox 原子提交 |
+| LUX-295 | migrations/0153_scan_local_metadata_image_stage.sql、migrations-postgres/0153_scan_local_metadata_image_stage.sql、src/application/metadata.rs、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、src/storage/repository_tests.rs、src/api/legacy.rs、src/main.rs、tests/scanned_metadata.rs、tests/scanned_series_metadata.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；本地 outbox 后台消费与海报优先处理 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7187,6 +7188,25 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`migrations/0152_scan_manifest_workflow_three.sql`、`migrations-postgres/0152_scan_manifest_workflow_three.sql`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/ready_version.rs`、`tests/scanner.rs`、`tests/danmaku.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-09-28）：新扫描 workflow 3 的正向索引事务按最多 256 个 filesystem source 引用原子写入本地 outbox；DISCOVERING 期间可见，最终 target 物化不重复写入。SQLite 注入 outbox 写错验证回滚；1,025 文件批次、`.strm` 与现有 poster sidecar、workflow 2 恢复语义均有回归。SQLite/PostgreSQL workflow 约束迁移各通过；`cargo test --locked --test scanning_jobs -- --test-threads=4` 81 项通过，`cargo test --locked --all-targets -- --test-threads=4` 全目标通过，定向真实 PostgreSQL migration 用例通过；`cargo build --locked`、`cargo fmt --all -- --check` 与 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。当前工作只完成任务发布，尚未消费本地 NFO/图片，首张海报提速需要后续 worker 与页面更新任务。
+
+#### LUX-295：本地 outbox 后台消费与海报优先处理
+
+范围：实现 workflow 3 本地 outbox 消费者，服务启动时恢复遗留 RUNNING 批次并以有界单 worker 从持久队列领取工作；资源正向索引后即处理该资源目录中的本地图片与 NFO，图片登记先于可能较慢的 NFO 读取。扫描索引不等待 outbox 清空；worker 仅访问本地媒体根和本地存储，不调用 provider。复用现有媒体/剧集 NFO 与图片索引逻辑，并保留 workflow 1/2 原有后处理流程。workflow 3 的缩略图回退只等待本地图片阶段完成，不等待慢 NFO；这个等待位于索引完成之后，不能延迟索引完成事件。本任务不做对既有 unchanged 项目的全库回填、不确认缺失、不调度 FILL_MISSING，也不负责 Web 实时刷新；这些由后续任务完成。
+
+验收：
+
+- [x] 服务启动时恢复 RUNNING 本地批次，随后以单一有界 worker 领取、完成或退避重试；应用关闭/重启后已提交批次仍可恢复。
+- [x] workflow 3 的 outbox 可在扫描索引未完成时消费；扫描完成时间不等待本地 NFO/图片队列清空；workflow 1/2 原流程不变。
+- [x] 电影/剧集批次先发现并登记同目录本地图片，再读取/合并 NFO；已有多源和剧集父级去重逻辑继续生效。
+- [x] 本地图片阶段完成后才运行 workflow 3 的视频缩略图回退，避免本地剧集缩略图被误判为缺失；慢 NFO 不阻塞此图片屏障或索引完成。
+- [x] 本地处理不调用 scraper/provider；局部失败不能误标已完成，成功批次使主页投影失效以便后续刷新。
+- [x] SQLite integration tests 覆盖提前领取、poster-before-NFO、队列重启恢复和无在线请求；真实 PostgreSQL 复用已有领取存储合同。
+
+依赖：LUX-294。验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`；阶段完成再运行全目标门。
+
+预计文件：`migrations/0153_scan_local_metadata_image_stage.sql`、`migrations-postgres/0153_scan_local_metadata_image_stage.sql`、`src/api/legacy.rs`、`src/application/metadata.rs`、`src/application/scanner.rs`、`src/main.rs`、`src/storage/jobs.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`tests/admin_health.rs`、`tests/danmaku.rs`、`tests/library_cover_generation.rs`、`tests/postgres_database.rs`、`tests/ready_version.rs`、`tests/scanned_metadata.rs`、`tests/scanned_series_metadata.rs`、`tests/scanner.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`、`docs/LUX-DEVELOPMENT.md`。既有 `tests/thumbnails.rs::existing_series_episode_thumbnail_is_preserved_while_poster_is_generated` 用作图片屏障回归用例。
+
+结果（2026-09-28）：服务启动时恢复中断批次并运行一个持久 outbox worker；图片阶段先于 NFO，发现提交后唤醒 worker，扫描索引不等待 NFO/图片队列。图片写库错误或批次图片失败不会设置图片完成标记，worker 保留失败批次并退避重试。SQLite 定向目标 `scanned_metadata`（9）、`scanned_series_metadata`（2）、`scanning_jobs`（81）、`storage`（43）、`thumbnails`（17）共 152 项通过；真实 PostgreSQL 迁移合同 1 项通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。在线缺失标记/补刮、既有 unchanged 项目回填和 Web 实时刷新按范围留给阶段 23 后续任务；阶段 23 总体验收尚未完成。
 
 #### 阶段 23 总体验收与阶段门
 

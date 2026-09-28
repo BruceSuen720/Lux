@@ -818,6 +818,32 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert!(claimed_a.updated_at >= claimed_a.created_at);
     assert!(
         database
+            .has_pending_scan_local_metadata_images("scan-job")
+            .await
+            .expect("image stage is pending")
+    );
+    assert!(
+        database
+            .mark_scan_local_metadata_images_complete(&claimed_a.id)
+            .await
+            .expect("mark local images complete")
+    );
+    let claimed_a_images_completed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT images_completed_at FROM scan_local_metadata_batches WHERE id = ?",
+    )
+    .bind(&claimed_a.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("read image completion marker");
+    assert!(claimed_a_images_completed_at.is_some());
+    assert!(
+        database
+            .has_pending_scan_local_metadata_images("scan-job")
+            .await
+            .expect("another batch image stage remains pending")
+    );
+    assert!(
+        database
             .complete_scan_local_metadata_batch(&claimed_a.id)
             .await
             .expect("complete")
@@ -885,6 +911,18 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(retried.attempts, 2);
     assert!(
         database
+            .has_pending_scan_local_metadata_images("retry-job")
+            .await
+            .expect("claim resets the image stage")
+    );
+    assert!(
+        database
+            .mark_scan_local_metadata_images_complete(&retried.id)
+            .await
+            .expect("mark retried images complete")
+    );
+    assert!(
+        database
             .complete_scan_local_metadata_batch(&retried.id)
             .await
             .expect("complete retry")
@@ -914,6 +952,18 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
         .expect("claim interrupted batch")
         .expect("running batch");
     assert_eq!(running.id, "batch-e");
+    assert!(
+        database
+            .mark_scan_local_metadata_images_complete(&running.id)
+            .await
+            .expect("mark interrupted images complete")
+    );
+    assert!(
+        !database
+            .has_pending_scan_local_metadata_images("interrupted-job")
+            .await
+            .expect("persisted image completion")
+    );
     assert_eq!(
         database
             .requeue_interrupted_scan_local_metadata_batches()
@@ -928,6 +978,12 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
         .expect("recovered batch");
     assert_eq!(recovered.id, "batch-e");
     assert_eq!(recovered.attempts, 2);
+    assert!(
+        database
+            .has_pending_scan_local_metadata_images("interrupted-job")
+            .await
+            .expect("reclaimed batch reruns the image stage")
+    );
 
     database.close().await;
 }
