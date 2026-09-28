@@ -7353,6 +7353,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验证通过：scanner completeness/dispatch/incremental 三个定向单测；`reidentify` 12 项、`scanned_metadata` 11 项、`scanned_series_metadata` 2 项、`scanning_jobs` 81 项；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
+#### LUX-304：阶段 23 1k/10k 扫描与本地海报性能门
+
+范围：用 `lux_270_manifest_job_scan_benchmark` 对 1,000 与 10,000 文件 fixture 做 SQLite/PostgreSQL 基线 A/B，使用同一生成器、相同数据库参数和当前 ARM64 环境，基线为 LUX-295 前的 `6424ab12`，候选为本分支提交。每个大小/后端/版本至少交错运行三轮，记录首扫索引、无变化重扫、target 物化、前台 p95、事务/队列和 WAL/SQLite 锁指标。新增 ignored poster-worker 基准，在相同规模 fixture 为每个电影生成有效的本地海报文件，测量首条索引可查、首张本地 poster、扫描索引完成与全量本地 poster 队列完成时间；本地 worker 与刮削 job 的耗时分开记录。该本机 ARM64 / PostgreSQL 版本只作为同机 A/B，不外推为 NAS/x86_64 性能结论。
+
+验收：
+
+- [ ] 1k/10k SQLite 与 PostgreSQL 基线/候选各有至少三轮交错原始记录，包含环境、提交、fixture、参数和 p50/p95。
+- [ ] poster-worker 基准证明条目索引后可读，首张已存在本地 poster 可在扫描仍运行时写入；全库 poster 完成时间单独报告。
+- [ ] 扫描索引稳定耗时或前台 p95 若回退超过 5%，先调度本地 worker/写入批次并重测，不把回退归入在线刮削。
+- [ ] `docs/PERFORMANCE.md` 更新结果，并明确本机架构及 PostgreSQL 版本；阶段 23 其余兼容性与真实浏览器验证仍需在总体验收中完成。
+
+预计文件：`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
