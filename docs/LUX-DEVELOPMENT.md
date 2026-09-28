@@ -7249,15 +7249,17 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 安全正向索引提交后，扫描仍处于 DISCOVERING 时能收到 `home` 事件；事务失败不发事件。
-- [ ] 收到事件后再次读取首页不会命中提交前缓存；workflow 1/2 的最终刷新合同不变。
-- [ ] 新 outbox 与既有资源 backfill 的 poster/NFO 持久化后触发同一 `home` 事件；图片部分成功且页面可见时不被后续 NFO 失败吞掉通知。
-- [ ] 通知沿用 `UserEventHub` 合并，批量扫描不会按每个媒体/图片生成独立 SSE 消息；连接重建仍依靠既有 open 事件重新取数。
-- [ ] SQLite 测试覆盖事件在扫描结束前到达和回填 poster 后到达；已有 Web SSE scope/query invalidation 测试保持通过。
+- [x] 安全正向索引提交后，扫描仍处于 DISCOVERING 时能收到 `home` 事件；事务失败不发事件。
+- [x] 收到事件后再次读取首页不会命中提交前缓存；workflow 1/2 的最终刷新合同不变。
+- [x] 新 outbox 与既有资源 backfill 的 poster/NFO 持久化后触发同一 `home` 事件；图片部分成功且页面可见时不被后续 NFO 失败吞掉通知。
+- [x] 通知沿用 `UserEventHub` 合并，批量扫描不会按每个媒体/图片生成独立 SSE 消息；连接重建仍依靠既有 open 事件重新取数。
+- [x] SQLite 测试覆盖事件在扫描结束前到达和回填 poster 后到达；已有 Web SSE scope/query invalidation 测试保持通过。
 
 依赖：LUX-294、LUX-295、LUX-297。验证：`cargo test --locked --test scanning_jobs --test scanned_metadata`、`pnpm --dir web test`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
 预计文件：`src/application/scanner.rs`、`tests/scanning_jobs.rs`、`tests/scanned_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。Web listener 和 SSE query invalidation 已存在，经现有 `web/tests/lux-shell.test.tsx` 验证；若源码检查发现协议不匹配，再将 Web 修正拆成独立任务。
+
+结果（2026-09-28）：workflow 3 正向索引事务提交后先同步失效 HomeService 缓存，再发送合并的 `home` SSE；outbox/backfill 图片与 NFO更新也刷新缓存并复用同一事件，scan terminal 改为合并发布，workflow 1/2 继续使用旧扫描期稳定快照路径。测试证明事件在 manifest 仍 DISCOVERING 时到达、回填 poster 后到达，注入索引事务失败没有事件；既有 Web SSE listener 和 query invalidation 测试未改且通过。`scanning_jobs` 81 项、`scanned_metadata` 11 项、progressive Home 单测 1 项通过；Web 75 个 Vitest 文件/526 项和样式 Node 测试通过；`cargo build --locked`、fmt、all-target clippy 通过。migration 升级使一项扫描测试的预期 schema version 从 153 更新为 154。
 
 #### 阶段 23 总体验收与阶段门
 

@@ -1,6 +1,7 @@
 use luxd::{
     application::scanner::LibraryScanner,
     application::{
+        admin_events::{UserEventHub, UserEventScope},
         libraries::LibraryService,
         scanner::{IncrementalScanChange, ScanJobService},
         watch::ChangeKind,
@@ -112,7 +113,9 @@ async fn local_metadata_worker_backfills_posters_for_unchanged_indexed_items()
     .execute(database.pool())
     .await?;
 
-    let jobs = ScanJobService::new(database.clone());
+    let user_events = UserEventHub::new();
+    let mut user_event_receiver = user_events.subscribe();
+    let jobs = ScanJobService::new(database.clone()).with_user_events(user_events);
     jobs.start_local_metadata_outbox_worker().await?;
     let registered_roots: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_local_metadata_backfills WHERE library_root_id =
@@ -124,6 +127,32 @@ async fn local_metadata_worker_backfills_posters_for_unchanged_indexed_items()
     assert_eq!(
         registered_roots, 1,
         "worker startup registers existing roots"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let image_count: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER'
+                   AND local_path LIKE '%/poster.jpg'",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+            if image_count > 0 {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            user_event_receiver.recv(),
+        )
+        .await??,
+        UserEventScope::Home
     );
 
     tokio::time::timeout(std::time::Duration::from_secs(10), async {

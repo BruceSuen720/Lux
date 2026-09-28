@@ -4593,6 +4593,7 @@ async fn process_scan_local_metadata_batch(
     database: &Database,
     enricher: &MetadataEnricher,
     home: Option<&HomeService>,
+    user_events: &UserEventHub,
     batch: StoredScanLocalMetadataBatch,
 ) -> Option<(String, Vec<String>)> {
     let batch_id = batch.id.clone();
@@ -4634,8 +4635,9 @@ async fn process_scan_local_metadata_batch(
         Err(error) => Err(error.to_string()),
     };
     if let Some(home) = home {
-        home.invalidate_scan_batch().await;
+        home.invalidate();
     }
+    user_events.publish_home_coalesced().await;
 
     match result {
         Ok(()) => Some((batch_id, source_ids)),
@@ -4651,6 +4653,7 @@ async fn finish_scan_local_metadata_batch(
     database: &Database,
     enricher: &MetadataEnricher,
     home: Option<&HomeService>,
+    user_events: &UserEventHub,
     batch_id: &str,
     source_ids: &[String],
 ) {
@@ -4669,8 +4672,9 @@ async fn finish_scan_local_metadata_batch(
             }
         });
     if let Some(home) = home {
-        home.invalidate_scan_batch().await;
+        home.invalidate();
     }
+    user_events.publish_home_coalesced().await;
 
     match result {
         Ok(()) => match database.complete_scan_local_metadata_batch(batch_id).await {
@@ -4712,14 +4716,16 @@ async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, err
 async fn process_scan_local_metadata_backfill_images(
     enricher: &MetadataEnricher,
     home: Option<&HomeService>,
+    user_events: &UserEventHub,
     page: &StoredScanLocalMetadataBackfillPage,
 ) -> Result<(), String> {
     let result = enricher
         .index_scan_local_metadata_batch_images(&page.entry_ids)
         .await;
     if let Some(home) = home {
-        home.invalidate_scan_batch().await;
+        home.invalidate();
     }
+    user_events.publish_home_coalesced().await;
     let report = result.map_err(|error| error.to_string())?;
     if !report.failed_item_ids.is_empty() {
         return Err(format!(
@@ -4734,6 +4740,7 @@ async fn finish_scan_local_metadata_backfill_page(
     database: &Database,
     enricher: &MetadataEnricher,
     home: Option<&HomeService>,
+    user_events: &UserEventHub,
     page: StoredScanLocalMetadataBackfillPage,
 ) {
     let result = enricher
@@ -4751,8 +4758,9 @@ async fn finish_scan_local_metadata_backfill_page(
             }
         });
     if let Some(home) = home {
-        home.invalidate_scan_batch().await;
+        home.invalidate();
     }
+    user_events.publish_home_coalesced().await;
 
     match result {
         Ok(()) => match database
@@ -5044,7 +5052,7 @@ impl ScanJobService {
     async fn flush_home_after_scan_terminal(&self) {
         if let Some(home) = &self.home {
             if home.flush_scan_invalidation().await {
-                self.user_events.publish_home_now().await;
+                self.user_events.publish_home_coalesced().await;
             }
         }
     }
@@ -6545,6 +6553,7 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
+                self.publish_home_after_manifest_commit(&result).await;
                 if result.local_metadata_batches_changed {
                     self.notify_local_metadata_outbox_worker();
                 }
@@ -6604,6 +6613,7 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
+                self.publish_home_after_manifest_commit(&result).await;
                 if result.local_metadata_batches_changed {
                     self.notify_local_metadata_outbox_worker();
                 }
@@ -6625,6 +6635,19 @@ impl ScanJobService {
                 }
             }
         }
+    }
+
+    async fn publish_home_after_manifest_commit(&self, result: &ManifestDiscoveryCommitResult) {
+        if result.created_items == 0
+            && !result.local_metadata_batches_changed
+            && !result.metadata_targets_changed
+        {
+            return;
+        }
+        if let Some(home) = &self.home {
+            home.invalidate();
+        }
+        self.user_events.publish_home_coalesced().await;
     }
 
     async fn run_lite_scan_manifest_discovery_batch(
@@ -9977,6 +10000,7 @@ impl ScanJobService {
         let database = self.database.clone();
         let local_nfo = self.local_nfo.clone();
         let home = self.home.clone();
+        let user_events = self.user_events.clone();
         let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
         tokio::spawn(async move {
             let enricher = MetadataEnricher::new(database.clone());
@@ -9998,6 +10022,7 @@ impl ScanJobService {
                             &database,
                             &enricher,
                             home.as_ref(),
+                            &user_events,
                             batch,
                         )
                         .await
@@ -10005,11 +10030,13 @@ impl ScanJobService {
                             let database = database.clone();
                             let enricher = enricher.clone();
                             let home = home.clone();
+                            let user_events = user_events.clone();
                             nfo_tasks.spawn(async move {
                                 finish_scan_local_metadata_batch(
                                     &database,
                                     &enricher,
                                     home.as_ref(),
+                                    &user_events,
                                     &batch_id,
                                     &source_ids,
                                 )
@@ -10029,6 +10056,7 @@ impl ScanJobService {
                                 match process_scan_local_metadata_backfill_images(
                                     &enricher,
                                     home.as_ref(),
+                                    &user_events,
                                     &page,
                                 )
                                 .await
@@ -10037,12 +10065,14 @@ impl ScanJobService {
                                         let database = database.clone();
                                         let enricher = enricher.clone();
                                         let home = home.clone();
+                                        let user_events = user_events.clone();
                                         let library_root_id = page.library_root_id.clone();
                                         nfo_tasks.spawn(async move {
                                             finish_scan_local_metadata_backfill_page(
                                                 &database,
                                                 &enricher,
                                                 home.as_ref(),
+                                                &user_events,
                                                 page,
                                             )
                                             .await;
