@@ -1065,12 +1065,11 @@ async fn progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scop
             .expect("register existing roots"),
         1
     );
-    assert_eq!(
-        database
+    assert!(
+        !database
             .ensure_scan_local_metadata_backfill_root(&root_id)
             .await
             .expect("register existing root again"),
-        false,
         "root registration is idempotent"
     );
     assert_eq!(
