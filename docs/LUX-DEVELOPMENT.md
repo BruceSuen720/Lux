@@ -2171,6 +2171,8 @@ services:
 | LUX-292 | src/storage/metadata.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；能力级本地完整性存储 |
 | LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
 | LUX-294 | migrations/0152_scan_manifest_workflow_three.sql、migrations-postgres/0152_scan_manifest_workflow_three.sql、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、tests/admin_health.rs、tests/ready_version.rs、tests/scanner.rs、tests/danmaku.rs、docs/LUX-DEVELOPMENT.md；workflow 3 正向索引与本地 outbox 原子提交 |
+| LUX-296 | docs/LUX-DEVELOPMENT.md、docs/API.md、src/api/media.rs、tests/catalog.rs；Lux 媒体条目响应公开入库时间 |
+| LUX-297 | docs/LUX-DEVELOPMENT.md、web/src/lib/api/types.ts、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；资源详情显示添加时间 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7196,6 +7198,38 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] SQLite 与 PostgreSQL 同 fixture A/B 分开报告索引完成耗时、首批可见、首张海报、local queue、在线 queue、前台 p95、事务/队列规模和内存；稳定索引或前台 p95 回退超过 5% 时先调度/并发并重测。
 - [ ] 扫描索引耗时与本地/在线处理耗时分别呈现；不以任务仍有后台工作为由把索引时间混入扫描性能结论。
 - [ ] 完成相关 Rust/Web 全量质量门、兼容性和性能记录、本机架构记录，并由项目所有者确认后结束阶段。
+
+### 资源详情入库时间
+
+#### LUX-296：Lux 媒体条目响应公开入库时间
+
+范围：在 Lux API 的媒体条目 JSON 响应中暴露现有 `media_items.added_at`，字段名为 `addedAt`，值为 Unix epoch 秒。使用现有 `CatalogItem.added_at`，不新增或修改数据库字段，不改变 Emby DTO。
+
+验收：
+
+- [x] `GET /api/v1/items/{itemId}` 返回的 `addedAt` 与该条目的存储值一致。
+- [x] `docs/API.md` 说明 `addedAt` 的含义、单位和来源；Emby 响应合同不变。
+- [x] 无数据库 migration，Lux API 既有 ACL 和字段响应保持不变。
+
+验证：`cargo test --locked --test catalog`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+文件：`src/api/media.rs`、`tests/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：详情 API 返回数据库中的 `added_at` Unix 秒值，集成测试验证 JSON 与存储值一致。回归断言先因响应为 `null` 而失败，修复后 `cargo test --locked --test catalog` 的 3 项通过；`cargo fmt --all -- --check`、全目标 Clippy 和 `git diff --check` 通过。
+
+#### LUX-297：资源详情显示添加时间
+
+范围：Lux Web 具体资源详情的元信息行显示“添加于”及资源加入 Lux 媒体库的本地日期和时间，数据来自 LUX-296 的 `addedAt`。时间按浏览器本地时区显示到分钟；字段缺失或无效时隐藏该标签。本任务不改变列表排序和 Emby 客户端行为。
+
+验收：
+
+- [ ] 有效 `addedAt` 在电影、剧集、季度、单集和 VIDEO 详情元信息行显示“添加于”及对应本地时间。
+- [ ] 页面以语义化 `<time>` 暴露 ISO 8601 `dateTime`；缺失或无效值不会显示 `Invalid Date` 或占位标签。
+- [ ] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
+
+依赖：LUX-296。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web build`。
+
+文件：`web/src/lib/api/types.ts`、`web/src/features/detail/MediaDetailPage.tsx`、`web/tests/media-detail.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 
