@@ -2170,6 +2170,7 @@ services:
 | LUX-291 | src/storage/jobs.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；渐进扫描本地 metadata outbox 操作 |
 | LUX-292 | src/storage/metadata.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；能力级本地完整性存储 |
 | LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
+| LUX-294 | migrations/0152_scan_manifest_workflow_three.sql、migrations-postgres/0152_scan_manifest_workflow_three.sql、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；workflow 3 正向索引与本地 outbox 原子提交 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7169,6 +7170,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-09-28）：完整性 READY/missing 更新与策略允许的 FILL_MISSING job 在同一事务提交；PostgreSQL 按库锁串行化自动调度、按媒体项行锁与手动 item job 创建协调，SQLite 使用写事务串行化。策略关闭、不可执行条目和现有活跃 job 不会产生重复在线请求；自动 job 每批最多 100 项。SQLite 用例验证策略关闭、手动活跃 job 去重、回滚后仍为 RUNNING 及成功调度；真实 PostgreSQL 用例验证注入 INSERT 错误后的回滚、成功调度和后续能力去重。两个定向用例各 1 项通过；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。尚未接入本地检查 worker 或扫描入口，按后续任务实施。
+
+#### LUX-294：workflow 3 正向索引与本地 outbox 原子提交
+
+范围：新建 Manifest 扫描切换为 `workflow_version=3`，沿用已验证的 Lite frontier、正向索引和删除安全合同；迁移放宽 SQLite/PostgreSQL 的 workflow 约束并保留旧任务数据。每个已提交的正向媒体/旁车引用在同一索引事务中写入不超过 256 项的持久本地 metadata outbox 批次。root 的单调序号在同一事务中为观察记录和 outbox 批次分别预留范围，生成稳定幂等批次身份。workflow 1/2 和已持久化任务仍按原语义恢复；最终 targets-ready barrier 继续保护其余后处理。本任务只发布本地工作，不读取 NFO/图片，也不接入本地 worker。
+
+验收：
+
+- [ ] 新扫描创建 workflow 3；workflow 1/2 的发现、计数、恢复和后处理语义保持不变。
+- [ ] workflow 3 正向索引实际应用的媒体来源与旁车引用，在同一事务写入有界、稳定、幂等的 outbox；事务失败不留下索引或队列单边状态。
+- [ ] 首批 outbox 在扫描仍处于 DISCOVERING 时可领取；扫描结束/target 物化不重复发布已处理引用。
+- [ ] 大目录索引事务可拆成每批最多 256 个引用，批次序号稳定且不冲突；targets-ready barrier 与根覆盖/删除 CAS 不变。
+
+依赖：LUX-293。验证：workflow 版本约束迁移的 SQLite 与 PostgreSQL 用例、`cargo test --locked --test scanning_jobs` 全目标，以及 fmt/clippy。
+
+预计文件：`migrations/0152_scan_manifest_workflow_three.sql`、`migrations-postgres/0152_scan_manifest_workflow_three.sql`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 #### 阶段 23 总体验收与阶段门
 
