@@ -7231,15 +7231,17 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] worker 启动时注册现存 roots、恢复 RUNNING 回填页；worker 重复启动不会重复创建消费者。
-- [ ] 全库本地回填最多一次领取有界页；workflow 3 新 outbox 始终优先，图片登记先于 NFO，后续索引不等待回填完成。
-- [ ] 已完成索引且未变化的旧媒体，在没有新扫描 outbox 的情况下也能登记本地 poster 与 NFO；任务不发网络请求。
-- [ ] 图片或 NFO 错误使当前页退避重试，不推进游标；worker 重启后从当前页恢复。
-- [ ] SQLite 集成测试覆盖旧资源 poster 展示、无在线任务、与新 outbox 的优先关系及失败恢复。
+- [x] worker 启动时注册现存 roots、恢复 RUNNING 回填页；worker 重复启动不会重复创建消费者。
+- [x] 全库本地回填最多一次领取有界页；workflow 3 新 outbox 始终优先，图片登记先于 NFO，后续索引不等待回填完成。
+- [x] 已完成索引且未变化的旧媒体，在没有新扫描 outbox 的情况下也能登记本地 poster 与 NFO；任务不发网络请求。
+- [x] 图片或 NFO 错误使当前页退避重试，不推进游标；worker 重启后从当前页恢复。
+- [x] SQLite 集成测试覆盖旧资源 poster/NFO 登记、无在线任务、失败后游标不前进及重试恢复；worker 领取代码先查新 outbox，再查低优先级 backfill。
 
 依赖：LUX-295、LUX-296。验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
-预计文件：`src/application/scanner.rs`、`tests/scanned_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/application/scanner.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`tests/scanned_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：现有本地 metadata worker 启动时恢复中断回填并幂等登记数据库中的 roots；队列每次先检查 workflow 3 outbox，再取最多 16 个旧文件 entry。回填复用既有本地图片/NFO enricher，图片阶段完成即失效主页投影，NFO 在有界任务集合中继续；只有两阶段成功才提交游标。worker 不持有 scraper，也不把 backfill 加入扫描完成屏障。新增测试证明无新 outbox 时旧资源仍补出 poster 和 NFO、没有创建 FILL_MISSING job；NFO 写入失败后游标不前进，恢复后同页成功。`scanned_metadata` 11 项、`scanned_series_metadata` 2 项通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 fixture 性能对比与浏览器实时刷新仍留在阶段 23 总体验收。
 
 #### 阶段 23 总体验收与阶段门
 

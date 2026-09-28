@@ -1,4 +1,5 @@
 use luxd::{
+    application::scanner::LibraryScanner,
     application::{
         libraries::LibraryService,
         scanner::{IncrementalScanChange, ScanJobService},
@@ -30,6 +31,271 @@ async fn wait_for_local_metadata_batches(
             }
             if pending == 0 {
                 return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_metadata_worker_backfills_posters_for_unchanged_indexed_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Existing Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Existing.Movie.2024.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("Existing.Movie.2024.nfo"),
+        "<movie><title>Existing Title From NFO</title></movie>",
+    )
+    .await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scan_local_metadata_batches")
+            .fetch_one(database.pool())
+            .await?,
+        0,
+        "this existing item has no newly created scan outbox work"
+    );
+    assert_ne!(
+        sqlx::query_scalar::<_, String>("SELECT title FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?,
+        "Existing Title From NFO",
+        "the pre-existing item has not had its NFO processed yet"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "the pre-existing poster has not been indexed yet"
+    );
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, status, attempts)
+         VALUES (?, 'RUNNING', 1)",
+    )
+    .bind(root.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+    let registered_roots: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_local_metadata_backfills WHERE library_root_id =
+            (SELECT id FROM library_roots WHERE library_id = ?)",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        registered_roots, 1,
+        "worker startup registers existing roots"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let image_count: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER'
+                   AND local_path LIKE '%/poster.jpg'",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+            let title: String =
+                sqlx::query_scalar::<_, String>("SELECT title FROM media_items WHERE id = ?")
+                    .bind(&item_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            let backfill_status: String = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM scan_local_metadata_backfills
+                 WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ?)",
+            )
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if image_count == 1
+                && title == "Existing Title From NFO"
+                && backfill_status == "COMPLETED"
+            {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT attempts FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+        )
+        .bind(root.id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+        2,
+        "startup requeues and resumes an interrupted backfill page"
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "local backfill does not call online metadata providers"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_metadata_backfill_retries_nfo_failure_without_advancing_its_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Retry Existing Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Retry.Existing.Movie.2024.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("Retry.Existing.Movie.2024.nfo"),
+        "<movie><title>Recovered Title From NFO</title></movie>",
+    )
+    .await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_backfill_nfo_update
+         BEFORE UPDATE OF title ON media_items
+         WHEN OLD.item_type = 'MOVIE'
+         BEGIN SELECT RAISE(ABORT, 'injected backfill NFO failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+            )
+            .bind(root.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if status == "FAILED" {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+
+    let failed_state: (Option<String>, i64) = sqlx::query_as(
+        "SELECT cursor_entry_id, attempts FROM scan_local_metadata_backfills
+         WHERE library_root_id = ?",
+    )
+    .bind(root.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        failed_state.0, None,
+        "failed NFO does not advance the page cursor"
+    );
+    assert_eq!(failed_state.1, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?,
+        1,
+        "the poster is indexed before the failing NFO stage"
+    );
+
+    sqlx::query("DROP TRIGGER fail_backfill_nfo_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_backfills SET next_attempt_at = 0
+         WHERE library_root_id = ?",
+    )
+    .bind(root.id.to_string())
+    .execute(database.pool())
+    .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (status, title, attempts): (String, String, i64) = sqlx::query_as(
+                "SELECT backfill.status, item.title, backfill.attempts
+                 FROM scan_local_metadata_backfills backfill
+                 JOIN library_roots root ON root.id = backfill.library_root_id
+                 JOIN media_items item ON item.library_id = root.library_id
+                 WHERE root.id = ? AND item.id = ?",
+            )
+            .bind(root.id.to_string())
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" && title == "Recovered Title From NFO" && attempts == 2 {
+                return Ok::<(), sqlx::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

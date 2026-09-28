@@ -27,6 +27,7 @@ mod device_pairings;
 mod emby_migration;
 #[path = "jobs.rs"]
 mod jobs;
+pub(crate) use jobs::StoredScanLocalMetadataBackfillPage;
 #[path = "library.rs"]
 mod library;
 #[path = "media.rs"]

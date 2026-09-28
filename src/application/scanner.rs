@@ -67,7 +67,7 @@ use crate::{
         NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile, ReconciliationBatchCommit,
         StorageError, StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
-        StoredScanLocalMetadataBatch, StoredScanManifestDelta,
+        StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch, StoredScanManifestDelta,
         StoredScanManifestFilesystemBaseline, is_lite_manifest_discovery,
         movie_parent_folder_identity,
     },
@@ -1856,6 +1856,7 @@ const LOCAL_METADATA_BATCH_SIZE: usize = 16;
 const SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK: Duration = Duration::from_millis(250);
 const SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS: i64 = 30;
 const MAX_SCAN_LOCAL_METADATA_SOURCE_IDS: usize = 256;
+const SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
 const MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT: usize = 4;
 
 #[derive(Clone)]
@@ -4705,6 +4706,110 @@ async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, err
         .await
     {
         tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
+    }
+}
+
+async fn process_scan_local_metadata_backfill_images(
+    enricher: &MetadataEnricher,
+    home: Option<&HomeService>,
+    page: &StoredScanLocalMetadataBackfillPage,
+) -> Result<(), String> {
+    let result = enricher
+        .index_scan_local_metadata_batch_images(&page.entry_ids)
+        .await;
+    if let Some(home) = home {
+        home.invalidate_scan_batch().await;
+    }
+    let report = result.map_err(|error| error.to_string())?;
+    if !report.failed_item_ids.is_empty() {
+        return Err(format!(
+            "{} local image item(s) failed",
+            report.failed_item_ids.len()
+        ));
+    }
+    Ok(())
+}
+
+async fn finish_scan_local_metadata_backfill_page(
+    database: &Database,
+    enricher: &MetadataEnricher,
+    home: Option<&HomeService>,
+    page: StoredScanLocalMetadataBackfillPage,
+) {
+    let result = enricher
+        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids)
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|report| {
+            if report.failed_item_ids.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} local NFO item(s) failed",
+                    report.failed_item_ids.len()
+                ))
+            }
+        });
+    if let Some(home) = home {
+        home.invalidate_scan_batch().await;
+    }
+
+    match result {
+        Ok(()) => match database
+            .complete_scan_local_metadata_backfill_page(&page)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                library_root_id = %page.library_root_id,
+                "local metadata backfill page was already terminal or changed"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    library_root_id = %page.library_root_id,
+                    %error,
+                    "local metadata backfill page completion could not be saved"
+                );
+                fail_scan_local_metadata_backfill_page(
+                    database,
+                    &page,
+                    "local metadata backfill completion failed",
+                )
+                .await;
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                library_root_id = %page.library_root_id,
+                %error,
+                "local metadata backfill NFO failed and will be retried"
+            );
+            fail_scan_local_metadata_backfill_page(database, &page, &error).await;
+        }
+    }
+}
+
+async fn fail_scan_local_metadata_backfill_page(
+    database: &Database,
+    page: &StoredScanLocalMetadataBackfillPage,
+    error: &str,
+) {
+    let retry_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
+        .unwrap_or(i64::MAX);
+    if let Err(storage_error) = database
+        .fail_scan_local_metadata_backfill_page(page, error, Some(retry_at))
+        .await
+    {
+        tracing::warn!(
+            library_root_id = %page.library_root_id,
+            %storage_error,
+            "local metadata backfill retry could not be saved"
+        );
     }
 }
 
@@ -9850,6 +9955,24 @@ impl ScanJobService {
                 .store(false, Ordering::Release);
             return Err(error.into());
         }
+        if let Err(error) = self
+            .database
+            .requeue_interrupted_scan_local_metadata_backfills()
+            .await
+        {
+            self.local_metadata_outbox_worker_started
+                .store(false, Ordering::Release);
+            return Err(error.into());
+        }
+        if let Err(error) = self
+            .database
+            .ensure_scan_local_metadata_backfill_roots()
+            .await
+        {
+            self.local_metadata_outbox_worker_started
+                .store(false, Ordering::Release);
+            return Err(error.into());
+        }
 
         let database = self.database.clone();
         let local_nfo = self.local_nfo.clone();
@@ -9896,20 +10019,70 @@ impl ScanJobService {
                         }
                     }
                     Ok(None) => {
-                        if nfo_tasks.is_empty() {
-                            tokio::select! {
-                                _ = outbox_notify.notified() => {}
-                                _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
-                            }
-                        } else {
-                            tokio::select! {
-                                result = nfo_tasks.join_next() => {
-                                    if let Some(Err(error)) = result {
-                                        tracing::error!(%error, "local metadata NFO worker task panicked");
+                        match database
+                            .claim_next_scan_local_metadata_backfill_page(
+                                SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
+                            )
+                            .await
+                        {
+                            Ok(Some(page)) => {
+                                match process_scan_local_metadata_backfill_images(
+                                    &enricher,
+                                    home.as_ref(),
+                                    &page,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let database = database.clone();
+                                        let enricher = enricher.clone();
+                                        let home = home.clone();
+                                        let library_root_id = page.library_root_id.clone();
+                                        nfo_tasks.spawn(async move {
+                                            finish_scan_local_metadata_backfill_page(
+                                                &database,
+                                                &enricher,
+                                                home.as_ref(),
+                                                page,
+                                            )
+                                            .await;
+                                            library_root_id
+                                        });
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            library_root_id = %page.library_root_id,
+                                            %error,
+                                            "local metadata backfill image stage failed and will be retried"
+                                        );
+                                        fail_scan_local_metadata_backfill_page(
+                                            &database, &page, &error,
+                                        )
+                                        .await;
                                     }
                                 }
-                                _ = outbox_notify.notified() => {}
-                                _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+                            }
+                            Ok(None) => {
+                                if nfo_tasks.is_empty() {
+                                    tokio::select! {
+                                        _ = outbox_notify.notified() => {}
+                                        _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+                                    }
+                                } else {
+                                    tokio::select! {
+                                        result = nfo_tasks.join_next() => {
+                                            if let Some(Err(error)) = result {
+                                                tracing::error!(%error, "local metadata worker task panicked");
+                                            }
+                                        }
+                                        _ = outbox_notify.notified() => {}
+                                        _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "local metadata backfill claim failed; retrying");
+                                tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
                             }
                         }
                     }
