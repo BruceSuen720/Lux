@@ -7,6 +7,18 @@ const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
 const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
+const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+
+#[derive(Debug)]
+#[allow(dead_code)] // The next phase worker consumes the bounded page payload.
+pub(crate) struct StoredScanLocalMetadataBackfillPage {
+    pub(crate) library_root_id: String,
+    pub(crate) cursor_entry_id: Option<String>,
+    pub(crate) entry_ids: Vec<String>,
+    pub(crate) next_cursor_entry_id: String,
+    pub(crate) has_more: bool,
+    pub(crate) attempts: i64,
+}
 
 fn escape_sql_like_pattern(value: &str) -> String {
     value
@@ -86,8 +98,280 @@ impl Database {
         "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
 }
 
-#[allow(dead_code)] // The local outbox worker is connected in the following phase task.
+#[allow(dead_code)] // Local metadata workers consume these durable queue operations.
 impl Database {
+    pub(crate) async fn ensure_scan_local_metadata_backfill_roots(
+        &self,
+    ) -> Result<u64, StorageError> {
+        let root_ids = self
+            .query_scalar::<String>("SELECT id FROM library_roots ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut inserted = 0_u64;
+        for library_root_id in root_ids {
+            inserted = inserted.saturating_add(u64::from(
+                self.ensure_scan_local_metadata_backfill_root(&library_root_id)
+                    .await?,
+            ));
+        }
+        Ok(inserted)
+    }
+
+    pub(crate) async fn ensure_scan_local_metadata_backfill_root(
+        &self,
+        library_root_id: &str,
+    ) -> Result<bool, StorageError> {
+        if library_root_id.trim().is_empty() {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill root id is empty".into(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        self.query(
+            "INSERT INTO scan_local_metadata_backfills (library_root_id)
+             VALUES (?) ON CONFLICT(library_root_id) DO NOTHING",
+        )
+        .bind(library_root_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_next_scan_local_metadata_backfill_page(
+        &self,
+        page_size: usize,
+    ) -> Result<Option<StoredScanLocalMetadataBackfillPage>, StorageError> {
+        if !(1..=MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE).contains(&page_size) {
+            return Err(StorageError::Conflict(
+                "invalid scan metadata backfill page size".into(),
+            ));
+        }
+        let query_limit = i64::try_from(page_size.saturating_add(1)).map_err(|_| {
+            StorageError::Conflict("scan metadata backfill page size overflow".into())
+        })?;
+
+        loop {
+            let _write_guard = self.acquire_metadata_write_lock().await;
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            let next_root = self
+                .query_scalar::<String>(
+                    "SELECT library_root_id FROM scan_local_metadata_backfills
+                     WHERE status IN ('PENDING', 'FAILED')
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
+                     ORDER BY updated_at, library_root_id LIMIT 1",
+                )
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let Some(library_root_id) = next_root else {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                return Ok(None);
+            };
+            let claimed: Option<(Option<String>, i64)> = self
+                .query_as(
+                    "UPDATE scan_local_metadata_backfills
+                     SET status = 'RUNNING', attempts = attempts + 1,
+                         next_attempt_at = NULL, error = NULL, updated_at = unixepoch()
+                     WHERE library_root_id = ? AND status IN ('PENDING', 'FAILED')
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
+                     RETURNING cursor_entry_id, attempts",
+                )
+                .bind(&library_root_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let Some((cursor_entry_id, attempts)) = claimed else {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                continue;
+            };
+            let mut entry_ids = self
+                .query_scalar::<String>(
+                    "SELECT DISTINCT entry.id
+                     FROM filesystem_entries entry
+                     WHERE entry.library_root_id = ? AND entry.entry_kind = 'FILE'
+                       AND entry.is_missing = 0
+                       AND entry.id > COALESCE(?, '')
+                       AND EXISTS (
+                           SELECT 1 FROM media_sources source
+                           JOIN media_items item ON item.id = source.item_id
+                           WHERE source.filesystem_entry_id = entry.id
+                             AND item.removed_at IS NULL
+                       )
+                     ORDER BY entry.id LIMIT ?",
+                )
+                .bind(&library_root_id)
+                .bind(cursor_entry_id.as_deref())
+                .bind(query_limit)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if entry_ids.is_empty() {
+                self.query(
+                    "UPDATE scan_local_metadata_backfills
+                     SET status = 'COMPLETED', next_attempt_at = NULL, error = NULL,
+                         updated_at = unixepoch()
+                     WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
+                       AND cursor_entry_id IS NOT DISTINCT FROM ?",
+                )
+                .bind(&library_root_id)
+                .bind(attempts)
+                .bind(cursor_entry_id.as_deref())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                continue;
+            }
+
+            let has_more = entry_ids.len() > page_size;
+            if has_more {
+                entry_ids.pop();
+            }
+            let next_cursor_entry_id = entry_ids.last().cloned().ok_or_else(|| {
+                StorageError::Conflict("scan metadata backfill returned an empty page".into())
+            })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(Some(StoredScanLocalMetadataBackfillPage {
+                library_root_id,
+                cursor_entry_id,
+                entry_ids,
+                next_cursor_entry_id,
+                has_more,
+                attempts,
+            }));
+        }
+    }
+
+    pub(crate) async fn complete_scan_local_metadata_backfill_page(
+        &self,
+        page: &StoredScanLocalMetadataBackfillPage,
+    ) -> Result<bool, StorageError> {
+        let status = if page.has_more {
+            "PENDING"
+        } else {
+            "COMPLETED"
+        };
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_backfills
+                 SET cursor_entry_id = ?, status = ?, next_attempt_at = NULL, error = NULL,
+                     updated_at = unixepoch()
+                 WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
+                   AND cursor_entry_id IS NOT DISTINCT FROM ?",
+            )
+            .bind(&page.next_cursor_entry_id)
+            .bind(status)
+            .bind(&page.library_root_id)
+            .bind(page.attempts)
+            .bind(page.cursor_entry_id.as_deref())
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_backfill_page(
+        &self,
+        page: &StoredScanLocalMetadataBackfillPage,
+        error: &str,
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill error exceeds the storage limit".into(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_backfills
+                 SET status = 'FAILED', next_attempt_at = ?, error = ?,
+                     updated_at = unixepoch()
+                 WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
+                   AND cursor_entry_id IS NOT DISTINCT FROM ?",
+            )
+            .bind(next_attempt_at)
+            .bind(error)
+            .bind(&page.library_root_id)
+            .bind(page.attempts)
+            .bind(page.cursor_entry_id.as_deref())
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn requeue_interrupted_scan_local_metadata_backfills(
+        &self,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_backfills
+                 SET status = 'PENDING', next_attempt_at = NULL,
+                     error = COALESCE(error, 'worker interrupted'), updated_at = unixepoch()
+                 WHERE status = 'RUNNING'",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
     pub(crate) async fn enqueue_scan_local_metadata_batch(
         &self,
         batch: NewScanLocalMetadataBatch<'_>,

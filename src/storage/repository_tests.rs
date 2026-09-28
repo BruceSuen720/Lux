@@ -989,6 +989,357 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
 }
 
 #[tokio::test]
+async fn progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    for name in [
+        "First.Movie.2023.mkv",
+        "Second.Movie.2024.mkv",
+        "Third.Movie.2025.mkv",
+        "Fourth.Movie.2026.mkv",
+    ] {
+        tokio::fs::write(media_root.join(name), b"video")
+            .await
+            .expect("movie file");
+    }
+    tokio::fs::write(media_root.join("notes.txt"), b"not media")
+        .await
+        .expect("non-media file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Backfill", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    let root_id = root.root.id.to_string();
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index media files");
+
+    let expected_ids = database
+        .query_scalar::<String>(
+            "SELECT entry.id
+             FROM filesystem_entries entry
+             JOIN media_sources source ON source.filesystem_entry_id = entry.id
+             JOIN media_items item ON item.id = source.item_id
+             WHERE entry.library_root_id = ? AND entry.entry_kind = 'FILE'
+               AND entry.is_missing = 0 AND item.removed_at IS NULL
+             ORDER BY entry.id",
+        )
+        .bind(&root_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read media source entry ids");
+    assert_eq!(expected_ids.len(), 4, "the text file is not a media source");
+    sqlx::query("UPDATE filesystem_entries SET is_missing = 1 WHERE id = ?")
+        .bind(&expected_ids[0])
+        .execute(database.pool())
+        .await
+        .expect("mark one entry missing");
+    sqlx::query(
+        "UPDATE media_items SET removed_at = unixepoch()
+         WHERE id = (SELECT item_id FROM media_sources WHERE filesystem_entry_id = ?)",
+    )
+    .bind(&expected_ids[1])
+    .execute(database.pool())
+    .await
+    .expect("remove one source item");
+
+    assert_eq!(
+        database
+            .ensure_scan_local_metadata_backfill_roots()
+            .await
+            .expect("register existing roots"),
+        1
+    );
+    assert_eq!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&root_id)
+            .await
+            .expect("register existing root again"),
+        false,
+        "root registration is idempotent"
+    );
+    assert_eq!(
+        database
+            .ensure_scan_local_metadata_backfill_roots()
+            .await
+            .expect("register roots again"),
+        0
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(0)
+            .await
+            .is_err(),
+        "a zero-sized page is invalid"
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(17)
+            .await
+            .is_err(),
+        "the public storage limit caps backfill windows"
+    );
+
+    let first = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim first page")
+        .expect("first page exists");
+    assert_eq!(first.library_root_id, root_id);
+    assert_eq!(first.entry_ids.len(), 1);
+    assert!(first.has_more);
+    assert_eq!(first.cursor_entry_id, None);
+    assert_eq!(first.attempts, 1);
+    assert_eq!(first.entry_ids[0], expected_ids[2]);
+
+    assert!(
+        database
+            .fail_scan_local_metadata_backfill_page(
+                &first,
+                "temporary local failure",
+                Some(i64::MAX),
+            )
+            .await
+            .expect("persist page failure")
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await
+            .expect("check retry delay")
+            .is_none(),
+        "failed page remains deferred"
+    );
+    sqlx::query(
+        "UPDATE scan_local_metadata_backfills SET next_attempt_at = 0 WHERE library_root_id = ?",
+    )
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("make retry due");
+    let retried = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim retry")
+        .expect("retry page exists");
+    assert_eq!(retried.entry_ids, first.entry_ids);
+    assert_eq!(retried.cursor_entry_id, first.cursor_entry_id);
+    assert_eq!(retried.attempts, 2);
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&first)
+            .await
+            .expect("reject stale worker completion"),
+        "an old attempt cannot advance the retry cursor"
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = ?
+             WHERE library_root_id = ?",
+        )
+        .bind(&expected_ids[0])
+        .bind(&root_id)
+        .execute(database.pool())
+        .await
+        .expect("simulate a cursor change during the claimed attempt");
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&retried)
+            .await
+            .expect("reject mismatched cursor CAS"),
+        "a page cannot advance a cursor that changed during its attempt"
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = NULL
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await
+        .expect("restore the claimed page cursor");
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&retried)
+            .await
+            .expect("advance first page")
+    );
+
+    let second = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim second page")
+        .expect("second page exists");
+    assert_eq!(
+        second.cursor_entry_id.as_deref(),
+        Some(first.entry_ids[0].as_str())
+    );
+    assert_eq!(second.entry_ids, vec![expected_ids[3].clone()]);
+    assert!(!second.has_more);
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_backfills()
+            .await
+            .expect("recover interrupted page"),
+        1
+    );
+    let recovered = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim recovered page")
+        .expect("recovered page exists");
+    assert_eq!(recovered.entry_ids, second.entry_ids);
+    assert_eq!(recovered.cursor_entry_id, second.cursor_entry_id);
+    assert_eq!(recovered.attempts, 4);
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&recovered)
+            .await
+            .expect("complete backfill")
+    );
+    let completed_status: String = database
+        .query_scalar("SELECT status FROM scan_local_metadata_backfills WHERE library_root_id = ?")
+        .bind(&root_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read completed status");
+    assert_eq!(completed_status, "COMPLETED");
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await
+            .expect("check completed root")
+            .is_none()
+    );
+
+    let empty_root_path = temp_dir.path().join("Empty");
+    tokio::fs::create_dir_all(&empty_root_path)
+        .await
+        .expect("empty root directory");
+    let empty_library = libraries
+        .create_library("Empty backfill", LibraryKind::Movie, false)
+        .await
+        .expect("empty library");
+    let empty_root = libraries
+        .add_root(
+            empty_library.id,
+            empty_root_path.to_str().expect("empty root path"),
+        )
+        .await
+        .expect("empty library root");
+    let empty_root_id = empty_root.root.id.to_string();
+    assert!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&empty_root_id)
+            .await
+            .expect("register empty root")
+    );
+
+    let populated_root_path = temp_dir.path().join("Populated");
+    tokio::fs::create_dir_all(&populated_root_path)
+        .await
+        .expect("populated root directory");
+    tokio::fs::write(populated_root_path.join("Later.Movie.2026.mkv"), b"video")
+        .await
+        .expect("populated root media file");
+    let populated_library = libraries
+        .create_library("Populated backfill", LibraryKind::Movie, false)
+        .await
+        .expect("populated library");
+    let populated_root = libraries
+        .add_root(
+            populated_library.id,
+            populated_root_path.to_str().expect("populated root path"),
+        )
+        .await
+        .expect("populated library root");
+    let populated_root_id = populated_root.root.id.to_string();
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(populated_library.id)
+        .await
+        .expect("index populated root");
+    assert!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&populated_root_id)
+            .await
+            .expect("register populated root")
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET updated_at = 0
+             WHERE library_root_id = ?",
+        )
+        .bind(&empty_root_id)
+        .execute(database.pool())
+        .await
+        .expect("order empty root first");
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET updated_at = 1
+             WHERE library_root_id = ?",
+        )
+        .bind(&populated_root_id)
+        .execute(database.pool())
+        .await
+        .expect("order populated root second");
+    let populated_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("skip empty root and keep claiming")
+        .expect("populated root page remains claimable");
+    assert_eq!(populated_page.library_root_id, populated_root_id);
+    assert_eq!(populated_page.entry_ids.len(), 1);
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&populated_page)
+            .await
+            .expect("complete populated root")
+    );
+    let empty_status: String = database
+        .query_scalar("SELECT status FROM scan_local_metadata_backfills WHERE library_root_id = ?")
+        .bind(&empty_root_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read empty-root status");
+    assert_eq!(empty_status, "COMPLETED");
+
+    database
+        .query("DELETE FROM library_roots WHERE id = ?")
+        .bind(&empty_root_id)
+        .execute(database.pool())
+        .await
+        .expect("delete empty root");
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+            )
+            .bind(&empty_root_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("check root cascade"),
+        0
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -1650,6 +2001,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let movie_dir = media_root.join("Postgres Movie (2025)");
     tokio::fs::create_dir_all(&movie_dir).await?;
     tokio::fs::write(movie_dir.join("Postgres.Movie.2025.mkv"), b"video").await?;
+    tokio::fs::write(media_root.join("Second.Postgres.Movie.2026.mkv"), b"video").await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Postgres progressive", LibraryKind::Movie, false)
@@ -1671,6 +2023,124 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .bind(library.id.to_string())
         .fetch_one(database.pool())
         .await?;
+
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        1
+    );
+    let (claim_a, claim_b) = tokio::join!(
+        database.claim_next_scan_local_metadata_backfill_page(1),
+        database.claim_next_scan_local_metadata_backfill_page(1),
+    );
+    let mut claimed_pages = [claim_a?, claim_b?].into_iter().flatten();
+    let backfill_page = claimed_pages
+        .next()
+        .ok_or("PostgreSQL backfill page was not claimable")?;
+    assert!(
+        claimed_pages.next().is_none(),
+        "concurrent PostgreSQL claimers cannot claim the same root page twice"
+    );
+    assert_eq!(backfill_page.library_root_id, root_id);
+    assert_eq!(backfill_page.entry_ids.len(), 1);
+    assert!(backfill_page.has_more);
+    assert!(
+        database
+            .fail_scan_local_metadata_backfill_page(
+                &backfill_page,
+                "temporary local failure",
+                Some(i64::MAX),
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await?
+            .is_none()
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET next_attempt_at = 0
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    let retry_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await?
+        .ok_or("failed PostgreSQL page did not retry")?;
+    assert_eq!(retry_page.entry_ids, backfill_page.entry_ids);
+    assert_eq!(retry_page.cursor_entry_id, backfill_page.cursor_entry_id);
+    assert_eq!(retry_page.attempts, 2);
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&backfill_page)
+            .await?
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = 'stale-cursor'
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&retry_page)
+            .await?
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = NULL
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&retry_page)
+            .await?
+    );
+    let second_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await?
+        .ok_or("second PostgreSQL page was not claimable")?;
+    assert_eq!(
+        second_page.cursor_entry_id,
+        retry_page.entry_ids.first().cloned()
+    );
+    assert!(!second_page.has_more);
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_backfills()
+            .await?,
+        1
+    );
+    let recovered_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await?
+        .ok_or("interrupted PostgreSQL page was not recovered")?;
+    assert_eq!(recovered_page.entry_ids, second_page.entry_ids);
+    assert_eq!(recovered_page.cursor_entry_id, second_page.cursor_entry_id);
+    assert_eq!(recovered_page.attempts, 4);
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&second_page)
+            .await?
+    );
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&recovered_page)
+            .await?
+    );
+    assert!(
+        !database
+            .ensure_scan_local_metadata_backfill_root(&root_id)
+            .await?
+    );
 
     let source_ids = vec!["postgres-source".to_owned()];
     let batch = NewScanLocalMetadataBatch {
@@ -1925,6 +2395,45 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             .fetch_one(database.pool())
             .await?,
         1
+    );
+
+    let empty_root_path = temp_dir.path().join("Empty");
+    tokio::fs::create_dir_all(&empty_root_path).await?;
+    let empty_library = libraries
+        .create_library("Postgres empty backfill", LibraryKind::Movie, false)
+        .await?;
+    let empty_root = libraries
+        .add_root(
+            empty_library.id,
+            empty_root_path.to_str().ok_or("non-UTF8 empty root")?,
+        )
+        .await?;
+    let empty_root_id = empty_root.root.id.to_string();
+    assert!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&empty_root_id)
+            .await?
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await?
+            .is_none()
+    );
+    database
+        .query("DELETE FROM library_roots WHERE id = ?")
+        .bind(&empty_root_id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+            )
+            .bind(&empty_root_id)
+            .fetch_one(database.pool())
+            .await?,
+        0
     );
 
     database.close().await;

@@ -7214,14 +7214,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite/PostgreSQL migration 均可从空库升级；回填状态约束、根路径级联与 claim 索引一致。
-- [ ] 同一根路径重复登记幂等；分页稳定有界；只有当前游标匹配时才能推进，失败/重启保留当前页。
-- [ ] 没有可处理来源时可持久完成；已删除/缺失或无媒体 source 的条目不产生回填候选。
-- [ ] SQLite 与真实 PostgreSQL 存储合同覆盖登记、领取、推进、失败恢复、完成和根删除。
+- [x] SQLite/PostgreSQL migration 均可从空库升级；回填状态约束、根路径级联与 claim 索引一致。
+- [x] 同一根路径重复登记幂等；分页稳定有界；只有当前游标和 attempt 匹配时才能推进，失败/重启保留当前页。
+- [x] 没有可处理来源时可持久完成；已删除/缺失或无媒体 source 的条目不产生回填候选；空根完成后领取器继续查找后续根。
+- [x] SQLite 与真实 PostgreSQL 存储合同覆盖登记、并发领取、推进、失败恢复、完成和根删除。
 
 依赖：LUX-295。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_backfill`、真实 PostgreSQL 对应 ignored 存储合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
 预计文件：`migrations/0154_scan_local_metadata_backfill.sql`、`migrations-postgres/0154_scan_local_metadata_backfill.sql`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：新增根级 durable backfill 游标和按 filesystem entry ID 的最多 16 项候选页；候选只包含仍有有效媒体 source 的非 missing 文件。空/无效根在同一次领取中被完成并跳过；失败和 RUNNING 恢复保持当前游标，提交与失败操作同时比较 cursor 和 attempt。SQLite 定向存储测试 1 项、真实 PostgreSQL 合同 1 项通过，覆盖空根优先、多根继续领取、并发 claim 去重、失败重试、重启恢复、旧 attempt/旧 cursor 拒写及根删除级联；`cargo fmt --all -- --check` 和 `cargo clippy --locked --lib -- -D warnings` 通过。该项只提供存储能力，后台回填消费者与启动/扫描入口登记由后续任务接入。
 
 #### 阶段 23 总体验收与阶段门
 
