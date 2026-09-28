@@ -259,3 +259,78 @@ jobs:
               "${runtime_image}-amd64" \
               "${runtime_image}-arm64"
           fi
+
+  notify:
+    name: Notify Telegram after main publish
+    needs: manifest
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Check out published source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Send Telegram release notification
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          IMAGE_REF: docker.io/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import tomllib
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          repository = os.environ["REPOSITORY"]
+          revision = os.environ["REVISION"]
+          message = (
+              f"🚀 Lux v{version} 已发布\n"
+              f"Docker Hub：{os.environ['IMAGE_REF']}\n"
+              f"提交：https://github.com/{repository}/commit/{revision}"
+          )
+          payload = {
+              "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+              "text": message,
+              "disable_web_page_preview": True,
+          }
+          request = Request(
+              f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          try:
+              with urlopen(request, timeout=20) as response:
+                  result = json.load(response)
+          except HTTPError as error:
+              print(f"Telegram notification failed (HTTP {error.code}).", file=sys.stderr)
+              sys.exit(1)
+          except URLError:
+              print("Telegram notification could not reach the Bot API.", file=sys.stderr)
+              sys.exit(1)
+
+          if not result.get("ok"):
+              print("Telegram Bot API rejected the notification.", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Report missing Telegram secrets
+        if: env.TELEGRAM_BOT_TOKEN == '' || env.TELEGRAM_CHAT_ID == ''
+        run: echo "::warning::Telegram notification skipped; configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID repository secrets."
