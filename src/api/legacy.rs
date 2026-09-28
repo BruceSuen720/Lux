@@ -342,6 +342,10 @@ impl AppState {
                 Some(selection) => service.with_metadata_selection(selection),
                 None => service,
             };
+            let service = match metadata_reidentify.clone() {
+                Some(reidentify) => service.with_metadata_reidentify(reidentify),
+                None => service,
+            };
             match webhooks.clone() {
                 Some(webhooks) => service.with_webhooks(webhooks),
                 None => service,

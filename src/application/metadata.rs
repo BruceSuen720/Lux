@@ -1004,6 +1004,9 @@ impl MetadataEnricher {
                     "DONE",
                 )
                 .await?;
+            report
+                .locally_enriched_item_ids
+                .extend(completed_item_ids.iter().cloned());
             return Ok(report);
         }
 
@@ -1043,6 +1046,9 @@ impl MetadataEnricher {
                     "DONE",
                 )
                 .await?;
+            report
+                .locally_enriched_item_ids
+                .extend(completed_item_ids.iter().cloned());
             return Ok(report);
         }
 
@@ -1084,6 +1090,9 @@ impl MetadataEnricher {
                 "DONE",
             )
             .await?;
+        report
+            .locally_enriched_item_ids
+            .extend(completed_item_ids.iter().cloned());
         Ok(report)
     }
 
@@ -1879,6 +1888,7 @@ pub struct MetadataReport {
     pub nfo_skipped: usize,
     pub images_found: usize,
     pub items_processed: usize,
+    pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
 }
 
@@ -1889,6 +1899,8 @@ impl MetadataReport {
         self.nfo_skipped += other.nfo_skipped;
         self.images_found += other.images_found;
         self.items_processed += other.items_processed;
+        self.locally_enriched_item_ids
+            .extend(other.locally_enriched_item_ids);
         for item_id in other.failed_item_ids {
             self.mark_item_failed(&item_id);
         }
