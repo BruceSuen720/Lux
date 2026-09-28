@@ -6573,16 +6573,16 @@ Bing 图片由原作者/权利人持有。上游项目将接口限于个人学�
 验收：
 
 - [x] API 固定使用 `time_window=day` 和 Trending All 混合入口；只保留 `media_type=movie` 或 `tv` 且有有效 `backdrop_path` 的项目，过滤人物及无横幅项目，按原榜单顺序选中第一项；不将海报作为回退。
-- [ ] 只返回一张 `https://image.tmdb.org/t/p/w1280/…` 图片 CDN URL；只生成 URL，不下载或重新编码图片。宿主以 `HERO_IMAGE` 铺满登录页左侧视觉区，不旋转、遮罩或拼贴。
+- [x] 只返回一张 `https://image.tmdb.org/t/p/w1280/…` 图片 CDN URL；只生成 URL，不下载或重新编码图片。宿主以 `HERO_IMAGE` 铺满登录页左侧视觉区，不旋转、遮罩或拼贴。
 - [x] 该插件具有独立 package ID、独立 manifest 和独立插件配置；使用现有 `TmdbClient` 编译内嵌 fallback key，不再要求管理员提供另一把 API key。key 不读 `org.lux.tmdb` 插件配置、不由 Lux API/RPC 返回，也不写日志。
 - [x] 记录复用仓库内 `TmdbClient` 的审查结果：Trending All/day 响应字段、Rust/Tokio/reqwest 兼容性及许可证；不复用元数据插件运行时配置或生命周期。
 - [x] 仅缓存榜单结构所需的图片引用和刷新时间；支持超时、限流、空榜、缺失海报和 TMDb 故障，并通过宿主静态回退恢复登录页。
 - [x] 在 Lux“关于/鸣谢”区域展示获准 TMDb Logo 及要求的非背书声明；页面不暗示 TMDb 赞助或认证 Lux。
 - [x] 上线前确认实际部署用途符合 TMDb API 许可；商业使用必须先取得书面许可，未确认时不发布/启用该 provider。插件配置显式要求管理员确认已核对适用许可，确认开关不替代许可本身。
 - [x] 测试覆盖 movie/tv/person、缺少 backdrop、海报不回退、恶意路径、榜单顺序和首个有效项；mock HTTP 验证只请求日榜且不依赖真实 TMDb 网络。
-- [ ] TMDb 背景插件 v0.1.1 登记到外部仓库正式目录；仓库自动完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 和目录校验后，Lux 商店目录提供铺满左侧的版本。
+- [x] TMDb 背景插件 v0.1.1 登记到外部仓库正式目录；仓库自动完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 和目录校验后，Lux 商店目录提供铺满左侧的版本。
 
-验证：外部仓库的 Rust 单测、mock HTTP fixture、`cargo fmt --all -- --check`、插件 Clippy、双架构构建、ZIP/manifest/hash 检验和 `index.json` 校验。
+验证：外部仓库 Rust 单测、mock HTTP fixture、`cargo fmt --all -- --check`、插件 Clippy、双架构构建及 ZIP/manifest/hash 校验均通过；v0.1.1 aarch64 与 x86_64 包已在正式 `index.json` 登记。
 
 依赖：LUX-259、LUX-260、LUX-261。
 
