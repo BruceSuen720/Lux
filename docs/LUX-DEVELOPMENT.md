@@ -2170,7 +2170,7 @@ services:
 | LUX-291 | src/storage/jobs.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；渐进扫描本地 metadata outbox 操作 |
 | LUX-292 | src/storage/metadata.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；能力级本地完整性存储 |
 | LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
-| LUX-294 | migrations/0152_scan_manifest_workflow_three.sql、migrations-postgres/0152_scan_manifest_workflow_three.sql、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；workflow 3 正向索引与本地 outbox 原子提交 |
+| LUX-294 | migrations/0152_scan_manifest_workflow_three.sql、migrations-postgres/0152_scan_manifest_workflow_three.sql、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、tests/admin_health.rs、tests/ready_version.rs、tests/scanner.rs、tests/danmaku.rs、docs/LUX-DEVELOPMENT.md；workflow 3 正向索引与本地 outbox 原子提交 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7184,7 +7184,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-293。验证：workflow 版本约束迁移的 SQLite 与 PostgreSQL 用例、`cargo test --locked --test scanning_jobs` 全目标，以及 fmt/clippy。
 
-预计文件：`migrations/0152_scan_manifest_workflow_three.sql`、`migrations-postgres/0152_scan_manifest_workflow_three.sql`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`migrations/0152_scan_manifest_workflow_three.sql`、`migrations-postgres/0152_scan_manifest_workflow_three.sql`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/ready_version.rs`、`tests/scanner.rs`、`tests/danmaku.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 #### 阶段 23 总体验收与阶段门
 
