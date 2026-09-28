@@ -7177,14 +7177,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 新扫描创建 workflow 3；workflow 1/2 的发现、计数、恢复和后处理语义保持不变。
-- [ ] workflow 3 正向索引实际应用的媒体来源与旁车引用，在同一事务写入有界、稳定、幂等的 outbox；事务失败不留下索引或队列单边状态。
-- [ ] 首批 outbox 在扫描仍处于 DISCOVERING 时可领取；扫描结束/target 物化不重复发布已处理引用。
-- [ ] 大目录索引事务可拆成每批最多 256 个引用，批次序号稳定且不冲突；targets-ready barrier 与根覆盖/删除 CAS 不变。
+- [x] 新扫描创建 workflow 3；workflow 1/2 的发现、计数、恢复和后处理语义保持不变。
+- [x] workflow 3 正向索引实际应用的媒体来源与旁车引用，在同一事务写入有界、稳定、幂等的 outbox；事务失败不留下索引或队列单边状态。
+- [x] 首批 outbox 在扫描仍处于 DISCOVERING 时可领取；扫描结束/target 物化不重复发布已处理引用。
+- [x] 大目录索引事务可拆成每批最多 256 个引用，批次序号稳定且不冲突；targets-ready barrier 与根覆盖/删除 CAS 不变。
 
 依赖：LUX-293。验证：workflow 版本约束迁移的 SQLite 与 PostgreSQL 用例、`cargo test --locked --test scanning_jobs` 全目标，以及 fmt/clippy。
 
 预计文件：`migrations/0152_scan_manifest_workflow_three.sql`、`migrations-postgres/0152_scan_manifest_workflow_three.sql`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/ready_version.rs`、`tests/scanner.rs`、`tests/danmaku.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：新扫描 workflow 3 的正向索引事务按最多 256 个 filesystem source 引用原子写入本地 outbox；DISCOVERING 期间可见，最终 target 物化不重复写入。SQLite 注入 outbox 写错验证回滚；1,025 文件批次、`.strm` 与现有 poster sidecar、workflow 2 恢复语义均有回归。SQLite/PostgreSQL workflow 约束迁移各通过；`cargo test --locked --test scanning_jobs -- --test-threads=4` 81 项通过，`cargo test --locked --all-targets -- --test-threads=4` 全目标通过，定向真实 PostgreSQL migration 用例通过；`cargo build --locked`、`cargo fmt --all -- --check` 与 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。当前工作只完成任务发布，尚未消费本地 NFO/图片，首张海报提速需要后续 worker 与页面更新任务。
 
 #### 阶段 23 总体验收与阶段门
 

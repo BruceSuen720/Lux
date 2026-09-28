@@ -1203,7 +1203,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
-#[allow(dead_code)] // Scanner wiring follows the isolated storage task.
+#[allow(dead_code)] // The local metadata worker consumes these batches in the next phase task.
 #[derive(Clone, Copy)]
 pub(crate) struct NewScanLocalMetadataBatch<'a> {
     pub(crate) id: &'a str,
@@ -1395,7 +1395,7 @@ pub(crate) fn is_lite_manifest_discovery(
     discovery_format_version: i64,
     discovery_mode: &str,
 ) -> bool {
-    workflow_version == 2 && discovery_format_version == 3 && discovery_mode == "LITE"
+    matches!(workflow_version, 2 | 3) && discovery_format_version == 3 && discovery_mode == "LITE"
 }
 
 #[derive(Debug)]

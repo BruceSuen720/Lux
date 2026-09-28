@@ -5415,7 +5415,7 @@ impl ScanJobService {
                         &manifest.id,
                         batch_size,
                         &cancellation,
-                        manifest.workflow_version == 2,
+                        matches!(manifest.workflow_version, 2 | 3),
                         lite_mode,
                     )
                     .await
@@ -5425,7 +5425,7 @@ impl ScanJobService {
                         &job,
                         &manifest.id,
                         &cancellation,
-                        manifest.workflow_version == 2,
+                        matches!(manifest.workflow_version, 2 | 3),
                         manifest.discovery_format_version,
                         lite_mode,
                     )
@@ -7575,7 +7575,7 @@ impl ScanJobService {
         let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? else {
             return Ok(false);
         };
-        if manifest.workflow_version != 2 || manifest.discovery_format_version != 3 {
+        if !matches!(manifest.workflow_version, 2 | 3) || manifest.discovery_format_version != 3 {
             return Ok(false);
         }
         if job.status != "COMPLETED" || job.scan_phase != "POSTPROCESSING" {
@@ -9250,7 +9250,7 @@ impl ScanJobService {
         let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? else {
             return Ok(());
         };
-        if manifest.workflow_version != 2 || manifest.discovery_format_version != 3 {
+        if !matches!(manifest.workflow_version, 2 | 3) || manifest.discovery_format_version != 3 {
             return Ok(());
         }
         for root in self
@@ -9983,7 +9983,7 @@ impl ScanJobService {
             .get_scan_manifest_by_job(job_id)
             .await?
             .is_some_and(|manifest| {
-                manifest.workflow_version == 2 && manifest.discovery_format_version == 3
+                matches!(manifest.workflow_version, 2 | 3) && manifest.discovery_format_version == 3
             });
         let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let mut local_metadata_worker =

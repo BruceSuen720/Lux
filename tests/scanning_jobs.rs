@@ -1730,8 +1730,8 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(
-        workflow_version, 2,
-        "new jobs use the streamed apply workflow"
+        workflow_version, 3,
+        "new jobs use the progressive local metadata workflow"
     );
     let discovery_format_version: i64 =
         sqlx::query_scalar("SELECT discovery_format_version FROM scan_manifests WHERE job_id = ?")
@@ -1790,6 +1790,23 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
         visible_items > 0,
         "the discovery worker should commit safe positive indexes before discovery finishes"
     );
+    let discovery_state: String =
+        sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    let early_local_batches: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(source_count), 0),
+                COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0)
+         FROM scan_local_metadata_batches WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(discovery_state, "DISCOVERING");
+    assert!(early_local_batches.0 > 0);
+    assert_eq!(early_local_batches.0, early_local_batches.2);
+    assert!(early_local_batches.1 > 0);
     let mut manifest_state = String::new();
     for _ in 0..100 {
         manifest_state = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
@@ -1850,6 +1867,11 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
     assert_eq!(seen_path_count, 0);
     assert_eq!(indexed_generation_path_count, 128);
     assert_eq!(manifest_remove_count, 0);
+    let batches_before_target_materialization: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
     jobs.run_to_completion(&job.id, 1, None).await?;
     let visible_items: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_items
@@ -1858,6 +1880,126 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(visible_items, 64);
+    let batches_after_target_materialization: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        batches_after_target_materialization, batches_before_target_materialization,
+        "final target materialization must not republish early local work"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_directory = root.join("Atomic Movie (2024)");
+    tokio::fs::create_dir_all(&movie_directory).await?;
+    tokio::fs::write(movie_directory.join("Atomic.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_batch(&job.id, 100).await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_scan_local_metadata_batch
+         BEFORE INSERT ON scan_local_metadata_batches
+         BEGIN SELECT RAISE(ABORT, 'injected local metadata outbox failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(jobs.run_batch(&job.id, 100).await.is_err());
+    sqlx::query("DROP TRIGGER reject_scan_local_metadata_batch")
+        .execute(database.pool())
+        .await?;
+
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots WHERE library_id = ?")
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    let rolled_back: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM media_items
+              WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL),
+             (SELECT COUNT(*) FROM filesystem_entries WHERE library_root_id = ?),
+             (SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?)",
+    )
+    .bind(library.id.to_string())
+    .bind(root_id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(rolled_back, (0, 0, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_workflow_two_manifest_keeps_its_scan_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Workflow.Two.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 2 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let job_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    let persisted_state: (i64, String) =
+        sqlx::query_as("SELECT workflow_version, state FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    let indexed_movies: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let local_batch_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(job_status, "COMPLETED");
+    assert_eq!(persisted_state, (2, "COMPLETED".to_owned()));
+    assert_eq!(indexed_movies, 1);
+    assert_eq!(local_batch_count, 0);
     Ok(())
 }
 
@@ -2123,7 +2265,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 148);
+    assert_eq!(database.schema_version().await?, 152);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -4705,6 +4847,39 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(generation_indexed_paths, 1_025);
+    let local_batches: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT batch_sequence, source_count, source_refs_json
+         FROM scan_local_metadata_batches WHERE job_id = ? ORDER BY batch_sequence",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert!(!local_batches.is_empty());
+    assert!(
+        local_batches
+            .iter()
+            .all(|(_, source_count, _)| { (1..=256).contains(source_count) })
+    );
+    let mut local_source_ids = Vec::new();
+    for (_, source_count, source_refs_json) in &local_batches {
+        let source_ids: Vec<String> = serde_json::from_str(source_refs_json)?;
+        assert_eq!(i64::try_from(source_ids.len())?, *source_count);
+        local_source_ids.extend(source_ids);
+    }
+    let unique_local_source_ids = local_source_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(local_source_ids.len(), 1_025);
+    assert_eq!(unique_local_source_ids.len(), local_source_ids.len());
+    assert_eq!(
+        local_batches
+            .iter()
+            .map(|(sequence, _, _)| sequence)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        local_batches.len(),
+        "observation-based batch sequences remain unique"
+    );
     let directory_entries: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_manifest_directories
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -5766,6 +5941,11 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
         br#"[{"MediaSourceInfo":{"Container":"mp4","RunTimeTicks":300000000,"Bitrate":128000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"h264"}]}}]"#,
     )
     .await?;
+    tokio::fs::write(
+        movie_dir.join("Remote.Movie.2022-poster.jpg"),
+        b"poster fixture",
+    )
+    .await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
@@ -5814,6 +5994,31 @@ async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(stream_count, 1);
+
+    let source_refs_json: String = sqlx::query_scalar(
+        "SELECT source_refs_json FROM scan_local_metadata_batches WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let source_refs: Vec<String> = serde_json::from_str(&source_refs_json)?;
+    let mut source_paths = Vec::with_capacity(source_refs.len());
+    for source_ref in source_refs {
+        let path: String =
+            sqlx::query_scalar("SELECT relative_path FROM filesystem_entries WHERE id = ?")
+                .bind(source_ref)
+                .fetch_one(database.pool())
+                .await?;
+        source_paths.push(path);
+    }
+    source_paths.sort();
+    assert_eq!(
+        source_paths,
+        vec![
+            "Remote Movie (2022)/Remote.Movie.2022-poster.jpg".to_owned(),
+            "Remote Movie (2022)/Remote.Movie.2022.strm".to_owned(),
+        ]
+    );
     Ok(())
 }
 

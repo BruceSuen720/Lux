@@ -33,6 +33,7 @@ struct ManifestDiscoveryPositiveIndexResult<'a> {
     reappeared_count: i64,
     applied_count: i64,
     indexed_paths: Vec<&'a str>,
+    local_metadata_refs: Vec<(&'a str, &'a str)>,
 }
 
 struct ManifestDiscoveryPositiveIndexCommit<'a, 'b> {
@@ -49,6 +50,10 @@ fn record_manifest_positive_applied<'a>(
     positive: &'a NewScanManifestPositiveIndex,
 ) {
     result.indexed_paths.push(positive.relative_path.as_str());
+    result.local_metadata_refs.push((
+        positive.relative_path.as_str(),
+        manifest_positive_file_filesystem_entry_id(&positive.file),
+    ));
     result.applied_count = result.applied_count.saturating_add(1);
     match positive.delta_kind.as_str() {
         "ADD" => result.add_count = result.add_count.saturating_add(1),
@@ -81,10 +86,30 @@ impl Database {
         "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
 }
 
-#[allow(dead_code)] // The outbox primitives are wired into scanner workers by the next P3 task.
+#[allow(dead_code)] // The local outbox worker is connected in the following phase task.
 impl Database {
     pub(crate) async fn enqueue_scan_local_metadata_batch(
         &self,
+        batch: NewScanLocalMetadataBatch<'_>,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let inserted = self
+            .enqueue_scan_local_metadata_batch_in_transaction(&mut transaction, batch)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted)
+    }
+
+    async fn enqueue_scan_local_metadata_batch_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
         batch: NewScanLocalMetadataBatch<'_>,
     ) -> Result<bool, StorageError> {
         if batch.id.trim().is_empty()
@@ -114,8 +139,6 @@ impl Database {
             StorageError::Conflict("scan local metadata source count overflow".into())
         })?;
 
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
         let inserted = self
             .query(
                 "INSERT INTO scan_local_metadata_batches (
@@ -130,20 +153,13 @@ impl Database {
             .bind(batch.batch_sequence)
             .bind(&source_refs_json)
             .bind(source_count)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
         if inserted.is_some() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
             return Ok(true);
         }
 
@@ -156,7 +172,7 @@ impl Database {
             .bind(batch.job_id)
             .bind(batch.library_root_id)
             .bind(batch.batch_sequence)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -175,14 +191,50 @@ impl Database {
                 "scan local metadata batch sequence already has different input".into(),
             ));
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         Ok(false)
+    }
+
+    async fn enqueue_manifest_local_metadata_refs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        library_root_id: &str,
+        local_metadata_refs: &[(&str, &str)],
+        sequence_start: i64,
+    ) -> Result<(), StorageError> {
+        let mut ordered_refs = local_metadata_refs.to_vec();
+        ordered_refs.sort_unstable();
+        let mut unique_refs = std::collections::HashSet::with_capacity(ordered_refs.len());
+        ordered_refs.retain(|(_, reference_id)| unique_refs.insert(*reference_id));
+
+        for (batch_index, refs) in ordered_refs
+            .chunks(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES)
+            .enumerate()
+        {
+            let batch_index = i64::try_from(batch_index).map_err(|_| {
+                StorageError::Conflict("local metadata batch sequence overflow".into())
+            })?;
+            let batch_sequence = sequence_start.checked_add(batch_index).ok_or_else(|| {
+                StorageError::Conflict("local metadata batch sequence overflow".into())
+            })?;
+            let source_ids = refs
+                .iter()
+                .map(|(_, reference_id)| (*reference_id).to_owned())
+                .collect::<Vec<_>>();
+            let id = format!("{job_id}:{library_root_id}:{batch_sequence}");
+            self.enqueue_scan_local_metadata_batch_in_transaction(
+                transaction,
+                NewScanLocalMetadataBatch {
+                    id: &id,
+                    job_id,
+                    library_root_id,
+                    batch_sequence,
+                    source_ids: &source_ids,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn list_scan_local_metadata_batches(
@@ -1096,7 +1148,7 @@ impl Database {
                      discovery_format_version, discovery_mode, root_count,
                      postprocessing_targets_ready
                  )
-                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 2, 3, 'LITE', ?, 0
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 3, 3, 'LITE', ?, 0
                  FROM scan_jobs sj
                  WHERE sj.id = ? AND sj.library_id = ?
                    AND sj.job_type = 'RECONCILE_LIBRARY' AND sj.status = 'PENDING'",
@@ -1475,7 +1527,7 @@ impl Database {
             ));
         };
         if manifest_state != "POSTPROCESSING"
-            || workflow != 2
+            || !matches!(workflow, 2 | 3)
             || format != 3
             || ready != 0
             || job_status != "COMPLETED"
@@ -2401,13 +2453,26 @@ impl Database {
         } else {
             entries.clone()
         };
-        let observation_count_i64 = if workflow_version == 2 {
+        let observation_count_i64 = if matches!(workflow_version, 2 | 3) {
             i64::try_from(observation_entries.len()).map_err(|_| {
                 StorageError::Conflict("manifest observation count overflow".to_owned())
             })?
         } else {
             0
         };
+        let reserved_local_batch_sequence_count = if workflow_version == 3 {
+            i64::try_from(
+                positive_indexes
+                    .len()
+                    .div_ceil(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES),
+            )
+            .map_err(|_| StorageError::Conflict("local metadata batch count overflow".to_owned()))?
+        } else {
+            0
+        };
+        let root_sequence_increment = observation_count_i64
+            .checked_add(reserved_local_batch_sequence_count)
+            .ok_or_else(|| StorageError::Conflict("manifest root sequence overflow".into()))?;
         let discovered_directory_count_i64 = if lite_mode {
             i64::try_from(child_directories.len()).map_err(|_| {
                 StorageError::Conflict("manifest directory count overflow".to_owned())
@@ -2458,7 +2523,7 @@ impl Database {
             .bind(discovered_directory_count_i64)
             .bind(completed_directory_count_for_root)
             .bind(inserted_file_count_i64)
-            .bind(observation_count_i64)
+            .bind(root_sequence_increment)
             .bind(chunk.manifest_id)
             .bind(chunk.library_root_id)
             .bind(chunk.manifest_id)
@@ -2482,10 +2547,10 @@ impl Database {
             inserted_file_count,
             completed_directories.len(),
         );
-        let observation_sequence_start = if workflow_version == 2 && observation_count_i64 > 0 {
+        let observation_sequence_start = if observation_count_i64 > 0 {
             Some(
                 last_sequence
-                    .checked_sub(observation_count_i64)
+                    .checked_sub(root_sequence_increment)
                     .and_then(|sequence| sequence.checked_add(1))
                     .ok_or_else(|| {
                         StorageError::Conflict("manifest observation sequence overflow".to_owned())
@@ -2494,8 +2559,20 @@ impl Database {
         } else {
             None
         };
+        let local_metadata_sequence_start = if reserved_local_batch_sequence_count > 0 {
+            Some(
+                last_sequence
+                    .checked_sub(reserved_local_batch_sequence_count)
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .ok_or_else(|| {
+                        StorageError::Conflict("local metadata batch sequence overflow".to_owned())
+                    })?,
+            )
+        } else {
+            None
+        };
 
-        let observation_batch_size = if workflow_version == 2 {
+        let observation_batch_size = if matches!(workflow_version, 2 | 3) {
             super::manifest_path_query_chunk_size(self.backend())
         } else {
             80
@@ -2610,14 +2687,14 @@ impl Database {
                 .count(),
         );
 
-        if workflow_version != 2 && !positive_indexes.is_empty() {
+        if !matches!(workflow_version, 2 | 3) && !positive_indexes.is_empty() {
             return Err(StorageError::Conflict(
                 "legacy manifest cannot receive streamed positive indexes".to_owned(),
             ));
         }
         let mut positive_result = ManifestDiscoveryPositiveIndexResult::default();
         let positive_index_started = Instant::now();
-        if workflow_version == 2 && !positive_indexes.is_empty() {
+        if matches!(workflow_version, 2 | 3) && !positive_indexes.is_empty() {
             if job_status != "RUNNING" || cancel_requested != 0 {
                 return Err(StorageError::Conflict(
                     "streamed indexing requires an active manifest scan job".to_owned(),
@@ -2644,6 +2721,30 @@ impl Database {
             positive_indexes.len(),
             0,
         );
+
+        if workflow_version == 3 && !positive_result.local_metadata_refs.is_empty() {
+            let local_metadata_started = Instant::now();
+            let sequence_start = local_metadata_sequence_start.ok_or_else(|| {
+                StorageError::Conflict(
+                    "workflow 3 local metadata references require reserved batch sequences".into(),
+                )
+            })?;
+            self.enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                chunk.job_id,
+                chunk.library_root_id,
+                &positive_result.local_metadata_refs,
+                sequence_start,
+            )
+            .await?;
+            record_manifest_storage_stage(
+                "local_metadata_outbox",
+                local_metadata_started,
+                positive_result.local_metadata_refs.len(),
+                positive_result.local_metadata_refs.len(),
+                0,
+            );
+        }
 
         let presence_ledger_started = Instant::now();
         let mut ledger_paths = Vec::new();
@@ -2864,7 +2965,7 @@ impl Database {
                  WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
             )
             .bind(inserted_file_count_i64)
-            .bind(if workflow_version == 2 {
+            .bind(if matches!(workflow_version, 2 | 3) {
                 inserted_file_count_i64
             } else {
                 0
@@ -3888,7 +3989,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?
-        } else if workflow_version == 2 && discovery_format_version == 3 {
+        } else if matches!(workflow_version, 2 | 3) && discovery_format_version == 3 {
             self.query_scalar(
                 "SELECT COUNT(*)
                  FROM filesystem_entries fe
@@ -3956,7 +4057,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?
-        } else if workflow_version == 2 {
+        } else if matches!(workflow_version, 2 | 3) {
             self.query_scalar(
                 "SELECT COUNT(*)
                  FROM filesystem_entries fe
@@ -4058,7 +4159,7 @@ impl Database {
         if remaining_changes > 0 {
             return Ok(false);
         }
-        let unchanged_count: i64 = if workflow_version == 2 {
+        let unchanged_count: i64 = if matches!(workflow_version, 2 | 3) {
             self.query_scalar("SELECT unchanged_count FROM scan_manifests WHERE id = ?")
                 .bind(manifest_id)
                 .fetch_one(&mut *transaction)
@@ -4119,7 +4220,7 @@ impl Database {
             return Ok(false);
         }
         let total_count: i64 = self
-            .query_scalar(if workflow_version == 2 {
+            .query_scalar(if matches!(workflow_version, 2 | 3) {
                 "SELECT observed_file_count + remove_count FROM scan_manifests WHERE id = ?"
             } else {
                 "SELECT unchanged_count + add_count + change_count + remove_count + reappeared_count
@@ -4132,7 +4233,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let processed_count = if workflow_version == 2 {
+        let processed_count = if matches!(workflow_version, 2 | 3) {
             self.query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
                 .bind(job_id)
                 .fetch_one(&mut *transaction)
@@ -8710,7 +8811,7 @@ impl Database {
                  JOIN scan_manifests manifest ON manifest.job_id = job.id
                  WHERE job.library_id = ? AND job.job_type = 'RECONCILE_LIBRARY'
                    AND job.status = 'COMPLETED' AND job.scan_phase = 'POSTPROCESSING'
-                   AND manifest.workflow_version = 2
+                   AND manifest.workflow_version IN (2, 3)
                    AND manifest.discovery_format_version = 3
                    AND manifest.postprocessing_targets_ready = 0
              ) THEN 1 ELSE 0 END",
@@ -9113,7 +9214,7 @@ impl Database {
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_manifests
-                       WHERE job_id = ? AND workflow_version = 2
+                       WHERE job_id = ? AND workflow_version IN (2, 3)
                          AND discovery_format_version = 3
                          AND postprocessing_targets_ready = 0
                    )",
@@ -9177,7 +9278,7 @@ impl Database {
                          )
                      ) OR EXISTS (
                        SELECT 1 FROM scan_manifests
-                       WHERE job_id = ? AND workflow_version = 2
+                       WHERE job_id = ? AND workflow_version IN (2, 3)
                          AND discovery_format_version = 3
                          AND postprocessing_targets_ready = 0
                      )
@@ -9218,7 +9319,7 @@ impl Database {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
                  SELECT 1 FROM scan_manifests
-                 WHERE job_id = ? AND workflow_version = 2
+                 WHERE job_id = ? AND workflow_version IN (2, 3)
                    AND discovery_format_version = 3
                    AND postprocessing_targets_ready = 0
              ) THEN 1 ELSE 0 END",
