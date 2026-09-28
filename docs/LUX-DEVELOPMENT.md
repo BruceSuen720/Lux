@@ -7134,22 +7134,25 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
 
-结果（2026-09-28）：SQLite outbox 单测覆盖 256 来源边界、非法/重复输入、幂等冲突、稳定分页、并发领取、到期退避、终态 CAS、job 取消和重启恢复；`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_batches` 1 项通过，`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。PostgreSQL 运行时合同留到 P2 双后端验证；本任务未接入 scanner。
+结果（2026-09-28）：SQLite outbox 单测覆盖 256 来源边界、非法/重复输入、幂等冲突、稳定分页、并发领取、到期退避、终态 CAS、job 取消和重启恢复；`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_batches` 1 项通过。LUX-292 的真实 PostgreSQL 同合同用例也验证了 outbox 领取/取消/恢复；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。本任务未接入 scanner。
 
-#### LUX-292：能力级本地完整性与在线补缺意向原子存储
+#### LUX-292：能力级本地完整性状态存储
 
 范围：以 item+capability+输入版本记录本地检查 PENDING/RUNNING/READY/FAILED/CANCELLED 与已确认 missing；提供输入指纹条件更新和缺失能力的有界分页读取。本任务不接入本地检查 worker 或扫描入口。
 
 验收：
 
-- [ ] 非 READY 不能持久化 missing；fingerprint 变化时旧确认不能被当作当前版本结果。
-- [ ] item+capability 唯一记录支持有限状态转换；只有输入 fingerprint 仍匹配时才能接受 READY/missing 结果。
-- [ ] READY 缺失能力分页按稳定游标返回并有服务端上限；失败/未确认能力不会进入缺失列表。
-- [ ] SQLite 与 PostgreSQL 使用同一合同通过自动化覆盖。
+- [x] 非 READY 不能持久化 missing；fingerprint 变化时旧确认不能被当作当前版本结果。
+- [x] item+capability 唯一记录支持有限状态转换；只有输入 fingerprint 仍匹配时才能接受 READY/missing 结果。
+- [x] READY 缺失能力分页按稳定游标返回并有服务端上限；失败/未确认能力不会进入缺失列表。
+- [x] 进程重启时可在 worker 启动前将 RUNNING 检查恢复为 PENDING，旧 worker 不能用旧 fingerprint 回写。
+- [x] SQLite 与 PostgreSQL 使用同一合同通过自动化覆盖。
 
-依赖：LUX-291。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`，并运行真实 PostgreSQL 存储合同用例。
+依赖：LUX-291。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`、`cargo test --locked --lib storage::repository::repository_tests::postgres_progressive_scan_metadata_storage_contract -- --ignored`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
 预计文件：`src/storage/metadata.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：SQLite 用例覆盖指纹换代时清除旧缺失、RUNNING 重启恢复、拒绝旧 worker CAS、READY missing 双页读取、失败/可用/取消状态过滤；真实 PostgreSQL 用例覆盖 bytea 指纹换代与恢复、旧结果 CAS、缺失读取及 LUX-291 outbox 操作。两个定向用例各 1 项通过；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。应用 worker 尚未接入，按后续任务实施。
 
 #### LUX-293：缺失结果与独立 FILL_MISSING 调度意向原子提交
 

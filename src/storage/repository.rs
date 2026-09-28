@@ -2054,6 +2054,20 @@ pub(crate) struct StoredMetadataCapabilityAttempt {
     pub(crate) next_retry_at: Option<i64>,
 }
 
+#[allow(dead_code)] // Consumed by local metadata scanning in the next phase task.
+#[derive(Debug)]
+pub(crate) struct StoredItemMetadataCompleteness {
+    pub(crate) item_id: String,
+    pub(crate) capability: String,
+    pub(crate) local_state: String,
+    pub(crate) is_missing: Option<bool>,
+    pub(crate) input_fingerprint: Option<Vec<u8>>,
+    pub(crate) checked_at: Option<i64>,
+    pub(crate) retry_after: Option<i64>,
+    pub(crate) error: Option<String>,
+    pub(crate) updated_at: i64,
+}
+
 pub(crate) struct MetadataCapabilityResult<'a> {
     pub(crate) capability: &'a str,
     pub(crate) has_data: bool,
@@ -2163,6 +2177,22 @@ fn stored_metadata_candidate(row: sqlx::any::AnyRow) -> StoredMetadataCandidate 
         status: row.get("status"),
         expires_at: row.get("expires_at"),
         item_title: row.get("item_title"),
+    }
+}
+
+fn stored_item_metadata_completeness(row: sqlx::any::AnyRow) -> StoredItemMetadataCompleteness {
+    StoredItemMetadataCompleteness {
+        item_id: row.get("item_id"),
+        capability: row.get("capability"),
+        local_state: row.get("local_state"),
+        is_missing: row
+            .get::<Option<i64>, _>("is_missing")
+            .map(|value| value != 0),
+        input_fingerprint: row.get("input_fingerprint"),
+        checked_at: row.get("checked_at"),
+        retry_after: row.get("retry_after"),
+        error: row.get("error"),
+        updated_at: row.get("updated_at"),
     }
 }
 
