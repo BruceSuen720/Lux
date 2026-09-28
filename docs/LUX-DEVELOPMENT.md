@@ -2138,7 +2138,7 @@ services:
 | LUX-259 | docs/PLUGIN-SDK.md、src/application/plugin_protocol.rs、src/application/plugins.rs、tests/plugins.rs、docs/；登录页背景插件类型与有界数据 RPC 合同 |
 | LUX-260 | migrations/、migrations-postgres/、src/application/、src/storage/、src/api/users.rs、src/api/admin_handlers.rs、tests/、docs/；登录背景插件的后台刷新、缓存、来源选择与公开接口 |
 | LUX-261 | web/src/features/auth/LoginPage.tsx、web/src/features/admin/AdminSettingsPage.tsx、web/src/app/、web/src/lib/api/、web/tests/、docs/；插件来源选择、瀑布流/大图布局和来源鸣谢 |
-| LUX-262 | Lux-plugins/src/bin/lux-plugin-wikimedia-potd-background.rs、manifests/org.lux.wikimedia-potd-background.json、tests/、docs/；经逐图许可筛选的 Wikimedia Commons 每日图片插件（必应来源不满足许可门槛） |
+| LUX-262 | Lux-plugins/src/bin/lux-plugin-bing-daily-background.rs、manifests/org.lux.bing-daily-background.json、tests/、docs/；独立 Bing 每日图片插件 |
 | LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
@@ -6517,7 +6517,7 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 验收：
 
-- [ ] 管理员可选固定海报墙、媒体库最新添加、Wikimedia Commons 每日图片或 TMDb 日榜横幅图；未安装/不可用插件不会被错误展示为可用选项，并清楚提示启用和公开访问的风险。
+- [ ] 管理员可选固定海报墙、媒体库最新添加、Bing 每日图片或 TMDb 日榜横幅图；未安装/不可用插件不会被错误展示为可用选项，并清楚提示启用和公开访问的风险。
 - [ ] `POSTER_FEED` 使用既有五列紧凑倾斜瀑布流和当前位置/留白，不改变尺寸、列距、倾斜角、交错规则；`HERO_IMAGE` 用 Lux 自带 CSS 呈现，不加载插件自定义 UI。
 - [ ] `SINGLE_POSTER` 只展示一张完整原比例海报，不裁切、旋转、拼贴或叠加遮罩；由宿主固定布局在左侧视觉区呈现，不改变既有海报瀑布流。
 - [ ] `SINGLE_IMAGE` 只展示一张完整原比例图片，不裁切、旋转、拼贴、压暗或叠加遮罩；作品署名与许可作为独立、可访问的外链呈现。
@@ -6539,28 +6539,32 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 - 不让插件注入任意前端代码或自定义主题；不改变既有登录表单和按钮下方留白。
 - 不生成或上传媒体库图片衍生文件。
 
-#### LUX-262：独立 Wikimedia Commons 每日图片插件（替代必应来源）
+#### LUX-262：独立 Bing 每日图片插件
 
-范围：在外部 `Lux-plugins` 仓库实现独立的 Wikimedia Commons Picture of the Day 登录背景插件。项目所有者提供的 [`wefashe/bing-image`](https://github.com/wefashe/bing-image) 已完成审查：其 MIT 许可允许复用代码，但 README 将接口限制于个人学习/研究、图片限制为个人壁纸，且列出的每日接口未能在微软正式 API 文档中确认。因此不实现或发布该 Bing 图片来源，MIT 代码许可不构成图片展示授权。替代插件仅使用 Wikimedia Commons 官方 MediaWiki Action API，读取当日 POTD 模板和对应文件的 `imageinfo/extmetadata`，请求上游按比例生成最长边 1920px 的缩略图；逐项校验图片授权并保留原比例展示。
+范围：在外部 `Lux-plugins` 仓库实现独立的 Bing 每日图片登录背景插件。复用项目所有者指定的 [`wefashe/bing-image`](https://github.com/wefashe/bing-image) 所记录的 `HPImageArchive.aspx` 数据格式，请求 `https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN`，仅取当日图片的直链、标题和版权说明。接口并非微软公开的第三方开发者 API，可能随时变化；插件不抓取 Bing 页面、不依赖第三方 API/容器，也不在服务端下载、缓存或重编码图片。图片 URL 由登录浏览器直接请求 Bing。
+
+Bing 图片由原作者/权利人持有。上游项目将接口限于个人学习/研究，并将图片用途描述为个人壁纸；微软也说明每日图片是否可下载取决于具体图片的许可限制。因此插件必须明确提示管理员核对部署用途与适用许可，并设置启用确认；该确认不是版权授权或 Microsoft 背书。没有相应权利时不得商业使用、转载或对外再分发图片。
+
+每日图片以 `HERO_IMAGE` 返回，由 Lux 固定 CSS 用 `object-fit: cover` 铺满登录页左侧视觉区；署名只在背景区域低干扰展示，不以居中的原比例 `SINGLE_IMAGE` 布局呈现。
 
 验收：
 
-- [x] 插件仓库记录 Bing 来源审查与 Commons API/许可选择；不请求 Bing 未公开/个人壁纸端点、不依赖第三方 Bing API/容器。
-- [x] 只访问 `commons.wikimedia.org` 官方 Action API 获取当日 POTD 文件名及文件元数据，并使用 `iiurlwidth=1920` 获取上游缩略图；不抓取 HTML 页面或由 Lux 下载图片字节。
-- [x] 仅接受公共领域、CC0、CC BY 或 CC BY-SA 许可，拒绝 NC、ND、未知许可及缺少作者/作品页等署名信息的资源；许可 URL 与作品页 URL 必须由 API 返回并通过宿主 manifest 主机校验。
-- [x] 插件使用独立 ID、manifest 和包版本；返回一张 `thumb.wikimedia.org` HTTPS 缩略图 URL、纯文本标题/作者/许可，以及作品页和许可证链接；图片不裁切、编辑、重编码或拼贴。
-- [x] 缺失当日模板、无图、许可证不允许、元数据畸形及 Commons 网络错误均返回可恢复错误，宿主回退静态海报墙。
-- [x] fixture 与 mock HTTP 测试覆盖 UTC 日期模板、作者 HTML 转纯文本、许可白名单/拒绝清单、图片 URL 主机、署名链接和空结果，不访问真实 Commons。
-- [x] Commons 来源逐图许可筛选、ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 校验通过后，将独立插件登记到 `plugins.json`；插件仓库 main 分支的 release workflow 负责发布包并生成 `index.json`。此授权仅适用于 Commons，不适用于未经授权的 Bing 图片。
+- [x] 只请求 `www.bing.com` 的 `HPImageArchive.aspx`，固定 `idx=0`、`n=1`、`mkt=zh-CN`；请求限时、关闭重定向、限制 JSON 响应大小，畸形/空结果及上游错误返回可恢复插件错误。
+- [x] 严格校验上游图片为 Bing HTTPS 直链，拒绝非 `www.bing.com` 主机、凭据、端口、片段、非 `/th` 路径及非 `_1920x1080.jpg` 当日大图。
+- [x] 使用独立 ID、manifest、配置和版本；只输出一张 `HERO_IMAGE`，保留 Bing 给出的图片 URL，不自行代理、下载、存储、编辑或重编码图片。
+- [x] 标题与版权说明仅按纯文本输出并限制长度；上游错误、恶意 URL、空结果和无法确认图片信息时回退固定海报墙。
+- [x] manifest 明确声明网络/图片主机；配置要求管理员确认已核对适用许可并限定个人用途，且说明确认本身不授予图片版权。
+- [x] Rust 单元与 mock HTTP 测试覆盖请求参数、直链与 `HERO_IMAGE` 输出、畸形响应、恶意图片 URL、大小限制、超时/重定向；测试不访问真实 Bing。
+- [x] 完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 校验后登记正式插件目录；仓库 `main` 分支 release workflow 自动生成正式包和 `index.json`。
 
-验证：外部仓库的 Rust 单测、SDK 合同测试、mock HTTP fixture、`cargo fmt --all -- --check`、双架构构建和 ZIP/manifest/hash 检验。
+验证：Lux-plugins PR #11 已合并；v0.1.0 正式包已发布并登记至 `index.json`，aarch64 与 x86_64 均含 SHA-256。外部仓库 Rust 单测、插件 SDK/目录合同测试、mock HTTP、`cargo fmt --all -- --check`、双架构发布检查均通过。
 
-依赖：LUX-259、LUX-260、LUX-261；逐图许可筛选为可用性门槛。
+依赖：LUX-259、LUX-260、LUX-261；管理员确认适用许可为启用门槛。
 
 明确不做：
 
-- 不使用许可未知、NC 或 ND 图片，不将 API 返回 HTML 当成宿主 UI。
-- 不在插件中打包、下载或重编码日图图片。
+- 不将 Bing 当作微软承诺长期支持的公共 API；上游端点变化时安全失败并回退固定海报墙。
+- 不把任何 Bing 图片文件打包进插件或 Lux，也不缓存/代理图片字节。
 
 #### LUX-263：独立 TMDb 日榜电影+剧集横幅图插件
 
