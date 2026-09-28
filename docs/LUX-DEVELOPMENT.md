@@ -7296,6 +7296,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：`MetadataRequestPlan` 额外保留每种图像类型的 missing mask；`MetadataSelectionService` 现在可将当前本地值拆成 METADATA、单图能力、CREDITS、EXTERNAL_IDS、TRAILERS，并分别给出实际缺失与按已有 attempt history 仍可请求的计划。fingerprint 由当前本地投影与两类计划的稳定摘要生成。纯计划用例覆盖单图策略、Unavailable、fingerprint 换代、锁定字段/NFO 现有逻辑和 VIDEO 排除；不发请求、不写数据库。定向 candidates 单测 1 项、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。扫描 worker 尚未调用该计划，留给下一项接线任务。
 
+#### LUX-301：扫描本地完成后保存能力级缺失
+
+范围：将 `MetadataSelectionService` 注入现有 local metadata worker。仅在本地图片与 NFO 检查都成功后，为该批条目计算 LUX-300 的 completeness plan，通过 LUX-299 批量 claim，把每项能力 READY/missing 结果写入 `item_metadata_completeness`。重复输入 fingerprint 幂等；过期检查不得回写。全量 outbox 与既有资源 backfill 共用同一流程；本地读取失败不写 READY/missing。本任务暂不传入自动补缺 item IDs，也不创建 `FILL_MISSING` job，不访问 provider。
+
+验收：
+
+- [ ] 生产 `ScanJobService` 获得现有 MetadataSelectionService；两类本地队列成功后均写能力状态，unsupported 类型安全跳过。
+- [ ] 图片/NFO 任一失败时不产生该页的 READY/missing 结果；完整输入版本变化时旧结果不能覆盖新检查。
+- [ ] poster 已有标为 available、仅 poster 缺失标为 missing；媒体字段按本地 NFO 与锁定规则判定，重复扫描不重置同版本 READY。
+- [ ] 本地缺失记录不会直接创建在线 job，worker 本身不调用 scraper。
+- [ ] SQLite 测试覆盖新 outbox 与 old-item backfill；PostgreSQL 存储合同复用 LUX-299 批量 claim/CAS。
+
+依赖：LUX-295、LUX-297、LUX-299、LUX-300。验证：`cargo test --locked --lib application::scanner::tests::local_metadata_worker_persists_capability_missing`、`cargo test --locked --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/scanner.rs`、`src/api/legacy.rs`、`docs/LUX-DEVELOPMENT.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
