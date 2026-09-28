@@ -7243,13 +7243,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：现有本地 metadata worker 启动时恢复中断回填并幂等登记数据库中的 roots；队列每次先检查 workflow 3 outbox，再取最多 16 个旧文件 entry。回填复用既有本地图片/NFO enricher，图片阶段完成即失效主页投影，NFO 在有界任务集合中继续；只有两阶段成功才提交游标。worker 不持有 scraper，也不把 backfill 加入扫描完成屏障。新增测试证明无新 outbox 时旧资源仍补出 poster 和 NFO、没有创建 FILL_MISSING job；NFO 写入失败后游标不前进，恢复后同页成功。`scanned_metadata` 11 项、`scanned_series_metadata` 2 项通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 fixture 性能对比与浏览器实时刷新仍留在阶段 23 总体验收。
 
-#### LUX-298：渐进扫描与本地媒体变更合并通知
+#### LUX-298：渐进扫描查询刷新与本地媒体合并通知
 
-范围：复用现有 `UserEventHub` 的 `home` SSE scope 和 1 秒合并窗口。每次 workflow 3 正向索引事务成功提交后发布首页/媒体库失效通知；本地 outbox 与旧资源回填完成图片登记、NFO 更新后也发布同类通知。失败/回滚的索引事务不发事件。图片部分成功后即使同页后续能力失败也要通知；多文件和扫描/worker 并发变化合并发送，不按条目发事件。Lux Web 的 `useUserEvents` 已监听 `home` 并失效首页与媒体库查询，本任务不更改 SSE payload、Emby API 或前端协议。
+范围：复用现有 `HomeService::invalidate` 和 `UserEventHub` 的 `home` SSE scope/1 秒合并窗口。每次 workflow 3 正向索引事务成功提交后，同步使首页缓存代次失效，再发布首页/媒体库失效通知；本地 outbox 与旧资源回填完成图片登记、NFO 更新后也失效首页缓存并发布同类通知。失败/回滚的索引事务不发事件。图片部分成功后即使同页后续能力失败也要通知；多文件和扫描/worker 并发变化合并发送，不按条目发事件。workflow 1/2 继续保留扫描期间首页稳定快照语义。Lux Web 的 `useUserEvents` 已监听 `home` 并失效首页与媒体库查询，本任务不更改 SSE payload、Emby API 或前端协议。
 
 验收：
 
 - [ ] 安全正向索引提交后，扫描仍处于 DISCOVERING 时能收到 `home` 事件；事务失败不发事件。
+- [ ] 收到事件后再次读取首页不会命中提交前缓存；workflow 1/2 的最终刷新合同不变。
 - [ ] 新 outbox 与既有资源 backfill 的 poster/NFO 持久化后触发同一 `home` 事件；图片部分成功且页面可见时不被后续 NFO 失败吞掉通知。
 - [ ] 通知沿用 `UserEventHub` 合并，批量扫描不会按每个媒体/图片生成独立 SSE 消息；连接重建仍依靠既有 open 事件重新取数。
 - [ ] SQLite 测试覆盖事件在扫描结束前到达和回填 poster 后到达；已有 Web SSE scope/query invalidation 测试保持通过。
