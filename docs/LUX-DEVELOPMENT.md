@@ -7223,13 +7223,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 有效 `addedAt` 在电影、剧集、季度、单集和 VIDEO 详情元信息行显示“添加于”及对应本地时间。
-- [ ] 页面以语义化 `<time>` 暴露 ISO 8601 `dateTime`；缺失或无效值不会显示 `Invalid Date` 或占位标签。
-- [ ] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
+- [x] 有效 `addedAt` 在电影、剧集、季度、单集和 VIDEO 详情元信息行显示“添加于”及对应本地时间。
+- [x] 页面以语义化 `<time>` 暴露 ISO 8601 `dateTime`；缺失或无效值不会显示 `Invalid Date` 或占位标签。
+- [x] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
 
 依赖：LUX-296。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web build`。
 
 文件：`web/src/lib/api/types.ts`、`web/src/features/detail/MediaDetailPage.tsx`、`web/tests/media-detail.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：有效时间在详情元信息行显示“添加于”及按浏览器本地时区格式化到分钟的日期，并提供 ISO 8601 `dateTime`；缺失和无效时间不显示标签。`pnpm --dir web install --frozen-lockfile` 通过，详情页测试 26 项通过，完整 Web 测试 75 个文件/526 项通过，`pnpm --dir web build` 通过。输出仍有既存 jsdom 媒体元素 `load/pause` 告警和 Vite 大 chunk 提示。
 
 ## 26. 风险与缓解
 

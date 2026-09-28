@@ -212,6 +212,7 @@ export type MediaItem = {
   seasonCount?: number | null;
   episodeCount?: number | null;
   runtimeTicks?: number | null;
+  addedAt?: number | null;
   imageTags?: ImageTags;
   userData?: UserData;
   mediaSources?: MediaSource[];
