@@ -954,3 +954,21 @@ PostgreSQL `unixepoch()` 原先在每次求值时调用 `clock_timestamp()`。mi
 `insert_scan_manifest_postprocessing_targets_in_transaction` 已把当前 Manifest 全量扫描的 SOURCE / ITEM target 物化合并为一个 bounded-page CTE 和一条 INSERT。附件指出的两条重复 JOIN 位于通用 `record_scan_job_targets_in_transaction`，主要服务 reconciliation/path target 写入；本轮 60k Manifest 首扫的主 target 路径不走这两个重复 SELECT。没有为不影响该首扫瓶颈的兼容/增量路径改写 SQL；如后续以 path/reconciliation 批处理为目标，应单独量测该调用链并覆盖多 source 同 item 的去重语义。
 
 LUX-275 双后端严格阶段门仍开放。以上数据库结果仅代表本机 ARM64 与 PostgreSQL 16 容器，不外推到 NAS/x86_64。
+
+### PostgreSQL 扫描事务局部异步提交 A/B（保留）
+
+2026-09-28 在本机 ARM64、PostgreSQL 16 本地容器，以固定 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）评估扫描事务局部 `SET LOCAL synchronous_commit = off`。基线与候选各运行六轮 release `lux_270_manifest_job_scan_benchmark`，每轮使用新数据库；候选只在 `begin_scan_write_transaction()` 的 PostgreSQL 事务中设置该值。该设置新增每事务一条 SQL，DML 数不变。
+
+| PostgreSQL 指标 | 默认同步提交：六轮中位数 | 扫描事务局部异步提交：六轮中位数 |
+|---|---:|---:|
+| 首扫索引完成 | 5,599 ms | 5,236 ms |
+| 120k target 物化 | 1,895 ms | 1,824 ms |
+| 无变化重扫 | 3,032 ms | 3,027 ms |
+| 前台请求 p95 | 290.5 ms | 292.5 ms |
+| batch p95 | 783.5 ms | 719.5 ms |
+| SQL / DML | 322 / 95 | 336 / 95 |
+| WAL 字节 | 222,482,798（5 个有效基线样本） | 222,288,478 |
+
+六轮汇总首扫中位数快约 6.5%，但样本受缓存变热和运行顺序影响。最后三轮采用反序交错运行，首扫中位数为 5,390→5,188 ms（快约 3.7%），三组中两组更快、一组慢约 3.8%；该子集更适合作为稳定收益估计。相同子集的 target 为 1,907→1,897 ms，重扫为 2,977→3,059 ms，前台 p95 为 292→292 ms，batch p95 为 733→731 ms。累计 `transaction_commit` 等待的中位数从 78.9 ms（5 个有效基线样本）降至 2.35 ms（6 个候选样本）；首个基线样本没有该阶段记录。WAL 与 DML 没有可辨变化。
+
+PostgreSQL 的 `SET LOCAL` 在事务结束时恢复；metadata 写事务和 SQLite 不受影响。异步提交不会破坏数据库一致性，但异常退出可能丢失近期已确认而 WAL 尚未落盘的整笔事务，不只是相同时间长度对应的部分工作。PostgreSQL 16 文档说明默认 `wal_writer_delay = 200ms` 时，延迟上限可达三倍该值；具体丢失哪些事务取决于 WAL 刷盘时序。[WAL 配置文档](https://www.postgresql.org/docs/16/runtime-config-wal.html)；[`SET LOCAL` 文档](https://www.postgresql.org/docs/16/sql-set.html)。Lux 启动时会将未完成扫描标记取消，不自动续跑；异常退出后需重新发起扫描。基于扫描数据可通过重扫重建，保留此 PostgreSQL-only 局部设置。结果仅代表本机 ARM64 和本地 PostgreSQL 容器，不外推 NAS/x86_64，也不关闭 LUX-275 全阶段性能门。
