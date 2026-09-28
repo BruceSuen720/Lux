@@ -7261,6 +7261,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：workflow 3 正向索引事务提交后先同步失效 HomeService 缓存，再发送合并的 `home` SSE；outbox/backfill 图片与 NFO更新也刷新缓存并复用同一事件，scan terminal 改为合并发布，workflow 1/2 继续使用旧扫描期稳定快照路径。测试证明事件在 manifest 仍 DISCOVERING 时到达、回填 poster 后到达，注入索引事务失败没有事件；既有 Web SSE listener 和 query invalidation 测试未改且通过。`scanning_jobs` 81 项、`scanned_metadata` 11 项、progressive Home 单测 1 项通过；Web 75 个 Vitest 文件/526 项和样式 Node 测试通过；`cargo build --locked`、fmt、all-target clippy 通过。migration 升级使一项扫描测试的预期 schema version 从 153 更新为 154。
 
+#### LUX-299：本地完整性能力检查批量领取存储
+
+范围：为已有 `item_metadata_completeness` 增加有界的批量 prepare-and-claim 操作，供本地检查 worker 在一次短事务中准备并领取 item+capability+input fingerprint。新增或版本变化、FAILED/CANCELLED 的能力重置为 PENDING 并原子进入 RUNNING；同 fingerprint 的 READY 结果保持不动，同 fingerprint 的 RUNNING 不重复领取。保留现有逐项接口和 `complete_local_metadata_and_enqueue_fill_missing` 的事务合同；本任务不计算字段/图片缺失，不调用 provider，也不连接扫描 worker。
+
+验收：
+
+- [ ] 一批检查有硬上限、拒绝空/超限 fingerprint 与重复 item+capability；新/变化/可重试能力原子进入 RUNNING。
+- [ ] 同版本 READY 不重置，已经 RUNNING 的同版本能力不会被第二 worker 重领；旧 fingerprint 结果仍被完成 CAS 拒绝。
+- [ ] 返回本次实际领取的输入位置，使调用者只为领取成功的检查提交结果。
+- [ ] SQLite 与真实 PostgreSQL 合同覆盖批量 prepare/claim、版本替换、重复/并发 claim、失败恢复及完成 CAS。
+
+依赖：LUX-292、LUX-293。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`、真实 PostgreSQL 对应 ignored 存储合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
