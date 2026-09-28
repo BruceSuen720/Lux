@@ -7278,6 +7278,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：新增最多 512 项的单事务 completeness prepare/claim 操作，按输入位置返回本 worker 实际领取的检查；相同 READY/RUNNING fingerprint 不重领，新版本和 FAILED/CANCELLED 可重置后领取。SQLite 定向存储用例与真实 PostgreSQL storage contract 各 1 项通过，覆盖并发双领取、同版本去重、版本换代、失败恢复和旧 fingerprint 拒写；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。能力判定与扫描 worker 接线继续由后续任务实现。
 
+#### LUX-300：从 MetadataRequestPlan 计算能力级本地缺失
+
+范围：在现有 `MetadataSelectionService` 请求计划基础上增加纯本地 completeness 视图，分别返回 METADATA、各个启用图片类型、CREDITS、EXTERNAL_IDS、TRAILERS 的实际 missing/available，以及输入 fingerprint 和“当前按计划可请求”的标记。缺失图像按类型记录，不把多个图像合并成一个布尔值。复用现有 FILL_MISSING 字段集合、NFO projection、图片策略、锁定字段与 attempt history；区分实际缺失与当前可请求状态。VIDEO/HOMEVIDEOS/FOLDER 等禁止在线识别的类型不产生自动补缺能力。本任务只提供计算合同，不写完整性表、不入队、不调用 provider，也不连接扫描 worker。
+
+验收：
+
+- [ ] 无 provider 网络调用时能对支持类型返回每项实际缺失状态；关闭的图片能力不会生成可自动请求项，poster/fanart 等分别标记。
+- [ ] 实际缺失独立于 UNAVAILABLE/冷却记录；requestable 视图尊重这些记录，并复用手动 FILL_MISSING 请求规则。
+- [ ] 字段锁定、继承/回退图片与本地 NFO projection 沿用现有 selection 判断；不适用的媒体类型不伪造完整请求计划。
+- [ ] 输入 fingerprint 随当前元数据、有效图像能力与策略变化而变化；一致输入产生稳定指纹。
+- [ ] 单测覆盖缺少/已有/关闭图像类型、锁定字段、NFO、Unavailable 和不支持类型。
+
+依赖：LUX-299。验证：`cargo test --locked --lib application::candidates::tests::<本地完整性计划用例>`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
