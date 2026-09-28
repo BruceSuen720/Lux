@@ -265,7 +265,10 @@ describe("LoginPage session state", () => {
       contentKind: "HERO_IMAGE",
       sourceName: "Bing 每日图片",
       copyrightNotice: "摄影者与版权信息",
-      items: [{ imageUrl: "https://images.example.com/today.jpg", title: "今日主题" }],
+      items: [{
+        imageUrl: "https://www.bing.com/th?id=OHR.FlamingosNamibia_ZH-CN3639748956_1920x1080.jpg",
+        title: "今日主题",
+      }],
     });
     container = document.createElement("div");
     document.body.append(container);
@@ -283,7 +286,7 @@ describe("LoginPage session state", () => {
     await act(async () => {
       await vi.waitFor(() => {
         expect(container.querySelector<HTMLImageElement>(".lux-auth-hero-image")?.src)
-          .toContain("https://images.example.com/today.jpg");
+          .toContain("https://www.bing.com/th?id=OHR.FlamingosNamibia_ZH-CN3639748956_1920x1080.jpg");
       });
     });
     expect(container.textContent).toContain("摄影者与版权信息");
