@@ -7105,13 +7105,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite 新库启动后，catalog rebuild 前后均保留 `scan_missing_metadata_auto_match_enabled` 列与回填值；已有普通 catalog 列不丢失。
-- [ ] PostgreSQL 0150→0151 升级保留关闭/开启设置，新库行默认开启；批次与完整性约束、唯一索引和级联语义有效。
-- [ ] 未连接 PostgreSQL 时明确记录受限；完成验收需在 PostgreSQL 服务上实际运行 `postgres_database` 用例，忽略状态不算通过。
+- [x] SQLite 新库启动后，catalog rebuild 前后均保留 `scan_missing_metadata_auto_match_enabled` 列与回填值；已有普通 catalog 列不丢失。
+- [x] PostgreSQL 0150→0151 升级保留关闭/开启设置，新库行默认开启；批次与完整性约束、唯一索引和级联语义有效。
+- [x] 已连接本机 PostgreSQL 服务并实际运行 bootstrap、0150→0151 upgrade 与 HomeVideos upgrade 用例；均非默认 ignored 结果。
 
 依赖：LUX-289。验证：`cargo test --locked --test storage progressive_scan_metadata`；`cargo test --locked --test postgres_database` 与定向 ignored PostgreSQL migration 用例。
 
 文件：`src/storage/migration.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：SQLite 旧库经启动时 catalog 重建后仍保留扫描补缺策略及 0/1 配置；SQLite `storage` 43 项通过。PostgreSQL bootstrap、0150→0151 策略/队列迁移、既有 HomeVideos 迁移用例在本机 PostgreSQL 服务上各 1 项通过。`cargo fmt --all -- --check`、`cargo clippy --locked --test storage -- -D warnings`、`cargo clippy --locked --test postgres_database -- -D warnings` 通过。
 
 #### 阶段 23 总体验收与阶段门
 

@@ -724,6 +724,75 @@ async fn progressive_scan_metadata_upgrade_preserves_existing_policy_intent()
 }
 
 #[tokio::test]
+async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir_all(&config_dir)?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migration_dir = temp_dir.path().join("migrations-v148");
+    fs::create_dir(&migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 148 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing name")?),
+            )?;
+        }
+    }
+
+    let database_path = config_dir.join("lux.db");
+    let old_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&old_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind, realtime_metadata_auto_match_enabled)
+         VALUES ('rebuild-off', 'Rebuild off', 'MOVIE', 0),
+                ('rebuild-on', 'Rebuild on', 'MOVIE', 1)",
+    )
+    .execute(&old_pool)
+    .await?;
+    old_pool.close().await;
+
+    let database = Database::connect(&config).await?;
+    let policies: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE id IN ('rebuild-off', 'rebuild-on') ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        policies,
+        vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
+    );
+    let schema_version = database.schema_version().await?;
+    assert_eq!(schema_version, 151);
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn sqlite_homevideos_and_video_types_migrate_from_empty_and_existing_databases()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
