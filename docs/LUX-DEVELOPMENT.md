@@ -7294,7 +7294,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`。
 
-结果（2026-09-28）：`MetadataRequestPlan` 额外保留每种图像类型的 missing mask；`MetadataSelectionService` 现在可将当前本地值拆成 METADATA、单图能力、CREDITS、EXTERNAL_IDS、TRAILERS，并分别给出实际缺失与按已有 attempt history 仍可请求的计划。fingerprint 由当前本地投影与两类计划的稳定摘要生成。纯计划用例覆盖单图策略、Unavailable、fingerprint 换代、锁定字段/NFO 现有逻辑和 VIDEO 排除；不发请求、不写数据库。定向 candidates 单测 1 项、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。扫描 worker 尚未调用该计划，留给下一项接线任务。
+结果（2026-09-28）：`MetadataRequestPlan` 额外保留每种图像类型的 missing mask；`MetadataSelectionService` 现在可将当前本地值拆成 METADATA、单图能力、CREDITS、EXTERNAL_IDS、TRAILERS，并分别给出实际缺失与按已有 attempt history 仍可请求的计划。实际与可请求计划共享一次本地字段/NFO/图片读取，fingerprint 由当前本地投影与两类计划的稳定摘要生成。纯计划用例覆盖单图策略、Unavailable、fingerprint 换代、锁定字段/NFO 现有逻辑和 VIDEO 排除；不发请求、不写数据库。定向 candidates 单测 1 项、`reidentify` integration 12 项、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。扫描 worker 尚未调用该计划，留给下一项接线任务。
 
 #### LUX-301：扫描本地完成后保存能力级缺失
 

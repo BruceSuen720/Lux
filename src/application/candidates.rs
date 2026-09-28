@@ -1961,8 +1961,10 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        self.fill_missing_request_plan_for_current_with_options(item_id, current, false)
-            .await
+        Ok(self
+            .fill_missing_request_plans_for_current(item_id, current)
+            .await?
+            .1)
     }
 
     pub(crate) async fn fallback_request_plan_for_current(
@@ -1970,11 +1972,12 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        self.fill_missing_request_plan_for_current_with_options(item_id, current, true)
-            .await
+        Ok(self
+            .fill_missing_request_plans_for_current(item_id, current)
+            .await?
+            .0)
     }
 
-    #[allow(dead_code)] // The next task connects this plan to the local scan worker.
     pub(crate) async fn local_metadata_completeness_plan(
         &self,
         item_id: &str,
@@ -1983,11 +1986,8 @@ impl MetadataSelectionService {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok(None);
         }
-        let actual_plan = self
-            .fallback_request_plan_for_current(item_id, current)
-            .await?;
-        let requestable_plan = self
-            .fill_missing_request_plan_for_current(item_id, current)
+        let (actual_plan, requestable_plan) = self
+            .fill_missing_request_plans_for_current(item_id, current)
             .await?;
         Ok(local_metadata_completeness_plan(
             item_id,
@@ -2029,14 +2029,13 @@ impl MetadataSelectionService {
             .any(|image_type| !local_image_types.contains(*image_type)))
     }
 
-    async fn fill_missing_request_plan_for_current_with_options(
+    async fn fill_missing_request_plans_for_current(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
-        ignore_attempt_history: bool,
-    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+    ) -> Result<(MetadataRequestPlan, MetadataRequestPlan), MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
-            return Ok(MetadataRequestPlan::full());
+            return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full()));
         }
         let image_policy = self.image_selection_policy(item_id).await?;
         let capability_states = self
@@ -2058,13 +2057,21 @@ impl MetadataSelectionService {
         } else {
             self.images.local_image_types(item_id, &image_types).await?
         };
-        let mut missing_image_mask = 0_u16;
+        let mut actual_missing_image_mask = 0_u16;
+        let mut requestable_missing_image_mask = 0_u16;
         for image_type in image_types {
             if local_image_types.contains(image_type) {
                 continue;
             }
-            let explicitly_unavailable = !ignore_attempt_history
-                && !image_attempt_identities.is_empty()
+            let Some(index) = SCRAPER_IMAGE_TYPES
+                .iter()
+                .position(|candidate| *candidate == image_type)
+            else {
+                continue;
+            };
+            let image_mask = 1_u16 << index;
+            actual_missing_image_mask |= image_mask;
+            let explicitly_unavailable = !image_attempt_identities.is_empty()
                 && image_attempt_identities
                     .iter()
                     .all(|(source, provider_id)| {
@@ -2074,12 +2081,7 @@ impl MetadataSelectionService {
                         ))
                     });
             if !explicitly_unavailable {
-                if let Some(index) = SCRAPER_IMAGE_TYPES
-                    .iter()
-                    .position(|candidate| *candidate == image_type)
-                {
-                    missing_image_mask |= 1_u16 << index;
-                }
+                requestable_missing_image_mask |= image_mask;
             }
         }
         let details = current.nfo_metadata_json.as_deref().and_then(|value| {
@@ -2104,39 +2106,46 @@ impl MetadataSelectionService {
             }
             _ => false,
         };
-        let mut plan = metadata_request_plan(
+        let mut actual_plan = metadata_request_plan(
             current,
-            missing_image_mask != 0,
+            actual_missing_image_mask != 0,
             credits_missing,
             details.as_ref(),
         );
-        plan.image_policy = Some(image_policy);
-        plan.missing_image_mask = missing_image_mask;
+        actual_plan.image_policy = Some(image_policy);
+        actual_plan.missing_image_mask = actual_missing_image_mask;
+        let mut requestable_plan = metadata_request_plan(
+            current,
+            requestable_missing_image_mask != 0,
+            credits_missing,
+            details.as_ref(),
+        );
+        requestable_plan.image_policy = Some(image_policy);
+        requestable_plan.missing_image_mask = requestable_missing_image_mask;
         let capability_identity = selected_capability_identity(current);
-        if !ignore_attempt_history {
-            plan.needs_credits = plan.needs_credits
-                && capability_needs_request(
-                    &capability_states,
-                    capability_identity.as_ref(),
-                    CAPABILITY_CREDITS,
-                );
-            plan.needs_external_ids = plan.needs_external_ids
-                && capability_needs_request(
-                    &capability_states,
-                    capability_identity.as_ref(),
-                    CAPABILITY_EXTERNAL_IDS,
-                );
-            plan.needs_trailers = plan.needs_trailers
-                && capability_needs_request(
-                    &capability_states,
-                    capability_identity.as_ref(),
-                    CAPABILITY_TRAILERS,
-                );
-        }
+        requestable_plan.needs_credits = requestable_plan.needs_credits
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_CREDITS,
+            );
+        requestable_plan.needs_external_ids = requestable_plan.needs_external_ids
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_EXTERNAL_IDS,
+            );
+        requestable_plan.needs_trailers = requestable_plan.needs_trailers
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_TRAILERS,
+            );
         if !has_selected_provider_id(current) {
-            plan.needs_metadata = true;
+            actual_plan.needs_metadata = true;
+            requestable_plan.needs_metadata = true;
         }
-        Ok(plan)
+        Ok((actual_plan, requestable_plan))
     }
 
     pub async fn select(
