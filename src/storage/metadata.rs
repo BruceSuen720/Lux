@@ -120,6 +120,22 @@ impl Database {
         results: &[NewItemMetadataCompletenessResult<'_>],
         eligible_fill_missing_item_ids: &[String],
     ) -> Result<ItemMetadataCompletenessCommit, StorageError> {
+        self.complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            library_id,
+            results,
+            eligible_fill_missing_item_ids,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing_with_policy(
+        &self,
+        library_id: &str,
+        results: &[NewItemMetadataCompletenessResult<'_>],
+        eligible_fill_missing_item_ids: &[String],
+        auto_match_policy_override: Option<bool>,
+    ) -> Result<ItemMetadataCompletenessCommit, StorageError> {
         if library_id.trim().is_empty() || eligible_fill_missing_item_ids.len() > 256 {
             return Err(StorageError::Conflict(
                 "invalid library or fill-missing item count".into(),
@@ -226,8 +242,10 @@ impl Database {
             }
         }
 
-        let auto_match_enabled = self
-            .query_scalar::<i64>(
+        let auto_match_enabled = if let Some(override_enabled) = auto_match_policy_override {
+            override_enabled
+        } else {
+            self.query_scalar::<i64>(
                 "SELECT scan_missing_metadata_auto_match_enabled
                  FROM libraries WHERE id = ?",
             )
@@ -237,8 +255,43 @@ impl Database {
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?;
-        if auto_match_enabled != 0 && !eligible_ids.is_empty() && !confirmed_missing.is_empty() {
+            })? != 0
+        };
+        if auto_match_enabled {
+            for ids in eligible_ids.chunks(100) {
+                if ids.is_empty() {
+                    continue;
+                }
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT DISTINCT completeness.item_id
+                 FROM item_metadata_completeness completeness
+                 JOIN media_items item ON item.id = completeness.item_id
+                 WHERE item.library_id = ? AND item.removed_at IS NULL
+                   AND item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+                   AND completeness.local_state = 'READY' AND completeness.is_missing = 1
+                   AND completeness.item_id IN ({placeholders})"
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+                for item_id in ids {
+                    statement = statement.bind(item_id);
+                }
+                confirmed_missing.extend(
+                    statement
+                        .fetch_all(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?
+                        .into_iter()
+                        .map(|row| row.get::<String, _>("item_id")),
+                );
+            }
+        }
+        if auto_match_enabled && !eligible_ids.is_empty() && !confirmed_missing.is_empty() {
             let candidate_ids = eligible_ids
                 .into_iter()
                 .filter(|item_id| confirmed_missing.contains(item_id))

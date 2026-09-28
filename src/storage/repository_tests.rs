@@ -1925,7 +1925,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         config_dir: temp_dir.path().join("config"),
     };
     let media_root = temp_dir.path().join("Movies");
-    for directory in ["First Movie (2025)", "Second Movie (2025)"] {
+    for directory in [
+        "First Movie (2025)",
+        "Second Movie (2025)",
+        "Third Movie (2025)",
+        "Replay Movie (2025)",
+    ] {
         let movie_dir = media_root.join(directory);
         tokio::fs::create_dir_all(&movie_dir)
             .await
@@ -1957,7 +1962,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .fetch_all(database.pool())
         .await
         .expect("indexed movies");
-    assert_eq!(item_ids.len(), 2);
+    assert_eq!(item_ids.len(), 4);
     let library_id = library.id.to_string();
 
     sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
@@ -1965,7 +1970,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .execute(database.pool())
         .await
         .expect("disable scan auto-match");
-    let poster_fingerprints = [b"poster-v1".to_vec(), b"poster-v2".to_vec()];
+    let poster_fingerprints = [
+        b"poster-v1".to_vec(),
+        b"poster-v2".to_vec(),
+        b"poster-v3".to_vec(),
+        b"poster-v4".to_vec(),
+    ];
     let mut poster_results = Vec::new();
     for (item_id, fingerprint) in item_ids.iter().zip(&poster_fingerprints) {
         assert!(
@@ -1992,7 +2002,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &poster_results, &item_ids)
         .await
         .expect("persist missing posters while auto-match is disabled");
-    assert_eq!(disabled.updated_count, 2);
+    assert_eq!(disabled.updated_count, 4);
     assert!(disabled.scheduled_job_ids.is_empty());
     for item_id in &item_ids {
         let completeness = database
@@ -2009,6 +2019,149 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .execute(database.pool())
         .await
         .expect("enable scan auto-match");
+
+    let incremental_disabled_fingerprint = b"incremental-disabled";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_ids[0],
+                "EXTERNAL_IDS",
+                incremental_disabled_fingerprint,
+            )
+            .await
+            .expect("prepare disabled incremental capability")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_ids[0],
+                "EXTERNAL_IDS",
+                incremental_disabled_fingerprint,
+            )
+            .await
+            .expect("claim disabled incremental capability")
+    );
+    let incremental_disabled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[0],
+        capability: "EXTERNAL_IDS",
+        input_fingerprint: incremental_disabled_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let incremental_disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &incremental_disabled_result,
+            std::slice::from_ref(&item_ids[0]),
+            Some(false),
+        )
+        .await
+        .expect("incremental job policy overrides enabled full-scan policy");
+    assert_eq!(incremental_disabled.updated_count, 1);
+    assert!(incremental_disabled.scheduled_job_ids.is_empty());
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("disable full-scan policy");
+    let incremental_enabled_fingerprint = b"incremental-enabled";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_ids[2],
+                "TRAILERS",
+                incremental_enabled_fingerprint,
+            )
+            .await
+            .expect("prepare enabled incremental capability")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_ids[2],
+                "TRAILERS",
+                incremental_enabled_fingerprint,
+            )
+            .await
+            .expect("claim enabled incremental capability")
+    );
+    let incremental_enabled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[2],
+        capability: "TRAILERS",
+        input_fingerprint: incremental_enabled_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let incremental_enabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &incremental_enabled_result,
+            std::slice::from_ref(&item_ids[2]),
+            Some(true),
+        )
+        .await
+        .expect("incremental job policy can enable auto-match for its sources");
+    assert_eq!(incremental_enabled.scheduled_job_ids.len(), 1);
+
+    let replay_fingerprint = b"replay-without-new-result";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_ids[3], "POSTER", replay_fingerprint,)
+            .await
+            .expect("prepare replay poster")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_ids[3], "POSTER", replay_fingerprint,)
+            .await
+            .expect("claim replay poster")
+    );
+    let replay_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[3],
+        capability: "POSTER",
+        input_fingerprint: replay_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let policy_disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &replay_result,
+            std::slice::from_ref(&item_ids[3]),
+            Some(false),
+        )
+        .await
+        .expect("persist missing without scheduling when the call disables auto-match");
+    assert_eq!(policy_disabled.updated_count, 1);
+    assert!(policy_disabled.scheduled_job_ids.is_empty());
+    let replayed_without_new_result = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("schedule an already-confirmed missing poster after policy changes");
+    assert_eq!(replayed_without_new_result.updated_count, 0);
+    assert_eq!(replayed_without_new_result.scheduled_job_ids.len(), 1);
+    let replayed_active_job = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("deduplicate replay against the active fill-missing job");
+    assert!(replayed_active_job.scheduled_job_ids.is_empty());
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("restore full-scan policy");
     database
         .create_metadata_reidentify_job(
             "manual-fill-missing",
@@ -2018,7 +2171,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .await
         .expect("create active manual fill-missing job");
 
-    let backdrop_fingerprints = [b"backdrop-v1".to_vec(), b"backdrop-v2".to_vec()];
+    let backdrop_fingerprints = [
+        b"backdrop-v1".to_vec(),
+        b"backdrop-v2".to_vec(),
+        b"backdrop-v3".to_vec(),
+        b"backdrop-v4".to_vec(),
+    ];
     let mut backdrop_results = Vec::new();
     for (item_id, fingerprint) in item_ids.iter().zip(&backdrop_fingerprints) {
         assert!(
@@ -2079,7 +2237,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
         .await
         .expect("atomically persist and schedule missing backdrops");
-    assert_eq!(scheduled.updated_count, 2);
+    assert_eq!(scheduled.updated_count, 4);
     assert_eq!(scheduled.scheduled_job_ids.len(), 1);
     let scheduled_job_id = &scheduled.scheduled_job_ids[0];
     let job: (String, String, i64, String) = database
@@ -2117,7 +2275,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(replayed.updated_count, 0);
     assert!(replayed.scheduled_job_ids.is_empty());
 
-    let still_fingerprints = [b"still-v1".to_vec(), b"still-v2".to_vec()];
+    let still_fingerprints = [
+        b"still-v1".to_vec(),
+        b"still-v2".to_vec(),
+        b"still-v3".to_vec(),
+        b"still-v4".to_vec(),
+    ];
     let duplicate_results = item_ids
         .iter()
         .zip(&still_fingerprints)
@@ -2159,7 +2322,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         )
         .await
         .expect("reuse active fill-missing jobs");
-    assert_eq!(deduplicated.updated_count, 2);
+    assert_eq!(deduplicated.updated_count, 4);
     assert!(deduplicated.scheduled_job_ids.is_empty());
     assert_eq!(
         database
@@ -2169,9 +2332,130 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             .fetch_one(database.pool())
             .await
             .expect("count fill-missing jobs"),
-        2,
-        "the manual active job plus one eligible automatic job are retained"
+        4,
+        "replay, manual, and incremental-policy jobs plus one eligible auto job are retained"
     );
+
+    let pagination_root_path = temp_dir.path().join("Pagination Movies");
+    for index in 0..103 {
+        let directory = format!("Pagination Movie {index:03} (2025)");
+        let movie_dir = pagination_root_path.join(&directory);
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("pagination movie directory");
+        tokio::fs::write(
+            movie_dir.join(format!("Pagination.Movie.{index:03}.2025.mkv")),
+            b"video",
+        )
+        .await
+        .expect("pagination movie file");
+    }
+    let pagination_library = libraries
+        .create_library("Progressive dispatch pagination", LibraryKind::Movie, false)
+        .await
+        .expect("pagination library");
+    libraries
+        .add_root(
+            pagination_library.id,
+            pagination_root_path.to_str().expect("pagination root"),
+        )
+        .await
+        .expect("pagination library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(pagination_library.id)
+        .await
+        .expect("index pagination movies");
+    let pagination_library_id = pagination_library.id.to_string();
+    let pagination_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read pagination movies");
+    assert_eq!(pagination_item_ids.len(), 103);
+    let unsupported_item_id = &pagination_item_ids[0];
+    let removed_item_id = &pagination_item_ids[1];
+    database
+        .query("UPDATE media_items SET item_type = 'FOLDER' WHERE id = ?")
+        .bind(unsupported_item_id)
+        .execute(database.pool())
+        .await
+        .expect("mark one item type as unsupported for automatic metadata jobs");
+    database
+        .query("UPDATE media_items SET removed_at = 1 WHERE id = ?")
+        .bind(removed_item_id)
+        .execute(database.pool())
+        .await
+        .expect("mark one item removed before metadata completion");
+    let pagination_fingerprint = b"pagination-input-v1";
+    let pagination_checks = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&pagination_checks)
+            .await
+            .expect("claim pagination completeness checks")
+            .len(),
+        103
+    );
+    let pagination_results = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+            is_missing: true,
+            checked_at: 13,
+        })
+        .collect::<Vec<_>>();
+    let pagination_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &pagination_library_id,
+            &pagination_results,
+            &pagination_item_ids,
+            Some(true),
+        )
+        .await
+        .expect("enqueue pagination jobs");
+    assert_eq!(pagination_dispatch.updated_count, 102);
+    assert_eq!(pagination_dispatch.scheduled_job_ids.len(), 2);
+    let pagination_job_counts: Vec<i64> = database
+        .query_scalar(
+            "SELECT total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING' ORDER BY total_count DESC",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read pagination job sizes");
+    assert_eq!(pagination_job_counts, vec![100, 1]);
+    let pagination_job_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT job_items.item_id FROM metadata_reidentify_job_items job_items
+             JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+             WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read paginated job items");
+    assert_eq!(pagination_job_item_ids.len(), 101);
+    assert!(!pagination_job_item_ids.contains(unsupported_item_id));
+    assert!(!pagination_job_item_ids.contains(removed_item_id));
+    let removed_completeness = database
+        .find_item_metadata_completeness(removed_item_id, "POSTER")
+        .await
+        .expect("read removed item completeness")
+        .expect("removed item completeness row");
+    assert_eq!(removed_completeness.local_state, "RUNNING");
 
     database.close().await;
 }
@@ -2238,13 +2522,16 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id = database
-        .query_scalar::<String>(
-            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
         )
         .bind(library.id.to_string())
-        .fetch_one(database.pool())
+        .fetch_all(database.pool())
         .await?;
+    assert_eq!(item_ids.len(), 2);
+    let item_id = item_ids[0].clone();
+    let replay_item_id = item_ids[1].clone();
 
     let completeness_fingerprint_v1 = b"postgres-batch-input-v1";
     let completeness_checks = [
@@ -2300,6 +2587,76 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             .await?
             .is_empty()
     );
+
+    let library_id = library.id.to_string();
+    database
+        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let replay_fingerprint = b"postgres-replay-without-new-result";
+    assert!(database
+        .prepare_item_metadata_completeness_check(
+            &replay_item_id,
+            "POSTER",
+            replay_fingerprint,
+        )
+        .await?);
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&replay_item_id, "POSTER", replay_fingerprint,)
+            .await?
+    );
+    let replay_result = [NewItemMetadataCompletenessResult {
+        item_id: &replay_item_id,
+        capability: "POSTER",
+        input_fingerprint: replay_fingerprint,
+        is_missing: true,
+        checked_at: 1_001,
+    }];
+    let policy_disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &replay_result,
+            std::slice::from_ref(&replay_item_id),
+            Some(false),
+        )
+        .await?;
+    assert_eq!(policy_disabled.updated_count, 1);
+    assert!(policy_disabled.scheduled_job_ids.is_empty());
+    let default_policy_replay = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    assert!(default_policy_replay.scheduled_job_ids.is_empty());
+    let enabled_policy_replay = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+            Some(true),
+        )
+        .await?;
+    assert_eq!(enabled_policy_replay.updated_count, 0);
+    assert_eq!(enabled_policy_replay.scheduled_job_ids.len(), 1);
+    let duplicate_policy_replay = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+            Some(true),
+        )
+        .await?;
+    assert!(duplicate_policy_replay.scheduled_job_ids.is_empty());
+    database
+        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
     let completeness_fingerprint_v2 = b"postgres-batch-input-v2";
     let replacement_check = [NewItemMetadataCompletenessCheck {
         item_id: &item_id,
@@ -2612,8 +2969,8 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let missing = database
         .list_confirmed_missing_metadata("POSTER", None, 10)
         .await?;
-    assert_eq!(missing.len(), 1);
-    assert_eq!(missing[0].item_id, item_id);
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().any(|entry| entry.item_id == item_id));
 
     let dispatch_fingerprint = b"postgres-dispatch-v1";
     assert!(
@@ -2626,7 +2983,6 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             .claim_item_metadata_completeness_check(&item_id, "BACKDROP", dispatch_fingerprint)
             .await?
     );
-    let library_id = library.id.to_string();
     let dispatch_results = [NewItemMetadataCompletenessResult {
         item_id: &item_id,
         capability: "BACKDROP",
@@ -2741,8 +3097,117 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             )
             .fetch_one(database.pool())
             .await?,
-        1
+        2
     );
+
+    let pagination_root_path = temp_dir.path().join("Pagination Movies");
+    for index in 0..103 {
+        let directory = format!("Pagination Movie {index:03} (2025)");
+        let movie_dir = pagination_root_path.join(&directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Pagination.Movie.{index:03}.2025.mkv")),
+            b"video",
+        )
+        .await?;
+    }
+    let pagination_library = libraries
+        .create_library("Postgres dispatch pagination", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            pagination_library.id,
+            pagination_root_path
+                .to_str()
+                .ok_or("non-UTF8 pagination root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(pagination_library.id)
+        .await?;
+    let pagination_library_id = pagination_library.id.to_string();
+    let pagination_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(pagination_item_ids.len(), 103);
+    let unsupported_item_id = &pagination_item_ids[0];
+    let removed_item_id = &pagination_item_ids[1];
+    database
+        .query("UPDATE media_items SET item_type = 'FOLDER' WHERE id = ?")
+        .bind(unsupported_item_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query("UPDATE media_items SET removed_at = 1 WHERE id = ?")
+        .bind(removed_item_id)
+        .execute(database.pool())
+        .await?;
+    let pagination_fingerprint = b"postgres-pagination-input-v1";
+    let pagination_checks = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&pagination_checks)
+            .await?
+            .len(),
+        103
+    );
+    let pagination_results = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+            is_missing: true,
+            checked_at: 1_004,
+        })
+        .collect::<Vec<_>>();
+    let pagination_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &pagination_library_id,
+            &pagination_results,
+            &pagination_item_ids,
+            Some(true),
+        )
+        .await?;
+    assert_eq!(pagination_dispatch.updated_count, 102);
+    assert_eq!(pagination_dispatch.scheduled_job_ids.len(), 2);
+    let pagination_job_counts: Vec<i64> = database
+        .query_scalar(
+            "SELECT total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING' ORDER BY total_count DESC",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(pagination_job_counts, vec![100, 1]);
+    let pagination_job_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT job_items.item_id FROM metadata_reidentify_job_items job_items
+             JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+             WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(pagination_job_item_ids.len(), 101);
+    assert!(!pagination_job_item_ids.contains(unsupported_item_id));
+    assert!(!pagination_job_item_ids.contains(removed_item_id));
+    let removed_completeness = database
+        .find_item_metadata_completeness(&removed_item_id, "POSTER")
+        .await?
+        .ok_or("missing removed item completeness row")?;
+    assert_eq!(removed_completeness.local_state, "RUNNING");
 
     let empty_root_path = temp_dir.path().join("Empty");
     tokio::fs::create_dir_all(&empty_root_path).await?;

@@ -7314,21 +7314,39 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：生产 API startup 将现有 MetadataSelectionService 注入 local metadata worker；图片与 NFO 全部成功后，为每个支持条目批量 prepare/claim capability，再用 LUX-293 事务保存 READY/available 或 READY/missing，自动入队候选仍留空。真实旧资源 backfill 与 workflow 3 outbox 都有用例：poster 存在记为 available、METADATA 缺失写入 missing；NFO 故障期间没有 completeness READY，重试成功后才写入；未产生 FILL_MISSING job。`scanned_metadata` 11 项、`scanned_series_metadata` 2 项、scanner completeness 集成单测 1 项通过；`cargo build --locked`、fmt 与 all-target clippy 通过。P6 的独立自动调度由下一任务接线。
 
-#### LUX-302：原子调度独立 FILL_MISSING 补缺任务
+#### LUX-302：策略感知的缺失结果与 FILL_MISSING 存储事务
 
-范围：将 `MetadataReidentifyService` 注入本地 completeness worker。只有本地检查成功、存在实际缺失且对应 requestable plan 有工作、库策略允许且找到已配置刮削器时，才把 eligible item IDs 传入 LUX-293 的同事务 READY/missing + `FILL_MISSING` 入队；未配置刮削器、关闭策略或只有 UNAVAILABLE/cooling 能力时只保存真实缺失。全量/手动扫描和旧资源 backfill 使用 `scan_missing_metadata_auto_match_enabled`；`INCREMENTAL_SCAN` 使用该 job 创建时持久化的 `auto_metadata_match`，不能由全量开关覆盖。workflow 3 不再在扫描末尾额外创建整库 FILL_MISSING，在线 job 由现有 worker 独立领取，扫描不等待。worker 启动时恢复 QUEUED/RUNNING metadata jobs；入队成功后立即 spawn 现有 reidentify worker。workflow 1/2 保留原来的终点行为。
+范围：扩展既有本地完整性与 FILL_MISSING 原子存储接口。调用者可以显式覆盖媒体库 `scan_missing_metadata_auto_match_enabled`（供实时增量任务传入创建时保存的策略），未传入时继续使用全量/backfill 策略。合格 item 的 eligible 列表即使没有新鲜 READY 结果，也可依据同事务中当前已确认 missing 的完整性行调度，解决策略开启或 scraper 安装后重放旧缺失标记的路径。仍复用既有任务表、active job 去重、支持类型过滤和每个 job 最多 100 项；本任务不连接扫描 worker、selection plan 或 provider。
 
 验收：
 
-- [ ] 缺失状态与策略允许的入队意向仍由同一存储事务提交；同一 item 活跃 job 去重，单 job 有界最多 100 项。
-- [ ] workflow 3 全量、backfill 与实时增量分别使用正确策略；扫描末尾不重复创建整库 job，workflow 1/2 不改。
-- [ ] 没有 provider、策略关闭、不可支持类型、request plan complete 或只有不可用/冷却能力时不排队/不访问网络，实际 missing 仍保存。
-- [ ] 新 FILL_MISSING job 不阻塞本地 worker 或扫描完成；在线 worker 启动重试排队项，并在执行前按最新 NFO/锁定字段/图片重新计算 request plan。
-- [ ] 测试覆盖配置 provider 后只对缺失项入队、多个 item 合并、活动 job 去重、incremental 开关关闭、scan policy 关闭、无 provider 无请求和在线结果完成后页面失效。
+- [x] READY/missing 新结果与对应 `FILL_MISSING` job 同事务提交；回滚不留下单边状态。
+- [x] 默认策略取 `scan_missing_metadata_auto_match_enabled`；显式 true/false 覆盖只作用于当前调用。
+- [x] 对没有新鲜完整性结果但已有 READY/missing 状态的 eligible item 可安全重放；活跃任务去重且每个 job 有界最多 100 项。
+- [x] 自动调度只包含未删除的 MOVIE/SERIES/SEASON/EPISODE；HOMEVIDEOS/VIDEO/FOLDER 不进入在线 job。
+- [x] SQLite 与真实 PostgreSQL 测试覆盖开关覆盖、已有 missing 重放、失败事务、active job 去重和任务分页合同。
 
-依赖：LUX-293、LUX-295、LUX-297、LUX-299、LUX-300、LUX-301。验证：`cargo test --locked --lib application::scanner::tests::local_metadata_worker_dispatches_fill_missing`、`cargo test --locked --test reidentify --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+依赖：LUX-293、LUX-299。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_dispatch_is_atomic_and_deduplicated`、真实 PostgreSQL completeness/storage 合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
-预计文件：`src/application/scanner.rs`、`src/application/reidentify.rs`、`src/api/legacy.rs`、`src/storage/metadata.rs`、`docs/LUX-DEVELOPMENT.md`。相关行为测试放在 `scanner.rs` 和 `reidentify.rs` 内部模块。
+预计文件：`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：存储事务支持本次调用的策略覆盖，并可只凭现有 READY/missing 状态重新派发；事务失败不会留下单边完整性状态，活跃 job 按 item 去重。SQLite 和真实 PostgreSQL 合同均通过；103 项边界用例确认 FOLDER 与已删除资源不入队，101 个可调度 item 被分页为 100 + 1。SQLite 定向测试、PostgreSQL ignored 合同、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。LUX-303 扫描 worker 接线继续作为独立任务处理。
+
+#### LUX-303：本地缺失计划的独立 FILL_MISSING 调度接线
+
+范围：将 `MetadataReidentifyService` 注入本地 completeness worker。只有本地检查成功、存在实际缺失且 requestable plan 有工作、当前入口策略允许并找到已配置 scraper 时，才将 eligible item IDs 交给 LUX-302 原子存储事务；无 provider、关闭策略或只有 UNAVAILABLE/cooling 能力时只保存真实缺失。全量/backfill 使用 scan missing 开关，INCREMENTAL_SCAN 使用 job 创建时持久化的 `auto_metadata_match`。workflow 3 不再在扫描末尾创建整库 FILL_MISSING；完成本地页后立即 spawn 现有 reidentify worker，不等在线任务。进程重启沿用项目现有未完成任务取消/重试合同，不自动恢复 metadata jobs。workflow 1/2 原终点流程保持不变。
+
+验收：
+
+- [ ] Workflow 3 outbox 与 backfill 成功后按策略/plan/provider availability 决定 eligible IDs，并原子调度；缺失标记独立于是否能入队。
+- [ ] 实时增量关闭时不排队；打开时只为该批缺失条目排队；扫描末尾不再创建整库重复任务。
+- [ ] 无 provider、unsupported type、计划完整或 only unavailable/cooling 时不入队；provider 网络只由现有独立 job worker 发起。
+- [ ] 新 job 不阻塞本地 worker 或扫描完成；活动任务去重，执行前沿用现有 FILL_MISSING 二次检查和只补空值语义。
+- [ ] 测试覆盖配置 provider 后按需入队、job 与扫描并行、实时/全量策略隔离、无 provider 不请求和在线结果后页面通知。
+
+依赖：LUX-293、LUX-295、LUX-297、LUX-298、LUX-300、LUX-301、LUX-302。验证：`cargo test --locked --lib application::scanner::tests::local_metadata_worker_dispatches_fill_missing_without_blocking_scan`、`cargo test --locked --test reidentify --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/scanner.rs`、`src/application/reidentify.rs`、`src/api/legacy.rs`、`docs/LUX-DEVELOPMENT.md`。相关行为测试放在 scanner/reidentify 内部模块。
 
 #### 阶段 23 总体验收与阶段门
 
