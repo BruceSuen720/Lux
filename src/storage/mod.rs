@@ -1,5 +1,21 @@
 mod repository;
 
+#[allow(dead_code)] // Scanner jobs build these values after evaluating local metadata.
+pub(crate) struct NewItemMetadataCompletenessResult<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) capability: &'a str,
+    pub(crate) input_fingerprint: &'a [u8],
+    pub(crate) is_missing: bool,
+    pub(crate) checked_at: i64,
+}
+
+#[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
+#[derive(Debug, Default)]
+pub(crate) struct ItemMetadataCompletenessCommit {
+    pub(crate) updated_count: usize,
+    pub(crate) scheduled_job_ids: Vec<String>,
+}
+
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 pub use repository::{
     Database, DatabaseLifecycleCleanupReport, PersonListOptions, PersonSort, StorageError,

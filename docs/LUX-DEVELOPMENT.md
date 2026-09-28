@@ -2169,7 +2169,7 @@ services:
 | LUX-290 | src/storage/migration.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；SQLite catalog 重建兼容与 PostgreSQL 升级合同 |
 | LUX-291 | src/storage/jobs.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；渐进扫描本地 metadata outbox 操作 |
 | LUX-292 | src/storage/metadata.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；能力级本地完整性存储 |
-| LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/repository.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
+| LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7160,13 +7160,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 确认结果和可调度的缺失请求同事务提交，回滚不留下单边状态；重复提交按 item/能力/输入版本去重。
-- [ ] 同一 item 已有可复用活跃 FILL_MISSING 作业时不创建重复在线工作；策略关闭或不可执行缺失仍保留结果但不排队。
-- [ ] SQLite 与 PostgreSQL 使用同一合同通过自动化覆盖。
+- [x] 确认结果和可调度的缺失请求同事务提交，回滚不留下单边状态；重复提交按 item/能力/输入版本去重。
+- [x] 同一 item 已有可复用活跃 FILL_MISSING 作业时不创建重复在线工作；策略关闭或不可执行缺失仍保留结果但不排队。
+- [x] SQLite 与 PostgreSQL 使用同一合同通过自动化覆盖。
 
 依赖：LUX-292。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_dispatch`，并运行真实 PostgreSQL 存储合同用例。
 
-预计文件：`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：完整性 READY/missing 更新与策略允许的 FILL_MISSING job 在同一事务提交；PostgreSQL 按库锁串行化自动调度、按媒体项行锁与手动 item job 创建协调，SQLite 使用写事务串行化。策略关闭、不可执行条目和现有活跃 job 不会产生重复在线请求；自动 job 每批最多 100 项。SQLite 用例验证策略关闭、手动活跃 job 去重、回滚后仍为 RUNNING 及成功调度；真实 PostgreSQL 用例验证注入 INSERT 错误后的回滚、成功调度和后续能力去重。两个定向用例各 1 项通过；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。尚未接入本地检查 worker 或扫描入口，按后续任务实施。
 
 #### 阶段 23 总体验收与阶段门
 

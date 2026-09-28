@@ -10,6 +10,7 @@ use crate::{
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
+    storage::NewItemMetadataCompletenessResult,
 };
 
 async fn refresh_recommendation_stats(database: &Database) {
@@ -1288,6 +1289,265 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
 }
 
 #[tokio::test]
+async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for directory in ["First Movie (2025)", "Second Movie (2025)"] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("movie directory");
+        let filename = directory.replace(' ', ".");
+        tokio::fs::write(movie_dir.join(format!("{filename}.mkv")), b"video")
+            .await
+            .expect("movie file");
+    }
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Progressive dispatch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movies");
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("indexed movies");
+    assert_eq!(item_ids.len(), 2);
+    let library_id = library.id.to_string();
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("disable scan auto-match");
+    let poster_fingerprints = [b"poster-v1".to_vec(), b"poster-v2".to_vec()];
+    let mut poster_results = Vec::new();
+    for (item_id, fingerprint) in item_ids.iter().zip(&poster_fingerprints) {
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+                .await
+                .expect("prepare poster")
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+                .await
+                .expect("claim poster")
+        );
+        poster_results.push(NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: fingerprint,
+            is_missing: true,
+            checked_at: 10,
+        });
+    }
+    let disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &poster_results, &item_ids)
+        .await
+        .expect("persist missing posters while auto-match is disabled");
+    assert_eq!(disabled.updated_count, 2);
+    assert!(disabled.scheduled_job_ids.is_empty());
+    for item_id in &item_ids {
+        let completeness = database
+            .find_item_metadata_completeness(item_id, "POSTER")
+            .await
+            .expect("read disabled missing poster")
+            .expect("poster completeness");
+        assert_eq!(completeness.local_state, "READY");
+        assert_eq!(completeness.is_missing, Some(true));
+    }
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("enable scan auto-match");
+    database
+        .create_metadata_reidentify_job(
+            "manual-fill-missing",
+            &[item_ids[0].clone()],
+            "FILL_MISSING",
+        )
+        .await
+        .expect("create active manual fill-missing job");
+
+    let backdrop_fingerprints = [b"backdrop-v1".to_vec(), b"backdrop-v2".to_vec()];
+    let mut backdrop_results = Vec::new();
+    for (item_id, fingerprint) in item_ids.iter().zip(&backdrop_fingerprints) {
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "BACKDROP", fingerprint)
+                .await
+                .expect("prepare backdrop")
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "BACKDROP", fingerprint)
+                .await
+                .expect("claim backdrop")
+        );
+        backdrop_results.push(NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "BACKDROP",
+            input_fingerprint: fingerprint,
+            is_missing: true,
+            checked_at: 11,
+        });
+    }
+
+    sqlx::query(
+        "CREATE TRIGGER reject_fill_missing_job
+         BEFORE INSERT ON metadata_reidentify_jobs
+         WHEN NEW.mode = 'FILL_MISSING'
+         BEGIN SELECT RAISE(ABORT, 'injected fill-missing job failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("install rollback trigger");
+    assert!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &backdrop_results,
+                &item_ids,
+            )
+            .await
+            .is_err()
+    );
+    sqlx::query("DROP TRIGGER reject_fill_missing_job")
+        .execute(database.pool())
+        .await
+        .expect("remove rollback trigger");
+    for item_id in &item_ids {
+        let completeness = database
+            .find_item_metadata_completeness(item_id, "BACKDROP")
+            .await
+            .expect("read rolled-back completeness")
+            .expect("backdrop completeness");
+        assert_eq!(completeness.local_state, "RUNNING");
+        assert_eq!(completeness.is_missing, None);
+    }
+
+    let scheduled = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
+        .await
+        .expect("atomically persist and schedule missing backdrops");
+    assert_eq!(scheduled.updated_count, 2);
+    assert_eq!(scheduled.scheduled_job_ids.len(), 1);
+    let scheduled_job_id = &scheduled.scheduled_job_ids[0];
+    let job: (String, String, i64, String) = database
+        .query_as(
+            "SELECT mode, status, total_count, job_scope
+             FROM metadata_reidentify_jobs WHERE id = ?",
+        )
+        .bind(scheduled_job_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("scheduled fill-missing job");
+    assert_eq!(
+        job,
+        (
+            "FILL_MISSING".to_owned(),
+            "QUEUED".to_owned(),
+            1,
+            "ITEMS".to_owned()
+        )
+    );
+    let scheduled_items: Vec<String> = database
+        .query_scalar(
+            "SELECT item_id FROM metadata_reidentify_job_items WHERE job_id = ? ORDER BY item_id",
+        )
+        .bind(scheduled_job_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("scheduled item page");
+    assert_eq!(scheduled_items, vec![item_ids[1].clone()]);
+
+    let replayed = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
+        .await
+        .expect("replay the already completed local result");
+    assert_eq!(replayed.updated_count, 0);
+    assert!(replayed.scheduled_job_ids.is_empty());
+
+    let still_fingerprints = [b"still-v1".to_vec(), b"still-v2".to_vec()];
+    let duplicate_results = item_ids
+        .iter()
+        .zip(&still_fingerprints)
+        .map(|(item_id, fingerprint)| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "STILL",
+            input_fingerprint: &fingerprint,
+            is_missing: true,
+            checked_at: 12,
+        })
+        .collect::<Vec<_>>();
+    for result in &duplicate_results {
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(
+                    result.item_id,
+                    result.capability,
+                    result.input_fingerprint,
+                )
+                .await
+                .expect("prepare still")
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(
+                    result.item_id,
+                    result.capability,
+                    result.input_fingerprint,
+                )
+                .await
+                .expect("claim still")
+        );
+    }
+    let deduplicated = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &duplicate_results,
+            &item_ids,
+        )
+        .await
+        .expect("reuse active fill-missing jobs");
+    assert_eq!(deduplicated.updated_count, 2);
+    assert!(deduplicated.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+            )
+            .fetch_one(database.pool())
+            .await
+            .expect("count fill-missing jobs"),
+        2,
+        "the manual active job plus one eligible automatic job are retained"
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_progressive_scan_metadata_storage_contract()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1481,6 +1741,135 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .await?;
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].item_id, item_id);
+
+    let dispatch_fingerprint = b"postgres-dispatch-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "BACKDROP", dispatch_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "BACKDROP", dispatch_fingerprint)
+            .await?
+    );
+    let library_id = library.id.to_string();
+    let dispatch_results = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: dispatch_fingerprint,
+        is_missing: true,
+        checked_at: 1_002,
+    }];
+    sqlx::query(
+        "CREATE FUNCTION lux_reject_fill_missing_job() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.mode = 'FILL_MISSING' THEN
+                 RAISE EXCEPTION 'injected fill-missing job failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_fill_missing_job
+         BEFORE INSERT ON metadata_reidentify_jobs
+         FOR EACH ROW EXECUTE FUNCTION lux_reject_fill_missing_job()",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &dispatch_results,
+                std::slice::from_ref(&item_id),
+            )
+            .await
+            .is_err()
+    );
+    let rolled_back = database
+        .find_item_metadata_completeness(&item_id, "BACKDROP")
+        .await?
+        .ok_or("missing rolled-back completeness row")?;
+    assert_eq!(rolled_back.local_state, "RUNNING");
+    assert_eq!(rolled_back.is_missing, None);
+    sqlx::query("DROP TRIGGER reject_fill_missing_job ON metadata_reidentify_jobs")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION lux_reject_fill_missing_job()")
+        .execute(database.pool())
+        .await?;
+
+    let scheduled = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &dispatch_results,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(scheduled.updated_count, 1);
+    assert_eq!(scheduled.scheduled_job_ids.len(), 1);
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ? AND status = 'PENDING'",
+            )
+            .bind(&scheduled.scheduled_job_ids[0])
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let replayed = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &dispatch_results,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(replayed.updated_count, 0);
+    assert!(replayed.scheduled_job_ids.is_empty());
+
+    let still_fingerprint = b"postgres-still-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "STILL", still_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "STILL", still_fingerprint)
+            .await?
+    );
+    let still_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "STILL",
+        input_fingerprint: still_fingerprint,
+        is_missing: true,
+        checked_at: 1_003,
+    }];
+    let deduplicated = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &still_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(deduplicated.updated_count, 1);
+    assert!(deduplicated.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
 
     database.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!(
