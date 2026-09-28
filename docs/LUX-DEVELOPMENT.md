@@ -7225,6 +7225,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：新增根级 durable backfill 游标和按 filesystem entry ID 的最多 16 项候选页；候选只包含仍有有效媒体 source 的非 missing 文件。空/无效根在同一次领取中被完成并跳过；失败和 RUNNING 恢复保持当前游标，提交与失败操作同时比较 cursor 和 attempt。SQLite 定向存储测试 1 项、真实 PostgreSQL 合同 1 项通过，覆盖空根优先、多根继续领取、并发 claim 去重、失败重试、重启恢复、旧 attempt/旧 cursor 拒写及根删除级联；`cargo fmt --all -- --check` 和 `cargo clippy --locked --lib -- -D warnings` 通过。该项只提供存储能力，后台回填消费者与启动/扫描入口登记由后续任务接入。
 
+#### LUX-297：既有资源本地海报/NFO 回填消费者
+
+范围：将 LUX-296 的根级持久游标接入现有 `start_local_metadata_outbox_worker`。worker 启动时幂等登记已存在的媒体根路径并恢复中断回填；每轮优先领取 workflow 3 新增/变化 outbox，只有新队列暂时为空时才领取一个最多 16 个 filesystem entry 的低优先级回填页。回填页复用同一套本地图片登记与 NFO 读取逻辑，先处理图片、再异步处理 NFO；任一阶段失败或进程中断均保留当前游标并退避重试。成功图片登记立即使主页投影失效。回填不调用 provider，不等待扫描索引或缩略图屏障，也不混入 scan job 进度。本任务不做能力级缺失判定/FILL_MISSING，不实现浏览器 SSE 更新。
+
+验收：
+
+- [ ] worker 启动时注册现存 roots、恢复 RUNNING 回填页；worker 重复启动不会重复创建消费者。
+- [ ] 全库本地回填最多一次领取有界页；workflow 3 新 outbox 始终优先，图片登记先于 NFO，后续索引不等待回填完成。
+- [ ] 已完成索引且未变化的旧媒体，在没有新扫描 outbox 的情况下也能登记本地 poster 与 NFO；任务不发网络请求。
+- [ ] 图片或 NFO 错误使当前页退避重试，不推进游标；worker 重启后从当前页恢复。
+- [ ] SQLite 集成测试覆盖旧资源 poster 展示、无在线任务、与新 outbox 的优先关系及失败恢复。
+
+依赖：LUX-295、LUX-296。验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/scanner.rs`、`tests/scanned_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
