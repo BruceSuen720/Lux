@@ -13398,13 +13398,9 @@ mod tests {
         let preparation =
             tokio::spawn(async move { deletion_jobs.prepare_library_deletion(library.id).await });
         let fence_set = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if let Some(late_run) = jobs.track_scan_job_run("late-run", &library_id) {
-                    drop(late_run);
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                } else {
-                    break;
-                }
+            while let Some(late_run) = jobs.track_scan_job_run("late-run", &library_id) {
+                drop(late_run);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
         .await
