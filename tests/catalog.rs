@@ -600,6 +600,93 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         "Writer"
     );
 
+    let alpha_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let beta_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
+        .bind(&beta_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let beta_parent_id: Option<String> =
+        sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
+            .bind(&beta_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let alpha_sort_title: String =
+        sqlx::query_scalar("SELECT sort_title FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let beta_sort_title: String =
+        sqlx::query_scalar("SELECT sort_title FROM media_items WHERE id = ?")
+            .bind(&beta_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE media_items SET added_at = 100, sort_title = 'zulu' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE media_items SET added_at = 200, sort_title = 'aardvark', parent_id = ? WHERE id = ?",
+    )
+    .bind(&alpha_parent_id)
+    .bind(&beta_item_id)
+    .execute(database.pool())
+    .await?;
+
+    let emby_recent_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=2&sortBy=DateCreated&sortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_recent_items.status(), reqwest::StatusCode::OK);
+    let emby_recent_body: Value = emby_recent_items.json().await?;
+
+    let emby_sort_name_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=2&SortBy=SortName%2CDateCreated&SortOrder=Ascending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_sort_name_items.status(), reqwest::StatusCode::OK);
+    let emby_sort_name_body: Value = emby_sort_name_items.json().await?;
+
+    let emby_recent_folder_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_alpha_parent_id}&IncludeItemTypes=Movie&Limit=2&sortBy=DateCreated&sortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_recent_folder_items.status(), reqwest::StatusCode::OK);
+    let emby_recent_folder_body: Value = emby_recent_folder_items.json().await?;
+
+    sqlx::query("UPDATE media_items SET added_at = ?, sort_title = ? WHERE id = ?")
+        .bind(alpha_added_at)
+        .bind(alpha_sort_title)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET added_at = ?, sort_title = ?, parent_id = ? WHERE id = ?")
+        .bind(beta_added_at)
+        .bind(beta_sort_title)
+        .bind(beta_parent_id)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(emby_recent_body["Items"][0]["Id"], emby_beta_item_id);
+    assert_eq!(emby_sort_name_body["Items"][0]["Id"], emby_beta_item_id);
+    assert_eq!(emby_recent_folder_body["TotalRecordCount"], 2);
+    assert_eq!(emby_recent_folder_body["Items"][0]["Id"], emby_beta_item_id);
+
     let popcorn_items = client
         .get(format!(
             "{base_url}/emby/Users/{}/Items?ExcludeItemTypes=Audio%2CBook%2CMusicVideo%2CMusicAlbum%2CGame%2CPhoto&StartIndex=0&Limit=50&ParentId={}&IncludeItemTypes=Movie&Recursive=true&SortOrder=Descending&SortBy=DateCreated%2CSortName&Fields=BasicSyncInfo%2CChildCount%2CRunTimeTicks%2CCommunityRating%2CPremiereDate%2CProductionYear%2CCanDownload",

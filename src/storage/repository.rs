@@ -3010,6 +3010,7 @@ pub(crate) struct ResumeItemsQuery<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum CatalogSort {
     Name,
+    SortName,
     DateCreated,
     PremiereDate,
     Rating,

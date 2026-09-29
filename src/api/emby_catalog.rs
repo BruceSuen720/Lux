@@ -65,9 +65,9 @@ pub(super) struct EmbyItemsQuery {
     pub(super) min_date_last_saved: Option<i64>,
     #[serde(rename = "Years", default)]
     pub(super) years: Option<String>,
-    #[serde(rename = "SortBy", default)]
+    #[serde(rename = "SortBy", alias = "sortBy", default)]
     pub(super) sort_by: Option<String>,
-    #[serde(rename = "SortOrder", default)]
+    #[serde(rename = "SortOrder", alias = "sortOrder", default)]
     pub(super) sort_order: Option<String>,
     #[serde(rename = "Fields", default)]
     pub(super) fields: Option<String>,
@@ -276,32 +276,24 @@ pub(super) fn catalog_filter_from_values(
         is_favorite,
         min_date_last_saved: None,
         metadata_pending,
-        sort_by: match sort_by {
-            Some(value)
-                if value
-                    .split(',')
-                    .any(|field| field.trim().eq_ignore_ascii_case("DateCreated")) =>
-            {
-                CatalogSort::DateCreated
-            }
-            Some(value)
-                if value
-                    .split(',')
-                    .any(|field| field.trim().eq_ignore_ascii_case("PremiereDate")) =>
-            {
-                CatalogSort::PremiereDate
-            }
-            Some(value)
-                if value.split(',').any(|field| {
-                    field.trim().eq_ignore_ascii_case("CommunityRating")
-                        || field.trim().eq_ignore_ascii_case("Rating")
-                }) =>
-            {
-                CatalogSort::Rating
-            }
-            _ => CatalogSort::Name,
-        },
+        sort_by: catalog_sort_from_value(sort_by),
         descending: sort_order.is_some_and(|value| value.eq_ignore_ascii_case("Descending")),
+    }
+}
+
+fn catalog_sort_from_value(value: Option<&str>) -> CatalogSort {
+    let field = value
+        .unwrap_or("Name")
+        .split(',')
+        .map(str::trim)
+        .find(|field| !field.is_empty())
+        .unwrap_or("Name");
+    match field.to_ascii_lowercase().as_str() {
+        "sortname" => CatalogSort::SortName,
+        "datecreated" => CatalogSort::DateCreated,
+        "premieredate" => CatalogSort::PremiereDate,
+        "communityrating" | "rating" => CatalogSort::Rating,
+        _ => CatalogSort::Name,
     }
 }
 
@@ -2279,6 +2271,19 @@ pub(super) async fn emby_catalog_page_for_item_parent(
         };
         child_type.to_owned()
     };
+    if parent.item_type == "FOLDER" && query.sort_by.is_some() {
+        let filter = catalog_filter_from_emby(query);
+        return catalog
+            .list_children_with_sort(
+                principal,
+                parent_id,
+                &child_types,
+                (filter.sort_by, filter.descending),
+                offset,
+                limit,
+            )
+            .await;
+    }
     catalog
         .list_children(principal, parent_id, &child_types, offset, limit)
         .await
