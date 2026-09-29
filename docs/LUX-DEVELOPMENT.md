@@ -7455,6 +7455,77 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-28）：有效时间在详情元信息行显示“添加于”及按浏览器本地时区格式化到分钟的日期，并提供 ISO 8601 `dateTime`；缺失和无效时间不显示标签。`pnpm --dir web install --frozen-lockfile` 通过，详情页测试 26 项通过，完整 Web 测试 75 个文件/526 项通过，`pnpm --dir web build` 通过。输出仍有既存 jsdom 媒体元素 `load/pause` 告警和 Vite 大 chunk 提示。
 
+#### LUX-309：配置目录日志分段归档与有界保留
+
+统一程序结构化日志、任务事件和管理员审计事件的文件归档策略。日志主文件写入 `/config/logs/`，按 UTC 日期命名；单个未压缩 JSONL 段达到 50 MiB 时封存为 ZIP，日期切换时也封存当前段。归档包放在 `/config/logs/archive/`，全局最多保留 20 个。第 21 个归档只有在 ZIP 写入并校验成功后才删除最旧包；压缩失败时保留原始日志段。stdout JSON 日志继续保留。
+
+验收：
+
+- [ ] 程序结构化日志通过独立 writer 写入配置目录 JSONL；写文件和压缩不阻塞 Tokio 核心 worker。
+- [ ] 单段在 50 MiB 边界和 UTC 日期切换时安全封存；重启后继续写入正确的当前日期文件。
+- [ ] 每个压缩包包含原始 JSONL 段；压缩包损坏或写入失败不会先删除原日志。
+- [ ] 归档目录最多 20 个包；成功完成第 21 个包后按创建顺序删最旧包。
+- [ ] 管理员按日期导出可读取当前文件和归档成员；单日仍返回 JSONL，多日仍返回 ZIP，日期权限和范围合同不变。
+- [ ] 自动化测试覆盖容量轮转、日期轮转、ZIP 内容、20/21 个归档边界、失败保留和导出读取。
+
+验证：`cargo test --locked --test observability --test log_export`、`cargo fmt --all -- --check`。
+
+预计文件：`src/observability/mod.rs`、`src/observability/logs.rs`、`tests/observability.rs`、`tests/log_export.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：LUX-156。明确不做：不改任务状态/恢复数据的数据库边界；不引入新的核心依赖。
+
+#### LUX-310：扫描任务事件文件化
+
+将扫描任务的生命周期事件（INFO、WARN、ERROR）及结构化详情写入 LUX-309 的 JSONL 文件层，并从文件归档读取管理员任务事件 API。`scan_jobs` 中用于队列、取消、重试、进度和恢复的状态、游标仍保留在数据库；`scan_job_events` 不再接收新日志。
+
+验收：
+
+- [ ] 每个任务事件在文件中包含稳定事件 ID、UTC 时间、jobId、level、eventCode、message 和脱敏 details；INFO 过程事件也可查询。
+- [ ] `GET /api/v1/admin/jobs/{jobId}/events` 保持管理员权限、级别/事件码筛选、分页和 JSON DTO 合同，结果按时间倒序。
+- [ ] 新产生的任务事件不会写入 `scan_job_events`；任务运行、取消、重试和恢复仍由数据库状态驱动。
+- [ ] 自动化测试覆盖文件事件、详情筛选、分页、不同级别、文件归档读取和数据库无新事件。
+
+验证：`cargo test --locked --test job_events_api --test scanning_jobs`、`cargo fmt --all -- --check`。
+
+预计文件：`src/observability/logs.rs`、`src/storage/repository.rs`、`src/storage/jobs.rs`、`tests/job_events_api.rs`、`tests/scanning_jobs.rs`。
+
+依赖：LUX-309、LUX-232。明确不做：不迁出 `scan_jobs` 的执行状态、进度或恢复游标。
+
+#### LUX-311：管理员审计事件与近期活动文件化
+
+将管理员审计事件写入 LUX-309 的 JSONL 文件层；`/api/v1/admin/audit`、`/api/v1/admin/logs` 和管理仪表盘近期活动从文件读取。旧的 `audit_events` 不再接收新日志。
+
+验收：
+
+- [ ] 管理审计 JSONL 包含稳定事件 ID、时间、actor、eventType、target 和脱敏 metadata；共享 API Key 元数据继续脱敏。
+- [ ] 两个管理员审计读取端点保持现有分页、权限和响应字段；仪表盘近期登录/播放活动可从文件正确读取并关联可用媒体标题。
+- [ ] 新审计事件不会写入 `audit_events`；播放历史、媒体状态、通知投递状态等业务记录仍留在数据库。
+- [ ] 自动化测试覆盖审计写入、分页/排序、近期活动、数据库无新审计事件及共享 API Key 脱敏。
+
+验证：`cargo test --locked --test users --test admin_health --test web_playback`、`cargo fmt --all -- --check`。
+
+预计文件：`src/observability/logs.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`tests/users.rs`、`tests/admin_health.rs`。
+
+依赖：LUX-309。明确不做：不迁出用户播放进度、播放历史或通知工作状态。
+
+#### LUX-312：历史数据库日志迁出与清理
+
+首次启动时把已有 `scan_job_events` 和 `audit_events` 记录安全导出到 `/config/logs/`，确认文件写入成功后删除对应数据库日志行。清理必须可重试，不能因为中断而先丢失数据库中的剩余历史；完成后移除扫描事件的 7 天数据库清理策略和文件读取中的旧数据库回退。
+
+验收：
+
+- [ ] 升级现有 SQLite 和 PostgreSQL 数据库时，旧任务事件、管理员审计事件按原 ID、时间和字段导出为 JSONL；不改变任何任务执行状态或业务关系。
+- [ ] 导出文件完成并确认可读后才删除数据库日志行；中断重启不会丢数据，重复执行不会产生可见重复事件。
+- [ ] 清理成功后两个日志表没有历史行，运行时也不再向这两个表写入或查询日志；表结构可以保留为空，不新增 schema migration。
+- [ ] 超出 20 个包保留量的历史日志按 LUX-309 的 FIFO 策略淘汰；剩余最新日志可从任务/审计 API 查询。
+- [ ] 测试覆盖空库、旧 SQLite 数据、导出失败/中断重试、数据库清空、幂等执行；PostgreSQL 路径在可用的集成环境验证。
+
+验证：`cargo test --locked --test log_migration --test job_events_api --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
+
+预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`tests/log_migration.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：LUX-310、LUX-311。明确不做：不删除旧 migration 文件，不移除空表定义，不搬迁任务控制状态和业务事件。
+
 ## 26. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
