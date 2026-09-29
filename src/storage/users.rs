@@ -664,24 +664,34 @@ impl Database {
         &self,
         event: NewAuditEvent<'_>,
     ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO audit_events (
-                id, actor_user_id, event_type, target_type, target_id, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(event.actor_user_id)
-        .bind(event.event_type)
-        .bind(event.target_type)
-        .bind(event.target_id)
-        .bind(event.metadata_json)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        let actor_username = if let Some(actor_user_id) = event.actor_user_id {
+            self.query_scalar::<String>("SELECT username_normalized FROM users WHERE id = ?")
+                .bind(actor_user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+        } else {
+            None
+        };
+        let event_id = Uuid::now_v7().to_string();
+        self.log_store
+            .append_audit_event(super::NewAuditLogEvent {
+                id: &event_id,
+                actor_user_id: event.actor_user_id,
+                actor_username: actor_username.as_deref(),
+                event_type: event.event_type,
+                target_type: event.target_type,
+                target_id: event.target_id,
+                metadata_json: event.metadata_json,
+            })
+            .await
+            .map_err(|source| StorageError::Io {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_audit_events(

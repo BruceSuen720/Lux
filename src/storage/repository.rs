@@ -233,6 +233,7 @@ pub(crate) use emby_migration::{
 };
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
+use crate::observability::logs::{LogStore, NewAuditLogEvent};
 
 // Keep the embedded migrator source coupled to newly added migration files.
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
@@ -325,6 +326,7 @@ fn playback_reached_played_threshold(
 #[derive(Clone)]
 pub struct Database {
     pool: AnyPool,
+    log_store: LogStore,
     pool_max_connections: u32,
     path: PathBuf,
     server_id: String,
@@ -452,6 +454,7 @@ impl Database {
 
         Ok(Self {
             pool,
+            log_store: LogStore::new(&config.config_dir),
             pool_max_connections,
             path,
             server_id,

@@ -7520,24 +7520,42 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-309。明确不做：不改变登录/播放活动、播放进度和业务播放历史。
 
-#### LUX-312：登录/播放活动文件化与仪表盘读取
+#### LUX-312：登录/播放活动文件化
 
-登录及播放活动日志写入同一 JSONL LogStore。仪表盘近期活动从文件读取，再关联数据库中仍存在的用户/媒体展示信息；用户播放进度和播放历史继续留在业务表中。
+登录及播放近期活动沿用 `audit_events` 的现有应用调用点，底层持久化改为 LUX-309 JSONL LogStore；仪表盘读取路径由 LUX-313 修改。用户播放进度、播放会话和业务播放历史继续留在业务表。
 
 验收：
 
-- [ ] `AUTH_LOGIN`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_STOPPED` 活动写入配置目录日志，不再新增到 `audit_events`。
-- [ ] 仪表盘近期活动保持现有类型、24 条上限、分类配额、字段合同和倒序；删除用户/媒体后仍能安全展示。
-- [ ] 播放会话、播放进度、业务播放事件、Webhook 投递状态仍按原合同留在数据库。
-- [ ] 测试覆盖登录/播放活动文件记录、数据库无新活动审计行、媒体标题/用户关联、仪表盘权限与响应。
+- [x] `AUTH_LOGIN`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_STOPPED` 活动写入配置目录日志，不再新增到 `audit_events`。
+- [x] 活动记录保存事件 ID、actor、eventType、target、脱敏 metadata 和时间；可从 LogStore 查询。
+- [x] 用户播放进度、播放会话、业务播放事件和 Webhook 投递状态保持原存储合同。
+- [x] 测试覆盖登录/播放活动文件记录、数据库无新活动审计行及 metadata 脱敏。
 
-验证：`cargo test --locked --test web_playback --test admin_health --test users`、`cargo fmt --all -- --check`。
+验证：`cargo test --locked --test web_playback`、`cargo fmt --all -- --check`。
 
 预计文件：`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`tests/web_playback.rs`、`docs/LUX-DEVELOPMENT.md`。
 
-依赖：LUX-311。明确不做：不迁移旧 `audit_events` 历史记录。
+结果（2026-09-29）：登录和播放状态变化仍通过原调用点产生审计活动，但 `Database.insert_audit_event` 改为写共享 JSONL LogStore；播放会话及进度表不变。`cargo test --locked --test web_playback --test admin_health --test users` 3 项通过，播放回归确认 `audit_events` 没有新活动行且文件含登录/播放事件。
 
-#### LUX-313：历史任务事件迁出数据库
+依赖：LUX-309、LUX-311。明确不做：不改变仪表盘读取路径；不迁移旧 `audit_events` 历史。
+
+#### LUX-313：仪表盘近期活动文件读取
+
+管理仪表盘近期登录与播放活动从文件审计记录生成，再关联数据库中仍存在的用户/媒体展示信息。
+
+验收：
+
+- [ ] 仪表盘近期活动从文件读取，保持现有事件类型、最多 24 条、登录/播放分类配额和 DTO 字段。
+- [ ] 活动按时间及 ID 倒序；用户或媒体已删除时 API 仍成功并安全返回可空名称/标题。
+- [ ] 测试覆盖登录与播放活动、分类配额、缺失用户/媒体、权限和响应合同。
+
+验证：`cargo test --locked --test admin_health --test web_playback`、`cargo fmt --all -- --check`。
+
+预计文件：`src/observability/logs.rs`、`src/storage/users.rs`、`tests/admin_health.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：LUX-312。明确不做：不迁移旧数据库审计历史，不改变业务播放状态。
+
+#### LUX-314：历史任务事件迁出数据库
 
 升级时将既有 `scan_job_events` 安全导出到 `/config/logs/`，文件写入并确认可读后才删除对应数据库行。清理可重试且不触及 `scan_jobs` 状态、进度或恢复游标。
 
@@ -7552,9 +7570,9 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`tests/log_migration.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
 
-依赖：LUX-310。明确不做：不清理旧管理员审计事件，不迁出扫描控制状态。
+依赖：LUX-310、LUX-313。明确不做：不清理旧管理员审计事件，不迁出扫描控制状态。
 
-#### LUX-314：历史管理员审计迁出与数据库日志停写
+#### LUX-315：历史管理员审计迁出与数据库日志停写
 
 升级时将既有 `audit_events` 导出至日志目录，确认文件持久且可读后才清理数据库记录。迁移完成后移除任务/审计日志 API 对数据库的历史回退和数据库事件留存清理；表结构保留为空。
 
@@ -7570,7 +7588,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`src/storage/users.rs`、`tests/log_migration.rs`、`docs/LUX-DEVELOPMENT.md`。
 
-依赖：LUX-312、LUX-313。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
+依赖：LUX-311、LUX-313、LUX-314。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
 
 ## 26. 风险与缓解
 

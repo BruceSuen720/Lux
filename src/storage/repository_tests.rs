@@ -5268,6 +5268,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
 
     let database = Database {
         pool,
+        log_store: LogStore::new(Path::new("unused-metadata-summary-test")),
         pool_max_connections: 1,
         path: PathBuf::from("metadata-summary-test.db"),
         server_id: "test".to_owned(),
@@ -7151,6 +7152,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
 
     let database = Database {
         pool,
+        log_store: LogStore::new(Path::new("unused-query-only-test")),
         pool_max_connections: 1,
         path: PathBuf::from("query-only-test.db"),
         server_id: "test".to_owned(),
@@ -7213,6 +7215,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
     }
     let database = Database {
         pool,
+        log_store: LogStore::new(Path::new("unused-metadata-order-test")),
         pool_max_connections: 1,
         path: PathBuf::from("metadata-order-test.db"),
         server_id: "test".to_owned(),
@@ -7307,6 +7310,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         .expect("insert metadata job");
     let database = Database {
         pool,
+        log_store: LogStore::new(Path::new("unused-metadata-batch-claim-test")),
         pool_max_connections: 1,
         path: PathBuf::from("metadata-batch-claim-test.db"),
         server_id: "test".to_owned(),
@@ -7414,6 +7418,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
     }
     let database = Database {
         pool,
+        log_store: LogStore::new(Path::new("unused-metadata-reconcile-test")),
         pool_max_connections: 1,
         path: PathBuf::from("metadata-reconcile-test.db"),
         server_id: "test".to_owned(),
