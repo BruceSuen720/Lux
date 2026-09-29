@@ -23,6 +23,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "媒体详情页展示条目加入媒体库的时间。",
       ] },
       { kind: "changed", items: [
+        "媒体库删除改用 Lux 风格的确认弹窗，支持键盘操作，并在删除过程中阻止关闭，替代浏览器原生确认框。",
         "Emby 目录查询现在遵循 SortBy 和 SortOrder，支持按名称、排序名称、创建时间、首播日期和评分排序。",
         "Emby AuthenticateByName 支持使用唯一匹配的公开显示名登录；规范用户名优先，重名显示名不会作为登录别名。",
         "登录背景支持 Bing 每日图片和 TMDb 全幅横幅，并更新内置海报墙素材。",
@@ -31,7 +32,7 @@ export const changelogReleases: ChangelogRelease[] = [
       ] },
       { kind: "fixed", items: [
         "删除媒体库时会阻止新扫描进入、请求取消相关扫描并等待活动 worker 退出后再删除，覆盖扫描后处理阶段，避免删除与扫描并发竞态；SQLite 扫描锁冲突增加有限退避重试。",
-        "为 SQLite 和 PostgreSQL 中媒体库删除涉及的外键级联查询补齐索引，减少删除时对子表的扫描开销。",
+        "为 SQLite 和 PostgreSQL 中媒体库删除涉及的外键查找补齐索引，覆盖级联及受限引用，减少删除时对子表的扫描开销。",
         "管理台扫描任务失败信息现在可读取并展示任务错误事件中的错误码。",
       ] },
     ],
