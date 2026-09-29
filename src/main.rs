@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
-    app_state.start_database_diagnostics();
+    app_state.start_database_diagnostics().await;
     let app = app_with_state(app_state);
 
     let serve_result = axum::serve(

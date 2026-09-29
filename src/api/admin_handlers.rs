@@ -5520,6 +5520,37 @@ pub(crate) async fn admin_database_diagnostics_status(
     response
 }
 
+pub(crate) async fn admin_start_database_diagnostics(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(diagnostics) = state.database_diagnostics.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match diagnostics.request_collection().await {
+        Ok(status) => {
+            let mut response = (StatusCode::ACCEPTED, Json(status)).into_response();
+            response.headers_mut().insert(
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-store, max-age=0"),
+            );
+            response
+        }
+        Err(
+            crate::application::database_diagnostics::DatabaseDiagnosticsStartError::AlreadyRunning,
+        ) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "数据库体检正在运行",
+        )
+        .into_response(),
+    }
+}
+
 pub(crate) async fn admin_export_database_diagnostics(
     headers: HeaderMap,
     State(state): State<AppState>,

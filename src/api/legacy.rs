@@ -579,12 +579,12 @@ impl AppState {
         }
     }
 
-    pub fn start_database_diagnostics(&self) {
+    pub async fn start_database_diagnostics(&self) {
         if self.database_selection_required {
             return;
         }
         if let Some(service) = &self.database_diagnostics {
-            service.start();
+            service.start().await;
         }
     }
 

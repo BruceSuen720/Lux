@@ -380,6 +380,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_database_diagnostics_status),
         )
         .route(
+            "/api/v1/admin/database-diagnostics/run",
+            post(admin_start_database_diagnostics),
+        )
+        .route(
             "/api/v1/admin/database-diagnostics/export",
             get(admin_export_database_diagnostics),
         )

@@ -636,6 +636,8 @@ export type AdminDatabaseDiagnosticsStatus = {
   startedAt?: number | null;
   completedAt?: number | null;
   errorCode?: string | null;
+  hasReport: boolean;
+  reportGeneratedAt?: number | null;
 };
 
 export type AdminDashboard = {

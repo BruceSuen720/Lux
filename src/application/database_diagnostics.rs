@@ -13,7 +13,12 @@ use tracing::{info, warn};
 use crate::storage::Database;
 
 const START_DELAY: Duration = Duration::from_secs(5 * 60);
-const COLLECTION_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+const COLLECTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseDiagnosticsStartError {
+    AlreadyRunning,
+}
 
 #[derive(Clone)]
 pub struct DatabaseDiagnosticsService {
@@ -32,27 +37,75 @@ impl DatabaseDiagnosticsService {
                 "startedAt": null,
                 "completedAt": null,
                 "report": null,
+                "hasReport": false,
+                "reportGeneratedAt": null,
                 "errorCode": null,
             }))),
             started: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn start(&self) {
-        self.start_after(START_DELAY);
+    pub async fn start(&self) {
+        self.start_after(START_DELAY).await;
     }
 
-    fn start_after(&self, delay: Duration) {
+    async fn start_after(&self, delay: Duration) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
         }
+        let scheduled_at = unix_timestamp().saturating_add(delay.as_secs() as i64);
+        self.state.write().await["scheduledAt"] = json!(scheduled_at);
         let service = self.clone();
         tokio::spawn(async move {
-            let scheduled_at = unix_timestamp().saturating_add(delay.as_secs() as i64);
-            service.state.write().await["scheduledAt"] = json!(scheduled_at);
             tokio::time::sleep(delay).await;
+            let _ = service.begin_collection(true).await;
+        });
+    }
+
+    pub async fn request_collection(&self) -> Result<Value, DatabaseDiagnosticsStartError> {
+        self.begin_collection(false).await?;
+        Ok(self.status().await)
+    }
+
+    async fn begin_collection(
+        &self,
+        only_if_waiting: bool,
+    ) -> Result<(), DatabaseDiagnosticsStartError> {
+        let started_at = unix_timestamp();
+        let mut state = self.state.write().await;
+        let current_status = state["status"].as_str().unwrap_or_default();
+        if current_status == "RUNNING" {
+            return Err(DatabaseDiagnosticsStartError::AlreadyRunning);
+        }
+        if only_if_waiting && current_status != "WAITING" {
+            return Ok(());
+        }
+
+        let scheduled_at = if only_if_waiting {
+            state["scheduledAt"].as_i64().unwrap_or(started_at)
+        } else {
+            started_at
+        };
+        let previous_report = state["report"].clone();
+        let report_generated_at = state["reportGeneratedAt"].clone();
+        let has_report = !previous_report.is_null();
+        *state = json!({
+            "status": "RUNNING",
+            "scheduledAt": scheduled_at,
+            "startedAt": started_at,
+            "completedAt": null,
+            "report": previous_report,
+            "hasReport": has_report,
+            "reportGeneratedAt": report_generated_at,
+            "errorCode": null,
+        });
+        drop(state);
+
+        let service = self.clone();
+        tokio::spawn(async move {
             service.collect().await;
         });
+        Ok(())
     }
 
     pub async fn status(&self) -> Value {
@@ -65,24 +118,11 @@ impl DatabaseDiagnosticsService {
 
     pub async fn report(&self) -> Option<Value> {
         let state = self.state.read().await;
-        (state["status"] == "READY")
-            .then(|| state["report"].clone())
-            .filter(|report| !report.is_null())
+        let report = state["report"].clone();
+        (!report.is_null()).then_some(report)
     }
 
     async fn collect(&self) {
-        let started_at = unix_timestamp();
-        let scheduled_at = self.state.read().await["scheduledAt"]
-            .as_i64()
-            .unwrap_or(started_at);
-        *self.state.write().await = json!({
-            "status": "RUNNING",
-            "scheduledAt": scheduled_at,
-            "startedAt": started_at,
-            "completedAt": null,
-            "report": null,
-            "errorCode": null,
-        });
         let result = tokio::time::timeout(COLLECTION_TIMEOUT, async {
             let mut report = self
                 .database
@@ -99,53 +139,32 @@ impl DatabaseDiagnosticsService {
         let completed_at = unix_timestamp();
         match result {
             Ok(Ok(report)) => {
-                *self.state.write().await = json!({
-                    "status": "READY",
-                    "scheduledAt": scheduled_at,
-                    "startedAt": started_at,
-                    "completedAt": completed_at,
-                    "report": report,
-                    "errorCode": null,
-                });
+                let report_generated_at = report["generatedAt"].clone();
+                let mut state = self.state.write().await;
+                state["status"] = json!("READY");
+                state["completedAt"] = json!(completed_at);
+                state["report"] = report;
+                state["hasReport"] = json!(true);
+                state["reportGeneratedAt"] = report_generated_at;
+                state["errorCode"] = Value::Null;
                 info!("read-only database diagnostics report is ready");
             }
-            Ok(Err(())) => {
-                self.mark_failed(scheduled_at, started_at, completed_at, "DIAGNOSTICS_FAILED")
-                    .await
-            }
-            Err(_) => {
-                self.mark_failed(
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    "DIAGNOSTICS_TIMEOUT",
-                )
-                .await
-            }
+            Ok(Err(())) => self.mark_failed(completed_at, "DIAGNOSTICS_FAILED").await,
+            Err(_) => self.mark_failed(completed_at, "DIAGNOSTICS_TIMEOUT").await,
         }
     }
 
-    async fn mark_failed(
-        &self,
-        scheduled_at: i64,
-        started_at: i64,
-        completed_at: i64,
-        error_code: &str,
-    ) {
-        *self.state.write().await = json!({
-            "status": "FAILED",
-            "scheduledAt": scheduled_at,
-            "startedAt": started_at,
-            "completedAt": completed_at,
-            "report": null,
-            "errorCode": error_code,
-        });
+    async fn mark_failed(&self, completed_at: i64, error_code: &str) {
+        let mut state = self.state.write().await;
+        state["status"] = json!("FAILED");
+        state["completedAt"] = json!(completed_at);
+        state["errorCode"] = json!(error_code);
         warn!(error_code, "read-only database diagnostics report failed");
     }
 
     #[cfg(test)]
-    pub(crate) fn start_immediately_for_test(&self) {
-        self.start_after(Duration::ZERO);
+    pub(crate) async fn start_immediately_for_test(&self) {
+        self.start_after(Duration::ZERO).await;
     }
 }
 
@@ -177,7 +196,7 @@ mod tests {
         assert!(status["scheduledAt"].is_null());
         assert!(service.report().await.is_none());
 
-        service.start_immediately_for_test();
+        service.start_immediately_for_test().await;
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let status = service.status().await;
@@ -194,6 +213,30 @@ mod tests {
         assert_eq!(status["status"], "READY");
         assert!(status["scheduledAt"].as_i64().is_some());
         assert!(status["completedAt"].as_i64().is_some());
+        assert_eq!(status["hasReport"], true);
+
+        let recollection_status = service
+            .request_collection()
+            .await
+            .expect("request recollection");
+        assert_eq!(recollection_status["hasReport"], true);
+        assert!(matches!(
+            service.request_collection().await,
+            Err(DatabaseDiagnosticsStartError::AlreadyRunning)
+        ));
+        assert!(service.report().await.is_some());
+        let recollected_status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = service.status().await;
+                if status["status"] == "READY" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recollection becomes ready");
+        assert_eq!(recollected_status["hasReport"], true);
         database.close().await;
     }
 }

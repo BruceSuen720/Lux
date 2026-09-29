@@ -636,6 +636,13 @@ export class LuxApiClient {
     );
   }
 
+  startAdminDatabaseDiagnostics() {
+    return this.request<AdminDatabaseDiagnosticsStatus>(
+      "/api/v1/admin/database-diagnostics/run",
+      { method: "POST" },
+    );
+  }
+
   adminDashboard() {
     return this.request<AdminDashboard>("/api/v1/admin/dashboard");
   }
