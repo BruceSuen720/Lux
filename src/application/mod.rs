@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod chapter_detector;
 pub mod collections;
 pub mod danmaku;
+pub mod database_diagnostics;
 pub mod database_setup;
 pub mod deletion;
 pub mod directory_browser;

@@ -7617,6 +7617,37 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-311、LUX-312、LUX-313、LUX-315。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
 
+#### LUX-316：临时数据库体检报告与导出
+
+范围：Lux 启动并开始监听 5 分钟后在后台生成一次只读数据库体检快照，目标在启动后 10 分钟内可导出，单次采集最多运行 15 分钟后超时。管理员也可通过手动接口立即发起首次采集或重新采集。报告覆盖 PostgreSQL 数据库总大小、用户表 heap/index/TOAST 大小、索引大小、估算行数、live/dead tuple、最近 analyze/autovacuum 时间和按 schema 汇总；SQLite 报告数据库文件/WAL/page/freelist 信息，并在 dbstat 可用时给出逐表/索引大小。无法读取或只能估算的字段必须明确标记，不执行全表 COUNT、ANALYZE、VACUUM 或任何写入。
+
+报告包含后端与数据库版本、schema 版本、生成时间、大小排名和采样限制；不得包含媒体记录、媒体路径、用户内容、连接串、密码或 API Key。报告只在进程内存中保留，不新增诊断结果表或 migration。统计查询需设置有界超时和关系条目上限，不得阻塞 HTTP 启动或扫描任务；数据库未完成选择/配置时不启动体检。
+
+提供管理员状态接口、手动启动/重新采集接口和 JSON 导出接口，均要求共享管理员 API Key 或管理员 Web session；API Key 通过请求头传递。采集中禁止并发重复启动；手动启动若先于启动延迟任务，则延迟任务跳过。重新采集期间及失败后保留上一份可用报告，直到新报告成功替换或 Lux 重启。服务器设置页显示等待/运行/完成/失败状态，允许立即开始、重新采集和下载。此功能是临时诊断能力，专用于收集下一版本用户数据库数据；在后续指定版本建立独立移除任务，届时一并删除启动调度、接口和 Web 入口。本任务不实施数据库瘦身、历史记录清理或物理空间回收。
+
+验收：
+
+- [x] PostgreSQL 报告数据库总大小、每个用户关系的 heap/index/TOAST/总大小和每个索引大小；行数及 dead tuple 明确标为统计估算。
+- [x] SQLite 报告文件、WAL、page size、page count、freelist；dbstat 不可用时优雅降级并说明逐对象大小不可用。
+- [x] 启动延迟约 5 分钟后只读生成一次，单次统计最多运行 15 分钟；报告目标在启动 10 分钟内就绪，超时/失败提供安全状态。
+- [x] 管理员可手动开始或重新采集；运行中拒绝重复启动，手动先启动时自动延迟任务不重复执行；重新采集期间上一份报告仍可导出。
+- [x] 状态、启动和下载接口拒绝未授权请求，接受共享 Admin API Key 请求头；Web 管理页面可以查看状态、手动开始/重采和下载 JSON。
+- [x] 报告不暴露数据库路径、连接配置或任何行数据；生成过程中不修改任何数据库内容。
+- [x] SQLite 与 PostgreSQL 覆盖存储查询；API 覆盖鉴权/未就绪/下载；Web 覆盖等待、就绪、失败和下载。
+- [x] 该临时功能无数据库 schema 变更，不引入新依赖。
+
+验证：`cargo test --locked --lib database_diagnostics`、`cargo test --locked --lib postgres_database_diagnostics -- --ignored --nocapture`、`cargo test --locked --test admin_database_diagnostics`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`pnpm --dir web test -- admin-database-diagnostics`、`pnpm --dir web build`。
+
+预计文件：`src/storage/database_diagnostics.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`src/application/database_diagnostics.rs`、`src/application/mod.rs`、`src/api/legacy.rs`、`src/api/admin.rs`、`src/api/admin_handlers.rs`、`src/main.rs`、`tests/admin_database_diagnostics.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminDatabaseDiagnosticsPanel.tsx`、`web/src/features/admin/AdminSettingsPage.tsx`、`web/tests/admin-database-diagnostics.test.tsx`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：无。明确不做：数据库瘦身、定时清理、删除现存数据、VACUUM/REINDEX、修改持久化任务模型。未来移除版本待项目所有者指定。
+
+结果（2026-09-29）：新增的进程内报告在 HTTP listener 就绪后等待 5 分钟运行；整体采集超时 15 分钟，SQLite `dbstat` 子查询超时 90 秒并可降级。管理员可通过 `POST /api/v1/admin/database-diagnostics/run` 立即开始/重新采集；重复运行时返回 409，重新采集期间保留上一份报告，直到新结果替换。SQLite 文件/WAL/页统计、PostgreSQL 16.15 数据库/关系/索引统计、API Key 鉴权和下载响应、设置页状态/按钮/导出均已实现。报告通过 `GET /api/v1/admin/database-diagnostics/export` 下载，状态轮询不传输完整报告；没有新增 migration 或持久化报告数据。定向存储、PostgreSQL、API 和 Web 体检测试通过；Rust build、fmt、Clippy 和 Web build 通过。`cargo test --locked --all-targets` 在既有 `tests/log_export.rs::admin_can_export_selected_daily_logs_but_viewer_cannot` 以 `FileNotFound` 失败，单独重跑仍失败；Web 全套测试有一个既有 `MediaDetailPage` 异步用例首轮失败，单测重跑通过，其余 531 项通过。
+
+更新（2026-09-30）：将采集最长时间调整为 15 分钟，并新增手动开始/重新采集接口及设置页按钮。重复触发在服务层原子拒绝；手动任务已开始后，5 分钟自动任务会跳过；重新采集及其失败期间继续保留上一份报告。新增手动 API 端到端、服务重采集状态和 Web 按钮/旧报告下载状态测试，均通过。
+
+复验（2026-09-30）：新接口及服务重采集定向 Rust 测试通过，真实 PostgreSQL 体检测试先前通过；全套 Web 测试 76 个文件/535 项全部通过，Web build、Rust build、fmt 和全目标 Clippy 通过。全目标 Rust 测试仍受无关 `tests/log_export.rs::admin_can_export_selected_daily_logs_but_viewer_cannot` 的 `FileNotFound` 阻断。
+
 ## 26. 风险与缓解
 
 | 风险 | 影响 | 缓解 |

@@ -375,6 +375,18 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_retry_webhook_delivery),
         )
         .route("/api/v1/admin/health", get(admin_health))
+        .route(
+            "/api/v1/admin/database-diagnostics",
+            get(admin_database_diagnostics_status),
+        )
+        .route(
+            "/api/v1/admin/database-diagnostics/run",
+            post(admin_start_database_diagnostics),
+        )
+        .route(
+            "/api/v1/admin/database-diagnostics/export",
+            get(admin_export_database_diagnostics),
+        )
         .route("/api/v1/admin/dashboard", get(admin_dashboard))
         .route("/api/v1/admin/events", get(admin_events))
         .route("/api/v1/events", get(user_events))

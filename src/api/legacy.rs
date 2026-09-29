@@ -11,7 +11,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, RawQuery, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
+        header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -62,6 +62,7 @@ use crate::{
             DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID,
         },
         collections::{CollectionError, CollectionService},
+        database_diagnostics::DatabaseDiagnosticsService,
         directory_browser::{DirectoryBrowserError, list_directories},
         emby_migration_service::{
             CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
@@ -166,6 +167,7 @@ pub struct AppState {
     emby_auth: Option<EmbyAuthService>,
     device_pairings: Option<DevicePairingService>,
     admin_api_key: Option<AdminApiKeyService>,
+    database_diagnostics: Option<DatabaseDiagnosticsService>,
     libraries: Option<LibraryService>,
     catalog: Option<CatalogService>,
     home: Option<HomeService>,
@@ -386,6 +388,7 @@ impl AppState {
                 config_dir.clone(),
                 database.clone(),
             )),
+            database_diagnostics: Some(DatabaseDiagnosticsService::new(database.clone())),
             libraries: Some(libraries),
             catalog: Some(catalog),
             home: Some(home),
@@ -573,6 +576,15 @@ impl AppState {
     pub fn start_webhook_worker(&self) {
         if let Some(webhooks) = self.webhooks.as_ref() {
             webhooks.spawn_worker();
+        }
+    }
+
+    pub async fn start_database_diagnostics(&self) {
+        if self.database_selection_required {
+            return;
+        }
+        if let Some(service) = &self.database_diagnostics {
+            service.start().await;
         }
     }
 
