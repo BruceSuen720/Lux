@@ -240,6 +240,21 @@ impl LogStore {
         .map_err(|error| io::Error::other(format!("审计日志读取任务失败: {error}")))?
     }
 
+    pub async fn list_activity_events(&self, limit: i64) -> io::Result<Vec<AuditLogEvent>> {
+        self.initialize().await?;
+        let log_dir = log_dir(&self.config_dir);
+        let archive_dir = archive_dir(&self.config_dir);
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let _manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            read_activity_events(&log_dir, &archive_dir, limit)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("近期活动日志读取任务失败: {error}")))?
+    }
+
     pub(crate) fn writer(&self) -> LogWriter {
         LogWriter {
             manager: Arc::clone(&self.manager),
@@ -548,6 +563,131 @@ fn read_audit_event_lines<R: io::BufRead>(
             created_at: record["createdAt"].as_i64().unwrap_or_default(),
         });
     }
+}
+
+fn read_activity_events(
+    log_dir: &Path,
+    archive_dir: &Path,
+    limit: i64,
+) -> io::Result<Vec<AuditLogEvent>> {
+    let category_limit = usize::try_from((limit / 2).max(1)).unwrap_or(usize::MAX);
+    let mut login_events = Vec::with_capacity(category_limit.min(12));
+    let mut playback_events = Vec::with_capacity(category_limit.min(12));
+    let active_entries = match fs::read_dir(log_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = active_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if name.starts_with("lux.") && name.ends_with(".log") {
+                read_activity_event_lines(
+                    io::BufReader::new(fs::File::open(path)?),
+                    category_limit,
+                    &mut login_events,
+                    &mut playback_events,
+                )?;
+            }
+        }
+    }
+    let archive_entries = match fs::read_dir(archive_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = archive_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".log.zip"))
+            {
+                continue;
+            }
+            let mut archive = ZipArchive::new(fs::File::open(path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            for index in 0..archive.len() {
+                let member = archive
+                    .by_index(index)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if member.name().ends_with(".log") {
+                    read_activity_event_lines(
+                        io::BufReader::new(member),
+                        category_limit,
+                        &mut login_events,
+                        &mut playback_events,
+                    )?;
+                }
+            }
+        }
+    }
+    login_events.extend(playback_events);
+    sort_audit_events(&mut login_events);
+    login_events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+    Ok(login_events)
+}
+
+fn read_activity_event_lines<R: io::BufRead>(
+    mut reader: R,
+    category_limit: usize,
+    login_events: &mut Vec<AuditLogEvent>,
+    playback_events: &mut Vec<AuditLogEvent>,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if record["recordType"] != "admin_audit_event" {
+            continue;
+        }
+        let Some(event_type) = record["eventType"].as_str() else {
+            continue;
+        };
+        let category = match event_type {
+            "AUTH_LOGIN" => &mut *login_events,
+            "PLAYBACK_STARTED" | "PLAYBACK_PAUSED" | "PLAYBACK_STOPPED" => &mut *playback_events,
+            _ => continue,
+        };
+        let Some(id) = record["id"].as_str() else {
+            continue;
+        };
+        let metadata_json =
+            serde_json::to_string(&record["metadata"]).unwrap_or_else(|_| "{}".to_owned());
+        category.push(AuditLogEvent {
+            id: id.to_owned(),
+            actor_user_id: record["actorUserId"].as_str().map(str::to_owned),
+            actor_username: record["actorUsername"].as_str().map(str::to_owned),
+            event_type: event_type.to_owned(),
+            target_type: record["targetType"].as_str().map(str::to_owned),
+            target_id: record["targetId"].as_str().map(str::to_owned),
+            metadata_json,
+            created_at: record["createdAt"].as_i64().unwrap_or_default(),
+        });
+        sort_audit_events(category);
+        category.truncate(category_limit);
+    }
+}
+
+fn sort_audit_events(events: &mut [AuditLogEvent]) {
+    events.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
 }
 
 pub(crate) struct LogWriter {

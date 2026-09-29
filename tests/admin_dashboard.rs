@@ -6,6 +6,7 @@ use luxd::{
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
+    observability::logs::LogStore,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -33,6 +34,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
+    let log_store = LogStore::new(&config.config_dir);
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
     let admin = setup.complete("Admin", "Admin", "correct password").await?;
@@ -169,6 +171,19 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             .await?;
         assert_eq!(repeated_login.status(), reqwest::StatusCode::OK);
     }
+    log_store
+        .append_json(json!({
+            "recordType": "admin_audit_event",
+            "id": "activity-with-deleted-user-and-media",
+            "actorUserId": "deleted-user",
+            "actorUsername": null,
+            "eventType": "PLAYBACK_PAUSED",
+            "targetType": "media_item",
+            "targetId": "deleted-media",
+            "metadata": {"state": "PAUSED"},
+            "createdAt": 1,
+        }))
+        .await?;
 
     let dashboard = client
         .get(format!("{base_url}/api/v1/admin/dashboard"))
@@ -239,6 +254,34 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(playback_activity["metadata"]["remoteIp"], "203.0.113.10");
     assert!(playback_activity["remoteIpLocation"].is_null());
     assert!(events.len() <= 24);
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["eventType"] == "AUTH_LOGIN")
+            .count()
+            <= 12
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["eventType"] != "AUTH_LOGIN")
+            .count()
+            <= 12
+    );
+    assert!(events.windows(2).all(|pair| {
+        let previous_time = pair[0]["createdAt"].as_i64().unwrap_or_default();
+        let next_time = pair[1]["createdAt"].as_i64().unwrap_or_default();
+        previous_time > next_time
+            || (previous_time == next_time
+                && pair[0]["id"].as_str().unwrap_or_default()
+                    >= pair[1]["id"].as_str().unwrap_or_default())
+    }));
+    let orphaned_activity = events
+        .iter()
+        .find(|event| event["id"] == "activity-with-deleted-user-and-media")
+        .ok_or("missing activity with deleted user and media")?;
+    assert!(orphaned_activity["userName"].is_null());
+    assert!(orphaned_activity["targetTitle"].is_null());
 
     sqlx::query(
         "UPDATE playback_sessions

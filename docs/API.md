@@ -95,9 +95,9 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - 弹幕插件 `org.lux.danmaku` 的配置通过通用 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存；除 `providerBaseUrl` 外还支持 `concurrency`（0-64，默认 2；0 表示不设插件级限制）和 `overwrite`（默认 `false`，勾选后每次运行覆盖已有同名 XML）；`providerBaseUrl` 只在插件配置响应中以脱敏值展示，主设置页不再保存弹幕配置。
 - `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求百度、Google 和 Cloudflare 三个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。具体 provider 的连通性由其插件自身的健康状态负责。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET /api/v1/admin/health`：返回管理员可见的运行诊断，包括 schema、SQLite WAL 与实际写探针结果（`database.status`、`database.writable`）、连接池当前快照（`database.pool.maxConnections`、`size`、`idle`、`inUse`、`saturated`）、配置目录实际写入能力、ffprobe、媒体库根路径和后台任务计数；同时返回 `runtime.seconds`、`resources.cpu`、`resources.memory` 和 `resources.mediaStorage`。具体 metadata provider 不在主程序健康响应中探测，插件状态请通过插件管理接口查看。CPU/内存只读取 Lux 容器 cgroup，`mediaStorage` 只读取容器内 `/media` 挂载点的文件系统容量；不回退到宿主机整体资源，不返回本地配置路径或密钥。CPU 返回 `usageCores`、`capacityCores` 和按该容量归一化到 0-100 的 `usagePercent`；有 cgroup 配额时容量为配额核数，没有配额时容量为进程可见的 CPU 核数。`limitCores` 保留为实际 cgroup 配额字段，没有配额时为 `null`。指标不可用时 `available` 为 `false`，数值字段为 `null`。写入能力失败时整体 `status` 为 `degraded`，但仍返回可诊断的安全状态。
-- `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`stats`（已启用媒体库中未移除的 `movieCount`、`seriesCount`，以及未禁用用户的 `userCount`）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。正在播放数据只返回安全的媒体/轨道摘要、可空的 `remoteIp` 客户端来源 IP，以及可空的 `remoteIpLocation`（`location`、`district`、`street`、`isp`）。归属地只读取进程内缓存；首次遇到公网 IP 时由后台异步查询 Hiofd，失败或未完成时为 `null`，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
+- `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`stats`（已启用媒体库中未移除的 `movieCount`、`seriesCount`，以及未禁用用户的 `userCount`）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。近期登录/播放活动来自配置目录文件日志；用户名称与媒体标题只从当前数据库记录补全，已删除目标显示为空。正在播放数据只返回安全的媒体/轨道摘要、可空的 `remoteIp` 客户端来源 IP，以及可空的 `remoteIpLocation`（`location`、`district`、`street`、`isp`）。归属地只读取进程内缓存；首次遇到公网 IP 时由后台异步查询 Hiofd，失败或未完成时为 `null`，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
 - `GET /api/v1/admin/events`：管理员 Web session 的 SSE 失效通知流，不要求 CSRF。响应为 `text/event-stream`、禁止缓存并关闭反向代理缓冲；首帧为 `event: ready` 与 `{"version":1}`，变更帧为 `event: invalidate` 与 `{"scope":"dashboard|jobs|libraries|plugins|users|metadata|settings|all"}`，每 15 秒发送注释心跳。广播丢帧时发送 `all`，客户端应重新读取所有管理员查询；流不传输业务数据或敏感信息。
-- `GET /api/v1/admin/logs`：返回脱敏的管理员审计事件，与 `/api/v1/admin/audit` 兼容；按创建时间和 ID 倒序合并文件日志与升级前数据库历史，支持 `page`、`pageSize`。
+- `GET /api/v1/admin/logs`：返回脱敏的管理员审计和近期活动事件，与 `/api/v1/admin/audit` 兼容；按创建时间和 ID 倒序合并文件日志与升级前数据库历史，支持 `page`、`pageSize`。
 - `GET /api/v1/admin/logs/export?from=YYYY-MM-DD&to=YYYY-MM-DD`：管理员按 UTC 日期导出持久化 JSON 日志；单日范围返回按时间拼接的原始 JSONL，多日范围返回包含每日文件的 ZIP。不传日期时默认最近 7 个 UTC 日，日期范围最多 31 天，可读取活动日文件及 `/config/logs/archive/` 中保留的分段。
 
 ## 插件与刮削器（LUX-142、LUX-162）
@@ -198,7 +198,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
 - `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；`PATCH` 携带 `isDisabled: true` 只禁用账户并保留数据，`DELETE` 永久删除账户及关联数据并返回 204；最后一个启用的服务器管理账户受保护。
 - `GET /api/v1/admin/users/{userId}/libraries`：读取该用户当前可访问的媒体库 ID，用于管理控制台展示 ACL；不返回服务器路径。
-- `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计事件。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；迁移前数据库历史仍参与查询，后续由 LUX-314 迁出。
+- `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计与近期登录/播放活动。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；迁移前数据库历史仍参与查询，后续由 LUX-315 迁出。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。
 - `DELETE /api/v1/admin/items/{itemId}`：管理员删除指定媒体源及其同名旁车文件；若媒体文件已被外部删除，仍会清理 Lux 中的媒体源记录，没有其他媒体源时同时标记逻辑条目移除。支持通过 `sourceId` 选择版本，要求 CSRF。

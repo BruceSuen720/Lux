@@ -737,8 +737,49 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredActivityEvent>, StorageError> {
         let category_limit = (limit / 2).max(1);
-        self.query(
-            "WITH ranked_activity AS (
+        let file_events = self
+            .log_store
+            .list_activity_events(limit)
+            .await
+            .map_err(|source| StorageError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        let actor_user_ids = file_events
+            .iter()
+            .filter_map(|event| event.actor_user_id.clone())
+            .collect::<Vec<_>>();
+        let actor_usernames = self.list_usernames_by_ids(&actor_user_ids).await?;
+        let item_ids = file_events
+            .iter()
+            .filter_map(|event| event.target_id.clone())
+            .collect::<Vec<_>>();
+        let item_metadata = self.list_media_item_metadata_by_ids(&item_ids).await?;
+        let mut events = file_events
+            .into_iter()
+            .map(|event| StoredActivityEvent {
+                actor_username: event.actor_username.or_else(|| {
+                    actor_usernames
+                        .get(event.actor_user_id.as_deref()?)
+                        .cloned()
+                }),
+                target_title: event
+                    .target_id
+                    .as_deref()
+                    .and_then(|item_id| item_metadata.get(item_id))
+                    .map(|metadata| metadata.title.clone()),
+                id: event.id,
+                actor_user_id: event.actor_user_id,
+                event_type: event.event_type,
+                target_type: event.target_type,
+                target_id: event.target_id,
+                metadata_json: event.metadata_json,
+                created_at: event.created_at,
+            })
+            .collect::<Vec<_>>();
+        let database_events = self
+            .query(
+                "WITH ranked_activity AS (
                  SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
                         ae.event_type, ae.target_type, ae.target_id,
                         mi.title AS target_title, ae.metadata_json, ae.created_at,
@@ -762,30 +803,93 @@ impl Database {
              WHERE category_rank <= ?
              ORDER BY created_at DESC, id DESC
              LIMIT ?",
-        )
-        .bind(category_limit)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredActivityEvent {
-                    id: row.get("id"),
-                    actor_user_id: row.get("actor_user_id"),
-                    actor_username: row.get("actor_username"),
-                    event_type: row.get("event_type"),
-                    target_type: row.get("target_type"),
-                    target_id: row.get("target_id"),
-                    target_title: row.get("target_title"),
-                    metadata_json: row.get("metadata_json"),
-                    created_at: row.get("created_at"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(category_limit)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredActivityEvent {
+                        id: row.get("id"),
+                        actor_user_id: row.get("actor_user_id"),
+                        actor_username: row.get("actor_username"),
+                        event_type: row.get("event_type"),
+                        target_type: row.get("target_type"),
+                        target_id: row.get("target_id"),
+                        target_title: row.get("target_title"),
+                        metadata_json: row.get("metadata_json"),
+                        created_at: row.get("created_at"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        events.extend(database_events);
+        events.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let mut seen_ids = HashSet::with_capacity(events.len());
+        events.retain(|event| seen_ids.insert(event.id.clone()));
+        let mut login_count = 0_i64;
+        let mut playback_count = 0_i64;
+        events.retain(|event| {
+            if event.event_type == "AUTH_LOGIN" {
+                login_count += 1;
+                login_count <= category_limit
+            } else {
+                playback_count += 1;
+                playback_count <= category_limit
+            }
+        });
+        events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        Ok(events)
+    }
+
+    async fn list_usernames_by_ids(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, String>, StorageError> {
+        let user_ids = user_ids
+            .iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut usernames = HashMap::with_capacity(user_ids.len());
+        for chunk in user_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query =
+                format!("SELECT id, username_normalized FROM users WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id.as_str());
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            usernames.extend(rows.into_iter().map(|row| {
+                (
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("username_normalized"),
+                )
+            }));
+        }
+        Ok(usernames)
     }
 
     pub(crate) async fn find_user_by_access_token(
