@@ -5,6 +5,7 @@ import type {
   AdminHealth,
   AdminImage,
   AdminJob,
+  AdminJobEventPage,
   AdminTaskActivity,
   AdminScheduledTask,
   AdminScheduledTaskPage,
@@ -1001,6 +1002,13 @@ export class LuxApiClient {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminJob[] }>(`/api/v1/admin/jobs?${params}`);
+  }
+
+  adminJobEvents(jobId: string, level = "ERROR") {
+    const params = new URLSearchParams({ page: "1", pageSize: "1", level });
+    return this.request<AdminJobEventPage>(
+      `/api/v1/admin/jobs/${encodeURIComponent(jobId)}/events?${params}`,
+    );
   }
 
   adminTaskActivity() {

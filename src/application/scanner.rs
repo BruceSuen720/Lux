@@ -1853,6 +1853,8 @@ impl ManifestDirectoryReader {
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
+const LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
+const SQLITE_SCAN_LOCK_RETRY_DELAYS_MS: [u64; 3] = [250, 750, 1_500];
 const SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK: Duration = Duration::from_millis(250);
 const SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS: i64 = 30;
 const MAX_SCAN_LOCAL_METADATA_SOURCE_IDS: usize = 256;
@@ -4575,6 +4577,7 @@ pub struct ScanJobService {
     default_scan_concurrency: usize,
     scan_concurrency_override: Option<usize>,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    scan_run_registry: Arc<Mutex<ScanRunRegistry>>,
     metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     local_metadata_outbox_worker_started: Arc<AtomicBool>,
     local_metadata_outbox_notify: Arc<Notify>,
@@ -4586,6 +4589,74 @@ struct LocalMetadataWorkerHandle {
     task: JoinHandle<()>,
     job_id: String,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
+
+#[derive(Default)]
+struct ActiveScanJobRun {
+    library_id: String,
+    run_count: usize,
+}
+
+#[derive(Default)]
+struct ScanRunRegistry {
+    active_runs: HashMap<String, ActiveScanJobRun>,
+    deleting_libraries: HashMap<String, usize>,
+}
+
+struct ScanJobRunGuard {
+    registry: Arc<Mutex<ScanRunRegistry>>,
+    job_id: String,
+}
+
+impl Drop for ScanJobRunGuard {
+    fn drop(&mut self) {
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let remove_job = if let Some(active_run) = registry.active_runs.get_mut(&self.job_id) {
+            if active_run.run_count > 1 {
+                active_run.run_count -= 1;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if remove_job {
+            registry.active_runs.remove(&self.job_id);
+        }
+    }
+}
+
+#[must_use = "keep this guard alive until the library has been deleted"]
+pub struct LibraryDeletionGuard {
+    registry: Arc<Mutex<ScanRunRegistry>>,
+    library_id: String,
+}
+
+impl Drop for LibraryDeletionGuard {
+    fn drop(&mut self) {
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let remove_library =
+            if let Some(deletion_count) = registry.deleting_libraries.get_mut(&self.library_id) {
+                if *deletion_count > 1 {
+                    *deletion_count -= 1;
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+        if remove_library {
+            registry.deleting_libraries.remove(&self.library_id);
+        }
+    }
 }
 
 async fn process_scan_local_metadata_batch(
@@ -4739,6 +4810,7 @@ impl ScanJobService {
                 .flatten()
                 .and_then(|value| usize::try_from(value).ok()),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
+            scan_run_registry: Arc::new(Mutex::new(ScanRunRegistry::default())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_metadata_outbox_worker_started: Arc::new(AtomicBool::new(false)),
             local_metadata_outbox_notify: Arc::new(Notify::new()),
@@ -4817,6 +4889,36 @@ impl ScanJobService {
             Err(poisoned) => poisoned.into_inner(),
         };
         flags.remove(job_id);
+    }
+
+    fn track_scan_job_run(&self, job_id: &str, library_id: &str) -> Option<ScanJobRunGuard> {
+        let mut registry = match self.scan_run_registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if registry.deleting_libraries.contains_key(library_id) {
+            return None;
+        }
+        let active_run = registry
+            .active_runs
+            .entry(job_id.to_owned())
+            .or_insert_with(|| ActiveScanJobRun {
+                library_id: library_id.to_owned(),
+                run_count: 0,
+            });
+        active_run.run_count += 1;
+        Some(ScanJobRunGuard {
+            registry: Arc::clone(&self.scan_run_registry),
+            job_id: job_id.to_owned(),
+        })
+    }
+
+    fn scan_job_run_is_active(&self, job_id: &str) -> bool {
+        let registry = match self.scan_run_registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.active_runs.contains_key(job_id)
     }
 
     async fn ensure_lite_manifest_discovery_session(
@@ -4957,20 +5059,65 @@ impl ScanJobService {
     pub async fn prepare_library_deletion(
         &self,
         library_id: LibraryId,
-    ) -> Result<(), ScanJobError> {
+    ) -> Result<LibraryDeletionGuard, ScanJobError> {
         let library_id = library_id.to_string();
-        for status in ["PENDING", "RUNNING"] {
-            let jobs = self
-                .database
-                .list_scan_jobs(Some(status), 0, 10_000)
-                .await?;
-            for job in jobs.into_iter().filter(|job| job.library_id == library_id) {
-                self.cancellation_flag(&job.id)
-                    .store(true, Ordering::Release);
-                self.database.request_scan_job_cancel(&job.id).await?;
+        let (deletion_guard, active_job_ids) = {
+            let mut registry = match self.scan_run_registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *registry
+                .deleting_libraries
+                .entry(library_id.clone())
+                .or_default() += 1;
+            let active_job_ids = registry
+                .active_runs
+                .iter()
+                .filter(|(_, active_run)| active_run.library_id == library_id)
+                .map(|(job_id, _)| job_id.clone())
+                .collect::<Vec<_>>();
+            (
+                LibraryDeletionGuard {
+                    registry: Arc::clone(&self.scan_run_registry),
+                    library_id: library_id.clone(),
+                },
+                active_job_ids,
+            )
+        };
+        let jobs = self
+            .database
+            .list_scan_jobs_for_library_deletion(&library_id)
+            .await?;
+        let mut cancellation_job_ids = active_job_ids.into_iter().collect::<HashSet<_>>();
+        cancellation_job_ids.extend(jobs.into_iter().map(|job| job.id));
+        let active_job_ids = cancellation_job_ids
+            .iter()
+            .filter(|job_id| self.scan_job_run_is_active(job_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for job_id in cancellation_job_ids {
+            self.cancellation_flag(&job_id)
+                .store(true, Ordering::Release);
+            self.database.request_scan_job_cancel(&job_id).await?;
+            if !self.scan_job_run_is_active(&job_id) {
+                self.cancel_running_job(&job_id).await?;
             }
         }
-        Ok(())
+        let wait_for_active_runs = async {
+            while active_job_ids
+                .iter()
+                .any(|job_id| self.scan_job_run_is_active(job_id))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT, wait_for_active_runs)
+            .await
+            .is_err()
+        {
+            return Err(ScanJobError::LibraryDeletionScanTimeout);
+        }
+        Ok(deletion_guard)
     }
 
     async fn cancel_running_job(&self, job_id: &str) -> Result<ScanBatchReport, ScanJobError> {
@@ -5455,14 +5602,32 @@ impl ScanJobService {
         } else {
             batch_size
         };
-        match self
-            .run_batch_unlocked(job_id, batch_size, stream_files_during_discovery)
-            .await
-        {
-            Ok(report) => Ok(report),
-            Err(error) => {
-                self.fail_unhandled_scan_job(job_id, &error).await?;
+        let mut retry_attempt = 0;
+        loop {
+            match self
+                .run_batch_unlocked(job_id, batch_size, stream_files_during_discovery)
+                .await
+            {
+                Ok(report) => return Ok(report),
                 Err(error)
+                    if error.is_retryable_sqlite_lock_contention()
+                        && retry_attempt < SQLITE_SCAN_LOCK_RETRY_DELAYS_MS.len() =>
+                {
+                    let retry_delay_ms = SQLITE_SCAN_LOCK_RETRY_DELAYS_MS[retry_attempt];
+                    retry_attempt += 1;
+                    tracing::warn!(
+                        job_id,
+                        retry_attempt,
+                        retry_delay_ms,
+                        error_code = error.code(),
+                        "SQLite write contention during scan; retrying the current batch"
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                }
+                Err(error) => {
+                    self.fail_unhandled_scan_job(job_id, &error).await?;
+                    return Err(error);
+                }
             }
         }
     }
@@ -7702,11 +7867,9 @@ impl ScanJobService {
         &self,
         job_id: &str,
     ) -> Result<bool, ScanJobError> {
-        let job = self
-            .database
-            .find_scan_job(job_id)
-            .await?
-            .ok_or(ScanJobError::JobNotFound)?;
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Ok(false);
+        };
         let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? else {
             return Ok(false);
         };
@@ -9310,6 +9473,9 @@ impl ScanJobService {
         _completed_entries: &[StoredReconciliationScanEntry],
         _next_count: i64,
     ) -> Result<ScanBatchReport, ScanJobError> {
+        if scanner_error_sqlite_lock_code(&error).is_some() {
+            return Err(error.into());
+        }
         let error_code = error.code();
         self.database
             .finish_scan_manifest(&job.id, "FAILED")
@@ -10113,6 +10279,13 @@ impl ScanJobService {
             .has_pending_scan_job_metadata_targets(scan_job_id)
             .await?
         {
+            let cancellation = self.cancellation_flag(scan_job_id);
+            if self
+                .cancellation_requested(scan_job_id, false, &cancellation)
+                .await?
+            {
+                break;
+            }
             if let Some(notify) = &notify {
                 let notified = notify.notified();
                 tokio::select! {
@@ -10132,6 +10305,13 @@ impl ScanJobService {
             .has_pending_scan_local_metadata_images(scan_job_id)
             .await?
         {
+            let cancellation = self.cancellation_flag(scan_job_id);
+            if self
+                .cancellation_requested(scan_job_id, false, &cancellation)
+                .await?
+            {
+                break;
+            }
             tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
         }
         Ok(())
@@ -10146,6 +10326,23 @@ impl ScanJobService {
         if let Ok(mut notifications) = worker.notifications.lock() {
             notifications.remove(&worker.job_id);
         }
+    }
+
+    async fn finish_cancellation_if_requested(
+        &self,
+        job_id: &str,
+        local_metadata_worker: &mut Option<LocalMetadataWorkerHandle>,
+    ) -> Result<bool, ScanJobError> {
+        let cancellation = self.cancellation_flag(job_id);
+        if !self
+            .cancellation_requested(job_id, false, &cancellation)
+            .await?
+        {
+            return Ok(false);
+        }
+        Self::stop_local_metadata_worker(local_metadata_worker).await;
+        self.cancel_running_job(job_id).await?;
+        Ok(true)
     }
 
     pub async fn run_to_completion(
@@ -10182,6 +10379,15 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            // Library deletion cascades queued jobs. A stale worker wakeup after that
+            // cascade has nothing left to run and should finish quietly.
+            return Ok(());
+        };
+        let Some(_run_guard) = self.track_scan_job_run(job_id, &job.library_id) else {
+            self.cancel_running_job(job_id).await?;
+            return Ok(());
+        };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(
                 job_id, batch_size, probe, metadata, thumbnails,
@@ -10292,9 +10498,10 @@ impl ScanJobService {
                     }
                 }
                 drop(scan_permit);
-                if self.cancellation_requested_in_memory(job_id) {
-                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    self.cancel_running_job(job_id).await?;
+                if self
+                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                    .await?
+                {
                     return Ok(());
                 }
                 if incremental {
@@ -10302,10 +10509,28 @@ impl ScanJobService {
                         Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                         return Err(error);
                     }
+                    if self
+                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     self.run_probe_after_scan(job_id, probe).await?;
+                    if self
+                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
                         .await?;
+                    if self
+                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     for target_type in ["SOURCE", "ITEM"] {
                         self.database
                             .skip_pending_scan_job_target_stage(job_id, target_type, "THUMBNAIL")
@@ -10356,6 +10581,12 @@ impl ScanJobService {
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     return Err(error);
                 }
+                if self
+                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                    .await?
+                {
+                    return Ok(());
+                }
                 Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                 self.update_activity(job_id, Some("媒体探测"), "POSTPROCESSING")
                     .await?;
@@ -10364,6 +10595,12 @@ impl ScanJobService {
                         .await?;
                 }
                 self.run_probe_after_scan(job_id, probe).await?;
+                if self
+                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                    .await?
+                {
+                    return Ok(());
+                }
                 self.update_activity(job_id, Some("本地元数据"), "POSTPROCESSING")
                     .await?;
                 if defer_local_metadata_worker {
@@ -10371,9 +10608,21 @@ impl ScanJobService {
                         .await?;
                 }
                 self.run_metadata_after_scan(job_id).await?;
+                if self
+                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                    .await?
+                {
+                    return Ok(());
+                }
                 self.update_activity(job_id, Some("媒体库封面"), "POSTPROCESSING")
                     .await?;
                 self.run_auto_library_cover_after_scan(job_id).await?;
+                if self
+                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                    .await?
+                {
+                    return Ok(());
+                }
                 self.update_activity(job_id, Some("视频缩略图"), "POSTPROCESSING")
                     .await?;
                 if defer_local_metadata_worker {
@@ -10382,8 +10631,20 @@ impl ScanJobService {
                 }
                 if uses_local_metadata_outbox && thumbnails.is_some() {
                     self.wait_for_local_metadata_images(job_id).await?;
+                    if self
+                        .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                        .await?
+                    {
+                        return Ok(());
+                    }
                 }
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
+                if self
+                    .finish_cancellation_if_requested(job_id, &mut local_metadata_worker)
+                    .await?
+                {
+                    return Ok(());
+                }
                 self.database
                     .clear_completed_scan_job_targets(job_id)
                     .await?;
@@ -11503,8 +11764,31 @@ pub enum ScanJobError {
     AlreadyActive(String),
     InvalidBatchSize,
     ScanLockClosed,
+    LibraryDeletionScanTimeout,
     Scanner(ScannerError),
     Storage(StorageError),
+}
+
+fn sqlite_lock_contention_code(error: &StorageError) -> Option<&'static str> {
+    let StorageError::Sqlx { source, .. } = error else {
+        return None;
+    };
+    let code = source
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .and_then(|code| code.parse::<i32>().ok())?;
+    match code & 0xff {
+        5 => Some("SQLITE_BUSY"),
+        6 => Some("SQLITE_LOCKED"),
+        _ => None,
+    }
+}
+
+fn scanner_error_sqlite_lock_code(error: &ScannerError) -> Option<&'static str> {
+    match error {
+        ScannerError::Storage(error) => sqlite_lock_contention_code(error),
+        _ => None,
+    }
 }
 
 impl ScanJobError {
@@ -11517,9 +11801,14 @@ impl ScanJobError {
             Self::AlreadyActive(_) => "ALREADY_ACTIVE",
             Self::InvalidBatchSize => "INVALID_BATCH_SIZE",
             Self::ScanLockClosed => "SCAN_LOCK_CLOSED",
+            Self::LibraryDeletionScanTimeout => "LIBRARY_DELETION_SCAN_TIMEOUT",
             Self::Scanner(error) => error.code(),
-            Self::Storage(_) => "STORAGE_ERROR",
+            Self::Storage(error) => sqlite_lock_contention_code(error).unwrap_or("STORAGE_ERROR"),
         }
+    }
+
+    fn is_retryable_sqlite_lock_contention(&self) -> bool {
+        matches!(self.code(), "SQLITE_BUSY" | "SQLITE_LOCKED")
     }
 }
 
@@ -11533,6 +11822,9 @@ impl std::fmt::Display for ScanJobError {
             Self::AlreadyActive(id) => write!(formatter, "scan job already active: {id}"),
             Self::InvalidBatchSize => formatter.write_str("scan batch size must be positive"),
             Self::ScanLockClosed => formatter.write_str("scan lock is closed"),
+            Self::LibraryDeletionScanTimeout => {
+                formatter.write_str("timed out waiting for scans to stop before library deletion")
+            }
             Self::Scanner(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
@@ -12348,7 +12640,7 @@ impl ScannerError {
             Self::NonUtf8Path => "NON_UTF8_PATH",
             Self::FileSizeOverflow(_) => "FILE_SIZE_OVERFLOW",
             Self::Io { .. } => "SCAN_IO",
-            Self::Storage(_) => "STORAGE_ERROR",
+            Self::Storage(error) => sqlite_lock_contention_code(error).unwrap_or("STORAGE_ERROR"),
         }
     }
 }
@@ -12444,6 +12736,71 @@ mod tests {
         assert_eq!(configured_scan_concurrency(Some(8), Some(4), 16), 8);
         assert_eq!(configured_scan_concurrency(None, Some(4), 16), 4);
         assert_eq!(configured_scan_concurrency(None, None, 16), 16);
+    }
+
+    #[tokio::test]
+    async fn library_deletion_waits_for_terminal_active_run_and_fences_new_runs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "active-terminal-job";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'COMPLETED', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let library_id = library.id.to_string();
+        let active_run = jobs
+            .track_scan_job_run(job_id, &library_id)
+            .ok_or("initial run should register before deletion starts")?;
+        sqlx::query("UPDATE scan_jobs SET status = 'CANCELLED', scan_phase = 'IDLE' WHERE id = ?")
+            .bind(job_id)
+            .execute(database.pool())
+            .await?;
+
+        let deletion_jobs = jobs.clone();
+        let preparation =
+            tokio::spawn(async move { deletion_jobs.prepare_library_deletion(library.id).await });
+        let fence_set = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(late_run) = jobs.track_scan_job_run("late-run", &library_id) {
+                    drop(late_run);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                } else {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(fence_set, "deletion should fence new runs promptly");
+        assert!(
+            !preparation.is_finished(),
+            "deletion must still wait when the active run's database row is terminal"
+        );
+
+        drop(active_run);
+        let _deletion_guard = preparation.await??;
+        libraries.delete_library(library.id).await?;
+        Ok(())
     }
 
     #[test]

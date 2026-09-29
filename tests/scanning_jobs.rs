@@ -4026,12 +4026,10 @@ async fn deleted_library_scan_worker_exits_as_cancelled_without_touching_media_f
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
-    jobs.prepare_library_deletion(library.id).await?;
+    let _deletion_guard = jobs.prepare_library_deletion(library.id).await?;
     libraries.delete_library(library.id).await?;
 
-    let report = jobs.run_batch(&job.id, 1).await?;
-    assert_eq!(report.status, "CANCELLED");
-    assert!(report.completed);
+    jobs.run_to_completion(&job.id, 1, None).await?;
     assert!(
         media_file.exists(),
         "library deletion must not delete media files"

@@ -8846,6 +8846,32 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_scan_jobs_for_library_deletion(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredScanJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error,
+                    created_at, started_at, finished_at,
+                    discovery_completed, auto_metadata_match,
+                    current_item, scan_phase
+             FROM scan_jobs
+             WHERE library_id = ?
+               AND (status IN ('PENDING', 'RUNNING')
+                    OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn count_scan_jobs_by_status(
         &self,
     ) -> Result<StoredScanJobCounts, StorageError> {
@@ -9382,7 +9408,8 @@ impl Database {
     pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs SET cancel_requested = 1, updated_at = unixepoch()
-             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+             WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
+                  OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))",
         )
         .bind(id)
         .execute(&self.pool)
@@ -9405,7 +9432,8 @@ impl Database {
              SET status = ?, error = ?, cursor = NULL, current_item = NULL,
                  scan_phase = 'IDLE',
                  finished_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+             WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
+                  OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))",
         )
         .bind(status)
         .bind(error)
