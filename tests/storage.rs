@@ -487,11 +487,10 @@ async fn sqlite_library_deletion_cascade_foreign_keys_have_indexes()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    let indexes: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'index'",
-    )
-    .fetch_all(database.pool())
-    .await?;
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .fetch_all(database.pool())
+            .await?;
 
     for expected in [
         "idx_danmaku_match_job_items_media_source_id",

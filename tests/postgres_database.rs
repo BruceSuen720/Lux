@@ -170,7 +170,10 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         .bind(index_name)
         .fetch_one(database.pool())
         .await?;
-        assert!(index_exists, "missing library-delete cascade index {index_name}");
+        assert!(
+            index_exists,
+            "missing library-delete cascade index {index_name}"
+        );
     }
     insert_postgres_homevideos_video(&database).await?;
     let manifest_tables: i64 = sqlx::query_scalar(
