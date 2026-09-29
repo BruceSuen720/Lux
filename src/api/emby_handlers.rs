@@ -1734,6 +1734,12 @@ pub(super) struct EmbyAuthenticateRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+pub(super) struct EmbyAuthenticateUserRequest {
+    #[serde(rename = "Pw")]
+    password: String,
+}
+
 pub(super) async fn emby_authenticate(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1756,46 +1762,7 @@ pub(super) async fn emby_authenticate(
         .await
     {
         Ok(Some(result)) => {
-            if state.remote_access.is_remote(
-                header_str(&headers, "x-lux-peer-ip"),
-                header_str(&headers, "x-forwarded-for"),
-            ) && !result.user.can_remote_access
-            {
-                let _ = auth.logout(&result.token).await;
-                return StatusCode::FORBIDDEN.into_response();
-            }
-            state.login_rate_limiter.record_success(&login_key).await;
-            let user_id = result.user.id.to_string();
-            record_activity_event(
-                state.database.as_ref(),
-                &state.admin_events,
-                &user_id,
-                "AUTH_LOGIN",
-                None,
-                json!({
-                    "client": result.device.client,
-                    "clientVersion": result.device.version,
-                    "deviceName": result.device.device,
-                    "deviceType": result.device.device,
-                    "remoteIp": request_client_ip(&headers, &state.remote_access),
-                }),
-            )
-            .await;
-            let server_name = current_emby_server_name(&state).await;
-            let ordered_views = emby_ordered_views(&state, &result.user).await;
-            let configuration = emby_user_configuration(&state, &result.user, &ordered_views).await;
-            Json(json!({
-                "User": emby_user_json(
-                    &result.user,
-                    &state.server_id,
-                    &server_name,
-                    configuration,
-                ),
-                "SessionInfo": emby_login_session_json(&result, &state.server_id),
-                "AccessToken": result.token,
-                "ServerId": state.server_id
-            }))
-            .into_response()
+            emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
@@ -1803,6 +1770,104 @@ pub(super) async fn emby_authenticate(
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+pub(super) async fn emby_authenticate_user_id(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let request = match parse_emby_authenticate_user_request(&headers, &body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+    let Some(auth) = state.emby_auth.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let login_key = login_attempt_key(&headers, &user_id);
+    if !state.login_rate_limiter.is_allowed(&login_key).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let device = emby_device_info_from_headers(&headers);
+    match auth
+        .authenticate_user_id(&user_id, &request.password, &device)
+        .await
+    {
+        Ok(Some(result)) => {
+            emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+        }
+        Ok(None) => {
+            state.login_rate_limiter.record_failure(&login_key).await;
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn emby_authentication_success_response(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &EmbyAuthService,
+    login_key: &str,
+    result: crate::auth::emby::EmbyAuthResult,
+) -> Response {
+    if state.remote_access.is_remote(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-for"),
+    ) && !result.user.can_remote_access
+    {
+        let _ = auth.logout(&result.token).await;
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    state.login_rate_limiter.record_success(login_key).await;
+    let user_id = result.user.id.to_string();
+    record_activity_event(
+        state.database.as_ref(),
+        &state.admin_events,
+        &user_id,
+        "AUTH_LOGIN",
+        None,
+        json!({
+            "client": result.device.client,
+            "clientVersion": result.device.version,
+            "deviceName": result.device.device,
+            "deviceType": result.device.device,
+            "remoteIp": request_client_ip(headers, &state.remote_access),
+        }),
+    )
+    .await;
+    let server_name = current_emby_server_name(state).await;
+    let ordered_views = emby_ordered_views(state, &result.user).await;
+    let configuration = emby_user_configuration(state, &result.user, &ordered_views).await;
+    Json(json!({
+        "User": emby_user_json(
+            &result.user,
+            &state.server_id,
+            &server_name,
+            configuration,
+        ),
+        "SessionInfo": emby_login_session_json(&result, &state.server_id),
+        "AccessToken": result.token,
+        "ServerId": state.server_id
+    }))
+    .into_response()
+}
+
+fn parse_emby_authenticate_user_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<EmbyAuthenticateUserRequest, StatusCode> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if content_type != "application/json" {
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 pub(super) fn parse_emby_authenticate_request(

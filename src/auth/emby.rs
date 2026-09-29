@@ -72,6 +72,26 @@ impl EmbyAuthService {
         else {
             return Ok(None);
         };
+        self.create_access_token(user, device).await.map(Some)
+    }
+
+    pub async fn authenticate_user_id(
+        &self,
+        user_id: &str,
+        password: &str,
+        device: &EmbyDeviceInfo,
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        let Some(user) = self.users.authenticate_by_id(user_id, password).await? else {
+            return Ok(None);
+        };
+        self.create_access_token(user, device).await.map(Some)
+    }
+
+    async fn create_access_token(
+        &self,
+        user: UserRecord,
+        device: &EmbyDeviceInfo,
+    ) -> Result<EmbyAuthResult, EmbyAuthError> {
         let token = generate_token()?;
         let token_id = UserId::new().to_string();
         let token_hash = hash_token(&token);
@@ -88,12 +108,12 @@ impl EmbyAuthService {
                 device_type: None,
             })
             .await?;
-        Ok(Some(EmbyAuthResult {
+        Ok(EmbyAuthResult {
             token,
             session_id: token_id,
             user: user.clone(),
             device: device.clone(),
-        }))
+        })
     }
 
     pub async fn logout(&self, token: &str) -> Result<(), EmbyAuthError> {

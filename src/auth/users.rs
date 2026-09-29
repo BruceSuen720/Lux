@@ -287,6 +287,15 @@ impl UserStore {
         self.authenticate_stored_user(stored, password).await
     }
 
+    pub(crate) async fn authenticate_by_id(
+        &self,
+        user_id: &str,
+        password: &str,
+    ) -> Result<Option<UserRecord>, UserStoreError> {
+        let stored = self.database.find_user_by_id(user_id).await?;
+        self.authenticate_stored_user(stored, password).await
+    }
+
     async fn authenticate_stored_user(
         &self,
         stored: Option<crate::storage::StoredUser>,

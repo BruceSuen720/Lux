@@ -14,14 +14,20 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
-## Emby 用户列表与登录名兼容（2026-09-29）
+## Emby 用户列表与登录兼容（2026-09-29）
 
 Lux 保持 Emby `UserDto.Name` 为账户显示名。`POST /Users/AuthenticateByName` 首先按规范登录用户名验证；若该用户名
 不存在，则允许用与 `Users/Public.Name` 完全相同且唯一的显示名登录。规范用户名优先；若多个账户有相同显示名则拒绝该别名，
 避免把凭据匹配到不确定的账户。登录会话的 `SessionInfo.UserName` 仍是显示名。
 
 `tests/emby_auth.rs` 覆盖从用户列表读取 `Name` 并将其原样提交登录，显示名和登录名不同仍返回 200；两个用户显示名相同时
-该别名返回 401。该自动化结果证明 Lux 服务端协议，与 AVdb 报告的失败条件相符；尚未在部署实例中进行 AVdb 实测。
+该别名返回 401。这个别名兼容不等于 AVdb 实际采用该用户名登录，AVdb 源码核查确认它使用用户 ID 登录。
+
+AVdb `20260909-1521` 镜像的设置保存代码实际调用 `POST /Users/{userId}/Authenticate`，发送 JSON `{"Pw": ...}`，并在
+请求头携带服务器 API Key。Lux 新增根路径和 `/emby` 前缀的同一端点，按路径中的用户 ID 验证密码并返回该用户的 Emby 登录响应。
+`tests/emby_auth.rs::emby_user_id_authentication_matches_avdb_request` 覆盖 AVdb 的请求头/请求体形状、两种路径及错误密码拒绝。Docker
+端到端验证使用 AVdb 镜像 `20260909-1521` 的实际设置页，用户和媒体库读取成功，旧 Lux 端点保存时显示密码验证失败；启用新端点后
+同一设置流程保存成功，页面显示 Emby API 连接正常和用户已登录。测试 Lux 为 `0.5.5`；未使用生产服务器或数据。
 
 ## Lux API 用户令牌与首页（2026-09-15）
 

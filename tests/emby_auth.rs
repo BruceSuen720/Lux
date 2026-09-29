@@ -415,6 +415,71 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
 }
 
 #[tokio::test]
+async fn emby_user_id_authentication_matches_avdb_request() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("login-name", "Display Name", "correct password")
+        .await?;
+    let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    for prefix in ["", "/emby"] {
+        let path = format!("{prefix}/Users/{}/Authenticate", admin.id);
+        let response = client
+            .post(format!("http://{address}{path}"))
+            .header("Accept", "application/json")
+            .header("X-Emby-Token", &admin_key)
+            .header("X-MediaBrowser-Token", &admin_key)
+            .header(
+                AUTHORIZATION,
+                r#"Emby Client="Avdb", Device="Avdb Server", DeviceId="avdb-server", Version="1.0""#,
+            )
+            .json(&json!({ "Pw": "correct password" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(body["User"]["Id"], admin.id.to_string());
+        assert!(
+            body["AccessToken"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        );
+    }
+
+    let wrong_password = client
+        .post(format!("http://{address}/Users/{}/Authenticate", admin.id))
+        .header("X-Emby-Token", &admin_key)
+        .json(&json!({ "Pw": "wrong password" }))
+        .send()
+        .await?;
+    assert_eq!(wrong_password.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_user_routes_match_official_request_and_response_contracts()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

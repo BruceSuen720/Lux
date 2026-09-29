@@ -2371,6 +2371,7 @@ services:
 
 - Users/Public、AuthenticateByName、Sessions/Logout 可用。
 - AuthenticateByName 接受规范登录用户名，或唯一匹配的 Users/Public `Name` 显示名；规范用户名优先，重名显示名拒绝登录。
+- `Users/{userId}/Authenticate` 接受 JSON `Pw`，只验证路径指定用户，并返回匹配的 `User.Id` 和 `AccessToken`；根路径与 `/emby` 前缀都可用。
 - 解析 Emby Authorization 设备字段。
 - AccessToken 仅返回一次，数据库只存哈希。
 - X-Emby-Token 和 api_key 兼容。
