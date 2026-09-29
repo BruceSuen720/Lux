@@ -2717,9 +2717,12 @@ services:
 
 验证：
 
-- `cargo test --locked --test media_matching --test scanner --test series_scanner --test metadata_api --test tmdb --test tmdb_plugin`
+- `cargo test --locked --test media_matching --test scanner --test series_scanner --test metadata_api`
+- `cargo test --locked --test scraper --test plugin_protocol --test plugin_runtime`
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+实施记录（2026-09-29）：新增同目录连字符后缀版本识别，只在恰好一个基础标题候选存在时聚合；扫描器覆盖初扫、旧拆分条目重扫修复、歧义拒绝和稳定重扫不重置 READY 探测状态。上述本地测试组 96 项、两项解析/扫描单测、Manifest 归并单测、`cargo build --locked` 和 `cargo fmt --all -- --check` 通过。`cargo test --locked --all-targets` 的 lib 阶段 591 项通过、1 项失败、7 项忽略；失败为既有 `embedded_subtitle::tests::rejects_excessive_extracted_output` 的超时/大小限制时序断言，单独重跑通过。Clippy 当前受日志改动阻塞：`src/observability/logs.rs::append_audit_event` 触发 `too_many_arguments`。仓库没有 `tmdb` 或 `tmdb_plugin` 测试目标；搜索分流由 `metadata_api` provider stub 覆盖，插件接口由 `plugin_protocol`/`plugin_runtime` 覆盖。
 
 依赖：LUX-052、LUX-060、LUX-061、LUX-142 的现有 TMDb 插件协议边界。
 
