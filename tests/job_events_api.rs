@@ -6,6 +6,7 @@ use luxd::{
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
+    observability::logs::LogStore,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -64,7 +65,8 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
 
-    let (base_url, server) = start_server(config, database, setup).await?;
+    let log_store = LogStore::new(&config.config_dir);
+    let (base_url, server) = start_server(config.clone(), database.clone(), setup).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -93,6 +95,16 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         .as_str()
         .ok_or("missing job ID")?
         .to_owned();
+    log_store
+        .append_scan_job_event(
+            "api-redaction-event",
+            &job_id,
+            "WARN",
+            "SCAN_SOURCE",
+            "fixture warning https://example.invalid/private?token=x",
+            r#"{"token":"do-not-log","apiKey":"do-not-log-either","sourceUrl":"https://example.invalid/private?token=x"}"#,
+        )
+        .await?;
 
     let mut events = Value::Null;
     for _ in 0..40 {
@@ -120,6 +132,15 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
             .iter()
             .any(|item| item["eventCode"] == "POSTPROCESSING_FAILED")
     }));
+    assert!(events["events"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["eventCode"] == "JOB_CREATED" && item["level"] == "INFO")
+    }));
+    let database_event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(database_event_count, 0);
 
     let completed = client
         .get(format!(
@@ -132,6 +153,26 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
     let completed_body: Value = completed.json().await?;
     assert_eq!(completed_body["total"], 1);
     assert_eq!(completed_body["events"][0]["level"], "ERROR");
+
+    let file_event = client
+        .get(format!(
+            "{base_url}/api/v1/admin/jobs/{job_id}/events?eventCode=SCAN_SOURCE&level=WARN"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(file_event.status(), reqwest::StatusCode::OK);
+    let file_event_body: Value = file_event.json().await?;
+    assert_eq!(file_event_body["total"], 1);
+    assert_eq!(
+        file_event_body["events"][0]["details"]["token"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        file_event_body["events"][0]["details"]["sourceUrl"],
+        "[REDACTED]"
+    );
+    assert_eq!(file_event_body["events"][0]["message"], "[REDACTED_URL]");
 
     let errors = client
         .get(format!(

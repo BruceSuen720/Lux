@@ -57,7 +57,7 @@ use crate::{
         DEFAULT_SCAN_CONCURRENCY, scan_concurrency_from_env, scan_concurrency_override_from_env,
     },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
-    observability::resources::ResourceMetrics,
+    observability::{logs::LogStore, resources::ResourceMetrics},
     storage::{
         Database, FilesystemEntryMove, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
         ManifestDeltaBatchCommit, ManifestDiscoveryCommitResult, ManifestPostprocessingTargetPage,
@@ -4579,6 +4579,7 @@ pub struct ScanJobService {
     metadata_reidentify: Option<MetadataReidentifyService>,
     home: Option<HomeService>,
     webhooks: Option<WebhookService>,
+    log_store: Option<LogStore>,
     resources: ResourceMetrics,
     default_scan_concurrency: usize,
     scan_concurrency_override: Option<usize>,
@@ -5178,6 +5179,7 @@ impl ScanJobService {
             metadata_reidentify: None,
             home: None,
             webhooks: None,
+            log_store: None,
             resources: ResourceMetrics::new(),
             default_scan_concurrency: usize::try_from(
                 scan_concurrency_from_env().unwrap_or(DEFAULT_SCAN_CONCURRENCY),
@@ -5208,6 +5210,11 @@ impl ScanJobService {
 
     pub fn with_user_events(mut self, user_events: UserEventHub) -> Self {
         self.user_events = user_events;
+        self
+    }
+
+    pub fn with_log_store(mut self, log_store: LogStore) -> Self {
+        self.log_store = Some(log_store);
         self
     }
 
@@ -11981,17 +11988,31 @@ impl ScanJobService {
         details_json: &str,
     ) {
         let id = Uuid::now_v7().to_string();
-        let _ = self
-            .database
-            .append_scan_job_event(NewScanJobEvent {
-                id: &id,
-                job_id,
-                level,
-                event_code,
-                message,
-                details_json,
-            })
-            .await;
+        if let Some(log_store) = self.log_store.as_ref() {
+            if let Err(error) = log_store
+                .append_scan_job_event(&id, job_id, level, event_code, message, details_json)
+                .await
+            {
+                tracing::error!(
+                    job_id,
+                    event_code,
+                    error_kind = ?error.kind(),
+                    "failed to persist scan job log event"
+                );
+            }
+        } else {
+            let _ = self
+                .database
+                .append_scan_job_event(NewScanJobEvent {
+                    id: &id,
+                    job_id,
+                    level,
+                    event_code,
+                    message,
+                    details_json,
+                })
+                .await;
+        }
         self.admin_events.publish(AdminEventScope::Jobs);
     }
 }

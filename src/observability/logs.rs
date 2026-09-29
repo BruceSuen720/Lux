@@ -1,12 +1,13 @@
 use std::{
+    collections::HashMap,
     fmt, fs,
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
 use serde_json::Value;
-use time::{Date, Month, OffsetDateTime};
+use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub const LOG_DIRECTORY: &str = "logs";
@@ -19,6 +20,8 @@ const MAX_DAILY_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
 
 type SharedLogManager = Arc<StdMutex<Option<LogManager>>>;
+type LogManagerRegistry = StdMutex<HashMap<PathBuf, Weak<StdMutex<Option<LogManager>>>>>;
+static LOG_MANAGER_REGISTRY: OnceLock<LogManagerRegistry> = OnceLock::new();
 
 /// Cloneable handle for structured JSONL logging and application event records.
 #[derive(Clone)]
@@ -27,11 +30,37 @@ pub struct LogStore {
     manager: SharedLogManager,
 }
 
+#[derive(Debug)]
+pub struct ScanJobLogEvent {
+    pub id: String,
+    pub job_id: String,
+    pub level: String,
+    pub event_code: String,
+    pub message: String,
+    pub details_json: String,
+    pub created_at: i64,
+}
+
 impl LogStore {
     pub fn new(config_dir: &Path) -> Self {
+        let manager_key = config_dir.to_path_buf();
+        let registry = LOG_MANAGER_REGISTRY.get_or_init(Default::default);
+        let mut registry = match registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.retain(|_, manager| manager.strong_count() > 0);
+        let manager = registry
+            .get(&manager_key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let manager = Arc::new(StdMutex::new(None));
+                registry.insert(manager_key.clone(), Arc::downgrade(&manager));
+                manager
+            });
         Self {
-            config_dir: config_dir.to_path_buf(),
-            manager: Arc::new(StdMutex::new(None)),
+            config_dir: manager_key,
+            manager,
         }
     }
 
@@ -76,10 +105,270 @@ impl LogStore {
         .map_err(|error| io::Error::other(format!("日志写入任务失败: {error}")))?
     }
 
+    pub async fn append_scan_job_event(
+        &self,
+        id: &str,
+        job_id: &str,
+        level: &str,
+        event_code: &str,
+        message: &str,
+        details_json: &str,
+    ) -> io::Result<()> {
+        if !matches!(level, "INFO" | "WARN" | "ERROR") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "任务事件级别无效",
+            ));
+        }
+        let details = serde_json::from_str::<Value>(details_json)
+            .map(redact_sensitive_log_values)
+            .unwrap_or_else(|_| serde_json::json!({ "invalid": true }));
+        let message = redact_sensitive_log_values(Value::String(message.to_owned()))
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let created_at = OffsetDateTime::now_utc();
+        self.append_json(serde_json::json!({
+            "recordType": "scan_job_event",
+            "id": id,
+            "jobId": job_id,
+            "level": level,
+            "eventCode": event_code,
+            "message": message,
+            "details": details,
+            "timestamp": created_at
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| created_at.unix_timestamp().to_string()),
+            "createdAt": created_at.unix_timestamp(),
+        }))
+        .await
+    }
+
+    pub async fn list_scan_job_events(
+        &self,
+        job_id: &str,
+        level: Option<&str>,
+        event_code: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> io::Result<(i64, Vec<ScanJobLogEvent>)> {
+        self.initialize().await?;
+        let log_dir = log_dir(&self.config_dir);
+        let archive_dir = archive_dir(&self.config_dir);
+        let job_id = job_id.to_owned();
+        let level = level.map(str::to_owned);
+        let event_code = event_code.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            read_scan_job_events(
+                &log_dir,
+                &archive_dir,
+                &job_id,
+                level.as_deref(),
+                event_code.as_deref(),
+                offset,
+                limit,
+            )
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("任务日志读取任务失败: {error}")))?
+    }
+
     pub(crate) fn writer(&self) -> LogWriter {
         LogWriter {
             manager: Arc::clone(&self.manager),
         }
+    }
+}
+
+fn redact_sensitive_log_values(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                let normalized_key = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                if [
+                    "password",
+                    "token",
+                    "secret",
+                    "cookie",
+                    "authorization",
+                    "apikey",
+                    "credential",
+                ]
+                .iter()
+                .any(|needle| normalized_key.contains(needle))
+                    || normalized_key.ends_with("url")
+                    || normalized_key.ends_with("uri")
+                {
+                    *value = Value::String("[REDACTED]".to_owned());
+                } else {
+                    *value = redact_sensitive_log_values(value.clone());
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                *value = redact_sensitive_log_values(value.clone());
+            }
+        }
+        Value::String(value) => {
+            let normalized = value.to_ascii_lowercase();
+            if value.contains("http://") || value.contains("https://") {
+                *value = "[REDACTED_URL]".to_owned();
+            } else if [
+                "token=",
+                "api_key=",
+                "apikey=",
+                "secret=",
+                "password=",
+                "cookie=",
+                "authorization:",
+                "bearer ",
+            ]
+            .iter()
+            .any(|needle| normalized.contains(needle))
+            {
+                *value = "[REDACTED]".to_owned();
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+fn read_scan_job_events(
+    log_dir: &Path,
+    archive_dir: &Path,
+    job_id: &str,
+    level: Option<&str>,
+    event_code: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> io::Result<(i64, Vec<ScanJobLogEvent>)> {
+    let mut events = Vec::new();
+    let active_entries = match fs::read_dir(log_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = active_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if name.starts_with("lux.") && name.ends_with(".log") {
+                let file = fs::File::open(path)?;
+                read_scan_job_event_lines(
+                    io::BufReader::new(file),
+                    job_id,
+                    level,
+                    event_code,
+                    &mut events,
+                )?;
+            }
+        }
+    }
+    let archive_entries = match fs::read_dir(archive_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = archive_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".log.zip"))
+            {
+                continue;
+            }
+            let file = fs::File::open(path)?;
+            let mut archive = ZipArchive::new(file)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            for index in 0..archive.len() {
+                let member = archive
+                    .by_index(index)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if !member.name().ends_with(".log") {
+                    continue;
+                }
+                read_scan_job_event_lines(
+                    io::BufReader::new(member),
+                    job_id,
+                    level,
+                    event_code,
+                    &mut events,
+                )?;
+            }
+        }
+    }
+    events.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let total = i64::try_from(events.len()).unwrap_or(i64::MAX);
+    let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    let count = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    let page = events.into_iter().skip(start).take(count).collect();
+    Ok((total, page))
+}
+
+fn read_scan_job_event_lines<R: io::BufRead>(
+    mut reader: R,
+    job_id: &str,
+    level: Option<&str>,
+    event_code: Option<&str>,
+    events: &mut Vec<ScanJobLogEvent>,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if record["recordType"] != "scan_job_event" || record["jobId"] != job_id {
+            continue;
+        }
+        let Some(id) = record["id"].as_str() else {
+            continue;
+        };
+        let Some(event_level) = record["level"].as_str() else {
+            continue;
+        };
+        let Some(code) = record["eventCode"].as_str() else {
+            continue;
+        };
+        if level.is_some_and(|value| !event_level.eq_ignore_ascii_case(value))
+            || event_code.is_some_and(|value| !code.eq_ignore_ascii_case(value))
+        {
+            continue;
+        }
+        let created_at = record["createdAt"].as_i64().unwrap_or_default();
+        let message = record["message"].as_str().unwrap_or_default().to_owned();
+        let details_json =
+            serde_json::to_string(&record["details"]).unwrap_or_else(|_| "{}".to_owned());
+        events.push(ScanJobLogEvent {
+            id: id.to_owned(),
+            job_id: job_id.to_owned(),
+            level: event_level.to_owned(),
+            event_code: code.to_owned(),
+            message,
+            details_json,
+            created_at,
+        });
     }
 }
 
@@ -678,11 +967,11 @@ fn compact_date(date: Date) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io};
+    use std::{fs, io, sync::Arc};
 
     use super::{
-        LogDateRange, LogExportError, LogManager, archive_dir, log_file_name, parse_date,
-        verify_archive,
+        LogDateRange, LogExportError, LogManager, LogStore, archive_dir, log_dir, log_file_name,
+        parse_date, read_scan_job_events, verify_archive,
     };
     use time::{Date, Month};
 
@@ -707,6 +996,14 @@ mod tests {
         assert!(parse_date("2026-8-09").is_err());
         assert!(parse_date("2026-02-30").is_err());
         assert!(parse_date("2026-02-09").is_ok());
+    }
+
+    #[test]
+    fn log_stores_for_the_same_config_directory_share_a_writer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let first = LogStore::new(temp_dir.path());
+        let second = LogStore::new(temp_dir.path());
+        assert!(Arc::ptr_eq(&first.manager, &second.manager));
     }
 
     #[test]
@@ -768,6 +1065,46 @@ mod tests {
             fs::read(temp_dir.path().join("logs/lux.2026-08-09.log"))?,
             b"x\n\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scan_job_event_query_reads_archived_jsonl_segments() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let date = Date::from_calendar_date(2026, Month::August, 9).unwrap();
+        let mut manager = LogManager::open_with_limits(temp_dir.path(), date, 1, 20)?;
+        for (id, level, code) in [
+            ("event-1", "INFO", "JOB_STARTED"),
+            ("event-2", "ERROR", "SCAN_IO"),
+        ] {
+            let record = serde_json::json!({
+                "recordType": "scan_job_event",
+                "id": id,
+                "jobId": "job-1",
+                "level": level,
+                "eventCode": code,
+                "message": "event",
+                "details": {"attempt": id},
+                "createdAt": if id == "event-1" { 1 } else { 2 },
+            });
+            let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
+            line.push(b'\n');
+            manager.write_line_for_date(date, &line)?;
+        }
+
+        let (total, events) = read_scan_job_events(
+            &log_dir(temp_dir.path()),
+            &archive_dir(temp_dir.path()),
+            "job-1",
+            Some("ERROR"),
+            Some("SCAN_IO"),
+            0,
+            10,
+        )?;
+        assert_eq!(total, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "event-2");
+        assert_eq!(events[0].created_at, 2);
         Ok(())
     }
 }

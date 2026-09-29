@@ -113,7 +113,7 @@ use crate::{
         redact_proxy_url,
     },
     observability::{
-        logs::{LogDateRange, LogExport, LogExportError, export_logs},
+        logs::{LogDateRange, LogExport, LogExportError, LogStore, export_logs},
         resources::ResourceMetrics,
     },
     security::{DevicePairingRateLimiter, LoginRateLimiter},
@@ -233,6 +233,7 @@ impl AppState {
             std::env::var("LUX_FILMLY_IMAGE_MODE").ok().as_deref(),
         );
         let config_dir = config.config_dir.clone();
+        let log_store = LogStore::new(&config_dir);
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
         let database_setup = Some(DatabaseSetupService::new(
@@ -328,6 +329,7 @@ impl AppState {
             let service = ScanJobService::new(database.clone())
                 .with_admin_events(admin_events.clone())
                 .with_user_events(user_events.clone())
+                .with_log_store(log_store.clone())
                 .with_resource_metrics(resources.clone())
                 .with_home(home.clone());
             let service = match library_covers.clone() {

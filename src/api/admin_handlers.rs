@@ -3811,6 +3811,31 @@ pub(crate) async fn admin_list_job_events(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let file_events = match crate::observability::logs::LogStore::new(config_dir)
+        .list_scan_job_events(
+            &job_id,
+            level.as_deref(),
+            event_code.as_deref(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(events) => events,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if file_events.0 > 0 {
+        return Json(json!({
+            "events": file_events.1.iter().map(scan_job_event_json).collect::<Vec<_>>(),
+            "total": file_events.0,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response();
+    }
     let total = match database
         .count_scan_job_events(&job_id, level.as_deref(), event_code.as_deref())
         .await
@@ -3829,7 +3854,19 @@ pub(crate) async fn admin_list_job_events(
         .await
     {
         Ok(events) => Json(json!({
-            "events": events.iter().map(scan_job_event_json).collect::<Vec<_>>(),
+            "events": events.iter().map(|event| {
+                let details = serde_json::from_str::<Value>(&event.details_json)
+                    .unwrap_or_else(|_| json!({ "invalid": true }));
+                json!({
+                    "id": event.id,
+                    "jobId": event.job_id,
+                    "level": event.level,
+                    "eventCode": event.event_code,
+                    "message": event.message,
+                    "details": details,
+                    "createdAt": event.created_at,
+                })
+            }).collect::<Vec<_>>(),
             "total": total,
             "page": offset / limit + 1,
             "pageSize": limit,
@@ -3969,7 +4006,7 @@ pub(crate) fn scheduled_task_plan_json(plan: &crate::storage::StoredScheduledTas
     })
 }
 
-pub(crate) fn scan_job_event_json(event: &crate::storage::StoredScanJobEvent) -> Value {
+pub(crate) fn scan_job_event_json(event: &crate::observability::logs::ScanJobLogEvent) -> Value {
     let details = serde_json::from_str::<Value>(&event.details_json)
         .unwrap_or_else(|_| json!({ "invalid": true }));
     json!({
