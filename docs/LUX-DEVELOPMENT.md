@@ -7483,14 +7483,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 每个任务事件在文件中包含稳定事件 ID、UTC 时间、jobId、level、eventCode、message 和脱敏 details；INFO 过程事件也可查询。
-- [ ] `GET /api/v1/admin/jobs/{jobId}/events` 保持管理员权限、级别/事件码筛选、分页和 JSON DTO 合同，结果按时间倒序。
-- [ ] 新产生的任务事件不会写入 `scan_job_events`；任务运行、取消、重试和恢复仍由数据库状态驱动。
-- [ ] 自动化测试覆盖文件事件、详情筛选、分页、不同级别、文件归档读取和数据库无新事件。
+- [x] 每个任务事件在文件中包含稳定事件 ID、UTC 时间、jobId、level、eventCode、message 和脱敏 details；INFO 过程事件也可查询。
+- [x] `GET /api/v1/admin/jobs/{jobId}/events` 保持管理员权限、级别/事件码筛选、分页和 JSON DTO 合同，结果按时间倒序，并查询活动文件及压缩归档。
+- [x] 新产生的任务事件不会写入 `scan_job_events`；任务运行、取消、重试和恢复仍由数据库状态驱动。迁移前旧事件仅在没有文件事件时由兼容回退读取。
+- [x] 自动化测试覆盖文件事件、详情筛选、分页、不同级别、归档读取、敏感内容脱敏和数据库无新事件。
 
 验证：`cargo test --locked --test job_events_api --test scanning_jobs`、`cargo fmt --all -- --check`。
 
-预计文件：`src/observability/logs.rs`、`src/storage/repository.rs`、`src/storage/jobs.rs`、`tests/job_events_api.rs`、`tests/scanning_jobs.rs`。
+文件：`src/observability/logs.rs`、`src/application/scanner.rs`、`src/api/legacy.rs`、`src/api/admin_handlers.rs`、`tests/job_events_api.rs`、`docs/API.md`。
+
+结果（2026-09-29）：所有新扫描任务生命周期事件（含 INFO）写入共享 JSONL LogStore；管理员任务事件 API 从活动文件与归档读取，并保留旧数据库记录回退。`cargo test --locked --test job_events_api --test scanning_jobs` 的 API 测试 1 项和扫描任务测试 81 项通过；LogStore 归档事件单测 1 项通过；`cargo fmt --all -- --check` 通过。Rust 编译仍报告既有未使用函数 `prepare_manifest_filename` 警告。
 
 依赖：LUX-309、LUX-232。明确不做：不迁出 `scan_jobs` 的执行状态、进度或恢复游标。
 
