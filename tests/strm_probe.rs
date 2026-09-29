@@ -421,6 +421,10 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
+    sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = libraries
         .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
         .await?

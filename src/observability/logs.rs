@@ -1107,6 +1107,9 @@ impl LogManager {
             self.active_path = self.log_dir.join(log_file_name(date));
             self.open_active_file()?;
         }
+        if let Some(file) = self.active_file.as_ref() {
+            self.active_bytes = repair_incomplete_jsonl_tail(file)?;
+        }
         let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
         if self.active_bytes > 0 && self.active_bytes.saturating_add(line_len) > self.segment_limit
         {
@@ -1907,18 +1910,31 @@ mod tests {
         store
             .append_scan_job_event("next", "job-1", "INFO", "JOB_STARTED", "started", "{}")
             .await?;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&current_log)?
+            .write_all(b"{\"torn-in-process\"")?;
+        store
+            .append_scan_job_event(
+                "after-torn-tail",
+                "job-1",
+                "INFO",
+                "JOB_STARTED",
+                "recovered",
+                "{}",
+            )
+            .await?;
 
         let (total, events) = store
             .list_scan_job_events("job-1", None, None, 0, 10)
             .await?;
-        assert_eq!(total, 2);
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.id.as_str())
-                .collect::<Vec<_>>(),
-            ["next", "complete"]
-        );
+        assert_eq!(total, 3);
+        let mut ids = events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["after-torn-tail", "complete", "next"]);
         for line in fs::read(current_log)?
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())

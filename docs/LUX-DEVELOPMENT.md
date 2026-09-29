@@ -7602,16 +7602,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite 与 PostgreSQL 既有审计记录保留 ID、actor、目标、脱敏 metadata 和时间迁入 JSONL。
-- [ ] 写入校验后才删除对应历史行；迁移失败重试不丢记录、不重复展示；完成标记后后续启动不查日志表。
-- [ ] 两个日志表没有运行时写入/查询；任务控制状态、播放状态和业务关系保持原样。
-- [ ] 文件日志 API 与仪表盘能读迁移后的历史记录；归档继续遵守 20 包 FIFO 保留。
-- [ ] 单条或单批跨越轮转边界时，当前批次在读回验证并删除源行前不会被 FIFO 淘汰；超出保留容量的已提交旧包仍按 FIFO 过期。
-- [ ] 测试覆盖旧审计历史迁移、失败重试、幂等、日志表不可用时的文件读取和清理隔离；最终执行 build、all-targets、fmt、Clippy 与 `uname -m` 完成门。
+- [x] SQLite 与 PostgreSQL 既有审计记录保留 ID、actor、目标、脱敏 metadata 和时间迁入 JSONL。
+- [x] 写入校验后才删除对应历史行；迁移失败重试不丢记录、不重复展示；完成标记后后续启动不查日志表。
+- [x] 两个日志表没有运行时写入/查询；任务控制状态、播放状态和业务关系保持原样。
+- [x] 文件日志 API 与仪表盘能读迁移后的历史记录；归档继续遵守 20 包 FIFO 保留。
+- [x] 单条或单批跨越轮转边界时，当前批次在读回验证并删除源行前不会被 FIFO 淘汰；超出保留容量的已提交旧包仍按 FIFO 过期。
+- [x] 测试覆盖旧审计历史迁移、失败重试、幂等、日志表不可用时的文件读取和清理隔离；最终执行 build、all-targets、fmt、Clippy 与 `uname -m` 完成门。
 
-验证：`cargo test --locked --test log_migration --test job_events_api --test users --test web_playback`、`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
+验证：`cargo test --locked --test log_migration --test job_events_api --test admin_dashboard --test users --test web_playback`、`cargo test --locked --lib observability::logs::tests`、单独启用的 PostgreSQL 迁移合同测试、`cargo build --locked`、串行 `cargo test --locked --all-targets -- --test-threads=1`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
 
 预计文件：`src/main.rs`、`src/api/admin_handlers.rs`、`src/application/scanner.rs`、`src/observability/logs.rs`、`src/storage/database_cleanup.rs`、`src/storage/jobs.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`tests/admin_dashboard.rs`、`tests/job_events_api.rs`、`tests/log_migration.rs`、`tests/postgres_database.rs`、`tests/scanning_jobs.rs`、`tests/shutdown_jobs.rs`、`tests/thumbnails.rs`、`tests/users.rs`、`tests/web_playback.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-30）：SQLite 与 PostgreSQL 的迁移均保留旧审计事件标识、操作者/目标、脱敏详情和时间；批次落盘、同步并回读验证后才删除源行，失败重试幂等。完成标记让后续启动在日志表不可用时仍跳过这些表；运行时任务事件、审计和近期活动均从 `/config/logs/` JSONL/ZIP 读取，任务状态与播放状态仍由业务存储负责。迁移/FIFO 回归覆盖 22 个日期批次，保留最多 20 个 ZIP，活动段仍可读，已验证的旧包按 FIFO 过期。JSONL 追加前会截去未完成尾行，避免进程内追加造成坏记录。迁移、任务事件 API、dashboard、用户与播放定向测试，14 项日志单测及 PostgreSQL 迁移合同测试通过。`cargo build --locked`、`cargo test --locked --all-targets -- --test-threads=1`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`git diff --check` 均通过；项目中已标记的专项测试仍保持 ignored，PostgreSQL 迁移专项已单独执行通过。扫描器测试 17 项、扫描任务 81 项通过；本机架构为 `arm64`。
 
 依赖：LUX-311、LUX-312、LUX-313、LUX-315。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
 
