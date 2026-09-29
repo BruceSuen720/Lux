@@ -728,6 +728,7 @@ pub(super) async fn load_lux_item_detail(
     .map_err(|_| ())?;
     let mut body = lux_catalog_item_json_with_user_state(item, user_state.as_ref());
     if let Value::Object(object) = &mut body {
+        object.insert("addedAt".to_owned(), json!(item.added_at));
         object.insert("actors".to_owned(), json!(actors));
         object.insert("nfo".to_owned(), json!(nfo));
         object.insert("metadataPending".to_owned(), json!(metadata_pending));

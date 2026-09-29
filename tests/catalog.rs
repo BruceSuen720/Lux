@@ -1382,6 +1382,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(lux_detail.status(), reqwest::StatusCode::OK);
     let lux_detail_body: Value = lux_detail.json().await?;
     assert_eq!(lux_detail_body["id"], item_id);
+    let stored_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(lux_detail_body["addedAt"], stored_added_at);
     assert_eq!(lux_detail_body["productionYear"], 2020);
     assert_eq!(lux_detail_body["rating"], 8.1);
     assert_eq!(lux_detail_body["ratingSource"], "NFO");

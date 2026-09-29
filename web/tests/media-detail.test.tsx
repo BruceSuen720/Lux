@@ -44,14 +44,15 @@ describe("MediaDetailPage series hierarchy", () => {
   });
 
   it("presents HomeVideos entries as regular videos with playback, NFO, and manual metadata editing", async () => {
-    vi.spyOn(api, "item").mockResolvedValue({
+    const addedAt = Date.parse("2026-09-24T01:35:00+08:00") / 1000;
+    vi.spyOn(api, "item").mockResolvedValue(Object.assign({
       id: "video-1",
       title: "家庭聚会",
       itemType: "VIDEO",
       overview: "本地视频简介",
       nfo: { tagline: "家庭录像" },
       mediaSources: [{ id: "source-1", sourceKind: "LOCAL_FILE", container: "mp4", isDefault: true }],
-    });
+    }, { addedAt }));
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "itemMetadata").mockResolvedValue({ title: "家庭聚会", lockedFields: [] });
 
@@ -78,6 +79,11 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-page-video")).not.toBeNull();
     expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("家庭聚会");
     expect(container.querySelector(".lux-detail-meta")?.textContent).toContain("其他视频");
+    const addedAtTime = container.querySelector(".lux-detail-meta time");
+    expect(addedAtTime).not.toBeNull();
+    expect(addedAtTime?.parentElement?.textContent ?? "").toContain("添加于");
+    expect(addedAtTime?.getAttribute("datetime")).toBe(new Date(addedAt * 1000).toISOString());
+    expect(addedAtTime?.textContent).toContain("2026");
     expect(container.querySelector(".lux-hero-actions a")?.getAttribute("href")).toBe("/watch/video-1?sourceId=source-1");
     expect(container.querySelector(".lux-media-nfo-tagline")?.textContent).toContain("家庭录像");
 
@@ -91,14 +97,14 @@ describe("MediaDetailPage series hierarchy", () => {
   });
 
   it("shows portrait season cards on a multi-season detail", async () => {
-    vi.spyOn(api, "item").mockResolvedValue({
+    vi.spyOn(api, "item").mockResolvedValue(Object.assign({
       id: "series-1",
       title: "示例剧集",
       itemType: "SERIES",
       rating: 7.6,
       ratingSource: "TMDb",
       mediaSources: [],
-    });
+    }, { addedAt: Number.NaN }));
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
@@ -136,6 +142,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector(".lux-detail-copy .lux-eyebrow")).toBeNull();
+    expect(container.querySelector(".lux-detail-meta")?.textContent).not.toContain("添加于");
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
     expect(container.querySelector(".lux-season-rail")?.textContent).toContain("第一季");
     expect(container.querySelectorAll(".lux-season-card")).toHaveLength(2);
@@ -201,6 +208,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector(".lux-season-rail")).toBeNull();
+    expect(container.querySelector(".lux-detail-meta")?.textContent).not.toContain("添加于");
     expect(container.querySelector(".lux-season-episodes")?.textContent).toContain("2 集");
     expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(2);
     expect(container.querySelector(".lux-season-episode-copy")?.getAttribute("href")).toBe("/items/episode-1");

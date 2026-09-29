@@ -125,6 +125,20 @@ export function MediaDetailPage() {
   if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
 
   const media = item.data;
+  const addedAtCandidate = typeof media.addedAt === "number" && Number.isFinite(media.addedAt)
+    ? new Date(media.addedAt * 1000)
+    : undefined;
+  const addedAt = addedAtCandidate && Number.isFinite(addedAtCandidate.getTime())
+    ? addedAtCandidate
+    : undefined;
+  const addedAtLabel = addedAt?.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
   const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
   const logoUrl = logo?.url ?? imageUrl(media, "logo");
   const seriesImageFallback = isSeason ? seriesContext.data : undefined;
@@ -294,6 +308,9 @@ export function MediaDetailPage() {
                 : media.productionYear
                   ? <span>{media.productionYear}</span>
                   : null}
+              {addedAt && addedAtLabel
+                ? <span>添加于 <time dateTime={addedAt.toISOString()}>{addedAtLabel}</time></span>
+                : null}
               {isSeries && media.seasonCount != null ? <span>{media.seasonCount} 季</span> : null}
               {isSeries && media.episodeCount != null ? <span>{media.episodeCount} 集</span> : null}
               {tmdbId ? <span>TMDb {tmdbId}</span> : null}

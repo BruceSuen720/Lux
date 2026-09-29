@@ -2172,6 +2172,19 @@ services:
 | LUX-293 | src/storage/metadata.rs、src/storage/jobs.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失结果与独立 FILL_MISSING 调度意向原子提交 |
 | LUX-294 | migrations/0152_scan_manifest_workflow_three.sql、migrations-postgres/0152_scan_manifest_workflow_three.sql、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、tests/admin_health.rs、tests/ready_version.rs、tests/scanner.rs、tests/danmaku.rs、docs/LUX-DEVELOPMENT.md；workflow 3 正向索引与本地 outbox 原子提交 |
 | LUX-295 | migrations/0153_scan_local_metadata_image_stage.sql、migrations-postgres/0153_scan_local_metadata_image_stage.sql、src/application/metadata.rs、src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、src/storage/repository_tests.rs、src/api/legacy.rs、src/main.rs、tests/scanned_metadata.rs、tests/scanned_series_metadata.rs、tests/scanning_jobs.rs、tests/storage.rs、tests/postgres_database.rs、docs/LUX-DEVELOPMENT.md；本地 outbox 后台消费与海报优先处理 |
+| LUX-296 | migrations/0154_scan_local_metadata_backfill.sql、migrations-postgres/0154_scan_local_metadata_backfill.sql、src/storage/jobs.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；既有资源回填游标存储 |
+| LUX-297 | src/application/scanner.rs、src/storage/mod.rs、src/storage/repository.rs、tests/scanned_metadata.rs、docs/LUX-DEVELOPMENT.md；既有资源本地海报/NFO 回填 worker |
+| LUX-298 | src/application/scanner.rs、tests/scanning_jobs.rs、tests/scanned_metadata.rs、docs/LUX-DEVELOPMENT.md；渐进扫描首页刷新与事件合并 |
+| LUX-299 | src/storage/metadata.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；完整性检查批量领取 |
+| LUX-300 | src/application/candidates.rs、docs/LUX-DEVELOPMENT.md；按请求计划计算本地元数据缺失 |
+| LUX-301 | src/application/scanner.rs、src/api/legacy.rs、docs/LUX-DEVELOPMENT.md；扫描后持久化本地完整性状态 |
+| LUX-302 | src/storage/metadata.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；缺失记录与补全任务原子提交 |
+| LUX-303 | src/application/metadata.rs、src/application/scanner.rs、src/application/reidentify.rs、src/api/legacy.rs、docs/LUX-DEVELOPMENT.md；渐进扫描接入 FILL_MISSING |
+| LUX-304 | tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；渐进扫描及海报处理性能测量 |
+| LUX-305 | src/storage/catalog.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/repository_tests.rs、docs/LUX-DEVELOPMENT.md；本地图片批量写入合同 |
+| LUX-306 | src/application/metadata.rs、tests/performance.rs、docs/PERFORMANCE.md、docs/LUX-DEVELOPMENT.md；海报 worker 批量写入及复测 |
+| LUX-307 | docs/LUX-DEVELOPMENT.md、docs/API.md、src/api/media.rs、tests/catalog.rs；Lux 媒体条目响应公开入库时间 |
+| LUX-308 | docs/LUX-DEVELOPMENT.md、web/src/lib/api/types.ts、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；资源详情显示添加时间 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -7407,6 +7420,40 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] SQLite 与 PostgreSQL 同 fixture A/B 分开报告索引完成耗时、首批可见、首张海报、local queue、在线 queue、前台 p95、事务/队列规模和内存；稳定索引或前台 p95 回退超过 5% 时先调度/并发并重测。
 - [ ] 扫描索引耗时与本地/在线处理耗时分别呈现；不以任务仍有后台工作为由把索引时间混入扫描性能结论。
 - [ ] 完成相关 Rust/Web 全量质量门、兼容性和性能记录、本机架构记录，并由项目所有者确认后结束阶段。
+
+### 资源详情入库时间
+
+#### LUX-307：Lux 媒体条目响应公开入库时间
+
+范围：在 Lux API 的媒体条目 JSON 响应中暴露现有 `media_items.added_at`，字段名为 `addedAt`，值为 Unix epoch 秒。使用现有 `CatalogItem.added_at`，不新增或修改数据库字段，不改变 Emby DTO。
+
+验收：
+
+- [x] `GET /api/v1/items/{itemId}` 返回的 `addedAt` 与该条目的存储值一致。
+- [x] `docs/API.md` 说明 `addedAt` 的含义、单位和来源；Emby 响应合同不变。
+- [x] 无数据库 migration，Lux API 既有 ACL 和字段响应保持不变。
+
+验证：`cargo test --locked --test catalog`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+文件：`src/api/media.rs`、`tests/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：详情 API 返回数据库中的 `added_at` Unix 秒值，集成测试验证 JSON 与存储值一致。回归断言先因响应为 `null` 而失败，修复后 `cargo test --locked --test catalog` 的 3 项通过；`cargo fmt --all -- --check`、全目标 Clippy 和 `git diff --check` 通过。
+
+#### LUX-308：资源详情显示添加时间
+
+范围：Lux Web 具体资源详情的元信息行显示“添加于”及资源加入 Lux 媒体库的本地日期和时间，数据来自 LUX-307 的 `addedAt`。时间按浏览器本地时区显示到分钟；字段缺失或无效时隐藏该标签。本任务不改变列表排序和 Emby 客户端行为。
+
+验收：
+
+- [x] 有效 `addedAt` 在电影、剧集、季度、单集和 VIDEO 详情元信息行显示“添加于”及对应本地时间。
+- [x] 页面以语义化 `<time>` 暴露 ISO 8601 `dateTime`；缺失或无效值不会显示 `Invalid Date` 或占位标签。
+- [x] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
+
+依赖：LUX-307。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web build`。
+
+文件：`web/src/lib/api/types.ts`、`web/src/features/detail/MediaDetailPage.tsx`、`web/tests/media-detail.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：有效时间在详情元信息行显示“添加于”及按浏览器本地时区格式化到分钟的日期，并提供 ISO 8601 `dateTime`；缺失和无效时间不显示标签。`pnpm --dir web install --frozen-lockfile` 通过，详情页测试 26 项通过，完整 Web 测试 75 个文件/526 项通过，`pnpm --dir web build` 通过。输出仍有既存 jsdom 媒体元素 `load/pause` 告警和 Vite 大 chunk 提示。
 
 ## 26. 风险与缓解
 
