@@ -195,7 +195,7 @@ async fn daily_log_export_reads_archived_segments() -> Result<(), Box<dyn std::e
 
     let from = time::Date::from_calendar_date(2026, time::Month::August, 8)?;
     let range = LogDateRange::new(from, from)?;
-    let export = export_logs(&log_dir.parent().ok_or("missing config directory")?, range).await?;
+    let export = export_logs(log_dir.parent().ok_or("missing config directory")?, range).await?;
     let LogExport::Daily { contents, filename } = export else {
         return Err("single-day export should remain a raw JSONL file".into());
     };
