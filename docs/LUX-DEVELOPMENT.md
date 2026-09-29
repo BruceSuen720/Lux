@@ -7441,19 +7441,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-308：资源详情显示添加时间
 
-范围：Lux Web 具体资源详情的元信息行显示“添加于”及资源加入 Lux 媒体库的本地日期和时间，数据来自 LUX-307 的 `addedAt`。时间按浏览器本地时区显示到分钟；字段缺失或无效时隐藏该标签。本任务不改变列表排序和 Emby 客户端行为。
+范围：Lux Web 具体资源详情的元信息行显示“添加于”及资源加入 Lux 媒体库的本地日期和时间，数据来自 LUX-307 的 `addedAt`。时间按浏览器本地时区显示到分钟；字段缺失或无效时隐藏该标签。详情页音频和字幕轨选择器在可用宽度足以容纳两个各 320px 的控件时横向排列，空间不足时上下排列。本任务不改变列表排序和 Emby 客户端行为。
 
 验收：
 
 - [x] 有效 `addedAt` 在电影、剧集、季度、单集和 VIDEO 详情元信息行显示“添加于”及对应本地时间。
 - [x] 页面以语义化 `<time>` 暴露 ISO 8601 `dateTime`；缺失或无效值不会显示 `Invalid Date` 或占位标签。
 - [x] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
+- [x] 音频和字幕选择器在可用宽度至少 657px 时各保留 320px 并横向排列；更窄时上下排列。
 
 依赖：LUX-307。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web build`。
 
 文件：`web/src/lib/api/types.ts`、`web/src/features/detail/MediaDetailPage.tsx`、`web/tests/media-detail.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-09-28）：有效时间在详情元信息行显示“添加于”及按浏览器本地时区格式化到分钟的日期，并提供 ISO 8601 `dateTime`；缺失和无效时间不显示标签。`pnpm --dir web install --frozen-lockfile` 通过，详情页测试 26 项通过，完整 Web 测试 75 个文件/526 项通过，`pnpm --dir web build` 通过。输出仍有既存 jsdom 媒体元素 `load/pause` 告警和 Vite 大 chunk 提示。
+
+追加（2026-09-29）：轨道选择器按可用宽度自动换列，两个控件能各保留 320px 时并排，窄于 657px 时堆叠。`node --test web/tests/detail-layout.test.mjs` 27 项通过，完整 Web 测试 75 个文件/529 项通过，`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。测试仍输出既存 jsdom `load/pause` 告警；构建保留既存大 chunk 提示。
 
 ## 26. 风险与缓解
 
