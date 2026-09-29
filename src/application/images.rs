@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
-    sync::{Mutex, OwnedMutexGuard, Semaphore},
+    sync::{Mutex, Notify, OwnedMutexGuard},
     time::sleep,
 };
 use uuid::Uuid;
@@ -47,11 +47,86 @@ const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
 const INTERNAL_IMAGE_WRITE_MARKER_TTL: Duration = Duration::from_secs(15);
 pub(crate) const MAX_IMAGE_VARIANTS: usize = 4;
 
-static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<ImagePermitPool>> = OnceLock::new();
+static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<ImagePermitPool>> = OnceLock::new();
 static IMAGE_ITEM_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 static INTERNAL_IMAGE_WRITES: OnceLock<StdMutex<HashMap<PathBuf, InternalImageWriteMarker>>> =
     OnceLock::new();
+
+struct ImagePermitPool {
+    maximum: usize,
+    active: std::sync::atomic::AtomicUsize,
+    available: Notify,
+}
+
+struct ImagePermit {
+    pool: Arc<ImagePermitPool>,
+}
+
+impl ImagePermitPool {
+    fn new(maximum: usize) -> Arc<Self> {
+        Arc::new(Self {
+            maximum: maximum.max(1),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            available: Notify::new(),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, target: usize) -> Option<ImagePermit> {
+        let limit = target.clamp(1, self.maximum);
+        let mut active = self.active.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if active >= limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ImagePermit {
+                        pool: Arc::clone(self),
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        resources: Option<ResourceMetrics>,
+        stage: &'static str,
+    ) -> ImagePermit {
+        let waiting_started = Instant::now();
+        loop {
+            let mut available = Box::pin(self.available.notified());
+            available.as_mut().enable();
+            let target = match resources.as_ref() {
+                Some(resources) => resources.image_concurrency(self.maximum).await,
+                None => self.maximum,
+            };
+            if let Some(permit) = self.try_acquire(target) {
+                if let Some(resources) = &resources {
+                    resources.record_metadata_stage(stage, waiting_started.elapsed());
+                }
+                return permit;
+            }
+            available.await;
+        }
+    }
+}
+
+impl Drop for ImagePermit {
+    fn drop(&mut self) {
+        self.pool
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.pool.available.notify_waiters();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InternalImageWriteMarker {
@@ -122,15 +197,15 @@ pub(crate) async fn should_suppress_internal_image_write(path: &Path) -> bool {
     false
 }
 
-fn global_image_download_permits() -> Arc<Semaphore> {
+fn global_image_download_permits() -> Arc<ImagePermitPool> {
     IMAGE_GLOBAL_DOWNLOAD_PERMITS
-        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
+        .get_or_init(|| ImagePermitPool::new(IMAGE_GLOBAL_CONCURRENCY))
         .clone()
 }
 
-fn global_image_write_permits() -> Arc<Semaphore> {
+fn global_image_write_permits() -> Arc<ImagePermitPool> {
     IMAGE_GLOBAL_WRITE_PERMITS
-        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
+        .get_or_init(|| ImagePermitPool::new(IMAGE_GLOBAL_CONCURRENCY))
         .clone()
 }
 
@@ -251,8 +326,8 @@ pub struct ImageWriteService {
     http: Client,
     max_bytes: u64,
     config_dir: Option<PathBuf>,
-    download_permits: Arc<Semaphore>,
-    write_permits: Arc<Semaphore>,
+    download_permits: Arc<ImagePermitPool>,
+    write_permits: Arc<ImagePermitPool>,
     resources: Option<ResourceMetrics>,
 }
 
@@ -341,8 +416,8 @@ impl ImageWriteService {
             config,
             proxy_url,
             config_dir,
-            Arc::new(Semaphore::new(concurrency)),
-            Arc::new(Semaphore::new(concurrency)),
+            ImagePermitPool::new(concurrency),
+            ImagePermitPool::new(concurrency),
         )
     }
 
@@ -351,8 +426,8 @@ impl ImageWriteService {
         config: ImageDownloadConfig,
         proxy_url: Option<String>,
         config_dir: Option<PathBuf>,
-        download_permits: Arc<Semaphore>,
-        write_permits: Arc<Semaphore>,
+        download_permits: Arc<ImagePermitPool>,
+        write_permits: Arc<ImagePermitPool>,
     ) -> Result<Self, ImageWriteError> {
         if config.max_bytes == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
@@ -973,12 +1048,8 @@ impl ImageWriteService {
 
         let _download_permit = self
             .download_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                ImageWriteError::InvalidConfiguration("image semaphore closed".to_owned())
-            })?;
+            .acquire(self.resources.clone(), "image_download_queue")
+            .await;
         let download_started = std::time::Instant::now();
         let response = self.fetch_image(&url).await;
         if let Some(resources) = &self.resources {
@@ -1089,12 +1160,8 @@ impl ImageWriteService {
         };
         let _write_permit = self
             .write_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                ImageWriteError::InvalidConfiguration("image write semaphore closed".to_owned())
-            })?;
+            .acquire(self.resources.clone(), "image_write_queue")
+            .await;
         let write_started = std::time::Instant::now();
         write_image_atomically(&target, &body).await?;
         if let Some(metadata_target) = metadata_target.as_deref() {
@@ -1105,7 +1172,11 @@ impl ImageWriteService {
             size,
             max: i64::MAX as u64,
         })?;
-        let content_tag = content_tag(&body);
+        let content_tag = tokio::task::spawn_blocking(move || content_tag(&body))
+            .await
+            .map_err(|_| {
+                ImageWriteError::InvalidConfiguration("image hash worker stopped".to_owned())
+            })?;
         let dimensions = read_image_dimensions(&target).await;
         let id = self
             .database
@@ -2692,12 +2763,12 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
-        canonical_image_stems, global_image_download_permits, global_image_write_permits,
-        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
-        image_download_retry_delay, image_language_matches, image_lookup_stems,
-        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
-        write_image_atomically,
+        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImagePermitPool,
+        ImageWriteError, canonical_image_stems, global_image_download_permits,
+        global_image_write_permits, image_attempt_failure,
+        image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
+        image_language_matches, image_lookup_stems, is_allowed_scraper_image_url,
+        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
     };
 
     #[test]
@@ -2731,11 +2802,35 @@ mod tests {
         let first = global_image_download_permits();
         let second = global_image_download_permits();
         assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert_eq!(first.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
+        assert_eq!(first.maximum, IMAGE_GLOBAL_CONCURRENCY);
 
         let write = global_image_write_permits();
         assert!(!std::sync::Arc::ptr_eq(&first, &write));
-        assert_eq!(write.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
+        assert_eq!(write.maximum, IMAGE_GLOBAL_CONCURRENCY);
+    }
+
+    #[test]
+    fn image_permit_pool_obeys_a_lowered_limit_and_its_hard_cap() {
+        let permits = ImagePermitPool::new(4);
+        let first = permits.try_acquire(2).expect("first image permit");
+        let second = permits.try_acquire(2).expect("second image permit");
+        assert!(permits.try_acquire(2).is_none());
+        assert!(permits.try_acquire(1).is_none());
+
+        drop(second);
+        assert!(permits.try_acquire(1).is_none());
+        drop(first);
+        let permit = permits
+            .try_acquire(usize::MAX)
+            .expect("permit within hard cap");
+        let second = permits.try_acquire(4).expect("second permit");
+        let third = permits.try_acquire(4).expect("third permit");
+        let fourth = permits.try_acquire(4).expect("fourth permit");
+        assert!(permits.try_acquire(4).is_none());
+        drop(permit);
+        drop(second);
+        drop(third);
+        drop(fourth);
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ const PROBE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 const METADATA_METRIC_SAMPLE_CAPACITY: usize = 128;
 const METADATA_GLOBAL_HARD_CAP: usize = 16;
 const METADATA_P95_SEVERE_MS: u64 = 1_000;
+const METADATA_QUEUE_CLAIM_DEGRADED_MS: u64 = 250;
+const METADATA_QUEUE_CLAIM_SEVERE_MS: u64 = 1_000;
 const PROBE_IO_CONCURRENCY_MULTIPLIER: usize = 32;
 const PROBE_STARTUP_CONCURRENCY_CAP: usize = 16;
 
@@ -186,8 +188,18 @@ impl ResourceMetrics {
             self.home_latency_p95_ms(),
             memory.usage_percent,
             cpu.usage_percent,
+            self.metadata_stage_p95_ms("queue_claim"),
             METADATA_GLOBAL_HARD_CAP,
         )
+    }
+
+    pub async fn image_concurrency(&self, configured: usize) -> usize {
+        self.metadata_concurrency(configured).await
+    }
+
+    fn metadata_stage_p95_ms(&self, stage: &str) -> Option<u64> {
+        let metrics = self.metadata.lock().ok()?;
+        percentile95(metrics.durations_ms.get(stage)?)
     }
 
     pub async fn probe_concurrency(&self, configured: usize, hard_cap: usize) -> usize {
@@ -300,9 +312,12 @@ fn metadata_capability_name(value: &str) -> Option<&'static str> {
 fn metadata_stage_name(value: &str) -> Option<&'static str> {
     match value {
         "queue_wait" => Some("queue_wait"),
+        "queue_claim" => Some("queue_claim"),
         "item_total" => Some("item_total"),
         "image_download" => Some("image_download"),
+        "image_download_queue" => Some("image_download_queue"),
         "image_write" => Some("image_write"),
+        "image_write_queue" => Some("image_write_queue"),
         "cache_persist" => Some("cache_persist"),
         "nfo_write" => Some("nfo_write"),
         _ => metadata_capability_name(value),
@@ -690,18 +705,21 @@ pub fn recommended_metadata_concurrency(
     home_p95_ms: Option<u64>,
     container_memory_usage_percent: Option<f64>,
     cpu_usage_percent: Option<f64>,
+    queue_claim_p95_ms: Option<u64>,
     hard_cap: usize,
 ) -> usize {
     let base = configured.clamp(1, hard_cap.max(1));
     let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
         || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
-        || home_p95_ms.is_some_and(|value| value >= METADATA_P95_SEVERE_MS);
+        || home_p95_ms.is_some_and(|value| value >= METADATA_P95_SEVERE_MS)
+        || queue_claim_p95_ms.is_some_and(|value| value >= METADATA_QUEUE_CLAIM_SEVERE_MS);
     if severe_pressure {
         return base.div_ceil(4).max(1);
     }
     let degraded = cpu_usage_percent.is_some_and(|value| value >= 75.0)
         || container_memory_usage_percent.is_some_and(|value| value >= 85.0)
-        || home_p95_ms.is_some_and(|value| value >= HOME_P95_TARGET_MS);
+        || home_p95_ms.is_some_and(|value| value >= HOME_P95_TARGET_MS)
+        || queue_claim_p95_ms.is_some_and(|value| value >= METADATA_QUEUE_CLAIM_DEGRADED_MS);
     if degraded {
         return base.div_ceil(2).max(1);
     }
@@ -875,6 +893,7 @@ mod tests {
         let metrics = ResourceMetrics::new();
         metrics.record_metadata_stage("metadata.images", Duration::from_millis(10));
         metrics.record_metadata_stage("metadata.images", Duration::from_millis(20));
+        metrics.record_metadata_stage("queue_claim", Duration::from_millis(300));
         metrics.record_metadata_request("metadata.images", false);
         metrics.record_metadata_request("metadata.images", true);
         metrics.record_metadata_retry("metadata.images");
@@ -893,6 +912,7 @@ mod tests {
         assert_eq!(snapshot.metadata.counters["cache.persist.success.count"], 1);
         assert_eq!(snapshot.metadata.counters["cache.persist.error.count"], 1);
         assert_eq!(snapshot.metadata.stage_p95_ms["images"], 20);
+        assert_eq!(snapshot.metadata.stage_p95_ms["queue_claim"], 300);
         assert_eq!(snapshot.metadata.stage_p95_ms["cache_persist"], 12);
     }
 
@@ -922,23 +942,37 @@ mod tests {
 
     #[test]
     fn metadata_concurrency_uses_io_defaults_and_backs_off_under_pressure() {
-        assert_eq!(recommended_metadata_concurrency(4, None, None, None, 16), 4);
-        assert_eq!(recommended_metadata_concurrency(8, None, None, None, 16), 8);
         assert_eq!(
-            recommended_metadata_concurrency(4, Some(400), None, None, 16),
-            2
-        );
-        assert_eq!(
-            recommended_metadata_concurrency(8, None, Some(90.0), None, 16),
+            recommended_metadata_concurrency(4, None, None, None, None, 16),
             4
         );
         assert_eq!(
-            recommended_metadata_concurrency(8, None, None, Some(95.0), 16),
+            recommended_metadata_concurrency(8, None, None, None, None, 16),
+            8
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(4, Some(400), None, None, None, 16),
             2
         );
         assert_eq!(
-            recommended_metadata_concurrency(16, None, None, None, 16),
+            recommended_metadata_concurrency(8, None, Some(90.0), None, None, 16),
+            4
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, None, Some(95.0), None, 16),
+            2
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(16, None, None, None, None, 16),
             16
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, None, None, Some(300), 16),
+            4
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, None, None, Some(1_000), 16),
+            2
         );
     }
 

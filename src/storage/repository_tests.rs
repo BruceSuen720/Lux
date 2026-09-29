@@ -7394,6 +7394,191 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
 }
 
 #[tokio::test]
+async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            AnyConnectOptions::from_str("sqlite://?mode=memory").expect("in-memory SQLite options"),
+        )
+        .await
+        .expect("in-memory SQLite connection");
+    sqlx::query(
+        "CREATE TABLE metadata_capability_attempts (
+                item_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                status TEXT NOT NULL,
+                next_retry_at INTEGER
+            )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create capability attempts");
+    sqlx::query(
+        "CREATE TABLE metadata_image_attempts (
+                item_id TEXT NOT NULL,
+                image_type TEXT NOT NULL,
+                candidate_key TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create image attempts");
+    sqlx::query(
+        "INSERT INTO metadata_capability_attempts
+             (item_id, provider, provider_id, capability, status, next_retry_at)
+         VALUES ('item', 'tmdb', '42', 'CREDITS', 'UNAVAILABLE', 123)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert capability attempt");
+    sqlx::query(
+        "INSERT INTO metadata_image_attempts
+             (item_id, image_type, candidate_key, status)
+         VALUES ('item', 'POSTER', 'tmdb:42', 'FAILED')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert image attempt");
+    let database = Database {
+        pool,
+        log_store: LogStore::new(Path::new("unused-metadata-attempt-test")),
+        pool_max_connections: 1,
+        path: PathBuf::from("metadata-attempt-test.db"),
+        server_id: "test".to_owned(),
+        backend: DatabaseBackend::Sqlite,
+        person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+        metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        query_count: Arc::new(AtomicUsize::new(0)),
+    };
+    database.reset_query_count();
+
+    let (capability_attempts, image_attempts) = database
+        .list_metadata_attempts("item")
+        .await
+        .expect("load metadata attempts");
+
+    assert_eq!(capability_attempts.len(), 1);
+    assert_eq!(capability_attempts[0].capability, "CREDITS");
+    assert_eq!(capability_attempts[0].next_retry_at, Some(123));
+    assert_eq!(image_attempts.len(), 1);
+    assert_eq!(image_attempts[0].image_type, "POSTER");
+    assert_eq!(database.query_count(), 1);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn item_media_strategy_settings_use_one_query_and_require_an_active_item() {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            AnyConnectOptions::from_str("sqlite://?mode=memory").expect("in-memory SQLite options"),
+        )
+        .await
+        .expect("in-memory SQLite connection");
+    sqlx::query(
+        "CREATE TABLE libraries (
+                id TEXT PRIMARY KEY,
+                is_enabled INTEGER NOT NULL,
+                media_strategy_json TEXT
+            )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create libraries");
+    sqlx::query(
+        "CREATE TABLE media_items (
+                id TEXT PRIMARY KEY,
+                library_id TEXT NOT NULL,
+                removed_at INTEGER
+            )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create media items");
+    sqlx::query("CREATE TABLE server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .expect("create server settings");
+    sqlx::query(
+        "INSERT INTO libraries (id, is_enabled, media_strategy_json)
+         VALUES ('enabled', 1, '{\"thumbnailScrapingMode\":\"SCREENSHOT_FIRST\"}'),
+                ('disabled', 0, '{\"thumbnailScrapingMode\":\"NONE\"}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert libraries");
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, removed_at)
+         VALUES ('active-item', 'enabled', NULL), ('disabled-item', 'disabled', NULL),
+                ('removed-item', 'enabled', 123)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert media items");
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('media_strategy', '{\"thumbnailScrapingMode\":\"SCRAPER_FIRST\"}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert global strategy");
+    let database = Database {
+        pool,
+        log_store: LogStore::new(Path::new("unused-media-strategy-test")),
+        pool_max_connections: 1,
+        path: PathBuf::from("media-strategy-test.db"),
+        server_id: "test".to_owned(),
+        backend: DatabaseBackend::Sqlite,
+        person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+        metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        query_count: Arc::new(AtomicUsize::new(0)),
+    };
+    database.reset_query_count();
+
+    let strategy = database
+        .find_item_media_strategy_settings("active-item")
+        .await
+        .expect("load active item strategy");
+
+    assert_eq!(
+        strategy,
+        Some((
+            Some("{\"thumbnailScrapingMode\":\"SCREENSHOT_FIRST\"}".to_owned()),
+            Some("{\"thumbnailScrapingMode\":\"SCRAPER_FIRST\"}".to_owned()),
+        ))
+    );
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        database
+            .find_item_media_strategy_settings("disabled-item")
+            .await
+            .expect("ignore disabled library"),
+        None
+    );
+    assert_eq!(
+        database
+            .find_item_media_strategy_settings("removed-item")
+            .await
+            .expect("ignore removed item"),
+        None
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn metadata_jobs_reconcile_items_left_running_by_workers() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()

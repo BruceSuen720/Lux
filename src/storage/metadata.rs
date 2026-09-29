@@ -838,60 +838,57 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn list_metadata_capability_attempts(
+    pub(crate) async fn list_metadata_attempts(
         &self,
         item_id: &str,
-    ) -> Result<Vec<StoredMetadataCapabilityAttempt>, StorageError> {
-        self.query(
-            "SELECT provider, provider_id, capability, status, next_retry_at
-             FROM metadata_capability_attempts
-             WHERE item_id = ?",
-        )
-        .bind(item_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMetadataCapabilityAttempt {
+    ) -> Result<
+        (
+            Vec<StoredMetadataCapabilityAttempt>,
+            Vec<StoredMetadataImageAttempt>,
+        ),
+        StorageError,
+    > {
+        let rows = self
+            .query(
+                "SELECT 'CAPABILITY' AS attempt_type, provider, provider_id, capability,
+                        status, next_retry_at, NULL AS image_type, NULL AS candidate_key
+                 FROM metadata_capability_attempts
+                 WHERE item_id = ?
+                 UNION ALL
+                 SELECT 'IMAGE' AS attempt_type, NULL AS provider, NULL AS provider_id,
+                        NULL AS capability, status, NULL AS next_retry_at,
+                        image_type, candidate_key
+                 FROM metadata_image_attempts
+                 WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .bind(item_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut capability_attempts = Vec::new();
+        let mut image_attempts = Vec::new();
+        for row in rows {
+            if row.get::<String, _>("attempt_type") == "CAPABILITY" {
+                capability_attempts.push(StoredMetadataCapabilityAttempt {
                     provider: row.get("provider"),
                     provider_id: row.get("provider_id"),
                     capability: row.get("capability"),
                     status: row.get("status"),
                     next_retry_at: row.get("next_retry_at"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn list_metadata_image_attempts(
-        &self,
-        item_id: &str,
-    ) -> Result<Vec<StoredMetadataImageAttempt>, StorageError> {
-        self.query(
-            "SELECT image_type, candidate_key, status
-             FROM metadata_image_attempts
-             WHERE item_id = ?",
-        )
-        .bind(item_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMetadataImageAttempt {
+                });
+            } else {
+                image_attempts.push(StoredMetadataImageAttempt {
                     image_type: row.get("image_type"),
                     candidate_key: row.get("candidate_key"),
                     status: row.get("status"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+                });
+            }
+        }
+        Ok((capability_attempts, image_attempts))
     }
 
     pub(crate) async fn record_metadata_capability_results(

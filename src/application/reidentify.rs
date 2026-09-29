@@ -17,10 +17,10 @@ use crate::{
         actor_enrichment::ActorEnrichmentQueue,
         admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
-            ImageSelectionPolicy, MetadataCandidateError, MetadataCandidatePage,
-            MetadataCandidateService, MetadataCandidateView, MetadataRequestPlan,
-            MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
-            has_selected_provider_id,
+            FillMissingRequestPlan, ImageSelectionPolicy, MetadataCandidateError,
+            MetadataCandidatePage, MetadataCandidateService, MetadataCandidateView,
+            MetadataRequestPlan, MetadataSelectionError, MetadataSelectionMode,
+            MetadataSelectionService, has_selected_provider_id,
         },
         notification_template::bounded_display_text,
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
@@ -620,11 +620,14 @@ impl MetadataReidentifyService {
                     };
                     worker_permits.push(worker_permit);
                 }
-                let Ok(item_ids) = self
+                let claim_started = Instant::now();
+                let item_ids_result = self
                     .database
                     .claim_next_metadata_reidentify_items(job_id, worker_permits.len())
-                    .await
-                else {
+                    .await;
+                self.resources
+                    .record_metadata_stage("queue_claim", claim_started.elapsed());
+                let Ok(item_ids) = item_ids_result else {
                     drop(worker_permits);
                     queue_exhausted = true;
                     break;
@@ -793,7 +796,7 @@ impl MetadataReidentifyService {
                     match request_plan {
                         Ok(Some(plan))
                             if matches!(mode, MetadataRefreshMode::FillMissing)
-                                && metadata_request_plan_is_complete(plan) =>
+                                && metadata_request_plan_is_complete(plan.requestable) =>
                         {
                             Ok(0)
                         }
@@ -806,16 +809,20 @@ impl MetadataReidentifyService {
                                 .await
                             {
                                 Ok(Some(providers)) => {
-                                    if matches!(mode, MetadataRefreshMode::FillMissing) {
-                                        self.schedule_thumbnail_scraper_retry_if_needed(item_id)
-                                            .await;
+                                    if matches!(mode, MetadataRefreshMode::FillMissing)
+                                        && let Some(plan) = request_plan
+                                    {
+                                        self.schedule_thumbnail_scraper_retry_if_needed(
+                                            item_id, plan,
+                                        )
+                                        .await;
                                     }
                                     self.refresh_with_scraper_roles(
                                         item_id,
                                         &item,
                                         mode,
                                         &providers,
-                                        request_plan,
+                                        request_plan.map(|plan| plan.requestable),
                                     )
                                     .await
                                 }
@@ -907,31 +914,24 @@ impl MetadataReidentifyService {
         }
     }
 
-    async fn schedule_thumbnail_scraper_retry_if_needed(&self, item_id: &str) {
-        let Some(selection) = self.selection.as_ref() else {
+    async fn schedule_thumbnail_scraper_retry_if_needed(
+        &self,
+        item_id: &str,
+        request_plan: FillMissingRequestPlan,
+    ) {
+        if !MetadataSelectionService::should_schedule_thumbnail_scraper_retry(request_plan) {
+            return;
+        }
+        let first_attempt_at = unix_now();
+        let Some(next_retry_at) = thumbnail_scraper_retry_at(first_attempt_at, 1) else {
             return;
         };
-        match selection
-            .should_schedule_thumbnail_scraper_retry(item_id)
+        if let Err(error) = self
+            .database
+            .ensure_thumbnail_scraper_retry(item_id, first_attempt_at, next_retry_at)
             .await
         {
-            Ok(true) => {
-                let first_attempt_at = unix_now();
-                let Some(next_retry_at) = thumbnail_scraper_retry_at(first_attempt_at, 1) else {
-                    return;
-                };
-                if let Err(error) = self
-                    .database
-                    .ensure_thumbnail_scraper_retry(item_id, first_attempt_at, next_retry_at)
-                    .await
-                {
-                    tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be saved");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be checked");
-            }
+            tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be saved");
         }
     }
 
@@ -1967,7 +1967,7 @@ mod tests {
             .fill_missing_request_plan_for_current(&item_id, &current)
             .await?;
         assert!(
-            super::metadata_request_plan_is_complete(plan),
+            super::metadata_request_plan_is_complete(plan.requestable),
             "unexpected fill-missing plan: {plan:?}"
         );
         let service = super::MetadataReidentifyService::with_selection(

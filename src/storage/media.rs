@@ -187,6 +187,29 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_item_media_strategy_settings(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, StorageError> {
+        self.query(
+            "SELECT libraries.media_strategy_json AS library_strategy,
+                    server_settings.value AS global_strategy
+             FROM media_items
+             JOIN libraries
+               ON libraries.id = media_items.library_id AND libraries.is_enabled = 1
+             LEFT JOIN server_settings ON server_settings.key = 'media_strategy'
+             WHERE media_items.id = ? AND media_items.removed_at IS NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| (row.get("library_strategy"), row.get("global_strategy"))))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_item_scan_source_path(
         &self,
         item_id: &str,

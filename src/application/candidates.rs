@@ -95,6 +95,12 @@ impl MetadataRequestPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FillMissingRequestPlan {
+    pub(crate) requestable: MetadataRequestPlan,
+    pub(crate) actual_missing_image_mask: u16,
+}
+
 fn metadata_request_plan(
     current: &StoredMediaMetadata,
     images_missing: bool,
@@ -1960,11 +1966,14 @@ impl MetadataSelectionService {
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
-    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        Ok(self
+    ) -> Result<FillMissingRequestPlan, MetadataSelectionError> {
+        let (_, requestable, actual_missing_image_mask) = self
             .fill_missing_request_plans_for_current(item_id, current)
-            .await?
-            .1)
+            .await?;
+        Ok(FillMissingRequestPlan {
+            requestable,
+            actual_missing_image_mask,
+        })
     }
 
     pub(crate) async fn fallback_request_plan_for_current(
@@ -1972,10 +1981,10 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        Ok(self
+        let (actual_plan, _, _) = self
             .fill_missing_request_plans_for_current(item_id, current)
-            .await?
-            .0)
+            .await?;
+        Ok(actual_plan)
     }
 
     pub(crate) async fn local_metadata_completeness_plan(
@@ -1986,7 +1995,7 @@ impl MetadataSelectionService {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok(None);
         }
-        let (actual_plan, requestable_plan) = self
+        let (actual_plan, requestable_plan, _) = self
             .fill_missing_request_plans_for_current(item_id, current)
             .await?;
         Ok(local_metadata_completeness_plan(
@@ -2008,41 +2017,41 @@ impl MetadataSelectionService {
         })
     }
 
-    pub(crate) async fn should_schedule_thumbnail_scraper_retry(
-        &self,
-        item_id: &str,
-    ) -> Result<bool, MetadataSelectionError> {
-        let image_policy = self.image_selection_policy(item_id).await?;
+    pub(crate) fn should_schedule_thumbnail_scraper_retry(
+        request_plan: FillMissingRequestPlan,
+    ) -> bool {
+        let Some(image_policy) = request_plan.requestable.image_policy else {
+            return false;
+        };
         if image_policy.thumbnail_scraping_mode != ThumbnailScrapingMode::ScraperFirst {
-            return Ok(false);
+            return false;
         }
-        let image_types = image_policy
+        let mut thumbnail_mask = 0_u16;
+        for image_type in image_policy
             .enabled_types()
             .filter(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
-            .collect::<Vec<_>>();
-        if image_types.is_empty() {
-            return Ok(false);
+        {
+            if let Some(index) = SCRAPER_IMAGE_TYPES
+                .iter()
+                .position(|candidate| *candidate == image_type)
+            {
+                thumbnail_mask |= 1_u16 << index;
+            }
         }
-        let local_image_types = self.images.local_image_types(item_id, &image_types).await?;
-        Ok(image_types
-            .iter()
-            .any(|image_type| !local_image_types.contains(*image_type)))
+        request_plan.actual_missing_image_mask & thumbnail_mask != 0
     }
 
     async fn fill_missing_request_plans_for_current(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
-    ) -> Result<(MetadataRequestPlan, MetadataRequestPlan), MetadataSelectionError> {
+    ) -> Result<(MetadataRequestPlan, MetadataRequestPlan, u16), MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
-            return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full()));
+            return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full(), 0));
         }
         let image_policy = self.image_selection_policy(item_id).await?;
-        let capability_states = self
-            .database
-            .list_metadata_capability_attempts(item_id)
-            .await?;
-        let image_attempts = self.database.list_metadata_image_attempts(item_id).await?;
+        let (capability_states, image_attempts) =
+            self.database.list_metadata_attempts(item_id).await?;
         let unavailable_image_attempts = image_attempts
             .into_iter()
             .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
@@ -2145,7 +2154,7 @@ impl MetadataSelectionService {
             actual_plan.needs_metadata = true;
             requestable_plan.needs_metadata = true;
         }
-        Ok((actual_plan, requestable_plan))
+        Ok((actual_plan, requestable_plan, actual_missing_image_mask))
     }
 
     pub async fn select(
@@ -2686,20 +2695,16 @@ impl MetadataSelectionService {
         &self,
         item_id: &str,
     ) -> Result<ImageSelectionPolicy, MetadataSelectionError> {
-        let library_id = self
+        let Some((library_strategy, global_strategy)) = self
             .database
-            .find_item_library_id(item_id)
+            .find_item_media_strategy_settings(item_id)
             .await?
-            .ok_or(MetadataSelectionError::ItemNotFound)?;
-        let library = self
-            .database
-            .find_library(&library_id)
-            .await?
-            .ok_or(MetadataSelectionError::ItemNotFound)?;
-        let global = self.database.media_strategy_settings().await?;
+        else {
+            return Err(MetadataSelectionError::ItemNotFound);
+        };
         Ok(ImageSelectionPolicy::from_json(
-            library.media_strategy_json.as_deref(),
-            global.as_deref(),
+            library_strategy.as_deref(),
+            global_strategy.as_deref(),
         ))
     }
 }
@@ -3706,8 +3711,9 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_METADATA_FETCH_CONCURRENCY, MetadataRequestPlan, SCRAPER_IMAGE_TYPES,
-        candidate_actors, capability_needs_request, completeness_capabilities, credits_are_missing,
+        ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
+        MetadataRequestPlan, MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actors,
+        capability_needs_request, completeness_capabilities, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
         local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
         metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
@@ -3719,6 +3725,7 @@ mod tests {
         ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
         ScraperSearchRequest, ScraperSearchResponse, ScraperTrailersResponse,
     };
+    use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
     use serde_json::json;
     use std::sync::{
@@ -3854,6 +3861,44 @@ mod tests {
         assert!(!enabled_types.contains(&"THUMB"));
         assert!(enabled_types.contains(&"FANART"));
         assert!(enabled_types.contains(&"LOGO"));
+    }
+
+    #[test]
+    fn thumbnail_retry_uses_actual_missing_images_from_the_request_plan() {
+        let mut policy = default_image_selection_policy();
+        policy.thumbnail_scraping_mode = ThumbnailScrapingMode::ScraperFirst;
+        let request_plan = FillMissingRequestPlan {
+            requestable: MetadataRequestPlan {
+                image_policy: Some(policy),
+                missing_image_mask: 0,
+                ..MetadataRequestPlan::default()
+            },
+            actual_missing_image_mask: 1,
+        };
+        assert!(MetadataSelectionService::should_schedule_thumbnail_scraper_retry(request_plan));
+
+        assert!(
+            !MetadataSelectionService::should_schedule_thumbnail_scraper_retry(
+                FillMissingRequestPlan {
+                    actual_missing_image_mask: 0,
+                    ..request_plan
+                }
+            )
+        );
+        assert!(
+            !MetadataSelectionService::should_schedule_thumbnail_scraper_retry(
+                FillMissingRequestPlan {
+                    requestable: MetadataRequestPlan {
+                        image_policy: Some(ImageSelectionPolicy {
+                            thumbnail_scraping_mode: ThumbnailScrapingMode::ScreenshotFirst,
+                            ..policy
+                        }),
+                        ..request_plan.requestable
+                    },
+                    ..request_plan
+                }
+            )
+        );
     }
 
     #[test]
