@@ -5,6 +5,35 @@ use luxd::{
     storage::Database,
 };
 
+async fn wait_for_local_metadata_batches(
+    database: &Database,
+    job_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (pending, failed): (i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*) FILTER (WHERE status IN ('PENDING', 'RUNNING')),
+                        COUNT(*) FILTER (WHERE status = 'FAILED')
+                 FROM scan_local_metadata_batches WHERE job_id = ?",
+            )
+            .bind(job_id)
+            .fetch_one(database.pool())
+            .await?;
+            if failed > 0 {
+                return Err(sqlx::Error::Protocol(format!(
+                    "{failed} local metadata batch(es) failed"
+                )));
+            }
+            if pending == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn completed_series_scan_indexes_local_nfo_and_images()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -54,6 +83,7 @@ async fn completed_series_scan_indexes_local_nfo_and_images()
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
+    wait_for_local_metadata_batches(&database, &job.id).await?;
 
     let series_title: String =
         sqlx::query_scalar("SELECT title FROM media_items WHERE item_type = 'SERIES'")
@@ -83,6 +113,30 @@ async fn completed_series_scan_indexes_local_nfo_and_images()
         ]
     );
     assert!(image_rows.iter().all(|(_, _, path)| path.ends_with(".jpg")));
+
+    let first_poster: (String, Option<String>) = sqlx::query_as(
+        "SELECT item_images.local_path, item_images.content_tag
+         FROM item_images JOIN media_items ON media_items.id = item_images.item_id
+         WHERE media_items.item_type = 'SERIES' AND item_images.image_type = 'POSTER'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    tokio::fs::remove_file(series_dir.join("poster.jpg")).await?;
+    tokio::fs::write(series_dir.join("poster.png"), b"updated-series-poster").await?;
+
+    let rescan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&rescan.id, 100, None).await?;
+    wait_for_local_metadata_batches(&database, &rescan.id).await?;
+
+    let updated_poster: (String, Option<String>) = sqlx::query_as(
+        "SELECT item_images.local_path, item_images.content_tag
+         FROM item_images JOIN media_items ON media_items.id = item_images.item_id
+         WHERE media_items.item_type = 'SERIES' AND item_images.image_type = 'POSTER'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(updated_poster.0.ends_with("poster.png"));
+    assert_ne!(first_poster.1, updated_poster.1);
     Ok(())
 }
 
@@ -127,6 +181,7 @@ async fn series_scan_indexes_images_in_nested_categories_after_one_nfo_conflict(
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
+    wait_for_local_metadata_batches(&database, &job.id).await?;
 
     let image_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT media_items.item_type, item_images.image_type

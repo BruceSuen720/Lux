@@ -218,6 +218,10 @@ async fn auto_cover_runs_before_unrelated_postprocessing_failure()
         ThumbnailService::with_runner(database.clone(), "false", Duration::from_secs(5));
     let jobs = ScanJobService::new(database.clone()).with_library_covers(covers);
     let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 2 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
     jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
         .await?;
 
@@ -232,9 +236,22 @@ async fn auto_cover_runs_before_unrelated_postprocessing_failure()
             .bind(library.id.to_string())
             .fetch_one(database.pool())
             .await?;
+    let poster_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT ii.item_id) FROM item_images ii
+         JOIN media_items mi ON mi.id = ii.item_id
+         WHERE mi.library_id = ? AND ii.image_type = 'POSTER' AND ii.image_index = 0",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let cover_jobs: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, error FROM library_cover_jobs WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_all(database.pool())
+            .await?;
     assert!(
         cover_path.is_some(),
-        "cover generation must not depend on thumbnails"
+        "cover generation must not depend on thumbnails; posters={poster_count}, jobs={cover_jobs:?}"
     );
 
     let registered: i64 = sqlx::query_scalar(

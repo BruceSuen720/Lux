@@ -65,7 +65,11 @@ impl EmbyAuthService {
         password: &str,
         device: &EmbyDeviceInfo,
     ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
-        let Some(user) = self.users.authenticate(username, password).await? else {
+        let Some(user) = self
+            .users
+            .authenticate_emby_name(username, password)
+            .await?
+        else {
             return Ok(None);
         };
         let token = generate_token()?;

@@ -134,7 +134,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 150);
+    assert_eq!(database.schema_version().await?, 153);
     insert_postgres_homevideos_video(&database).await?;
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
@@ -148,6 +148,22 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_tables, 6);
+    let progressive_metadata_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN ('scan_local_metadata_batches', 'item_metadata_completeness')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(progressive_metadata_tables, 2);
+    let scan_metadata_policy: i64 = sqlx::query_scalar(
+        "SELECT scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE kind = 'HOMEVIDEOS' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(scan_metadata_policy, 1);
     let removed_media_search_indexes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM pg_indexes
@@ -673,7 +689,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 150);
+    assert_eq!(database.schema_version().await?, 153);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -1973,7 +1989,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 150);
+    assert_eq!(database.schema_version().await?, 153);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
@@ -1996,6 +2012,255 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     insert_postgres_homevideos_video(&database).await?;
 
     database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_progressive_scan_metadata_migration_preserves_policy_and_queue_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let source_migrations =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    let old_migrations = temp_dir.path().join("migrations-v150");
+    fs::create_dir(&old_migrations)?;
+    for entry in fs::read_dir(&source_migrations)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let migration_name = name.to_str().ok_or("migration name is not UTF-8")?;
+        let version = migration_name
+            .split_once('_')
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration name has no version")?;
+        if version <= 150 {
+            fs::copy(entry.path(), old_migrations.join(name))?;
+        }
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    sqlx::migrate::Migrator::new(old_migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    for (id, enabled) in [("progressive-off", 0_i64), ("progressive-on", 1_i64)] {
+        sqlx::query(
+            "INSERT INTO libraries (
+                 id, name, kind, realtime_metadata_auto_match_enabled
+             ) VALUES ($1, $2, 'MOVIE', $3)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(enabled)
+        .execute(&pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('progressive-root', 'progressive-on', '/media', '/media', 1, 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (
+             'progressive-item', 'progressive-on', 'MOVIE', 'Progressive', 'progressive',
+             'LOCAL_CONFIRMED'
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
+    fs::copy(
+        source_migrations.join("0151_progressive_scan_metadata.sql"),
+        old_migrations.join("0151_progressive_scan_metadata.sql"),
+    )?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    sqlx::migrate::Migrator::new(old_migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('workflow-two-job', 'progressive-on', 'RECONCILE_LIBRARY', 'COMPLETED', 'g2')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifests (
+             id, job_id, library_id, state, workflow_version, resume_state
+         ) VALUES (
+             'workflow-two-manifest', 'workflow-two-job', 'progressive-on', 'FAILED', 2,
+             'DISCOVERING'
+         )",
+    )
+    .execute(&pool)
+    .await?;
+
+    fs::copy(
+        source_migrations.join("0152_scan_manifest_workflow_three.sql"),
+        old_migrations.join("0152_scan_manifest_workflow_three.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(old_migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_batches (
+             id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+         ) VALUES (
+             'pre-image-stage-batch', 'cleaned-scan-job', 'progressive-root', 10,
+             '[\"source-old\"]', 1
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    fs::copy(
+        source_migrations.join("0153_scan_local_metadata_image_stage.sql"),
+        old_migrations.join("0153_scan_local_metadata_image_stage.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(old_migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let legacy_manifest: (i32, Option<String>) = sqlx::query_as(
+        "SELECT workflow_version, resume_state FROM scan_manifests
+         WHERE id = 'workflow-two-manifest'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(legacy_manifest, (2, Some("DISCOVERING".to_owned())));
+    let old_batch_image_stage: Option<i64> = sqlx::query_scalar(
+        "SELECT images_completed_at FROM scan_local_metadata_batches
+         WHERE id = 'pre-image-stage-batch'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(old_batch_image_stage, None);
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('workflow-three-job', 'progressive-on', 'RECONCILE_LIBRARY', 'PENDING', 'g3')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifests (id, job_id, library_id, state, workflow_version)
+         VALUES ('workflow-three-manifest', 'workflow-three-job', 'progressive-on', 'DISCOVERING', 3)",
+    )
+    .execute(&pool)
+    .await?;
+
+    let existing_policy: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE id IN ('progressive-off', 'progressive-on') ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        existing_policy,
+        vec![
+            ("progressive-off".to_owned(), 0),
+            ("progressive-on".to_owned(), 1)
+        ]
+    );
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('progressive-new', 'New', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    let new_policy: i64 = sqlx::query_scalar(
+        "SELECT scan_missing_metadata_auto_match_enabled
+         FROM libraries WHERE id = 'progressive-new'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(new_policy, 1);
+
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_batches (
+             id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+         ) VALUES ('progressive-batch', 'cleaned-scan-job', 'progressive-root', 0, '[\"source-1\"]', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_metadata_completeness (
+             item_id, capability, local_state, is_missing
+         ) VALUES ('progressive-item', 'POSTER', 'READY', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing
+             ) VALUES ('progressive-item', 'POSTER', 'READY', 0)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing
+             ) VALUES ('progressive-item', 'BACKDROP', 'FAILED', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+             ) VALUES ('progressive-empty', 'cleaned-scan-job', 'progressive-root', 2, '[\"source-1\"]', 0)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+             ) VALUES ('progressive-oversized', 'cleaned-scan-job', 'progressive-root', 1, '[]', 257)",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+
+    sqlx::query("DELETE FROM libraries WHERE id = 'progressive-on'")
+        .execute(&pool)
+        .await?;
+    let cascaded_batch_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_local_metadata_batches WHERE id = 'progressive-batch'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let cascaded_completeness_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness WHERE item_id = 'progressive-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(cascaded_batch_count, 0);
+    assert_eq!(cascaded_completeness_count, 0);
+
+    pool.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }

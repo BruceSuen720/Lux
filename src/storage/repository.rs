@@ -1203,6 +1203,46 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
+#[allow(dead_code)] // The local metadata worker consumes these batches in the next phase task.
+#[derive(Clone, Copy)]
+pub(crate) struct NewScanLocalMetadataBatch<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) batch_sequence: i64,
+    pub(crate) source_ids: &'a [String],
+}
+
+#[allow(dead_code)] // Fields are consumed by the later local metadata worker.
+#[derive(Debug)]
+pub(crate) struct StoredScanLocalMetadataBatch {
+    pub(crate) id: String,
+    pub(crate) job_id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) batch_sequence: i64,
+    pub(crate) source_refs_json: String,
+    pub(crate) source_count: i64,
+    pub(crate) status: String,
+    pub(crate) attempts: i64,
+    pub(crate) next_attempt_at: Option<i64>,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanLocalMetadataSource {
+    pub(crate) source_id: String,
+    pub(crate) item_id: String,
+    pub(crate) item_type: String,
+    pub(crate) probe_status: String,
+    pub(crate) series_id: Option<String>,
+    pub(crate) season_id: Option<String>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NewScanManifestRoot<'a> {
     pub(crate) library_root_id: &'a str,
@@ -1368,7 +1408,7 @@ pub(crate) fn is_lite_manifest_discovery(
     discovery_format_version: i64,
     discovery_mode: &str,
 ) -> bool {
-    workflow_version == 2 && discovery_format_version == 3 && discovery_mode == "LITE"
+    matches!(workflow_version, 2 | 3) && discovery_format_version == 3 && discovery_mode == "LITE"
 }
 
 #[derive(Debug)]
@@ -1472,6 +1512,7 @@ pub(crate) struct ManifestDiscoveryCommitResult {
     pub(crate) observed_file_count: i64,
     pub(crate) created_items: usize,
     pub(crate) metadata_targets_changed: bool,
+    pub(crate) local_metadata_batches_changed: bool,
 }
 
 #[derive(Debug)]
@@ -1624,6 +1665,23 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
         current_item: row.get("current_item"),
         scan_phase: row.get("scan_phase"),
+    }
+}
+
+fn stored_scan_local_metadata_batch(row: sqlx::any::AnyRow) -> StoredScanLocalMetadataBatch {
+    StoredScanLocalMetadataBatch {
+        id: row.get("id"),
+        job_id: row.get("job_id"),
+        library_root_id: row.get("library_root_id"),
+        batch_sequence: row.get("batch_sequence"),
+        source_refs_json: row.get("source_refs_json"),
+        source_count: row.get("source_count"),
+        status: row.get("status"),
+        attempts: row.get("attempts"),
+        next_attempt_at: row.get("next_attempt_at"),
+        error: row.get("error"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }
 }
 
@@ -2010,6 +2068,20 @@ pub(crate) struct StoredMetadataCapabilityAttempt {
     pub(crate) next_retry_at: Option<i64>,
 }
 
+#[allow(dead_code)] // Consumed by local metadata scanning in the next phase task.
+#[derive(Debug)]
+pub(crate) struct StoredItemMetadataCompleteness {
+    pub(crate) item_id: String,
+    pub(crate) capability: String,
+    pub(crate) local_state: String,
+    pub(crate) is_missing: Option<bool>,
+    pub(crate) input_fingerprint: Option<Vec<u8>>,
+    pub(crate) checked_at: Option<i64>,
+    pub(crate) retry_after: Option<i64>,
+    pub(crate) error: Option<String>,
+    pub(crate) updated_at: i64,
+}
+
 pub(crate) struct MetadataCapabilityResult<'a> {
     pub(crate) capability: &'a str,
     pub(crate) has_data: bool,
@@ -2119,6 +2191,22 @@ fn stored_metadata_candidate(row: sqlx::any::AnyRow) -> StoredMetadataCandidate 
         status: row.get("status"),
         expires_at: row.get("expires_at"),
         item_title: row.get("item_title"),
+    }
+}
+
+fn stored_item_metadata_completeness(row: sqlx::any::AnyRow) -> StoredItemMetadataCompleteness {
+    StoredItemMetadataCompleteness {
+        item_id: row.get("item_id"),
+        capability: row.get("capability"),
+        local_state: row.get("local_state"),
+        is_missing: row
+            .get::<Option<i64>, _>("is_missing")
+            .map(|value| value != 0),
+        input_fingerprint: row.get("input_fingerprint"),
+        checked_at: row.get("checked_at"),
+        retry_after: row.get("retry_after"),
+        error: row.get("error"),
+        updated_at: row.get("updated_at"),
     }
 }
 

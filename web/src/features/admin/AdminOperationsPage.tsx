@@ -128,6 +128,8 @@ const ERROR_LABELS: Record<string, string> = {
   DEFERRED_PROVIDER_UNAVAILABLE: "刮削器暂不可用，已延后重试",
   WORKER_FAILED: "任务工作线程异常退出",
   STORAGE_ERROR: "数据库处理失败",
+  SQLITE_BUSY: "SQLite 写入繁忙，扫描重试后仍失败",
+  SQLITE_LOCKED: "SQLite 数据库锁冲突，扫描重试后仍失败",
 };
 
 export function AdminOperationsPage() {
@@ -852,7 +854,29 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
           ? "媒体库封面任务"
           : job.kind === "metadata" ? "元数据任务" : "扫描任务";
   const retryable = job.kind !== "cover" && (job.status === "FAILED" || job.status === "CANCELLED" || job.status === "COMPLETED_WITH_ISSUES" || job.status === "DEFERRED");
-  const error = formatJobError(job.error);
+  const needsScanErrorCode = job.kind === "scan" && job.status === "FAILED";
+  const scanErrorEvents = useQuery({
+    queryKey: ["admin", "job-events", job.id, "ERROR"],
+    queryFn: () => api.adminJobEvents(job.id),
+    enabled: needsScanErrorCode && !isErrorCode(job.error),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
+  const scanErrorCode = needsScanErrorCode
+    ? scanErrorEvents.data?.events?.[0]?.eventCode || (isErrorCode(job.error) ? job.error : null)
+    : null;
+  const error = needsScanErrorCode
+    ? scanErrorCode
+      ? formatScanJobError(scanErrorCode)
+      : scanErrorEvents.isPending
+        ? "扫描任务失败（正在读取错误码）"
+        : scanErrorEvents.isError
+          ? "扫描任务失败（错误码读取失败）"
+          : "扫描任务失败（未记录错误码）"
+    : formatJobError(
+        job.error,
+        job.kind === "scan" ? "扫描任务失败，具体原因请查看任务错误事件。" : undefined,
+      );
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
   const pendingCount = job.kind === "metadata" ? job.pendingCount ?? 0 : 0;
   const pendingHref = job.libraryId ? `/libraries/${encodeURIComponent(job.libraryId)}?metadataStatus=pending` : undefined;
@@ -935,10 +959,24 @@ function formatJobStatus(status: string) {
   return JOB_STATUS_LABELS[status] || "处理中";
 }
 
-function formatJobError(error?: string | null) {
+function isErrorCode(error?: string | null): error is string {
+  return Boolean(error && /^[A-Z][A-Z0-9_]{1,127}$/.test(error));
+}
+
+function formatScanJobError(errorCode: string) {
+  const knownLabel = Object.prototype.hasOwnProperty.call(ERROR_LABELS, errorCode)
+    ? ERROR_LABELS[errorCode]
+    : "扫描任务失败";
+  return `${knownLabel}（${errorCode}）`;
+}
+
+function formatJobError(
+  error?: string | null,
+  unrecognizedErrorLabel = "任务处理失败（未提供可识别的错误码）",
+) {
   if (!error) return "";
   const knownLabel = Object.prototype.hasOwnProperty.call(ERROR_LABELS, error) ? ERROR_LABELS[error] : undefined;
-  return knownLabel || (/^[A-Z][A-Z0-9_]{1,127}$/.test(error) ? `任务处理失败（${error}）` : "任务处理失败（未提供可识别的错误码）");
+  return knownLabel || (isErrorCode(error) ? `任务处理失败（${error}）` : unrecognizedErrorLabel);
 }
 
 function formatJobDuration(job: OperationsJob) {

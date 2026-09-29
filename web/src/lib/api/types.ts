@@ -737,6 +737,23 @@ export type AdminJob = {
   scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "POSTPROCESSING" | "IDLE" | string;
 };
 
+export type AdminJobEvent = {
+  id: string;
+  jobId: string;
+  level: string;
+  eventCode: string;
+  message: string;
+  details?: Record<string, unknown>;
+  createdAt: string | number;
+};
+
+export type AdminJobEventPage = {
+  events?: AdminJobEvent[];
+  total: number;
+  page: number;
+  pageSize: number;
+};
+
 export type AdminTaskActivity = {
   id: string;
   kind: "scan" | "metadata" | "strm" | "chapter" | "danmaku" | "cover" | string;

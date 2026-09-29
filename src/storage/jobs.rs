@@ -4,6 +4,9 @@ use std::time::Instant;
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
+const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
+const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
+const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 
 fn escape_sql_like_pattern(value: &str) -> String {
     value
@@ -30,6 +33,7 @@ struct ManifestDiscoveryPositiveIndexResult<'a> {
     reappeared_count: i64,
     applied_count: i64,
     indexed_paths: Vec<&'a str>,
+    local_metadata_refs: Vec<(&'a str, &'a str)>,
 }
 
 struct ManifestDiscoveryPositiveIndexCommit<'a, 'b> {
@@ -46,6 +50,10 @@ fn record_manifest_positive_applied<'a>(
     positive: &'a NewScanManifestPositiveIndex,
 ) {
     result.indexed_paths.push(positive.relative_path.as_str());
+    result.local_metadata_refs.push((
+        positive.relative_path.as_str(),
+        manifest_positive_file_filesystem_entry_id(&positive.file),
+    ));
     result.applied_count = result.applied_count.saturating_add(1);
     match positive.delta_kind.as_str() {
         "ADD" => result.add_count = result.add_count.saturating_add(1),
@@ -76,6 +84,643 @@ fn manifest_positive_file_filesystem_entry_id(file: &NewScanManifestIndexedFile)
 impl Database {
     pub(crate) const LEGACY_SCAN_REQUIRES_NEW_MANIFEST: &'static str =
         "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
+}
+
+#[allow(dead_code)] // The local outbox worker is connected in the following phase task.
+impl Database {
+    pub(crate) async fn enqueue_scan_local_metadata_batch(
+        &self,
+        batch: NewScanLocalMetadataBatch<'_>,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let inserted = self
+            .enqueue_scan_local_metadata_batch_in_transaction(&mut transaction, batch)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted)
+    }
+
+    async fn enqueue_scan_local_metadata_batch_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        batch: NewScanLocalMetadataBatch<'_>,
+    ) -> Result<bool, StorageError> {
+        if batch.id.trim().is_empty()
+            || batch.job_id.trim().is_empty()
+            || batch.library_root_id.trim().is_empty()
+            || batch.batch_sequence < 0
+            || batch.source_ids.is_empty()
+            || batch.source_ids.len() > MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES
+        {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch has invalid identity, sequence, or source count".into(),
+            ));
+        }
+        let mut unique_sources = std::collections::HashSet::with_capacity(batch.source_ids.len());
+        if batch
+            .source_ids
+            .iter()
+            .any(|source_id| source_id.trim().is_empty() || !unique_sources.insert(source_id))
+        {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch contains an empty or duplicate source".into(),
+            ));
+        }
+        let source_refs_json = serde_json::to_string(batch.source_ids)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        let source_count = i64::try_from(batch.source_ids.len()).map_err(|_| {
+            StorageError::Conflict("scan local metadata source count overflow".into())
+        })?;
+
+        let inserted = self
+            .query(
+                "INSERT INTO scan_local_metadata_batches (
+                     id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(job_id, library_root_id, batch_sequence) DO NOTHING
+                 RETURNING id",
+            )
+            .bind(batch.id)
+            .bind(batch.job_id)
+            .bind(batch.library_root_id)
+            .bind(batch.batch_sequence)
+            .bind(&source_refs_json)
+            .bind(source_count)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted.is_some() {
+            return Ok(true);
+        }
+
+        let existing = self
+            .query_as::<(String, String, i64)>(
+                "SELECT id, source_refs_json, source_count
+                 FROM scan_local_metadata_batches
+                 WHERE job_id = ? AND library_root_id = ? AND batch_sequence = ?",
+            )
+            .bind(batch.job_id)
+            .bind(batch.library_root_id)
+            .bind(batch.batch_sequence)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((existing_id, existing_sources, existing_count)) = existing else {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch id already belongs to another batch".into(),
+            ));
+        };
+        if existing_id != batch.id
+            || existing_sources != source_refs_json
+            || existing_count != source_count
+        {
+            return Err(StorageError::Conflict(
+                "scan local metadata batch sequence already has different input".into(),
+            ));
+        }
+        Ok(false)
+    }
+
+    async fn enqueue_manifest_local_metadata_refs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        library_root_id: &str,
+        local_metadata_refs: &[(&str, &str)],
+        sequence_start: i64,
+    ) -> Result<(), StorageError> {
+        let mut ordered_refs = local_metadata_refs.to_vec();
+        ordered_refs.sort_unstable();
+        let mut unique_refs = std::collections::HashSet::with_capacity(ordered_refs.len());
+        ordered_refs.retain(|(_, reference_id)| unique_refs.insert(*reference_id));
+
+        for (batch_index, refs) in ordered_refs
+            .chunks(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES)
+            .enumerate()
+        {
+            let batch_index = i64::try_from(batch_index).map_err(|_| {
+                StorageError::Conflict("local metadata batch sequence overflow".into())
+            })?;
+            let batch_sequence = sequence_start.checked_add(batch_index).ok_or_else(|| {
+                StorageError::Conflict("local metadata batch sequence overflow".into())
+            })?;
+            let source_ids = refs
+                .iter()
+                .map(|(_, reference_id)| (*reference_id).to_owned())
+                .collect::<Vec<_>>();
+            let id = format!("{job_id}:{library_root_id}:{batch_sequence}");
+            self.enqueue_scan_local_metadata_batch_in_transaction(
+                transaction,
+                NewScanLocalMetadataBatch {
+                    id: &id,
+                    job_id,
+                    library_root_id,
+                    batch_sequence,
+                    source_ids: &source_ids,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn list_scan_local_metadata_batches(
+        &self,
+        after_created_at: Option<i64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredScanLocalMetadataBatch>, StorageError> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| StorageError::Conflict("invalid scan metadata page size".into()))?;
+        if !(1..=MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE).contains(&limit)
+            || after_created_at.is_some() != after_id.is_some()
+        {
+            return Err(StorageError::Conflict(
+                "invalid scan metadata page size or cursor".into(),
+            ));
+        }
+        let rows = match (after_created_at, after_id) {
+            (None, None) => {
+                self.query(
+                    "SELECT * FROM scan_local_metadata_batches
+                     ORDER BY created_at, id LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (Some(created_at), Some(id)) => {
+                self.query(
+                    "SELECT * FROM scan_local_metadata_batches
+                     WHERE created_at > ? OR (created_at = ? AND id > ?)
+                     ORDER BY created_at, id LIMIT ?",
+                )
+                .bind(created_at)
+                .bind(created_at)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            _ => {
+                return Err(StorageError::Conflict(
+                    "invalid scan metadata page cursor".into(),
+                ));
+            }
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(stored_scan_local_metadata_batch)
+            .collect())
+    }
+
+    pub(crate) async fn list_scan_local_metadata_sources(
+        &self,
+        filesystem_entry_ids: &[String],
+    ) -> Result<Vec<StoredScanLocalMetadataSource>, StorageError> {
+        let mut referenced_directories = Vec::new();
+        let mut seen_directories = std::collections::HashSet::new();
+        for entry_ids in filesystem_entry_ids.chunks(SCAN_DML_CHUNK_SIZE) {
+            if entry_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", entry_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT DISTINCT library_root_id, relative_path
+                 FROM filesystem_entries
+                 WHERE id IN ({placeholders}) AND entry_kind = 'FILE' AND is_missing = 0"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for entry_id in entry_ids {
+                statement = statement.bind(entry_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let library_root_id: String = row.get("library_root_id");
+                let relative_path: String = row.get("relative_path");
+                let directory_path = relative_path
+                    .rsplit_once('/')
+                    .map_or_else(String::new, |(parent, _)| parent.to_owned());
+                let directory = (library_root_id, directory_path);
+                if seen_directories.insert(directory.clone()) {
+                    referenced_directories.push(directory);
+                }
+            }
+        }
+        if referenced_directories.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sources = Vec::new();
+        let mut directories_with_direct_sources = std::collections::HashSet::new();
+        for directories in referenced_directories.chunks(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES) {
+            let predicates = directories
+                .iter()
+                .map(|(_, directory_path)| {
+                    if directory_path.is_empty() {
+                        "(source_entry.library_root_id = ?
+                          AND source_entry.relative_path NOT LIKE '%/%' ESCAPE '\\')"
+                            .to_owned()
+                    } else {
+                        "(source_entry.library_root_id = ?
+                          AND source_entry.relative_path LIKE ? ESCAPE '\\'
+                          AND source_entry.relative_path NOT LIKE ? ESCAPE '\\')"
+                            .to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let query = format!(
+                "SELECT DISTINCT preferred.id AS source_id, mi.id AS item_id, mi.item_type,
+                        preferred.probe_status, series.id AS series_id,
+                        season.id AS season_id, season.season_number,
+                        lr.canonical_path AS root_path,
+                        source_entry.library_root_id AS queued_library_root_id,
+                        source_entry.relative_path AS queued_relative_path,
+                        preferred_entry.relative_path
+                 FROM media_sources queued
+                 JOIN filesystem_entries source_entry
+                   ON source_entry.id = queued.filesystem_entry_id
+                 JOIN media_items mi ON mi.id = queued.item_id
+                 JOIN media_sources preferred ON preferred.id = (
+                     SELECT candidate.id FROM media_sources candidate
+                     JOIN filesystem_entries candidate_entry
+                       ON candidate_entry.id = candidate.filesystem_entry_id
+                     WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
+                     ORDER BY candidate.is_default DESC, candidate.id
+                     LIMIT 1
+                 )
+                 JOIN filesystem_entries preferred_entry
+                   ON preferred_entry.id = preferred.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
+                 LEFT JOIN media_items season
+                   ON season.id = mi.parent_id AND season.item_type = 'SEASON'
+                 LEFT JOIN media_items series
+                   ON series.id = mi.series_id AND series.item_type = 'SERIES'
+                 WHERE source_entry.entry_kind = 'FILE' AND source_entry.is_missing = 0
+                   AND ({predicates})
+                   AND mi.removed_at IS NULL AND preferred_entry.is_missing = 0
+                 ORDER BY mi.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (library_root_id, directory_path) in directories {
+                statement = statement.bind(library_root_id);
+                if !directory_path.is_empty() {
+                    let escaped = escape_sql_like_pattern(directory_path);
+                    statement = statement
+                        .bind(format!("{escaped}/%"))
+                        .bind(format!("{escaped}/%/%"));
+                }
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let queued_relative_path: String = row.get("queued_relative_path");
+                let queued_library_root_id: String = row.get("queued_library_root_id");
+                let directory_path = queued_relative_path
+                    .rsplit_once('/')
+                    .map_or_else(String::new, |(parent, _)| parent.to_owned());
+                directories_with_direct_sources.insert((queued_library_root_id, directory_path));
+                let relative_path: String = row.get("relative_path");
+                sources.push(StoredScanLocalMetadataSource {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
+                    probe_status: row.get("probe_status"),
+                    series_id: row.get("series_id"),
+                    season_id: row.get("season_id"),
+                    season_number: row.get("season_number"),
+                    root_path: row.get("root_path"),
+                    relative_path,
+                });
+            }
+        }
+
+        // A series-level poster may be the only changed file in its directory. If that
+        // directory contains season subdirectories, associate it with one source per season
+        // so the existing series image indexer can find the poster and season artwork.
+        for (library_root_id, directory_path) in &referenced_directories {
+            if directory_path.is_empty()
+                || directories_with_direct_sources
+                    .contains(&(library_root_id.clone(), directory_path.clone()))
+            {
+                continue;
+            }
+            let escaped = escape_sql_like_pattern(directory_path);
+            let query = "SELECT DISTINCT preferred.id AS source_id, mi.id AS item_id, mi.item_type,
+                        preferred.probe_status, series.id AS series_id,
+                        season.id AS season_id, season.season_number,
+                        lr.canonical_path AS root_path, preferred_entry.relative_path
+                 FROM media_sources queued
+                 JOIN filesystem_entries source_entry
+                   ON source_entry.id = queued.filesystem_entry_id
+                 JOIN media_items mi ON mi.id = queued.item_id
+                 JOIN media_sources preferred ON preferred.id = (
+                     SELECT candidate.id FROM media_sources candidate
+                     JOIN filesystem_entries candidate_entry
+                       ON candidate_entry.id = candidate.filesystem_entry_id
+                     WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
+                     ORDER BY candidate.is_default DESC, candidate.id
+                     LIMIT 1
+                 )
+                 JOIN filesystem_entries preferred_entry
+                   ON preferred_entry.id = preferred.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
+                 LEFT JOIN media_items season
+                   ON season.id = mi.parent_id AND season.item_type = 'SEASON'
+                 LEFT JOIN media_items series
+                   ON series.id = mi.series_id AND series.item_type = 'SERIES'
+                 WHERE source_entry.library_root_id = ?
+                   AND source_entry.relative_path LIKE ? ESCAPE '\\'
+                   AND source_entry.entry_kind = 'FILE' AND source_entry.is_missing = 0
+                   AND mi.item_type = 'EPISODE' AND mi.removed_at IS NULL
+                   AND preferred_entry.is_missing = 0
+                 ORDER BY mi.id
+                 LIMIT ?";
+            let rows = self
+                .query(query)
+                .bind(library_root_id)
+                .bind(format!("{escaped}/%"))
+                .bind(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let mut seen_seasons = std::collections::HashSet::new();
+            for row in rows {
+                let season_id: String = row.get("season_id");
+                if !seen_seasons.insert(season_id) {
+                    continue;
+                }
+                sources.push(StoredScanLocalMetadataSource {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
+                    probe_status: row.get("probe_status"),
+                    series_id: row.get("series_id"),
+                    season_id: row.get("season_id"),
+                    season_number: row.get("season_number"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                });
+            }
+        }
+        let mut seen_items = std::collections::HashSet::with_capacity(sources.len());
+        sources.retain(|source| seen_items.insert(source.item_id.clone()));
+        Ok(sources)
+    }
+
+    pub(crate) async fn mark_scan_local_metadata_images_complete(
+        &self,
+        batch_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE scan_local_metadata_batches
+             SET images_completed_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'",
+        )
+        .bind(batch_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn has_pending_scan_local_metadata_images(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM scan_local_metadata_batches
+                 WHERE job_id = ? AND images_completed_at IS NULL
+                   AND status IN ('PENDING', 'RUNNING')
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_next_scan_local_metadata_batch(
+        &self,
+    ) -> Result<Option<StoredScanLocalMetadataBatch>, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let next_id = self
+            .query_scalar::<String>(
+                "SELECT id FROM scan_local_metadata_batches
+                 WHERE status IN ('PENDING', 'FAILED')
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
+                 ORDER BY created_at, id LIMIT 1",
+            )
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(next_id) = next_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(None);
+        };
+        let claimed = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'RUNNING', attempts = attempts + 1, next_attempt_at = NULL,
+                     error = NULL, images_completed_at = NULL, updated_at = unixepoch()
+                 WHERE id = ? AND status IN ('PENDING', 'FAILED')
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
+                 RETURNING *",
+            )
+            .bind(next_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(claimed.map(stored_scan_local_metadata_batch))
+    }
+
+    pub(crate) async fn complete_scan_local_metadata_batch(
+        &self,
+        batch_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.transition_scan_local_metadata_batch(batch_id, None, None)
+            .await
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_batch(
+        &self,
+        batch_id: &str,
+        error: &str,
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
+            return Err(StorageError::Conflict(
+                "scan local metadata error exceeds the storage limit".into(),
+            ));
+        }
+        self.transition_scan_local_metadata_batch(batch_id, next_attempt_at, Some(error))
+            .await
+    }
+
+    async fn transition_scan_local_metadata_batch(
+        &self,
+        batch_id: &str,
+        next_attempt_at: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = if let Some(error) = error {
+            self.query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'FAILED', next_attempt_at = ?, error = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(next_attempt_at)
+            .bind(error)
+            .bind(batch_id)
+            .execute(&mut *transaction)
+            .await
+        } else {
+            self.query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'COMPLETED', next_attempt_at = NULL, error = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(batch_id)
+            .execute(&mut *transaction)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn cancel_scan_local_metadata_batches(
+        &self,
+        job_id: &str,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'CANCELLED', next_attempt_at = NULL, updated_at = unixepoch()
+                 WHERE job_id = ? AND status IN ('PENDING', 'FAILED', 'RUNNING')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    /// Call once during startup, before outbox workers begin claiming work.
+    pub(crate) async fn requeue_interrupted_scan_local_metadata_batches(
+        &self,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'PENDING', next_attempt_at = NULL, updated_at = unixepoch()
+                 WHERE status = 'RUNNING'",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
@@ -756,7 +1401,7 @@ impl Database {
                      discovery_format_version, discovery_mode, root_count,
                      postprocessing_targets_ready
                  )
-                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 2, 3, 'LITE', ?, 0
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 3, 3, 'LITE', ?, 0
                  FROM scan_jobs sj
                  WHERE sj.id = ? AND sj.library_id = ?
                    AND sj.job_type = 'RECONCILE_LIBRARY' AND sj.status = 'PENDING'",
@@ -1135,7 +1780,7 @@ impl Database {
             ));
         };
         if manifest_state != "POSTPROCESSING"
-            || workflow != 2
+            || !matches!(workflow, 2 | 3)
             || format != 3
             || ready != 0
             || job_status != "COMPLETED"
@@ -2061,13 +2706,26 @@ impl Database {
         } else {
             entries.clone()
         };
-        let observation_count_i64 = if workflow_version == 2 {
+        let observation_count_i64 = if matches!(workflow_version, 2 | 3) {
             i64::try_from(observation_entries.len()).map_err(|_| {
                 StorageError::Conflict("manifest observation count overflow".to_owned())
             })?
         } else {
             0
         };
+        let reserved_local_batch_sequence_count = if workflow_version == 3 {
+            i64::try_from(
+                positive_indexes
+                    .len()
+                    .div_ceil(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES),
+            )
+            .map_err(|_| StorageError::Conflict("local metadata batch count overflow".to_owned()))?
+        } else {
+            0
+        };
+        let root_sequence_increment = observation_count_i64
+            .checked_add(reserved_local_batch_sequence_count)
+            .ok_or_else(|| StorageError::Conflict("manifest root sequence overflow".into()))?;
         let discovered_directory_count_i64 = if lite_mode {
             i64::try_from(child_directories.len()).map_err(|_| {
                 StorageError::Conflict("manifest directory count overflow".to_owned())
@@ -2118,7 +2776,7 @@ impl Database {
             .bind(discovered_directory_count_i64)
             .bind(completed_directory_count_for_root)
             .bind(inserted_file_count_i64)
-            .bind(observation_count_i64)
+            .bind(root_sequence_increment)
             .bind(chunk.manifest_id)
             .bind(chunk.library_root_id)
             .bind(chunk.manifest_id)
@@ -2142,10 +2800,10 @@ impl Database {
             inserted_file_count,
             completed_directories.len(),
         );
-        let observation_sequence_start = if workflow_version == 2 && observation_count_i64 > 0 {
+        let observation_sequence_start = if observation_count_i64 > 0 {
             Some(
                 last_sequence
-                    .checked_sub(observation_count_i64)
+                    .checked_sub(root_sequence_increment)
                     .and_then(|sequence| sequence.checked_add(1))
                     .ok_or_else(|| {
                         StorageError::Conflict("manifest observation sequence overflow".to_owned())
@@ -2154,8 +2812,20 @@ impl Database {
         } else {
             None
         };
+        let local_metadata_sequence_start = if reserved_local_batch_sequence_count > 0 {
+            Some(
+                last_sequence
+                    .checked_sub(reserved_local_batch_sequence_count)
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .ok_or_else(|| {
+                        StorageError::Conflict("local metadata batch sequence overflow".to_owned())
+                    })?,
+            )
+        } else {
+            None
+        };
 
-        let observation_batch_size = if workflow_version == 2 {
+        let observation_batch_size = if matches!(workflow_version, 2 | 3) {
             super::manifest_path_query_chunk_size(self.backend())
         } else {
             80
@@ -2270,14 +2940,14 @@ impl Database {
                 .count(),
         );
 
-        if workflow_version != 2 && !positive_indexes.is_empty() {
+        if !matches!(workflow_version, 2 | 3) && !positive_indexes.is_empty() {
             return Err(StorageError::Conflict(
                 "legacy manifest cannot receive streamed positive indexes".to_owned(),
             ));
         }
         let mut positive_result = ManifestDiscoveryPositiveIndexResult::default();
         let positive_index_started = Instant::now();
-        if workflow_version == 2 && !positive_indexes.is_empty() {
+        if matches!(workflow_version, 2 | 3) && !positive_indexes.is_empty() {
             if job_status != "RUNNING" || cancel_requested != 0 {
                 return Err(StorageError::Conflict(
                     "streamed indexing requires an active manifest scan job".to_owned(),
@@ -2304,6 +2974,32 @@ impl Database {
             positive_indexes.len(),
             0,
         );
+
+        let local_metadata_batches_changed =
+            workflow_version == 3 && !positive_result.local_metadata_refs.is_empty();
+        if local_metadata_batches_changed {
+            let local_metadata_started = Instant::now();
+            let sequence_start = local_metadata_sequence_start.ok_or_else(|| {
+                StorageError::Conflict(
+                    "workflow 3 local metadata references require reserved batch sequences".into(),
+                )
+            })?;
+            self.enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                chunk.job_id,
+                chunk.library_root_id,
+                &positive_result.local_metadata_refs,
+                sequence_start,
+            )
+            .await?;
+            record_manifest_storage_stage(
+                "local_metadata_outbox",
+                local_metadata_started,
+                positive_result.local_metadata_refs.len(),
+                positive_result.local_metadata_refs.len(),
+                0,
+            );
+        }
 
         let presence_ledger_started = Instant::now();
         let mut ledger_paths = Vec::new();
@@ -2524,7 +3220,7 @@ impl Database {
                  WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
             )
             .bind(inserted_file_count_i64)
-            .bind(if workflow_version == 2 {
+            .bind(if matches!(workflow_version, 2 | 3) {
                 inserted_file_count_i64
             } else {
                 0
@@ -2578,6 +3274,7 @@ impl Database {
                 .map_err(|_| StorageError::Conflict("manifest file count overflow".to_owned()))?,
             created_items: positive_result.created_items,
             metadata_targets_changed: positive_result.metadata_targets_changed,
+            local_metadata_batches_changed,
         })
     }
 
@@ -3548,7 +4245,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?
-        } else if workflow_version == 2 && discovery_format_version == 3 {
+        } else if matches!(workflow_version, 2 | 3) && discovery_format_version == 3 {
             self.query_scalar(
                 "SELECT COUNT(*)
                  FROM filesystem_entries fe
@@ -3616,7 +4313,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?
-        } else if workflow_version == 2 {
+        } else if matches!(workflow_version, 2 | 3) {
             self.query_scalar(
                 "SELECT COUNT(*)
                  FROM filesystem_entries fe
@@ -3718,7 +4415,7 @@ impl Database {
         if remaining_changes > 0 {
             return Ok(false);
         }
-        let unchanged_count: i64 = if workflow_version == 2 {
+        let unchanged_count: i64 = if matches!(workflow_version, 2 | 3) {
             self.query_scalar("SELECT unchanged_count FROM scan_manifests WHERE id = ?")
                 .bind(manifest_id)
                 .fetch_one(&mut *transaction)
@@ -3779,7 +4476,7 @@ impl Database {
             return Ok(false);
         }
         let total_count: i64 = self
-            .query_scalar(if workflow_version == 2 {
+            .query_scalar(if matches!(workflow_version, 2 | 3) {
                 "SELECT observed_file_count + remove_count FROM scan_manifests WHERE id = ?"
             } else {
                 "SELECT unchanged_count + add_count + change_count + remove_count + reappeared_count
@@ -3792,7 +4489,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let processed_count = if workflow_version == 2 {
+        let processed_count = if matches!(workflow_version, 2 | 3) {
             self.query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
                 .bind(job_id)
                 .fetch_one(&mut *transaction)
@@ -7120,6 +7817,8 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.lock_metadata_reidentify_items_for_update(&mut transaction, item_ids)
+            .await?;
         self.query(
             "INSERT INTO metadata_reidentify_jobs (
                 id, status, total_count, mode, library_id, job_scope
@@ -7183,6 +7882,90 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn lock_metadata_reidentify_items_for_update(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if self.backend != DatabaseBackend::Postgres || item_ids.is_empty() {
+            return Ok(());
+        }
+        let mut unique_ids = item_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        for chunk in unique_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id FROM media_items
+                 WHERE id IN ({placeholders}) ORDER BY id FOR UPDATE"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn enqueue_fill_missing_jobs_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        item_ids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut job_ids = Vec::new();
+        for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let job_id = Uuid::now_v7().to_string();
+            self.query(
+                "INSERT INTO metadata_reidentify_jobs (
+                     id, status, total_count, mode, library_id, job_scope
+                 ) VALUES (?, 'QUEUED', ?, 'FILL_MISSING', ?, 'ITEMS')",
+            )
+            .bind(&job_id)
+            .bind(i64::try_from(chunk.len()).unwrap_or(i64::MAX))
+            .bind(library_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+            let values = std::iter::repeat_n("(?, ?, 'PENDING')", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                 VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(&job_id).bind(item_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            job_ids.push(job_id);
+        }
+        Ok(job_ids)
     }
 
     pub(crate) async fn create_metadata_reidentify_library_job(
@@ -8063,6 +8846,32 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_scan_jobs_for_library_deletion(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<StoredScanJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error,
+                    created_at, started_at, finished_at,
+                    discovery_completed, auto_metadata_match,
+                    current_item, scan_phase
+             FROM scan_jobs
+             WHERE library_id = ?
+               AND (status IN ('PENDING', 'RUNNING')
+                    OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn count_scan_jobs_by_status(
         &self,
     ) -> Result<StoredScanJobCounts, StorageError> {
@@ -8284,7 +9093,7 @@ impl Database {
                  JOIN scan_manifests manifest ON manifest.job_id = job.id
                  WHERE job.library_id = ? AND job.job_type = 'RECONCILE_LIBRARY'
                    AND job.status = 'COMPLETED' AND job.scan_phase = 'POSTPROCESSING'
-                   AND manifest.workflow_version = 2
+                   AND manifest.workflow_version IN (2, 3)
                    AND manifest.discovery_format_version = 3
                    AND manifest.postprocessing_targets_ready = 0
              ) THEN 1 ELSE 0 END",
@@ -8599,7 +9408,8 @@ impl Database {
     pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs SET cancel_requested = 1, updated_at = unixepoch()
-             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+             WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
+                  OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))",
         )
         .bind(id)
         .execute(&self.pool)
@@ -8622,7 +9432,8 @@ impl Database {
              SET status = ?, error = ?, cursor = NULL, current_item = NULL,
                  scan_phase = 'IDLE',
                  finished_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+             WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
+                  OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))",
         )
         .bind(status)
         .bind(error)
@@ -8687,7 +9498,7 @@ impl Database {
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_manifests
-                       WHERE job_id = ? AND workflow_version = 2
+                       WHERE job_id = ? AND workflow_version IN (2, 3)
                          AND discovery_format_version = 3
                          AND postprocessing_targets_ready = 0
                    )",
@@ -8751,7 +9562,7 @@ impl Database {
                          )
                      ) OR EXISTS (
                        SELECT 1 FROM scan_manifests
-                       WHERE job_id = ? AND workflow_version = 2
+                       WHERE job_id = ? AND workflow_version IN (2, 3)
                          AND discovery_format_version = 3
                          AND postprocessing_targets_ready = 0
                      )
@@ -8792,7 +9603,7 @@ impl Database {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
                  SELECT 1 FROM scan_manifests
-                 WHERE job_id = ? AND workflow_version = 2
+                 WHERE job_id = ? AND workflow_version IN (2, 3)
                    AND discovery_format_version = 3
                    AND postprocessing_targets_ready = 0
              ) THEN 1 ELSE 0 END",

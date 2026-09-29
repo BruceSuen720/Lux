@@ -110,6 +110,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 cover_image_tag TEXT,
                 media_strategy_json TEXT,
                 realtime_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 0 CHECK (realtime_metadata_auto_match_enabled IN (0, 1)),
+                scan_missing_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 1 CHECK (scan_missing_metadata_auto_match_enabled IN (0, 1)),
                 chapter_source_id TEXT
             )",
             "INSERT INTO libraries_new (
@@ -117,14 +118,16 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 reconciliation_schedule, metadata_schedule, scan_concurrency, probe_concurrency,
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
-                realtime_metadata_auto_match_enabled, chapter_source_id
+                realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
+                chapter_source_id
              )
              SELECT
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
                 reconciliation_schedule, metadata_schedule, scan_concurrency, probe_concurrency,
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
-                realtime_metadata_auto_match_enabled, chapter_source_id
+                realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
+                chapter_source_id
              FROM libraries",
             "DROP TABLE libraries",
             "ALTER TABLE libraries_new RENAME TO libraries",

@@ -8,8 +8,9 @@ use crate::{
         scanner::{LibraryScanner, ScanJobService},
         setup::SetupService,
     },
-    config::{Config, DatabaseBackend, PostgresConnection},
+    config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
+    storage::NewItemMetadataCompletenessResult,
 };
 
 async fn refresh_recommendation_stats(database: &Database) {
@@ -642,6 +643,1298 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
     .await
     .expect("unchanged sidecar target timestamp");
     assert_eq!(updated_at, 1);
+}
+
+#[tokio::test]
+async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverable() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Progressive metadata", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    let root_id = root.root.id.to_string();
+    let sources = vec!["source-a".to_owned()];
+
+    for invalid_sources in [
+        Vec::new(),
+        vec!["".to_owned()],
+        vec!["same".to_owned(), "same".to_owned()],
+    ] {
+        let invalid = NewScanLocalMetadataBatch {
+            id: "invalid-batch",
+            job_id: "scan-job",
+            library_root_id: &root_id,
+            batch_sequence: 0,
+            source_ids: &invalid_sources,
+        };
+        assert!(
+            database
+                .enqueue_scan_local_metadata_batch(invalid)
+                .await
+                .is_err()
+        );
+    }
+    let oversized_sources = (0..257)
+        .map(|index| format!("source-{index}"))
+        .collect::<Vec<_>>();
+    let maximum_sources = (0..256)
+        .map(|index| format!("max-source-{index}"))
+        .collect::<Vec<_>>();
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id: "oversized-batch",
+                job_id: "scan-job",
+                library_root_id: &root_id,
+                batch_sequence: 0,
+                source_ids: &oversized_sources,
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id: "max-size-batch",
+                job_id: "limit-job",
+                library_root_id: &root_id,
+                batch_sequence: 0,
+                source_ids: &maximum_sources,
+            })
+            .await
+            .expect("256 sources are within the limit")
+    );
+    assert_eq!(
+        database
+            .cancel_scan_local_metadata_batches("limit-job")
+            .await
+            .expect("clean up boundary batch"),
+        1
+    );
+
+    let first = NewScanLocalMetadataBatch {
+        id: "batch-a",
+        job_id: "scan-job",
+        library_root_id: &root_id,
+        batch_sequence: 0,
+        source_ids: &sources,
+    };
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(first)
+            .await
+            .expect("enqueue")
+    );
+    assert!(
+        !database
+            .enqueue_scan_local_metadata_batch(first)
+            .await
+            .expect("idempotent enqueue")
+    );
+    let changed_payload = vec!["source-b".to_owned()];
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id: "batch-a",
+                job_id: "scan-job",
+                library_root_id: &root_id,
+                batch_sequence: 0,
+                source_ids: &changed_payload,
+            })
+            .await
+            .is_err()
+    );
+    for (id, sequence) in [("batch-b", 1), ("batch-c", 2), ("batch-d", 3)] {
+        database
+            .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+                id,
+                job_id: "scan-job",
+                library_root_id: &root_id,
+                batch_sequence: sequence,
+                source_ids: &sources,
+            })
+            .await
+            .expect("enqueue batch");
+    }
+
+    let page = database
+        .list_scan_local_metadata_batches(None, None, 1)
+        .await
+        .expect("first page");
+    assert_eq!(page.len(), 1);
+    assert!(
+        database
+            .list_scan_local_metadata_batches(None, None, 101)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .list_scan_local_metadata_batches(Some(page[0].created_at), None, 1)
+            .await
+            .is_err(),
+        "a cursor must provide both timestamp and id"
+    );
+    let second_page = database
+        .list_scan_local_metadata_batches(Some(page[0].created_at), Some(&page[0].id), 1)
+        .await
+        .expect("second page");
+    assert_eq!(second_page.len(), 1);
+    assert_ne!(page[0].id, second_page[0].id);
+
+    let (claimed_a, claimed_b) = tokio::join!(
+        database.claim_next_scan_local_metadata_batch(),
+        database.claim_next_scan_local_metadata_batch(),
+    );
+    let claimed_a = claimed_a.expect("claim a").expect("batch a");
+    let claimed_b = claimed_b.expect("claim b").expect("batch b");
+    assert_ne!(
+        claimed_a.id, claimed_b.id,
+        "concurrent claims must be distinct"
+    );
+    assert_eq!(claimed_a.status, "RUNNING");
+    assert_eq!(claimed_a.attempts, 1);
+    assert_eq!(claimed_a.job_id, "scan-job");
+    assert_eq!(claimed_a.library_root_id, root_id);
+    assert_eq!(claimed_a.source_count, 1);
+    assert_eq!(claimed_a.source_refs_json, r#"["source-a"]"#);
+    assert_eq!(claimed_a.batch_sequence, 0);
+    assert_eq!(claimed_a.next_attempt_at, None);
+    assert_eq!(claimed_a.error, None);
+    assert!(claimed_a.updated_at >= claimed_a.created_at);
+    assert!(
+        database
+            .has_pending_scan_local_metadata_images("scan-job")
+            .await
+            .expect("image stage is pending")
+    );
+    assert!(
+        database
+            .mark_scan_local_metadata_images_complete(&claimed_a.id)
+            .await
+            .expect("mark local images complete")
+    );
+    let claimed_a_images_completed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT images_completed_at FROM scan_local_metadata_batches WHERE id = ?",
+    )
+    .bind(&claimed_a.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("read image completion marker");
+    assert!(claimed_a_images_completed_at.is_some());
+    assert!(
+        database
+            .has_pending_scan_local_metadata_images("scan-job")
+            .await
+            .expect("another batch image stage remains pending")
+    );
+    assert!(
+        database
+            .complete_scan_local_metadata_batch(&claimed_a.id)
+            .await
+            .expect("complete")
+    );
+    assert!(
+        !database
+            .complete_scan_local_metadata_batch(&claimed_a.id)
+            .await
+            .expect("CAS complete")
+    );
+
+    let cancel_count = database
+        .cancel_scan_local_metadata_batches("scan-job")
+        .await
+        .expect("cancel pending and running batches");
+    assert_eq!(cancel_count, 3);
+    assert!(
+        !database
+            .fail_scan_local_metadata_batch(&claimed_b.id, "temporary failure", Some(i64::MAX),)
+            .await
+            .expect("cancelled batch failure CAS"),
+        "a cancelled running batch must reject later completion"
+    );
+    database
+        .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+            id: "retry-batch",
+            job_id: "retry-job",
+            library_root_id: &root_id,
+            batch_sequence: 0,
+            source_ids: &sources,
+        })
+        .await
+        .expect("enqueue retry batch");
+    let retryable = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim retryable batch")
+        .expect("retryable batch");
+    assert_eq!(retryable.id, "retry-batch");
+    assert!(
+        database
+            .fail_scan_local_metadata_batch(&retryable.id, "temporary failure", Some(i64::MAX))
+            .await
+            .expect("fail with delayed retry")
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_batch()
+            .await
+            .expect("deferred retry check")
+            .is_none(),
+        "a retry must not be claimable before next_attempt_at"
+    );
+    sqlx::query("UPDATE scan_local_metadata_batches SET next_attempt_at = 0 WHERE id = ?")
+        .bind(&retryable.id)
+        .execute(database.pool())
+        .await
+        .expect("make delayed retry due");
+    let retried = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim retry")
+        .expect("due retry");
+    assert_eq!(retried.id, retryable.id);
+    assert_eq!(retried.attempts, 2);
+    assert!(
+        database
+            .has_pending_scan_local_metadata_images("retry-job")
+            .await
+            .expect("claim resets the image stage")
+    );
+    assert!(
+        database
+            .mark_scan_local_metadata_images_complete(&retried.id)
+            .await
+            .expect("mark retried images complete")
+    );
+    assert!(
+        database
+            .complete_scan_local_metadata_batch(&retried.id)
+            .await
+            .expect("complete retry")
+    );
+
+    assert_eq!(
+        database
+            .cancel_scan_local_metadata_batches("retry-job")
+            .await
+            .expect("cancel completed job remainder"),
+        0
+    );
+    let interrupted = database
+        .enqueue_scan_local_metadata_batch(NewScanLocalMetadataBatch {
+            id: "batch-e",
+            job_id: "interrupted-job",
+            library_root_id: &root_id,
+            batch_sequence: 0,
+            source_ids: &sources,
+        })
+        .await
+        .expect("enqueue interrupted batch");
+    assert!(interrupted);
+    let running = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim interrupted batch")
+        .expect("running batch");
+    assert_eq!(running.id, "batch-e");
+    assert!(
+        database
+            .mark_scan_local_metadata_images_complete(&running.id)
+            .await
+            .expect("mark interrupted images complete")
+    );
+    assert!(
+        !database
+            .has_pending_scan_local_metadata_images("interrupted-job")
+            .await
+            .expect("persisted image completion")
+    );
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_batches()
+            .await
+            .expect("recover interrupted batch"),
+        1
+    );
+    let recovered = database
+        .claim_next_scan_local_metadata_batch()
+        .await
+        .expect("claim recovered batch")
+        .expect("recovered batch");
+    assert_eq!(recovered.id, "batch-e");
+    assert_eq!(recovered.attempts, 2);
+    assert!(
+        database
+            .has_pending_scan_local_metadata_images("interrupted-job")
+            .await
+            .expect("reclaimed batch reruns the image stage")
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Versioned Movie (2025)");
+    let second_movie_dir = media_root.join("Second Movie (2025)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::create_dir_all(&second_movie_dir)
+        .await
+        .expect("second movie directory");
+    tokio::fs::write(movie_dir.join("Versioned.Movie.2025.mkv"), b"video")
+        .await
+        .expect("movie file");
+    tokio::fs::write(second_movie_dir.join("Second.Movie.2025.mkv"), b"video")
+        .await
+        .expect("second movie file");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Completeness", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movie");
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await
+    .expect("indexed items");
+    assert_eq!(item_ids.len(), 2);
+    let item_id = item_ids[0].clone();
+    let second_item_id = item_ids[1].clone();
+
+    let old_fingerprint = b"source-version-1";
+    let current_fingerprint = b"source-version-2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await
+            .expect("prepare poster check")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await
+            .expect("claim poster check")
+    );
+    assert_eq!(
+        database
+            .requeue_interrupted_item_metadata_completeness_checks()
+            .await
+            .expect("recover interrupted check"),
+        1
+    );
+    assert_eq!(
+        database
+            .requeue_interrupted_item_metadata_completeness_checks()
+            .await
+            .expect("recovery is idempotent"),
+        0
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                old_fingerprint,
+                true,
+                999,
+            )
+            .await
+            .expect("recovered old worker CAS")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await
+            .expect("reclaim after restart")
+    );
+    assert!(
+        !database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await
+            .expect("claim once")
+    );
+    assert!(
+        !database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await
+            .expect("same running input is idempotent")
+    );
+
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await
+            .expect("replace stale input version")
+    );
+    let pending = database
+        .find_item_metadata_completeness(&item_id, "POSTER")
+        .await
+        .expect("read reset status")
+        .expect("completeness row");
+    assert_eq!(pending.local_state, "PENDING");
+    assert_eq!(pending.is_missing, None);
+    assert_eq!(
+        pending.input_fingerprint.as_deref(),
+        Some(current_fingerprint.as_slice())
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                old_fingerprint,
+                true,
+                1_000,
+            )
+            .await
+            .expect("stale worker result CAS")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await
+            .expect("claim current input")
+    );
+    assert!(
+        database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                current_fingerprint,
+                true,
+                1_001,
+            )
+            .await
+            .expect("confirm missing poster")
+    );
+    let ready = database
+        .find_item_metadata_completeness(&item_id, "POSTER")
+        .await
+        .expect("read ready state")
+        .expect("ready completeness");
+    assert_eq!(ready.local_state, "READY");
+    assert_eq!(ready.is_missing, Some(true));
+    assert_eq!(ready.checked_at, Some(1_001));
+    assert!(
+        !database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await
+            .expect("same ready input is idempotent")
+    );
+
+    let missing = database
+        .list_confirmed_missing_metadata("POSTER", None, 1)
+        .await
+        .expect("list confirmed missing posters");
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].item_id, item_id);
+    assert!(
+        database
+            .list_confirmed_missing_metadata("POSTER", Some(&item_id), 1)
+            .await
+            .expect("page after item")
+            .is_empty()
+    );
+    assert!(
+        database
+            .list_confirmed_missing_metadata("POSTER", None, 101)
+            .await
+            .is_err()
+    );
+
+    let failed_fingerprint = b"source-version-3";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", failed_fingerprint)
+            .await
+            .expect("prepare next version")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", failed_fingerprint)
+            .await
+            .expect("claim next version")
+    );
+    assert!(
+        database
+            .fail_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                failed_fingerprint,
+                Some(2_000),
+                "local read failed",
+            )
+            .await
+            .expect("record local read failure")
+    );
+    assert!(
+        database
+            .list_confirmed_missing_metadata("POSTER", None, 1)
+            .await
+            .expect("failed item must not be reported missing")
+            .is_empty()
+    );
+
+    let backdrop_fingerprint = b"backdrop-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "BACKDROP", backdrop_fingerprint)
+            .await
+            .expect("prepare backdrop")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "BACKDROP", backdrop_fingerprint)
+            .await
+            .expect("claim backdrop")
+    );
+    assert!(
+        database
+            .cancel_item_metadata_completeness_check(&item_id, "BACKDROP", backdrop_fingerprint)
+            .await
+            .expect("cancel backdrop")
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "BACKDROP",
+                backdrop_fingerprint,
+                true,
+                1_003,
+            )
+            .await
+            .expect("cancelled result CAS")
+    );
+
+    let current_fingerprint = b"source-version-4";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await
+            .expect("prepare current poster state")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await
+            .expect("claim current poster state")
+    );
+    assert!(
+        database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                current_fingerprint,
+                true,
+                1_004,
+            )
+            .await
+            .expect("confirm first missing poster")
+    );
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&second_item_id, "POSTER", b"second-poster")
+            .await
+            .expect("prepare second poster")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&second_item_id, "POSTER", b"second-poster")
+            .await
+            .expect("claim second poster")
+    );
+    assert!(
+        database
+            .finish_item_metadata_completeness_check(
+                &second_item_id,
+                "POSTER",
+                b"second-poster",
+                true,
+                1_005,
+            )
+            .await
+            .expect("confirm second missing poster")
+    );
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&second_item_id, "BACKDROP", b"backdrop")
+            .await
+            .expect("prepare available backdrop")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&second_item_id, "BACKDROP", b"backdrop")
+            .await
+            .expect("claim available backdrop")
+    );
+    assert!(
+        database
+            .finish_item_metadata_completeness_check(
+                &second_item_id,
+                "BACKDROP",
+                b"backdrop",
+                false,
+                1_006,
+            )
+            .await
+            .expect("confirm available backdrop")
+    );
+
+    let poster_page_one = database
+        .list_confirmed_missing_metadata("POSTER", None, 1)
+        .await
+        .expect("first missing poster page");
+    assert_eq!(poster_page_one.len(), 1);
+    let poster_page_two = database
+        .list_confirmed_missing_metadata("POSTER", Some(&poster_page_one[0].item_id), 1)
+        .await
+        .expect("second missing poster page");
+    assert_eq!(poster_page_two.len(), 1);
+    assert_ne!(poster_page_one[0].item_id, poster_page_two[0].item_id);
+    assert!(
+        database
+            .list_confirmed_missing_metadata("POSTER", Some(&poster_page_two[0].item_id), 1)
+            .await
+            .expect("end of missing poster pages")
+            .is_empty()
+    );
+    assert!(
+        database
+            .list_confirmed_missing_metadata("BACKDROP", None, 1)
+            .await
+            .expect("available backdrop is not missing")
+            .is_empty()
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for directory in ["First Movie (2025)", "Second Movie (2025)"] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("movie directory");
+        let filename = directory.replace(' ', ".");
+        tokio::fs::write(movie_dir.join(format!("{filename}.mkv")), b"video")
+            .await
+            .expect("movie file");
+    }
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Progressive dispatch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movies");
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("indexed movies");
+    assert_eq!(item_ids.len(), 2);
+    let library_id = library.id.to_string();
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("disable scan auto-match");
+    let poster_fingerprints = [b"poster-v1".to_vec(), b"poster-v2".to_vec()];
+    let mut poster_results = Vec::new();
+    for (item_id, fingerprint) in item_ids.iter().zip(&poster_fingerprints) {
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+                .await
+                .expect("prepare poster")
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+                .await
+                .expect("claim poster")
+        );
+        poster_results.push(NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: fingerprint,
+            is_missing: true,
+            checked_at: 10,
+        });
+    }
+    let disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &poster_results, &item_ids)
+        .await
+        .expect("persist missing posters while auto-match is disabled");
+    assert_eq!(disabled.updated_count, 2);
+    assert!(disabled.scheduled_job_ids.is_empty());
+    for item_id in &item_ids {
+        let completeness = database
+            .find_item_metadata_completeness(item_id, "POSTER")
+            .await
+            .expect("read disabled missing poster")
+            .expect("poster completeness");
+        assert_eq!(completeness.local_state, "READY");
+        assert_eq!(completeness.is_missing, Some(true));
+    }
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("enable scan auto-match");
+    database
+        .create_metadata_reidentify_job(
+            "manual-fill-missing",
+            &[item_ids[0].clone()],
+            "FILL_MISSING",
+        )
+        .await
+        .expect("create active manual fill-missing job");
+
+    let backdrop_fingerprints = [b"backdrop-v1".to_vec(), b"backdrop-v2".to_vec()];
+    let mut backdrop_results = Vec::new();
+    for (item_id, fingerprint) in item_ids.iter().zip(&backdrop_fingerprints) {
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "BACKDROP", fingerprint)
+                .await
+                .expect("prepare backdrop")
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "BACKDROP", fingerprint)
+                .await
+                .expect("claim backdrop")
+        );
+        backdrop_results.push(NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "BACKDROP",
+            input_fingerprint: fingerprint,
+            is_missing: true,
+            checked_at: 11,
+        });
+    }
+
+    sqlx::query(
+        "CREATE TRIGGER reject_fill_missing_job
+         BEFORE INSERT ON metadata_reidentify_jobs
+         WHEN NEW.mode = 'FILL_MISSING'
+         BEGIN SELECT RAISE(ABORT, 'injected fill-missing job failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("install rollback trigger");
+    assert!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &backdrop_results,
+                &item_ids,
+            )
+            .await
+            .is_err()
+    );
+    sqlx::query("DROP TRIGGER reject_fill_missing_job")
+        .execute(database.pool())
+        .await
+        .expect("remove rollback trigger");
+    for item_id in &item_ids {
+        let completeness = database
+            .find_item_metadata_completeness(item_id, "BACKDROP")
+            .await
+            .expect("read rolled-back completeness")
+            .expect("backdrop completeness");
+        assert_eq!(completeness.local_state, "RUNNING");
+        assert_eq!(completeness.is_missing, None);
+    }
+
+    let scheduled = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
+        .await
+        .expect("atomically persist and schedule missing backdrops");
+    assert_eq!(scheduled.updated_count, 2);
+    assert_eq!(scheduled.scheduled_job_ids.len(), 1);
+    let scheduled_job_id = &scheduled.scheduled_job_ids[0];
+    let job: (String, String, i64, String) = database
+        .query_as(
+            "SELECT mode, status, total_count, job_scope
+             FROM metadata_reidentify_jobs WHERE id = ?",
+        )
+        .bind(scheduled_job_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("scheduled fill-missing job");
+    assert_eq!(
+        job,
+        (
+            "FILL_MISSING".to_owned(),
+            "QUEUED".to_owned(),
+            1,
+            "ITEMS".to_owned()
+        )
+    );
+    let scheduled_items: Vec<String> = database
+        .query_scalar(
+            "SELECT item_id FROM metadata_reidentify_job_items WHERE job_id = ? ORDER BY item_id",
+        )
+        .bind(scheduled_job_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("scheduled item page");
+    assert_eq!(scheduled_items, vec![item_ids[1].clone()]);
+
+    let replayed = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
+        .await
+        .expect("replay the already completed local result");
+    assert_eq!(replayed.updated_count, 0);
+    assert!(replayed.scheduled_job_ids.is_empty());
+
+    let still_fingerprints = [b"still-v1".to_vec(), b"still-v2".to_vec()];
+    let duplicate_results = item_ids
+        .iter()
+        .zip(&still_fingerprints)
+        .map(|(item_id, fingerprint)| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "STILL",
+            input_fingerprint: fingerprint,
+            is_missing: true,
+            checked_at: 12,
+        })
+        .collect::<Vec<_>>();
+    for result in &duplicate_results {
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(
+                    result.item_id,
+                    result.capability,
+                    result.input_fingerprint,
+                )
+                .await
+                .expect("prepare still")
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(
+                    result.item_id,
+                    result.capability,
+                    result.input_fingerprint,
+                )
+                .await
+                .expect("claim still")
+        );
+    }
+    let deduplicated = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &duplicate_results,
+            &item_ids,
+        )
+        .await
+        .expect("reuse active fill-missing jobs");
+    assert_eq!(deduplicated.updated_count, 2);
+    assert!(deduplicated.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+            )
+            .fetch_one(database.pool())
+            .await
+            .expect("count fill-missing jobs"),
+        2,
+        "the manual active job plus one eligible automatic job are retained"
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_progressive_scan_metadata_storage_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection
+    };
+    let database =
+        Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
+            .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Postgres Movie (2025)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Postgres.Movie.2025.mkv"), b"video").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Postgres progressive", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    let root_id = root.root.id.to_string();
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id = database
+        .query_scalar::<String>(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+    let source_ids = vec!["postgres-source".to_owned()];
+    let batch = NewScanLocalMetadataBatch {
+        id: "postgres-outbox-batch",
+        job_id: "postgres-scan-job",
+        library_root_id: &root_id,
+        batch_sequence: 0,
+        source_ids: &source_ids,
+    };
+    assert!(database.enqueue_scan_local_metadata_batch(batch).await?);
+    assert!(!database.enqueue_scan_local_metadata_batch(batch).await?);
+    let claimed = database
+        .claim_next_scan_local_metadata_batch()
+        .await?
+        .ok_or("outbox batch was not claimable")?;
+    assert_eq!(claimed.status, "RUNNING");
+    assert_eq!(claimed.attempts, 1);
+    assert_eq!(claimed.source_refs_json, r#"["postgres-source"]"#);
+    assert_eq!(
+        database
+            .cancel_scan_local_metadata_batches("postgres-scan-job")
+            .await?,
+        1
+    );
+    assert!(
+        !database
+            .complete_scan_local_metadata_batch(&claimed.id)
+            .await?
+    );
+
+    let recovery_batch = NewScanLocalMetadataBatch {
+        id: "postgres-recovery-batch",
+        job_id: "postgres-recovery-job",
+        library_root_id: &root_id,
+        batch_sequence: 0,
+        source_ids: &source_ids,
+    };
+    assert!(
+        database
+            .enqueue_scan_local_metadata_batch(recovery_batch)
+            .await?
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_batch()
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_batches()
+            .await?,
+        1
+    );
+    let recovered = database
+        .claim_next_scan_local_metadata_batch()
+        .await?
+        .ok_or("interrupted outbox batch was not recovered")?;
+    assert_eq!(recovered.id, "postgres-recovery-batch");
+    assert_eq!(recovered.attempts, 2);
+    assert!(
+        database
+            .complete_scan_local_metadata_batch(&recovered.id)
+            .await?
+    );
+
+    let old_fingerprint = b"postgres-input-v1";
+    let current_fingerprint = b"postgres-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await?
+    );
+    assert_eq!(
+        database
+            .requeue_interrupted_item_metadata_completeness_checks()
+            .await?,
+        1
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", old_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await?
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                old_fingerprint,
+                true,
+                1_000,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", current_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                current_fingerprint,
+                true,
+                1_001,
+            )
+            .await?
+    );
+    let missing = database
+        .list_confirmed_missing_metadata("POSTER", None, 10)
+        .await?;
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].item_id, item_id);
+
+    let dispatch_fingerprint = b"postgres-dispatch-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "BACKDROP", dispatch_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "BACKDROP", dispatch_fingerprint)
+            .await?
+    );
+    let library_id = library.id.to_string();
+    let dispatch_results = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: dispatch_fingerprint,
+        is_missing: true,
+        checked_at: 1_002,
+    }];
+    sqlx::query(
+        "CREATE FUNCTION lux_reject_fill_missing_job() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.mode = 'FILL_MISSING' THEN
+                 RAISE EXCEPTION 'injected fill-missing job failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_fill_missing_job
+         BEFORE INSERT ON metadata_reidentify_jobs
+         FOR EACH ROW EXECUTE FUNCTION lux_reject_fill_missing_job()",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &dispatch_results,
+                std::slice::from_ref(&item_id),
+            )
+            .await
+            .is_err()
+    );
+    let rolled_back = database
+        .find_item_metadata_completeness(&item_id, "BACKDROP")
+        .await?
+        .ok_or("missing rolled-back completeness row")?;
+    assert_eq!(rolled_back.local_state, "RUNNING");
+    assert_eq!(rolled_back.is_missing, None);
+    sqlx::query("DROP TRIGGER reject_fill_missing_job ON metadata_reidentify_jobs")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION lux_reject_fill_missing_job()")
+        .execute(database.pool())
+        .await?;
+
+    let scheduled = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &dispatch_results,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(scheduled.updated_count, 1);
+    assert_eq!(scheduled.scheduled_job_ids.len(), 1);
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ? AND status = 'PENDING'",
+            )
+            .bind(&scheduled.scheduled_job_ids[0])
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let replayed = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &dispatch_results,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(replayed.updated_count, 0);
+    assert!(replayed.scheduled_job_ids.is_empty());
+
+    let still_fingerprint = b"postgres-still-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "STILL", still_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "STILL", still_fingerprint)
+            .await?
+    );
+    let still_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "STILL",
+        input_fingerprint: still_fingerprint,
+        is_missing: true,
+        checked_at: 1_003,
+    }];
+    let deduplicated = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &still_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(deduplicated.updated_count, 1);
+    assert!(deduplicated.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    Ok(())
 }
 
 #[tokio::test]

@@ -14,6 +14,15 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## Emby 用户列表与登录名兼容（2026-09-29）
+
+Lux 保持 Emby `UserDto.Name` 为账户显示名。`POST /Users/AuthenticateByName` 首先按规范登录用户名验证；若该用户名
+不存在，则允许用与 `Users/Public.Name` 完全相同且唯一的显示名登录。规范用户名优先；若多个账户有相同显示名则拒绝该别名，
+避免把凭据匹配到不确定的账户。登录会话的 `SessionInfo.UserName` 仍是显示名。
+
+`tests/emby_auth.rs` 覆盖从用户列表读取 `Name` 并将其原样提交登录，显示名和登录名不同仍返回 200；两个用户显示名相同时
+该别名返回 401。该自动化结果证明 Lux 服务端协议，与 AVdb 报告的失败条件相符；尚未在部署实例中进行 AVdb 实测。
+
 ## Lux API 用户令牌与首页（2026-09-15）
 
 Lux 自有 API 的媒体、搜索、首页、图片、播放和用户状态接口接受用户级 Emby AccessToken。客户端可发送
@@ -175,6 +184,12 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 完成时序对两后端相同，且不改变 API、Webhook DTO 或 Emby 合同：扫描期间首页继续读取旧快照；Manifest 索引与缺失确认提交后，任务进入 `status=COMPLETED, scan_phase=POSTPROCESSING`，刷新首页快照并发布一次 `home`，同时按既有时点发出 `ScanCompleted` webhook 和 `JOB_COMPLETED` INFO 运行事件。新 v3 Manifest 随后在后台分批物化 SOURCE/ITEM targets；所有 root cursor 完成的 ready barrier 提交后才启动 NFO、probe、封面和缩略图 worker，全部完成后阶段转为 `IDLE`。format 1/2 活动任务保留原执行器和已创建的 targets。target 物化/处理失败不撤销索引或重发索引完成事件，可从持久游标与未完成 target 状态恢复。INFO 运行事件按现有策略不写入 `scan_job_events` 表；PostgreSQL 根路径/CAS/取消恢复/旧版本升级由 `tests/postgres_database.rs` 覆盖。
 
 验证：0136 完成后 `cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（8/8），包括 PostgreSQL format 3 根目录恢复、checkpoint 重试和升级扫描；SQLite `scanning_jobs` 69/69、`scanner` 16/16、`storage` 28/28。`cargo test --locked --test webhooks --test catalog` 为 8/8。首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1；阶段门 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo test --locked --all-targets` 均通过，机器 `uname -m=arm64`、Rust 1.97.1。两后端 60,000 文件 release 指标见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。PostgreSQL 测试使用本机 ARM64 临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
+
+## LUX-288 渐进扫描与在线补缺兼容边界（规格）
+
+新建扫描 workflow 3 的目标行为是：已提交的正向索引按批次向 Lux Web 目录/首页可见；本地 NFO/图片读取由独立有界 worker 早于全库遍历结束启动；本地检查确认的缺失才进入独立 FILL_MISSING 作业。`ScanCompleted` 与 `JOB_COMPLETED` 仍表示索引完成，不等待在线补缺；Emby 路由、DTO、图片标签与授权合同不变。删除仍要求根路径完整、二次文件状态确认和基线 CAS。
+
+这条记录是产品兼容性决策，当前不证明 workflow 3、增量事件或在线补缺队列已在运行时实现。实现结果和 SQLite/PostgreSQL A/B 数据须在阶段 23 相关 LUX 任务完成后追加；既有 workflow 1/2 继续按其原合同恢复。
 
 ## 目标矩阵
 

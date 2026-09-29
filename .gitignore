@@ -25,6 +25,7 @@
 .DS_Store
 
 # Local-only design drafts and visual QA artifacts
+/posters/
 /.tmp/
 /design-qa.md
 /Lux-开发规格与分步实施计划.md

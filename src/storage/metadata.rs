@@ -1,4 +1,572 @@
 use super::*;
+use crate::storage::{ItemMetadataCompletenessCommit, NewItemMetadataCompletenessResult};
+
+const MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH: usize = 64;
+const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
+const MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES: usize = 4096;
+const MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE: i64 = 100;
+
+fn validate_item_metadata_completeness_key(
+    item_id: &str,
+    capability: &str,
+    fingerprint: &[u8],
+) -> Result<(), StorageError> {
+    let capability_length = capability.trim().chars().count();
+    if item_id.trim().is_empty()
+        || !(1..=MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH).contains(&capability_length)
+        || fingerprint.is_empty()
+        || fingerprint.len() > MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES
+    {
+        return Err(StorageError::Conflict(
+            "invalid item metadata completeness key or fingerprint".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // The local scan worker consumes these transitions in the next phase task.
+impl Database {
+    pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing(
+        &self,
+        library_id: &str,
+        results: &[NewItemMetadataCompletenessResult<'_>],
+        eligible_fill_missing_item_ids: &[String],
+    ) -> Result<ItemMetadataCompletenessCommit, StorageError> {
+        if library_id.trim().is_empty() || eligible_fill_missing_item_ids.len() > 256 {
+            return Err(StorageError::Conflict(
+                "invalid library or fill-missing item count".into(),
+            ));
+        }
+        let mut unique_results = HashSet::with_capacity(results.len());
+        for result in results {
+            validate_item_metadata_completeness_key(
+                result.item_id,
+                result.capability,
+                result.input_fingerprint,
+            )?;
+            if !unique_results.insert((result.item_id, result.capability.trim())) {
+                return Err(StorageError::Conflict(
+                    "metadata completeness result contains a duplicate item capability".into(),
+                ));
+            }
+        }
+        let mut eligible_ids = eligible_fill_missing_item_ids.to_vec();
+        if eligible_ids.iter().any(|item_id| item_id.trim().is_empty()) {
+            return Err(StorageError::Conflict(
+                "fill-missing plan contains an empty item id".into(),
+            ));
+        }
+        eligible_ids.sort_unstable();
+        eligible_ids.dedup();
+
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        if self.backend == crate::config::DatabaseBackend::Postgres {
+            let library_exists = self
+                .query_scalar::<String>("SELECT id FROM libraries WHERE id = ? FOR UPDATE")
+                .bind(library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if library_exists.is_none() {
+                return Err(StorageError::Conflict(
+                    "metadata completeness library was not found".into(),
+                ));
+            }
+        } else {
+            let library_exists = self
+                .query_scalar::<String>("SELECT id FROM libraries WHERE id = ?")
+                .bind(library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if library_exists.is_none() {
+                return Err(StorageError::Conflict(
+                    "metadata completeness library was not found".into(),
+                ));
+            }
+        }
+
+        let lock_ids = results
+            .iter()
+            .map(|result| result.item_id.to_owned())
+            .chain(eligible_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        self.lock_metadata_reidentify_items_for_update(&mut transaction, &lock_ids)
+            .await?;
+
+        let mut commit = ItemMetadataCompletenessCommit::default();
+        let mut confirmed_missing = HashSet::new();
+        for result in results {
+            let updated_item = self
+                .query_scalar::<String>(
+                    "UPDATE item_metadata_completeness
+                     SET local_state = 'READY', is_missing = ?, checked_at = ?,
+                         retry_after = NULL, error = NULL, updated_at = unixepoch()
+                     WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
+                       AND local_state = 'RUNNING'
+                       AND EXISTS (
+                           SELECT 1 FROM media_items
+                           WHERE id = item_metadata_completeness.item_id
+                             AND library_id = ? AND removed_at IS NULL
+                       )
+                     RETURNING item_id",
+                )
+                .bind(database_flag(result.is_missing))
+                .bind(result.checked_at)
+                .bind(result.item_id)
+                .bind(result.capability.trim())
+                .bind(result.input_fingerprint.to_vec())
+                .bind(library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if let Some(item_id) = updated_item {
+                commit.updated_count = commit.updated_count.saturating_add(1);
+                if result.is_missing {
+                    confirmed_missing.insert(item_id);
+                }
+            }
+        }
+
+        let auto_match_enabled = self
+            .query_scalar::<i64>(
+                "SELECT scan_missing_metadata_auto_match_enabled
+                 FROM libraries WHERE id = ?",
+            )
+            .bind(library_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if auto_match_enabled != 0 && !eligible_ids.is_empty() && !confirmed_missing.is_empty() {
+            let candidate_ids = eligible_ids
+                .into_iter()
+                .filter(|item_id| confirmed_missing.contains(item_id))
+                .collect::<Vec<_>>();
+            let mut schedulable_ids = Vec::new();
+            for ids in candidate_ids.chunks(100) {
+                if ids.is_empty() {
+                    continue;
+                }
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT id FROM media_items
+                     WHERE library_id = ? AND removed_at IS NULL
+                       AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+                       AND id IN ({placeholders})
+                     ORDER BY id"
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+                for item_id in ids {
+                    statement = statement.bind(item_id);
+                }
+                schedulable_ids.extend(
+                    statement
+                        .fetch_all(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?
+                        .into_iter()
+                        .map(|row| row.get::<String, _>("id")),
+                );
+            }
+            let mut active_fill_missing_ids = HashSet::new();
+            for ids in schedulable_ids.chunks(100) {
+                if ids.is_empty() {
+                    continue;
+                }
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT DISTINCT job_items.item_id
+                     FROM metadata_reidentify_job_items job_items
+                     JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+                     WHERE jobs.mode = 'FILL_MISSING'
+                       AND jobs.status IN ('QUEUED', 'RUNNING')
+                       AND jobs.cancel_requested = 0
+                       AND job_items.status IN ('PENDING', 'RUNNING')
+                       AND job_items.item_id IN ({placeholders})"
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                for item_id in ids {
+                    statement = statement.bind(item_id);
+                }
+                active_fill_missing_ids.extend(
+                    statement
+                        .fetch_all(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?
+                        .into_iter()
+                        .map(|row| row.get::<String, _>("item_id")),
+                );
+            }
+            schedulable_ids.retain(|item_id| !active_fill_missing_ids.contains(item_id));
+            commit.scheduled_job_ids = self
+                .enqueue_fill_missing_jobs_in_transaction(
+                    &mut transaction,
+                    library_id,
+                    &schedulable_ids,
+                )
+                .await?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(commit)
+    }
+
+    pub(crate) async fn prepare_item_metadata_completeness_check(
+        &self,
+        item_id: &str,
+        capability: &str,
+        input_fingerprint: &[u8],
+    ) -> Result<bool, StorageError> {
+        validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let changed = self
+            .query_scalar::<String>(
+                "INSERT INTO item_metadata_completeness (
+                     item_id, capability, local_state, is_missing, input_fingerprint
+                 ) VALUES (?, ?, 'PENDING', NULL, ?)
+                 ON CONFLICT(item_id, capability) DO UPDATE SET
+                     local_state = 'PENDING', is_missing = NULL,
+                     input_fingerprint = excluded.input_fingerprint,
+                     checked_at = NULL, retry_after = NULL, error = NULL,
+                     updated_at = unixepoch()
+                 WHERE item_metadata_completeness.input_fingerprint IS NULL
+                    OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
+                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')
+                 RETURNING item_id",
+            )
+            .bind(item_id)
+            .bind(capability.trim())
+            .bind(input_fingerprint.to_vec())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(changed.is_some())
+    }
+
+    pub(crate) async fn claim_item_metadata_completeness_check(
+        &self,
+        item_id: &str,
+        capability: &str,
+        input_fingerprint: &[u8],
+    ) -> Result<bool, StorageError> {
+        validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let changed = self
+            .query_scalar::<String>(
+                "UPDATE item_metadata_completeness
+                 SET local_state = 'RUNNING', is_missing = NULL, checked_at = NULL,
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
+                   AND local_state = 'PENDING'
+                 RETURNING item_id",
+            )
+            .bind(item_id)
+            .bind(capability.trim())
+            .bind(input_fingerprint.to_vec())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(changed.is_some())
+    }
+
+    pub(crate) async fn finish_item_metadata_completeness_check(
+        &self,
+        item_id: &str,
+        capability: &str,
+        input_fingerprint: &[u8],
+        is_missing: bool,
+        checked_at: i64,
+    ) -> Result<bool, StorageError> {
+        validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let changed = self
+            .query_scalar::<String>(
+                "UPDATE item_metadata_completeness
+                 SET local_state = 'READY', is_missing = ?, checked_at = ?, retry_after = NULL,
+                     error = NULL, updated_at = unixepoch()
+                 WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
+                   AND local_state = 'RUNNING'
+                 RETURNING item_id",
+            )
+            .bind(database_flag(is_missing))
+            .bind(checked_at)
+            .bind(item_id)
+            .bind(capability.trim())
+            .bind(input_fingerprint.to_vec())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(changed.is_some())
+    }
+
+    pub(crate) async fn fail_item_metadata_completeness_check(
+        &self,
+        item_id: &str,
+        capability: &str,
+        input_fingerprint: &[u8],
+        retry_after: Option<i64>,
+        error: &str,
+    ) -> Result<bool, StorageError> {
+        validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
+        if error.len() > MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES {
+            return Err(StorageError::Conflict(
+                "item metadata completeness error exceeds the storage limit".into(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let changed = self
+            .query_scalar::<String>(
+                "UPDATE item_metadata_completeness
+                 SET local_state = 'FAILED', is_missing = NULL, checked_at = NULL,
+                     retry_after = ?, error = ?, updated_at = unixepoch()
+                 WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
+                   AND local_state = 'RUNNING'
+                 RETURNING item_id",
+            )
+            .bind(retry_after)
+            .bind(error)
+            .bind(item_id)
+            .bind(capability.trim())
+            .bind(input_fingerprint.to_vec())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(changed.is_some())
+    }
+
+    pub(crate) async fn cancel_item_metadata_completeness_check(
+        &self,
+        item_id: &str,
+        capability: &str,
+        input_fingerprint: &[u8],
+    ) -> Result<bool, StorageError> {
+        validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let changed = self
+            .query_scalar::<String>(
+                "UPDATE item_metadata_completeness
+                 SET local_state = 'CANCELLED', is_missing = NULL, checked_at = NULL,
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
+                   AND local_state IN ('PENDING', 'RUNNING')
+                 RETURNING item_id",
+            )
+            .bind(item_id)
+            .bind(capability.trim())
+            .bind(input_fingerprint.to_vec())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(changed.is_some())
+    }
+
+    /// Call once during startup, before local metadata workers begin claiming checks.
+    pub(crate) async fn requeue_interrupted_item_metadata_completeness_checks(
+        &self,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE item_metadata_completeness
+                 SET local_state = 'PENDING', is_missing = NULL, checked_at = NULL,
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE local_state = 'RUNNING'",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    pub(crate) async fn find_item_metadata_completeness(
+        &self,
+        item_id: &str,
+        capability: &str,
+    ) -> Result<Option<StoredItemMetadataCompleteness>, StorageError> {
+        if item_id.trim().is_empty()
+            || capability.trim().is_empty()
+            || capability.trim().chars().count() > MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH
+        {
+            return Err(StorageError::Conflict(
+                "invalid item metadata completeness key".into(),
+            ));
+        }
+        self.query(
+            "SELECT item_id, capability, local_state, is_missing, input_fingerprint,
+                    checked_at, retry_after, error, updated_at
+             FROM item_metadata_completeness WHERE item_id = ? AND capability = ?",
+        )
+        .bind(item_id)
+        .bind(capability.trim())
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_item_metadata_completeness))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_confirmed_missing_metadata(
+        &self,
+        capability: &str,
+        after_item_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredItemMetadataCompleteness>, StorageError> {
+        let capability_length = capability.trim().chars().count();
+        let limit = i64::try_from(limit).map_err(|_| {
+            StorageError::Conflict("invalid metadata completeness page size".into())
+        })?;
+        if !(1..=MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH).contains(&capability_length)
+            || !(1..=MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE).contains(&limit)
+            || after_item_id.is_some_and(|item_id| item_id.trim().is_empty())
+        {
+            return Err(StorageError::Conflict(
+                "invalid metadata completeness filter or page size".into(),
+            ));
+        }
+        let rows = if let Some(after_item_id) = after_item_id {
+            self.query(
+                "SELECT completeness.item_id, completeness.capability, completeness.local_state,
+                        completeness.is_missing, completeness.input_fingerprint,
+                        completeness.checked_at, completeness.retry_after, completeness.error,
+                        completeness.updated_at
+                 FROM item_metadata_completeness completeness
+                 JOIN media_items ON media_items.id = completeness.item_id
+                 WHERE completeness.capability = ? AND completeness.local_state = 'READY'
+                   AND completeness.is_missing = 1
+                   AND media_items.removed_at IS NULL
+                   AND completeness.item_id > ?
+                 ORDER BY completeness.item_id LIMIT ?",
+            )
+            .bind(capability.trim())
+            .bind(after_item_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query(
+                "SELECT completeness.item_id, completeness.capability, completeness.local_state,
+                        completeness.is_missing, completeness.input_fingerprint,
+                        completeness.checked_at, completeness.retry_after, completeness.error,
+                        completeness.updated_at
+                 FROM item_metadata_completeness completeness
+                 JOIN media_items ON media_items.id = completeness.item_id
+                 WHERE completeness.capability = ? AND completeness.local_state = 'READY'
+                   AND completeness.is_missing = 1
+                   AND media_items.removed_at IS NULL
+                 ORDER BY completeness.item_id LIMIT ?",
+            )
+            .bind(capability.trim())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(stored_item_metadata_completeness)
+            .collect())
+    }
+}
 
 impl Database {
     pub(crate) async fn count_pending_metadata_candidates(&self) -> Result<i64, StorageError> {
