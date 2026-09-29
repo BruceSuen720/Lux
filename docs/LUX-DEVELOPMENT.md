@@ -7553,7 +7553,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 文件：`src/observability/logs.rs`、`src/storage/users.rs`、`tests/admin_dashboard.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
 
-结果（2026-09-29）：仪表盘将文件近期活动与历史数据库活动合并排序、去重后按登录/播放各 12 条限额与 24 条总限额返回；用当前用户/媒体信息填充名称，缺失关联返回空。`cargo test --locked --test admin_dashboard --test web_playback` 2 项、`cargo fmt --all -- --check` 和全目标 Clippy 通过；仪表盘测试覆盖分类配额、倒序与缺失用户/媒体。
+结果（2026-09-29）：仪表盘将文件近期活动与历史数据库活动合并排序、去重后按登录/播放各 12 条限额与 24 条总限额返回；用当前用户/媒体信息填充名称，缺失关联返回空。`cargo test --locked --test admin_dashboard --test web_playback` 2 项、`cargo fmt --all -- --check` 和全目标 Clippy 通过；仪表盘测试覆盖文件与遗留数据库活动合并、分类配额、倒序与缺失用户/媒体。
 
 依赖：LUX-312。明确不做：不迁移旧数据库审计历史，不改变业务播放状态。
 

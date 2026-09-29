@@ -125,6 +125,15 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     .bind("lux-emby:dashboard-transcode-session")
     .execute(database.pool())
     .await?;
+    sqlx::query(
+        "INSERT INTO audit_events (
+            id, actor_user_id, event_type, target_type, target_id, metadata_json, created_at
+         ) VALUES ('legacy-playback-activity', ?, 'PLAYBACK_PAUSED', 'media_item', ?, '{}', unixepoch())",
+    )
+    .bind(&user_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
         .header("X-Emby-Token", &token)
@@ -245,6 +254,11 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         events
             .iter()
             .any(|event| event["eventType"] == "PLAYBACK_STARTED")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["id"] == "legacy-playback-activity")
     );
     let playback_activity = events
         .iter()
