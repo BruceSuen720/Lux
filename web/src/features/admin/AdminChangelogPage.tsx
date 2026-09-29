@@ -24,6 +24,7 @@ export const changelogReleases: ChangelogRelease[] = [
       ] },
       { kind: "changed", items: [
         "Emby 目录查询现在遵循 SortBy 和 SortOrder，支持按名称、排序名称、创建时间、首播日期和评分排序。",
+        "Emby AuthenticateByName 支持使用唯一匹配的公开显示名登录；规范用户名优先，重名显示名不会作为登录别名。",
         "登录背景支持 Bing 每日图片和 TMDb 全幅横幅，并更新内置海报墙素材。",
         "PostgreSQL 扫描写事务使用事务局部异步提交以减少提交等待；普通元数据事务和 SQLite 不变。异常退出可能丢失近期已确认的整笔扫描事务，届时需重新发起扫描。",
         "Docker Hub 的 main 分支发布完成后可发送 Telegram 通知；未配置通知密钥时会跳过发送并给出警告。",
