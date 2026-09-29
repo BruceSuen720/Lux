@@ -212,6 +212,16 @@ test("detail lower sections use the full content width", () => {
   assert.match(hierarchyRule, /max-width:\s*none/);
 });
 
+test("media detail track selectors fit two 320px columns only when the available width allows", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const selectorsRule = stylesheet.match(/^\.lux-track-selectors\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const selectorRule = stylesheet.match(/^\.lux-track-selector\s*\{([^}]*)\}/m)?.[1] ?? "";
+
+  assert.match(selectorsRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*320px\),\s*1fr\)\)/);
+  assert.match(selectorsRule, /max-width:\s*657px/);
+  assert.match(selectorRule, /max-width:\s*320px/);
+});
+
 test("mobile detail pages use a full-bleed portrait poster and logo-first identity", () => {
   const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
