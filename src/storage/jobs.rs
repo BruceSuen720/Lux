@@ -8,6 +8,12 @@ const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
+    WHEN item_type IN ('MOVIE', 'SERIES') THEN 0
+    WHEN item_type = 'SEASON' THEN 1
+    WHEN item_type = 'EPISODE' THEN 2
+    ELSE 3
+END";
 
 #[derive(Debug)]
 #[allow(dead_code)] // The next phase worker consumes the bounded page payload.
@@ -8152,16 +8158,23 @@ impl Database {
             source,
         })?;
         for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
-            let values = std::iter::repeat_n("(?, ?, 'PENDING')", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values = std::iter::repeat_n(
+                format!(
+                    "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
+                     FROM media_items WHERE id = ?))"
+                ),
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
             let query = format!(
-                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                "INSERT INTO metadata_reidentify_job_items
+                     (job_id, item_id, status, priority)
                  VALUES {values}"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
-                statement = statement.bind(job_id).bind(item_id);
+                statement = statement.bind(job_id).bind(item_id).bind(item_id);
             }
             statement
                 .execute(&mut *transaction)
@@ -8263,16 +8276,23 @@ impl Database {
                 source,
             })?;
 
-            let values = std::iter::repeat_n("(?, ?, 'PENDING')", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values = std::iter::repeat_n(
+                format!(
+                    "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
+                     FROM media_items WHERE id = ?))"
+                ),
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
             let query = format!(
-                "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+                "INSERT INTO metadata_reidentify_job_items
+                     (job_id, item_id, status, priority)
                  VALUES {values}"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
-                statement = statement.bind(&job_id).bind(item_id);
+                statement = statement.bind(&job_id).bind(item_id).bind(item_id);
             }
             statement
                 .execute(&mut **transaction)
@@ -8333,8 +8353,14 @@ impl Database {
             return Ok(0);
         }
         self.query(
-            "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
-             SELECT ?, id, 'PENDING'
+            "INSERT INTO metadata_reidentify_job_items
+                 (job_id, item_id, status, priority)
+             SELECT ?, id, 'PENDING', CASE
+                 WHEN item_type IN ('MOVIE', 'SERIES') THEN 0
+                 WHEN item_type = 'SEASON' THEN 1
+                 WHEN item_type = 'EPISODE' THEN 2
+                 ELSE 3
+             END
              FROM media_items
              WHERE library_id = ? AND removed_at IS NULL
                AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
@@ -8716,29 +8742,27 @@ impl Database {
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
         self.query_scalar(
-            "WITH prioritized AS (
-                 SELECT job_items.item_id, job_items.status,
-                        CASE
-                            WHEN items.item_type IN ('MOVIE', 'SERIES') THEN 0
-                            WHEN items.item_type = 'SEASON' THEN 1
-                            WHEN items.item_type = 'EPISODE' THEN 2
-                            ELSE 3
-                        END AS priority
-                 FROM metadata_reidentify_job_items job_items
-                 JOIN media_items items ON items.id = job_items.item_id
-                 WHERE job_items.job_id = ?
+            "WITH active_priority AS (
+                 SELECT MIN(priority) AS priority
+                 FROM (
+                     SELECT MIN(priority) AS priority
+                     FROM metadata_reidentify_job_items
+                     WHERE job_id = ? AND status = 'PENDING'
+                     UNION ALL
+                     SELECT MIN(priority) AS priority
+                     FROM metadata_reidentify_job_items
+                     WHERE job_id = ? AND status = 'RUNNING'
+                 ) priorities
              )
              SELECT item_id
-             FROM prioritized
-             WHERE status = 'PENDING'
-               AND priority = (
-                   SELECT MIN(priority)
-                   FROM prioritized
-                   WHERE status IN ('PENDING', 'RUNNING')
-               )
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'PENDING'
+               AND priority = (SELECT priority FROM active_priority)
              ORDER BY item_id
              LIMIT 1",
         )
+        .bind(job_id)
+        .bind(job_id)
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await
@@ -8765,26 +8789,22 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let mut claimed = self
             .query_scalar::<String>(
-                "WITH prioritized AS (
-                     SELECT job_items.item_id, job_items.status,
-                            CASE
-                                WHEN items.item_type IN ('MOVIE', 'SERIES') THEN 0
-                                WHEN items.item_type = 'SEASON' THEN 1
-                                WHEN items.item_type = 'EPISODE' THEN 2
-                                ELSE 3
-                            END AS priority
-                     FROM metadata_reidentify_job_items job_items
-                     JOIN media_items items ON items.id = job_items.item_id
-                     WHERE job_items.job_id = ?
+                "WITH active_priority AS (
+                     SELECT MIN(priority) AS priority
+                     FROM (
+                         SELECT MIN(priority) AS priority
+                         FROM metadata_reidentify_job_items
+                         WHERE job_id = ? AND status = 'PENDING'
+                         UNION ALL
+                         SELECT MIN(priority) AS priority
+                         FROM metadata_reidentify_job_items
+                         WHERE job_id = ? AND status = 'RUNNING'
+                     ) priorities
                  ), eligible AS (
                      SELECT item_id
-                     FROM prioritized
-                     WHERE status = 'PENDING'
-                       AND priority = (
-                           SELECT MIN(priority)
-                           FROM prioritized
-                           WHERE status IN ('PENDING', 'RUNNING')
-                       )
+                     FROM metadata_reidentify_job_items
+                     WHERE job_id = ? AND status = 'PENDING'
+                       AND priority = (SELECT priority FROM active_priority)
                      ORDER BY item_id
                      LIMIT ?
                  )
@@ -8799,6 +8819,8 @@ impl Database {
                    )
                  RETURNING item_id",
             )
+            .bind(job_id)
+            .bind(job_id)
             .bind(job_id)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(job_id)

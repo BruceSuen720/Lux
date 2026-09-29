@@ -7187,16 +7187,17 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
                 job_id TEXT NOT NULL,
                 item_id TEXT NOT NULL,
                 status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
                 PRIMARY KEY (job_id, item_id)
             )",
     )
     .execute(&pool)
     .await
     .expect("create metadata job items table");
-    for (item_id, item_type) in [
-        ("episode", "EPISODE"),
-        ("season", "SEASON"),
-        ("series", "SERIES"),
+    for (item_id, item_type, priority) in [
+        ("episode", "EPISODE", 2_i64),
+        ("season", "SEASON", 1_i64),
+        ("series", "SERIES", 0_i64),
     ] {
         sqlx::query("INSERT INTO media_items (id, item_type) VALUES (?, ?)")
             .bind(item_id)
@@ -7205,10 +7206,12 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
             .await
             .expect("insert media item");
         sqlx::query(
-            "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
-                 VALUES ('job', ?, 'PENDING')",
+            "INSERT INTO metadata_reidentify_job_items
+                 (job_id, item_id, status, priority)
+                 VALUES ('job', ?, 'PENDING', ?)",
         )
         .bind(item_id)
+        .bind(priority)
         .execute(&pool)
         .await
         .expect("insert metadata job item");
@@ -7277,6 +7280,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
                 job_id TEXT NOT NULL,
                 item_id TEXT NOT NULL,
                 status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (job_id, item_id)
             )",
@@ -7284,10 +7288,18 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
     .execute(&pool)
     .await
     .expect("create metadata job items table");
-    for (item_id, item_type) in [
-        ("episode", "EPISODE"),
-        ("season", "SEASON"),
-        ("series", "SERIES"),
+    sqlx::query(
+        "CREATE INDEX idx_metadata_reidentify_items_claim_priority
+             ON metadata_reidentify_job_items(job_id, status, priority, item_id)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create metadata job claim index");
+    for (item_id, item_type, priority) in [
+        ("episode", "EPISODE", 2_i64),
+        ("season", "SEASON", 1_i64),
+        ("series", "SERIES", 0_i64),
+        ("movie", "MOVIE", 0_i64),
     ] {
         sqlx::query("INSERT INTO media_items (id, item_type) VALUES (?, ?)")
             .bind(item_id)
@@ -7296,10 +7308,12 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
             .await
             .expect("insert media item");
         sqlx::query(
-            "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
-                 VALUES ('job', ?, 'PENDING')",
+            "INSERT INTO metadata_reidentify_job_items
+                 (job_id, item_id, status, priority)
+                 VALUES ('job', ?, 'PENDING', ?)",
         )
         .bind(item_id)
+        .bind(priority)
         .execute(&pool)
         .await
         .expect("insert metadata job item");
@@ -7308,6 +7322,24 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         .execute(&pool)
         .await
         .expect("insert metadata job");
+    let plan = sqlx::query(
+        "EXPLAIN QUERY PLAN
+         SELECT MIN(priority) FROM metadata_reidentify_job_items
+         WHERE job_id = 'job' AND status = 'PENDING'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("explain priority lookup");
+    let plan_details = plan
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        plan_details.iter().any(|detail| {
+            detail.contains("USING COVERING INDEX idx_metadata_reidentify_items_claim_priority")
+        }),
+        "priority lookup should use the claim index: {plan_details:?}"
+    );
     let database = Database {
         pool,
         log_store: LogStore::new(Path::new("unused-metadata-batch-claim-test")),
@@ -7328,10 +7360,11 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         .claim_next_metadata_reidentify_items("job", 2)
         .await
         .expect("claim metadata items");
-    assert_eq!(claimed, vec!["series"]);
+    assert_eq!(claimed, vec!["movie", "series"]);
     sqlx::query(
         "UPDATE metadata_reidentify_job_items
-         SET status = 'COMPLETED' WHERE job_id = 'job' AND item_id = 'series'",
+         SET status = 'COMPLETED'
+         WHERE job_id = 'job' AND item_id IN ('movie', 'series')",
     )
     .execute(&database.pool)
     .await
@@ -7352,6 +7385,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         statuses,
         vec![
             ("episode".to_owned(), "PENDING".to_owned()),
+            ("movie".to_owned(), "COMPLETED".to_owned()),
             ("season".to_owned(), "RUNNING".to_owned()),
             ("series".to_owned(), "COMPLETED".to_owned()),
         ]

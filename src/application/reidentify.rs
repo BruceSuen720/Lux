@@ -604,33 +604,49 @@ impl MetadataReidentifyService {
             let mut queue_exhausted = false;
             while workers.len() < concurrency {
                 let queue_wait_started = Instant::now();
-                let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
+                let available_slots = concurrency.saturating_sub(workers.len());
+                let mut worker_permits = Vec::with_capacity(available_slots);
+                let Ok(first_worker_permit) =
+                    Arc::clone(&self.worker_permits).acquire_owned().await
                 else {
                     queue_exhausted = true;
                     break;
                 };
+                worker_permits.push(first_worker_permit);
+                for _ in 1..available_slots {
+                    let Ok(worker_permit) = Arc::clone(&self.worker_permits).try_acquire_owned()
+                    else {
+                        break;
+                    };
+                    worker_permits.push(worker_permit);
+                }
                 let Ok(item_ids) = self
                     .database
-                    .claim_next_metadata_reidentify_items(job_id, 1)
+                    .claim_next_metadata_reidentify_items(job_id, worker_permits.len())
                     .await
                 else {
-                    drop(worker_permit);
+                    drop(worker_permits);
                     queue_exhausted = true;
                     break;
                 };
-                let Some(item_id) = item_ids.into_iter().next() else {
-                    drop(worker_permit);
+                if item_ids.is_empty() {
+                    drop(worker_permits);
                     queue_exhausted = true;
                     break;
-                };
-                self.resources
-                    .record_metadata_stage("queue_wait", queue_wait_started.elapsed());
-                let service = self.clone();
-                let job_id = job_id.to_owned();
-                workers.spawn(async move {
-                    let _worker_permit = worker_permit;
-                    service.process_item(&job_id, &item_id, mode).await;
-                });
+                }
+                let queue_wait = queue_wait_started.elapsed();
+                for _ in 0..item_ids.len() {
+                    self.resources
+                        .record_metadata_stage("queue_wait", queue_wait);
+                }
+                for (item_id, worker_permit) in item_ids.into_iter().zip(worker_permits) {
+                    let service = self.clone();
+                    let job_id = job_id.to_owned();
+                    workers.spawn(async move {
+                        let _worker_permit = worker_permit;
+                        service.process_item(&job_id, &item_id, mode).await;
+                    });
+                }
             }
             if workers.is_empty() && queue_exhausted {
                 break;
@@ -645,6 +661,16 @@ impl MetadataReidentifyService {
                     worker_panicked = error.is_panic(),
                     "metadata refresh worker stopped before recording its result"
                 );
+            }
+            while let Some(worker_result) = workers.try_join_next() {
+                if let Err(error) = worker_result {
+                    tracing::error!(
+                        job_id,
+                        worker_cancelled = error.is_cancelled(),
+                        worker_panicked = error.is_panic(),
+                        "metadata refresh worker stopped before recording its result"
+                    );
+                }
             }
         }
         let reconciliation_failed = match self

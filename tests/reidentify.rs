@@ -618,18 +618,38 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
         .await?;
 
     assert_eq!(job.total_count, 4);
-    let refreshed_types: Vec<String> = sqlx::query_scalar(
-        "SELECT mi.item_type
+    let refreshed_types: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT mi.item_type, ji.priority
          FROM metadata_reidentify_job_items ji
          JOIN media_items mi ON mi.id = ji.item_id
          WHERE ji.job_id = ?
-         ORDER BY CASE mi.item_type WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 ELSE 2 END,
-                  mi.episode_number",
+         ORDER BY ji.priority, mi.episode_number",
     )
     .bind(&job.id)
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(refreshed_types, ["SERIES", "SEASON", "EPISODE", "EPISODE"]);
+    assert_eq!(
+        refreshed_types,
+        [
+            ("SERIES".to_owned(), 0),
+            ("SEASON".to_owned(), 1),
+            ("EPISODE".to_owned(), 2),
+            ("EPISODE".to_owned(), 2),
+        ]
+    );
+
+    let library_job = metadata.create_library_job(&library.id.to_string()).await?;
+    let library_priorities: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT mi.item_type, ji.priority
+         FROM metadata_reidentify_job_items ji
+         JOIN media_items mi ON mi.id = ji.item_id
+         WHERE ji.job_id = ?
+         ORDER BY ji.priority, mi.episode_number",
+    )
+    .bind(&library_job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(library_priorities, refreshed_types);
     Ok(())
 }
 
