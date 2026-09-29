@@ -574,6 +574,10 @@ impl Database {
         &self.pool
     }
 
+    pub(crate) fn log_store(&self) -> LogStore {
+        self.log_store.clone()
+    }
+
     pub(crate) fn pool_snapshot(&self) -> DatabasePoolSnapshot {
         let size = self.pool.size();
         let idle = self.pool.num_idle().min(size as usize) as u32;
@@ -918,18 +922,6 @@ pub(crate) struct NewAuditEvent<'a> {
     pub(crate) target_type: Option<&'a str>,
     pub(crate) target_id: Option<&'a str>,
     pub(crate) metadata_json: &'a str,
-}
-
-#[derive(Debug)]
-pub(crate) struct StoredAuditEvent {
-    pub(crate) id: String,
-    pub(crate) actor_user_id: Option<String>,
-    pub(crate) actor_username: Option<String>,
-    pub(crate) event_type: String,
-    pub(crate) target_type: Option<String>,
-    pub(crate) target_id: Option<String>,
-    pub(crate) metadata_json: String,
-    pub(crate) created_at: i64,
 }
 
 #[derive(Debug)]
@@ -1630,26 +1622,6 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) total_count: i64,
 }
 
-#[derive(Debug)]
-pub(crate) struct StoredScanJobEvent {
-    pub(crate) id: String,
-    pub(crate) job_id: String,
-    pub(crate) level: String,
-    pub(crate) event_code: String,
-    pub(crate) message: String,
-    pub(crate) details_json: String,
-    pub(crate) created_at: i64,
-}
-
-pub(crate) struct NewScanJobEvent<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) job_id: &'a str,
-    pub(crate) level: &'a str,
-    pub(crate) event_code: &'a str,
-    pub(crate) message: &'a str,
-    pub(crate) details_json: &'a str,
-}
-
 fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
     StoredScanJob {
         id: row.get("id"),
@@ -1746,18 +1718,6 @@ fn stored_chapter_detection_job(row: sqlx::any::AnyRow) -> StoredChapterDetectio
         created_at: row.get("created_at"),
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
-    }
-}
-
-fn stored_scan_job_event(row: sqlx::any::AnyRow) -> StoredScanJobEvent {
-    StoredScanJobEvent {
-        id: row.get("id"),
-        job_id: row.get("job_id"),
-        level: row.get("level"),
-        event_code: row.get("event_code"),
-        message: row.get("message"),
-        details_json: row.get("details_json"),
-        created_at: row.get("created_at"),
     }
 }
 

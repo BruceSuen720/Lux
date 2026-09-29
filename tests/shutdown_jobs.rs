@@ -2,6 +2,7 @@ use luxd::{
     application::{libraries::LibraryService, scanner::ScanJobService, setup::SetupService},
     config::Config,
     library::LibraryKind,
+    observability::logs::LogStore,
     storage::Database,
 };
 
@@ -20,6 +21,9 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("DROP TABLE scan_job_events")
+        .execute(database.pool())
         .await?;
     let library_id = library.id.to_string();
     let admin_id = admin.id.to_string();
@@ -148,14 +152,15 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
             Some("LEGACY_SCAN_REQUIRES_NEW_MANIFEST".to_owned())
         )
     );
-    let legacy_scan_event: (String, String) = sqlx::query_as(
-        "SELECT event_code, message FROM scan_job_events
-         WHERE job_id = 'shutdown-scan-pending'",
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(legacy_scan_event.0, "LEGACY_SCAN_REQUIRES_NEW_MANIFEST");
-    assert!(legacy_scan_event.1.contains("重试"));
+    let (_, legacy_scan_events) = LogStore::new(&config.config_dir)
+        .list_scan_job_events("shutdown-scan-pending", None, None, 0, 10)
+        .await?;
+    assert_eq!(legacy_scan_events.len(), 1);
+    assert_eq!(
+        legacy_scan_events[0].event_code,
+        "LEGACY_SCAN_REQUIRES_NEW_MANIFEST"
+    );
+    assert!(legacy_scan_events[0].message.contains("重试"));
     let preserved_legacy_entries: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_scan_entries
          WHERE job_id = 'shutdown-scan-pending'",

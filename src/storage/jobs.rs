@@ -1103,6 +1103,7 @@ impl Database {
                 source,
             })?;
         let mut cancelled = 0_u64;
+        let mut legacy_scan_events = Vec::new();
 
         let legacy_scan_ids: Vec<String> = self
             .query_scalar(
@@ -1141,21 +1142,7 @@ impl Database {
                 })?;
             cancelled = cancelled.saturating_add(result.rows_affected());
             if result.rows_affected() == 1 {
-                self.query(
-                    "INSERT INTO scan_job_events (
-                         id, job_id, level, event_code, message, details_json
-                     ) VALUES (?, ?, 'WARN', ?, ?, '{}')",
-                )
-                .bind(uuid::Uuid::now_v7().to_string())
-                .bind(job_id)
-                .bind(Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST)
-                .bind("旧版全量扫描没有 Manifest 检查点；请重试以创建新的 Manifest 扫描")
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                legacy_scan_events.push(job_id.clone());
             }
         }
 
@@ -1213,6 +1200,23 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        for job_id in legacy_scan_events {
+            let event_id = uuid::Uuid::now_v7().to_string();
+            self.log_store
+                .append_scan_job_event(
+                    &event_id,
+                    &job_id,
+                    "WARN",
+                    Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST,
+                    "旧版全量扫描没有 Manifest 检查点；请重试以创建新的 Manifest 扫描",
+                    "{}",
+                )
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         Ok(cancelled)
     }
 
@@ -7978,159 +7982,6 @@ impl Database {
             path: self.path.clone(),
             source,
         })
-    }
-
-    pub(crate) async fn append_scan_job_event(
-        &self,
-        event: NewScanJobEvent<'_>,
-    ) -> Result<(), StorageError> {
-        if event.level == "INFO" {
-            return Ok(());
-        }
-        self.query(
-            "INSERT INTO scan_job_events
-             (id, job_id, level, event_code, message, details_json)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(event.id)
-        .bind(event.job_id)
-        .bind(event.level)
-        .bind(event.event_code)
-        .bind(event.message)
-        .bind(event.details_json)
-        .execute(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        if let Err(error) = self.prune_scan_job_events().await {
-            tracing::warn!(job_id = event.job_id, %error, "scan event retention cleanup failed");
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn count_scan_job_events(
-        &self,
-        job_id: &str,
-        level: Option<&str>,
-        event_code: Option<&str>,
-    ) -> Result<i64, StorageError> {
-        let count = match (level, event_code) {
-            (Some(_), Some(_)) => {
-                self.query_scalar(
-                    "SELECT COUNT(*) FROM scan_job_events
-                     WHERE job_id = ? AND level = ? AND event_code = ?",
-                )
-                .bind(job_id)
-                .bind(level)
-                .bind(event_code)
-                .fetch_one(&self.pool)
-                .await
-            }
-            (Some(_), None) => {
-                self.query_scalar(
-                    "SELECT COUNT(*) FROM scan_job_events
-                     WHERE job_id = ? AND level = ?",
-                )
-                .bind(job_id)
-                .bind(level)
-                .fetch_one(&self.pool)
-                .await
-            }
-            (None, Some(_)) => {
-                self.query_scalar(
-                    "SELECT COUNT(*) FROM scan_job_events
-                     WHERE job_id = ? AND event_code = ?",
-                )
-                .bind(job_id)
-                .bind(event_code)
-                .fetch_one(&self.pool)
-                .await
-            }
-            (None, None) => {
-                self.query_scalar("SELECT COUNT(*) FROM scan_job_events WHERE job_id = ?")
-                    .bind(job_id)
-                    .fetch_one(&self.pool)
-                    .await
-            }
-        };
-        count.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn list_scan_job_events(
-        &self,
-        job_id: &str,
-        level: Option<&str>,
-        event_code: Option<&str>,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<StoredScanJobEvent>, StorageError> {
-        let rows = match (level, event_code) {
-            (Some(_), Some(_)) => {
-                self.query(
-                    "SELECT id, job_id, level, event_code, message, details_json, created_at
-                     FROM scan_job_events
-                     WHERE job_id = ? AND level = ? AND event_code = ?
-                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                )
-                .bind(job_id)
-                .bind(level)
-                .bind(event_code)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-            }
-            (Some(_), None) => {
-                self.query(
-                    "SELECT id, job_id, level, event_code, message, details_json, created_at
-                     FROM scan_job_events
-                     WHERE job_id = ? AND level = ?
-                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                )
-                .bind(job_id)
-                .bind(level)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-            }
-            (None, Some(_)) => {
-                self.query(
-                    "SELECT id, job_id, level, event_code, message, details_json, created_at
-                     FROM scan_job_events
-                     WHERE job_id = ? AND event_code = ?
-                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                )
-                .bind(job_id)
-                .bind(event_code)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-            }
-            (None, None) => {
-                self.query(
-                    "SELECT id, job_id, level, event_code, message, details_json, created_at
-                     FROM scan_job_events WHERE job_id = ?
-                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                )
-                .bind(job_id)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-            }
-        };
-        rows.map(|rows| rows.into_iter().map(stored_scan_job_event).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
     }
 
     pub(crate) async fn create_metadata_reidentify_job(

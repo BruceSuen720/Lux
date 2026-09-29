@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
@@ -86,6 +86,25 @@ impl LogStore {
         }
     }
 
+    #[cfg(test)]
+    fn new_with_limits_for_test(
+        config_dir: &Path,
+        active_date: Date,
+        segment_limit: u64,
+        archive_limit: usize,
+    ) -> io::Result<Self> {
+        let store = Self::new(config_dir);
+        let manager =
+            LogManager::open_with_limits(config_dir, active_date, segment_limit, archive_limit)?;
+        let mut slot = store
+            .manager
+            .lock()
+            .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+        *slot = Some(manager);
+        drop(slot);
+        Ok(store)
+    }
+
     pub async fn open(config_dir: &Path) -> io::Result<Self> {
         let store = Self::new(config_dir);
         store.initialize().await?;
@@ -128,10 +147,10 @@ impl LogStore {
     }
 
     pub(crate) async fn append_json_batch_and_sync(&self, records: Vec<Value>) -> io::Result<()> {
+        self.suspend_archive_pruning().await?;
         if records.is_empty() {
             return Ok(());
         }
-        self.initialize().await?;
         let manager = Arc::clone(&self.manager);
         tokio::task::spawn_blocking(move || {
             let mut manager = manager
@@ -166,8 +185,64 @@ impl LogStore {
         .map_err(|error| io::Error::other(format!("日志批量写入任务失败: {error}")))?
     }
 
+    pub(crate) async fn suspend_archive_pruning(&self) -> io::Result<()> {
+        self.initialize().await?;
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let mut manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            let manager = manager
+                .as_mut()
+                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
+            manager.defer_archive_pruning = true;
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("日志归档延期清理任务失败: {error}")))?
+    }
+
+    pub(crate) async fn prune_archives(&self) -> io::Result<()> {
+        self.initialize().await?;
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let mut manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            let manager = manager
+                .as_mut()
+                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
+            let previous_pruning_state = manager.defer_archive_pruning;
+            manager.defer_archive_pruning = false;
+            let result = manager.prune_archives();
+            if result.is_err() {
+                manager.defer_archive_pruning = previous_pruning_state;
+            }
+            result
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("日志归档清理任务失败: {error}")))?
+    }
+
     pub(crate) async fn existing_scan_job_event_ids(
         &self,
+        expected_ids: &[String],
+    ) -> io::Result<HashSet<String>> {
+        self.existing_record_ids("scan_job_event", expected_ids)
+            .await
+    }
+
+    pub(crate) async fn existing_audit_event_ids(
+        &self,
+        expected_ids: &[String],
+    ) -> io::Result<HashSet<String>> {
+        self.existing_record_ids("admin_audit_event", expected_ids)
+            .await
+    }
+
+    async fn existing_record_ids(
+        &self,
+        record_type: &'static str,
         expected_ids: &[String],
     ) -> io::Result<HashSet<String>> {
         if expected_ids.is_empty() {
@@ -182,7 +257,7 @@ impl LogStore {
             let _manager = manager
                 .lock()
                 .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
-            read_scan_job_event_ids(&log_dir, &archive_dir, &expected_ids)
+            read_record_ids(&log_dir, &archive_dir, record_type, &expected_ids)
         })
         .await
         .map_err(|error| io::Error::other(format!("任务日志索引读取失败: {error}")))?
@@ -193,16 +268,12 @@ impl LogStore {
         expected_ids: &[String],
     ) -> io::Result<()> {
         let persisted_ids = self.existing_scan_job_event_ids(expected_ids).await?;
-        if expected_ids
-            .iter()
-            .any(|expected_id| !persisted_ids.contains(expected_id))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "任务日志文件缺少本批次事件记录",
-            ));
-        }
-        Ok(())
+        verify_expected_log_ids(expected_ids, &persisted_ids, "任务日志")
+    }
+
+    pub(crate) async fn verify_audit_event_ids(&self, expected_ids: &[String]) -> io::Result<()> {
+        let persisted_ids = self.existing_audit_event_ids(expected_ids).await?;
+        verify_expected_log_ids(expected_ids, &persisted_ids, "审计日志")
     }
 
     pub async fn append_scan_job_event(
@@ -485,9 +556,27 @@ fn read_scan_job_events(
     Ok((total, page))
 }
 
-fn read_scan_job_event_ids(
+fn verify_expected_log_ids(
+    expected_ids: &[String],
+    persisted_ids: &HashSet<String>,
+    description: &str,
+) -> io::Result<()> {
+    if expected_ids
+        .iter()
+        .any(|expected_id| !persisted_ids.contains(expected_id))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description}文件缺少本批次事件记录"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_record_ids(
     log_dir: &Path,
     archive_dir: &Path,
+    record_type: &str,
     expected_ids: &HashSet<String>,
 ) -> io::Result<HashSet<String>> {
     let mut found_ids = HashSet::with_capacity(expected_ids.len());
@@ -505,8 +594,9 @@ fn read_scan_job_event_ids(
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
             if name.starts_with("lux.") && name.ends_with(".log") {
-                read_scan_job_event_ids_from_lines(
+                read_record_ids_from_lines(
                     io::BufReader::new(fs::File::open(path)?),
+                    record_type,
                     expected_ids,
                     &mut found_ids,
                 )?;
@@ -539,8 +629,9 @@ fn read_scan_job_event_ids(
                     .by_index(index)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 if member.name().ends_with(".log") {
-                    read_scan_job_event_ids_from_lines(
+                    read_record_ids_from_lines(
                         io::BufReader::new(member),
+                        record_type,
                         expected_ids,
                         &mut found_ids,
                     )?;
@@ -554,8 +645,9 @@ fn read_scan_job_event_ids(
     Ok(found_ids)
 }
 
-fn read_scan_job_event_ids_from_lines<R: io::BufRead>(
+fn read_record_ids_from_lines<R: io::BufRead>(
     mut reader: R,
+    record_type: &str,
     expected_ids: &HashSet<String>,
     found_ids: &mut HashSet<String>,
 ) -> io::Result<()> {
@@ -568,7 +660,7 @@ fn read_scan_job_event_ids_from_lines<R: io::BufRead>(
         let Ok(record) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
-        if record["recordType"] == "scan_job_event"
+        if record["recordType"] == record_type
             && let Some(id) = record["id"].as_str()
             && expected_ids.contains(id)
         {
@@ -693,6 +785,8 @@ fn read_audit_events(
             .cmp(&left.created_at)
             .then_with(|| right.id.cmp(&left.id))
     });
+    let mut seen_ids = HashSet::with_capacity(events.len());
+    events.retain(|event| seen_ids.insert(event.id.clone()));
     let total = i64::try_from(events.len()).unwrap_or(i64::MAX);
     let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
     let count = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
@@ -806,6 +900,8 @@ fn read_activity_events(
     }
     login_events.extend(playback_events);
     sort_audit_events(&mut login_events);
+    let mut seen_ids = HashSet::with_capacity(login_events.len());
+    login_events.retain(|event| seen_ids.insert(event.id.clone()));
     login_events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
     Ok(login_events)
 }
@@ -904,6 +1000,7 @@ struct LogManager {
     pending_bytes: Vec<u8>,
     segment_limit: u64,
     archive_limit: usize,
+    defer_archive_pruning: bool,
 }
 
 impl LogManager {
@@ -936,6 +1033,7 @@ impl LogManager {
             pending_bytes: Vec::new(),
             segment_limit: segment_limit.max(1),
             archive_limit,
+            defer_archive_pruning: false,
         };
         manager.archive_previous_days(active_date)?;
         manager.open_active_file()?;
@@ -968,8 +1066,9 @@ impl LogManager {
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&self.active_path)?;
-        self.active_bytes = file.metadata()?.len();
+        self.active_bytes = repair_incomplete_jsonl_tail(&file)?;
         self.active_file = Some(file);
         Ok(())
     }
@@ -1042,7 +1141,17 @@ impl LogManager {
     }
 
     fn archive_path(&mut self, source_path: &Path, date: Date) -> io::Result<()> {
-        if !source_path.exists() || fs::metadata(source_path)?.len() == 0 {
+        if !source_path.exists() {
+            return Ok(());
+        }
+        let source_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source_path)?;
+        let source_len = repair_incomplete_jsonl_tail(&source_file)?;
+        drop(source_file);
+        if source_len == 0 {
+            fs::remove_file(source_path)?;
             return Ok(());
         }
         let sequence = self.next_sequence(date)?;
@@ -1078,7 +1187,9 @@ impl LogManager {
             }
             fs::rename(&temp_path, &archive_path)?;
             fs::remove_file(source_path)?;
-            self.prune_archives()?;
+            if !self.defer_archive_pruning {
+                self.prune_archives()?;
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -1124,6 +1235,34 @@ impl LogManager {
         }
         Ok(())
     }
+}
+
+fn repair_incomplete_jsonl_tail(file: &fs::File) -> io::Result<u64> {
+    const CHUNK_BYTES: u64 = 8 * 1024;
+    let original_len = file.metadata()?.len();
+    let mut remaining = original_len;
+    let mut reader = file;
+    let mut buffer = [0_u8; CHUNK_BYTES as usize];
+    while remaining > 0 {
+        let chunk_start = remaining.saturating_sub(CHUNK_BYTES);
+        let chunk_len = usize::try_from(remaining - chunk_start).map_err(io::Error::other)?;
+        reader.seek(SeekFrom::Start(chunk_start))?;
+        reader.read_exact(&mut buffer[..chunk_len])?;
+        if let Some(newline_index) = buffer[..chunk_len].iter().rposition(|byte| *byte == b'\n') {
+            let valid_len = chunk_start
+                .saturating_add(u64::try_from(newline_index).map_err(io::Error::other)?)
+                .saturating_add(1);
+            if valid_len < original_len {
+                file.set_len(valid_len)?;
+                file.sync_all()?;
+            }
+            return Ok(valid_len);
+        }
+        remaining = chunk_start;
+    }
+    file.set_len(0)?;
+    file.sync_all()?;
+    Ok(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1393,9 +1532,18 @@ fn zip_io_error(error: zip::result::ZipError) -> io::Error {
 }
 
 fn create_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, LogExportError> {
+    let mut daily_files = BTreeMap::<String, Vec<u8>>::new();
+    for (name, contents) in files {
+        let date = export_file_date(&name)
+            .ok_or_else(|| LogExportError::Archive("日志分段文件名无效".to_owned()))?;
+        daily_files
+            .entry(log_file_name(date))
+            .or_default()
+            .extend_from_slice(&contents);
+    }
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    for (name, contents) in files {
+    for (name, contents) in daily_files {
         writer
             .start_file(name, options)
             .map_err(|error| LogExportError::Archive(error.to_string()))?;
@@ -1407,6 +1555,12 @@ fn create_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, LogExportErr
         .finish()
         .map(|cursor| cursor.into_inner())
         .map_err(|error| LogExportError::Archive(error.to_string()))
+}
+
+fn export_file_date(name: &str) -> Option<Date> {
+    let date_and_part = name.strip_prefix("lux.")?.strip_suffix(".log")?;
+    let date = date_and_part.split(".part-").next()?;
+    parse_date(date).ok()
 }
 
 fn parse_date(value: &str) -> Result<Date, LogExportError> {
@@ -1468,7 +1622,11 @@ fn compact_date(date: Date) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io, sync::Arc};
+    use std::{
+        fs,
+        io::{self, Write},
+        sync::Arc,
+    };
 
     use super::{
         LogDateRange, LogExport, LogExportError, LogManager, LogStore, NewAuditLogEvent,
@@ -1669,6 +1827,104 @@ mod tests {
         store
             .verify_scan_job_event_ids(&["persisted-event".to_owned()])
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_batch_can_verify_a_segment_before_fifo_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let future_date = Date::from_calendar_date(2030, Month::January, 1)?;
+        let old_date = Date::from_calendar_date(2020, Month::January, 1)?;
+        let archive_directory = archive_dir(temp_dir.path());
+        fs::create_dir_all(&archive_directory)?;
+        let future_member = format!("lux.{}.part-000001.log", "2030-01-01");
+        let future_archive = archive_directory.join(format!("{future_member}.zip"));
+        let archive_file = fs::File::create(future_archive)?;
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive.start_file(
+            &future_member,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )?;
+        archive.write_all(b"{\"recordType\":\"program_log\"}\n")?;
+        archive.finish()?;
+
+        let store = LogStore::new_with_limits_for_test(temp_dir.path(), future_date, 1, 1)?;
+        let expected_scan_ids = ["oldest-scan-event".to_owned()];
+        let expected_audit_ids = ["oldest-audit-event".to_owned()];
+        store
+            .append_json_batch_and_sync(vec![serde_json::json!({
+                "recordType": "scan_job_event",
+                "id": "oldest-scan-event",
+                "jobId": "job-1",
+                "level": "WARN",
+                "eventCode": "SCAN_IO",
+                "message": "legacy event",
+                "details": {},
+                "timestamp": "2020-01-01T00:00:00Z",
+                "createdAt": old_date.midnight().assume_utc().unix_timestamp(),
+            })])
+            .await?;
+        store.verify_scan_job_event_ids(&expected_scan_ids).await?;
+        store
+            .append_json_batch_and_sync(vec![serde_json::json!({
+                "recordType": "admin_audit_event",
+                "id": "oldest-audit-event",
+                "eventType": "USER_CREATED",
+                "metadata": {},
+                "timestamp": "2020-01-01T00:00:00Z",
+                "createdAt": old_date.midnight().assume_utc().unix_timestamp(),
+            })])
+            .await?;
+        store.verify_audit_event_ids(&expected_audit_ids).await?;
+        let archives_before_prune = fs::read_dir(archive_directory.clone())?.count();
+        assert_eq!(archives_before_prune, 3);
+
+        store.prune_archives().await?;
+        let remaining_scan_ids = store
+            .existing_scan_job_event_ids(&expected_scan_ids)
+            .await?;
+        let remaining_audit_ids = store.existing_audit_event_ids(&expected_audit_ids).await?;
+        assert!(remaining_scan_ids.is_empty());
+        assert!(remaining_audit_ids.is_empty());
+        assert_eq!(fs::read_dir(archive_directory)?.count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopen_discards_an_incomplete_jsonl_tail_before_appending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let current_log =
+            log_dir(temp_dir.path()).join(log_file_name(OffsetDateTime::now_utc().date()));
+        fs::create_dir_all(log_dir(temp_dir.path()))?;
+        fs::write(
+            &current_log,
+            b"{\"recordType\":\"scan_job_event\",\"id\":\"complete\",\"jobId\":\"job-1\",\"level\":\"WARN\",\"eventCode\":\"SCAN_IO\",\"message\":\"complete\",\"details\":{},\"createdAt\":1}\n{\"recordType\":\"scan_job_event\",\"id\":\"torn",
+        )?;
+        let store = LogStore::open(temp_dir.path()).await?;
+        store
+            .append_scan_job_event("next", "job-1", "INFO", "JOB_STARTED", "started", "{}")
+            .await?;
+
+        let (total, events) = store
+            .list_scan_job_events("job-1", None, None, 0, 10)
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["next", "complete"]
+        );
+        for line in fs::read(current_log)?
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            serde_json::from_slice::<Value>(line)?;
+        }
         Ok(())
     }
 

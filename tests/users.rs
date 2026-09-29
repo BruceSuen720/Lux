@@ -29,6 +29,9 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         web_auth,
         emby_auth,
     ));
+    sqlx::query("DROP TABLE audit_events")
+        .execute(database.pool())
+        .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -267,7 +270,13 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .header("x-csrf-token", &manager_csrf)
         .send()
         .await?;
-    assert_eq!(deleted_regular.status(), reqwest::StatusCode::NO_CONTENT);
+    let deleted_regular_status = deleted_regular.status();
+    let deleted_regular_body = deleted_regular.text().await?;
+    assert_eq!(
+        deleted_regular_status,
+        reqwest::StatusCode::NO_CONTENT,
+        "{deleted_regular_body}"
+    );
 
     let recreated_regular = client
         .post(format!("{base_url}/api/v1/admin/users"))
@@ -335,14 +344,6 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
                 && pair[0]["id"].as_str().unwrap_or_default()
                     >= pair[1]["id"].as_str().unwrap_or_default())
     }));
-    let database_admin_audit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events
-         WHERE event_type IN ('USER_CREATED', 'USER_UPDATED', 'USER_DISABLED', 'USER_DELETED')",
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(database_admin_audit_count, 0);
-
     let mut page_ids = Vec::new();
     for page in [1, 2] {
         let response = client

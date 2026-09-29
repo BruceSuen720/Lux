@@ -64,6 +64,9 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
+    sqlx::query("DROP TABLE scan_job_events")
+        .execute(database.pool())
+        .await?;
 
     let log_store = LogStore::new(&config.config_dir);
     let (base_url, server) = start_server(config.clone(), database.clone(), setup).await?;
@@ -137,11 +140,6 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
             .iter()
             .any(|item| item["eventCode"] == "JOB_CREATED" && item["level"] == "INFO")
     }));
-    let database_event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_events")
-        .fetch_one(database.pool())
-        .await?;
-    assert_eq!(database_event_count, 0);
-
     let completed = client
         .get(format!(
             "{base_url}/api/v1/admin/jobs/{job_id}/events?eventCode=POSTPROCESSING_FAILED&pageSize=1"
@@ -201,6 +199,16 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         .send()
         .await?;
     assert_eq!(too_large.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let no_matches = client
+        .get(format!(
+            "{base_url}/api/v1/admin/jobs/{job_id}/events?eventCode=NO_MATCHING_EVENT"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(no_matches.status(), reqwest::StatusCode::OK);
+    assert_eq!(no_matches.json::<Value>().await?["total"], 0);
 
     server.abort();
     Ok(())

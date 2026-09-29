@@ -124,6 +124,9 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .await?;
     }
 
+    sqlx::query("DROP TABLE audit_events")
+        .execute(database.pool())
+        .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -245,14 +248,6 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
             .ok_or("missing web playback notification")?,
     )?;
     assert_eq!(started["eventType"], "PLAYBACK_STARTED");
-    let activity_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events
-         WHERE event_type = 'PLAYBACK_STARTED' AND target_id = ?",
-    )
-    .bind(&item_id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(activity_count, 0);
     let (audit_total, audit_events) = audit_logs.list_audit_events(0, 10).await?;
     assert_eq!(audit_total, 2);
     assert!(
@@ -265,10 +260,6 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .find(|event| event.event_type == "PLAYBACK_STARTED")
         .ok_or("missing file-backed playback audit event")?;
     assert_eq!(playback_event.target_id.as_deref(), Some(item_id.as_str()));
-    let stored_audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
-        .fetch_one(database.pool())
-        .await?;
-    assert_eq!(stored_audit_count, 0);
     let duplicate = event("event-1", 1, "PLAYING", 100).send().await?;
     assert_eq!(duplicate.json::<Value>().await?["duplicate"], true);
     let stale = event("event-2", 0, "PAUSED", 0).send().await?;

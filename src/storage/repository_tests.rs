@@ -8648,20 +8648,10 @@ async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
         .expect("scan target");
     }
 
-    sqlx::query(
-        "INSERT INTO scan_job_events (id, job_id, level, event_code, message, created_at)
-         VALUES ('cleanup-info', 'cleanup-completed', 'INFO', 'INFO', 'info', ?),
-                ('cleanup-old-warn', 'cleanup-completed', 'WARN', 'WARN', 'old warn', ?),
-                ('cleanup-old-error', 'cleanup-completed', 'ERROR', 'ERROR', 'old error', ?),
-                ('cleanup-recent-warn', 'cleanup-completed', 'WARN', 'WARN', 'recent warn', ?)",
-    )
-    .bind(now - 8 * 86_400)
-    .bind(now - 8 * 86_400)
-    .bind(now - 8 * 86_400)
-    .bind(now - 86_400)
-    .execute(database.pool())
-    .await
-    .expect("scan events");
+    sqlx::query("DROP TABLE scan_job_events")
+        .execute(database.pool())
+        .await
+        .expect("drop legacy log table to verify cleanup does not query it");
 
     let report = database
         .run_database_lifecycle_cleanup()
@@ -8671,7 +8661,6 @@ async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
     assert_eq!(report.scan_job_paths_deleted, 1);
     assert_eq!(report.reconciliation_entries_deleted, 1);
     assert_eq!(report.scan_job_targets_deleted, 2);
-    assert_eq!(report.scan_job_events_deleted, 3);
     assert_eq!(report.scan_jobs_summarized, 2);
 
     let remaining_paths: Vec<String> =
@@ -8705,13 +8694,6 @@ async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
             ),
         ]
     );
-    let event_levels: Vec<String> =
-        sqlx::query_scalar("SELECT level FROM scan_job_events ORDER BY id")
-            .fetch_all(database.pool())
-            .await
-            .expect("remaining events");
-    assert_eq!(event_levels, ["WARN"]);
-
     let summary: (Option<String>, Option<String>, i64) = sqlx::query_as(
         "SELECT cursor, current_item, cancel_requested
          FROM scan_jobs WHERE id = 'cleanup-completed'",
@@ -8756,31 +8738,13 @@ async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
     .expect("cleanup marker");
     assert_eq!(marker, "COMPLETED");
 
-    sqlx::query(
-        "INSERT INTO scan_job_events
-            (id, job_id, level, event_code, message, created_at)
-         VALUES ('cleanup-expired-after-completion', 'cleanup-completed',
-                 'ERROR', 'ERROR', 'expired after first run', ?)",
-    )
-    .bind(now - 8 * 86_400)
-    .execute(database.pool())
-    .await
-    .expect("expired scan event");
     assert!(
         database
             .run_database_lifecycle_cleanup()
             .await
-            .expect("recurring event cleanup")
+            .expect("recurring cleanup")
             .is_none()
     );
-    let expired_event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_job_events
-         WHERE id = 'cleanup-expired-after-completion'",
-    )
-    .fetch_one(database.pool())
-    .await
-    .expect("expired event count");
-    assert_eq!(expired_event_count, 0);
 }
 
 #[tokio::test]

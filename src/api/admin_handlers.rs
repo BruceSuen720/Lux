@@ -3827,53 +3827,13 @@ pub(crate) async fn admin_list_job_events(
         Ok(events) => events,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if file_events.0 > 0 {
-        return Json(json!({
-            "events": file_events.1.iter().map(scan_job_event_json).collect::<Vec<_>>(),
-            "total": file_events.0,
-            "page": offset / limit + 1,
-            "pageSize": limit,
-        }))
-        .into_response();
-    }
-    let total = match database
-        .count_scan_job_events(&job_id, level.as_deref(), event_code.as_deref())
-        .await
-    {
-        Ok(total) => total,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    match database
-        .list_scan_job_events(
-            &job_id,
-            level.as_deref(),
-            event_code.as_deref(),
-            offset,
-            limit,
-        )
-        .await
-    {
-        Ok(events) => Json(json!({
-            "events": events.iter().map(|event| {
-                let details = serde_json::from_str::<Value>(&event.details_json)
-                    .unwrap_or_else(|_| json!({ "invalid": true }));
-                json!({
-                    "id": event.id,
-                    "jobId": event.job_id,
-                    "level": event.level,
-                    "eventCode": event.event_code,
-                    "message": event.message,
-                    "details": details,
-                    "createdAt": event.created_at,
-                })
-            }).collect::<Vec<_>>(),
-            "total": total,
-            "page": offset / limit + 1,
-            "pageSize": limit,
-        }))
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    Json(json!({
+        "events": file_events.1.iter().map(scan_job_event_json).collect::<Vec<_>>(),
+        "total": file_events.0,
+        "page": offset / limit + 1,
+        "pageSize": limit,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn admin_retry_scan(
@@ -4516,80 +4476,34 @@ pub(crate) async fn admin_list_audit(
             .into_response();
         }
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
     let Some(config_dir) = state.config_dir.as_deref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some(prefix_limit) = offset.checked_add(limit) else {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "分页参数超出范围",
-        )
-        .into_response();
-    };
     let file_events = match crate::observability::logs::LogStore::new(config_dir)
-        .list_audit_events(0, prefix_limit)
+        .list_audit_events(offset, limit)
         .await
     {
         Ok((_, events)) => events,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let database_events = match database.list_audit_events(0, prefix_limit).await {
-        Ok(events) => events,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let mut events = file_events
+    let events = file_events
         .into_iter()
         .map(|event| {
-            (
-                event.created_at,
-                event.id.clone(),
-                json!({
-                    "id": event.id,
-                    "actorUserId": event.actor_user_id,
-                    "actorUsername": event.actor_username,
-                    "eventType": event.event_type,
-                    "targetType": event.target_type,
-                    "targetId": event.target_id,
-                    "metadata": serde_json::from_str::<Value>(&event.metadata_json)
-                        .unwrap_or_else(|_| json!({})),
-                    "createdAt": event.created_at,
-                }),
-            )
+            json!({
+                "id": event.id,
+                "actorUserId": event.actor_user_id,
+                "actorUsername": event.actor_username,
+                "eventType": event.event_type,
+                "targetType": event.target_type,
+                "targetId": event.target_id,
+                "metadata": serde_json::from_str::<Value>(&event.metadata_json)
+                    .unwrap_or_else(|_| json!({})),
+                "createdAt": event.created_at,
+            })
         })
-        .chain(database_events.into_iter().map(|event| {
-            (
-                event.created_at,
-                event.id.clone(),
-                json!({
-                    "id": event.id,
-                    "actorUserId": event.actor_user_id,
-                    "actorUsername": event.actor_username,
-                    "eventType": event.event_type,
-                    "targetType": event.target_type,
-                    "targetId": event.target_id,
-                    "metadata": serde_json::from_str::<Value>(&event.metadata_json)
-                        .unwrap_or_else(|_| json!({})),
-                    "createdAt": event.created_at,
-                }),
-            )
-        }))
-        .collect::<Vec<_>>();
-    events.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-    let mut seen_ids = HashSet::with_capacity(events.len());
-    events.retain(|(_, id, _)| seen_ids.insert(id.clone()));
-    let page = events
-        .into_iter()
-        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-        .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .map(|(_, _, event)| event)
         .collect::<Vec<_>>();
     Json(json!({
-        "events": page,
+        "events": events,
         "page": offset / limit + 1,
         "pageSize": limit,
     }))

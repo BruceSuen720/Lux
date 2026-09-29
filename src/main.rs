@@ -43,8 +43,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 {
                     "CONFIG_LOG_PERMISSION_DENIED"
                 }
+                StorageError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::InvalidData =>
+                {
+                    "CONFIG_LOG_INVALID_DATA"
+                }
                 StorageError::Io { .. } => "CONFIG_LOG_WRITE_FAILED",
                 StorageError::Sqlx { .. } => "DATABASE_LOG_MIGRATION_FAILED",
+                StorageError::Conflict(_) => "LEGACY_LOG_DATA_INVALID",
                 _ => "LOG_MIGRATION_FAILED",
             };
             error!(
@@ -58,6 +64,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
             migrated_scan_events,
             "legacy scan events migrated to config logs"
+        );
+    }
+    let migrated_audit_events = match database.migrate_legacy_audit_events_to_logs().await {
+        Ok(migrated) => migrated,
+        Err(error) => {
+            let error_code = match &error {
+                StorageError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    "CONFIG_LOG_PERMISSION_DENIED"
+                }
+                StorageError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::InvalidData =>
+                {
+                    "CONFIG_LOG_INVALID_DATA"
+                }
+                StorageError::Io { .. } => "CONFIG_LOG_WRITE_FAILED",
+                StorageError::Sqlx { .. } => "DATABASE_LOG_MIGRATION_FAILED",
+                StorageError::Conflict(_) => "LEGACY_LOG_DATA_INVALID",
+                _ => "LOG_MIGRATION_FAILED",
+            };
+            error!(
+                error_code,
+                "legacy audit event migration failed; startup stopped"
+            );
+            return Err(std::io::Error::other("legacy audit event migration failed").into());
+        }
+    };
+    if migrated_audit_events > 0 {
+        info!(
+            migrated_audit_events,
+            "legacy audit events migrated to config logs"
         );
     }
     match luxd::application::image_repairs::repair_episode_image_path_conflicts(&database).await {
@@ -77,7 +115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 scan_job_paths_deleted = report.scan_job_paths_deleted,
                 reconciliation_entries_deleted = report.reconciliation_entries_deleted,
                 scan_job_targets_deleted = report.scan_job_targets_deleted,
-                scan_job_events_deleted = report.scan_job_events_deleted,
                 scan_jobs_summarized = report.scan_jobs_summarized,
                 "one-time database lifecycle cleanup completed"
             );

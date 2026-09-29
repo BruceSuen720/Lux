@@ -5,9 +5,10 @@ const DATABASE_CLEANUP_MARKER: &str = "database_lifecycle_cleanup_v1";
 const DATABASE_CLEANUP_PENDING: &str = "PENDING";
 const DATABASE_CLEANUP_RUNNING: &str = "RUNNING";
 const DATABASE_CLEANUP_COMPLETED: &str = "COMPLETED";
+const SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER: &str = "scan_job_events_config_log_migration_v1";
+const AUDIT_EVENTS_LOG_MIGRATION_MARKER: &str = "audit_events_config_log_migration_v1";
 const CLEANUP_BATCH_SIZE: i64 = 1_000;
-const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES;
-const SCAN_EVENT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES / 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DatabaseLifecycleCleanupReport {
@@ -17,12 +18,17 @@ pub struct DatabaseLifecycleCleanupReport {
     pub scan_manifest_entries_deleted: u64,
     pub scan_manifest_directories_deleted: u64,
     pub scan_job_targets_deleted: u64,
-    pub scan_job_events_deleted: u64,
     pub scan_jobs_summarized: u64,
 }
 
 impl Database {
     pub async fn migrate_legacy_scan_job_events_to_logs(&self) -> Result<u64, StorageError> {
+        if self
+            .is_config_log_migration_complete(SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER)
+            .await?
+        {
+            return Ok(0);
+        }
         let source_event_count: i64 = self
             .query_scalar("SELECT COUNT(*) FROM scan_job_events")
             .fetch_one(&self.pool)
@@ -32,6 +38,8 @@ impl Database {
                 source,
             })?;
         if source_event_count == 0 {
+            self.mark_config_log_migration_complete(SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER)
+                .await?;
             return Ok(0);
         }
         let mut migrated = 0_u64;
@@ -82,9 +90,7 @@ impl Database {
                     break;
                 }
 
-                let details = serde_json::from_str::<serde_json::Value>(&details_json)
-                    .map(crate::observability::logs::redact_sensitive_log_values)
-                    .unwrap_or_else(|_| serde_json::json!({ "invalid": true }));
+                let details = Self::redact_legacy_log_json(&details_json, "task event details")?;
                 let message = crate::observability::logs::redact_sensitive_log_values(
                     serde_json::Value::String(message),
                 )
@@ -126,6 +132,13 @@ impl Database {
                 records.push(record);
             }
 
+            self.log_store
+                .suspend_archive_pruning()
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
             let existing_event_ids = self
                 .log_store
                 .existing_scan_job_event_ids(&ids)
@@ -170,9 +183,242 @@ impl Database {
                     source,
                 })?
                 .rows_affected();
+            self.log_store
+                .prune_archives()
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
             migrated = migrated.saturating_add(deleted);
         }
+        self.mark_config_log_migration_complete(SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER)
+            .await?;
         Ok(migrated)
+    }
+
+    pub async fn migrate_legacy_audit_events_to_logs(&self) -> Result<u64, StorageError> {
+        if self
+            .is_config_log_migration_complete(AUDIT_EVENTS_LOG_MIGRATION_MARKER)
+            .await?
+        {
+            return Ok(0);
+        }
+        let source_event_count: i64 = self
+            .query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if source_event_count == 0 {
+            self.mark_config_log_migration_complete(AUDIT_EVENTS_LOG_MIGRATION_MARKER)
+                .await?;
+            return Ok(0);
+        }
+
+        let mut migrated = 0_u64;
+        loop {
+            let rows = self
+                .query(
+                    "SELECT ae.id, ae.actor_user_id, users.username_normalized AS actor_username,
+                            ae.event_type, ae.target_type, ae.target_id,
+                            ae.metadata_json, ae.created_at
+                     FROM audit_events ae
+                     LEFT JOIN users ON users.id = ae.actor_user_id
+                     ORDER BY ae.created_at, ae.id
+                     LIMIT ?",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let batch_date = rows.first().and_then(|row| {
+                let created_at: i64 = row.get("created_at");
+                OffsetDateTime::from_unix_timestamp(created_at)
+                    .ok()
+                    .map(|timestamp| timestamp.date())
+            });
+            let mut ids = Vec::with_capacity(rows.len());
+            let mut records = Vec::with_capacity(rows.len());
+            let mut batch_bytes = 0_u64;
+            for row in rows {
+                let id: String = row.get("id");
+                let actor_user_id: Option<String> = row.get("actor_user_id");
+                let actor_username: Option<String> = row.get("actor_username");
+                let event_type: String = row.get("event_type");
+                let target_type: Option<String> = row.get("target_type");
+                let target_id: Option<String> = row.get("target_id");
+                let metadata_json: String = row.get("metadata_json");
+                let created_at: i64 = row.get("created_at");
+                let event_date = OffsetDateTime::from_unix_timestamp(created_at)
+                    .ok()
+                    .map(|timestamp| timestamp.date());
+                if batch_date.is_some() && event_date != batch_date
+                    || batch_date.is_none() && !ids.is_empty()
+                {
+                    break;
+                }
+
+                let metadata = Self::redact_legacy_log_json(&metadata_json, "audit metadata")?;
+                let timestamp = OffsetDateTime::from_unix_timestamp(created_at)
+                    .ok()
+                    .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+                    .unwrap_or_else(|| created_at.to_string());
+                let record = serde_json::json!({
+                    "recordType": "admin_audit_event",
+                    "id": id.clone(),
+                    "actorUserId": actor_user_id,
+                    "actorUsername": actor_username,
+                    "eventType": event_type,
+                    "targetType": target_type,
+                    "targetId": target_id,
+                    "metadata": metadata,
+                    "timestamp": timestamp,
+                    "createdAt": created_at,
+                });
+                let record_bytes = u64::try_from(
+                    serde_json::to_vec(&record)
+                        .map_err(|source| StorageError::Io {
+                            path: self.path.clone(),
+                            source: std::io::Error::other(source),
+                        })?
+                        .len()
+                        .saturating_add(1),
+                )
+                .unwrap_or(u64::MAX);
+                if !ids.is_empty()
+                    && batch_bytes.saturating_add(record_bytes) > MAX_LOG_MIGRATION_BATCH_BYTES
+                {
+                    break;
+                }
+                ids.push(id);
+                batch_bytes = batch_bytes.saturating_add(record_bytes);
+                records.push(record);
+            }
+
+            self.log_store
+                .suspend_archive_pruning()
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let existing_event_ids = self
+                .log_store
+                .existing_audit_event_ids(&ids)
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            records.retain(|record| {
+                record["id"]
+                    .as_str()
+                    .is_none_or(|id| !existing_event_ids.contains(id))
+            });
+            self.log_store
+                .append_json_batch_and_sync(records)
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.log_store
+                .verify_audit_event_ids(&ids)
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete_query = format!("DELETE FROM audit_events WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(delete_query));
+            for id in &ids {
+                statement = statement.bind(id);
+            }
+            let deleted = statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            self.log_store
+                .prune_archives()
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            migrated = migrated.saturating_add(deleted);
+        }
+        self.mark_config_log_migration_complete(AUDIT_EVENTS_LOG_MIGRATION_MARKER)
+            .await?;
+        Ok(migrated)
+    }
+
+    async fn is_config_log_migration_complete(&self, key: &str) -> Result<bool, StorageError> {
+        let value: Option<String> = self
+            .query_scalar("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(value.as_deref() == Some(DATABASE_CLEANUP_COMPLETED))
+    }
+
+    async fn mark_config_log_migration_complete(&self, key: &str) -> Result<(), StorageError> {
+        let updated = self
+            .query("UPDATE lux_meta SET value = ? WHERE key = ?")
+            .bind(DATABASE_CLEANUP_COMPLETED)
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if updated.rows_affected() == 0 {
+            self.query("INSERT INTO lux_meta (key, value) VALUES (?, ?)")
+                .bind(key)
+                .bind(DATABASE_CLEANUP_COMPLETED)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn redact_legacy_log_json(
+        value: &str,
+        description: &str,
+    ) -> Result<serde_json::Value, StorageError> {
+        serde_json::from_str::<serde_json::Value>(value)
+            .map(crate::observability::logs::redact_sensitive_log_values)
+            .map_err(|_| {
+                StorageError::Conflict(format!(
+                    "legacy {description} is not valid JSON; source row was retained"
+                ))
+            })
     }
 
     /// Runs the one-time cleanup installed by the database lifecycle migration.
@@ -186,7 +432,6 @@ impl Database {
         self.reset_interrupted_database_cleanup().await?;
         if !self.claim_database_cleanup().await? {
             let report = self.cleanup_completed_scan_manifest_payloads().await?;
-            self.prune_scan_job_events().await?;
             return if report.scan_manifest_deltas_deleted > 0
                 || report.scan_manifest_entries_deleted > 0
                 || report.scan_manifest_directories_deleted > 0
@@ -297,7 +542,6 @@ impl Database {
             scan_manifest_entries_deleted: manifest_payload.scan_manifest_entries_deleted,
             scan_manifest_directories_deleted: manifest_payload.scan_manifest_directories_deleted,
             scan_job_targets_deleted: self.delete_non_retryable_scan_job_targets().await?,
-            scan_job_events_deleted: self.prune_scan_job_events().await?,
             scan_jobs_summarized: self.summarize_terminal_scan_jobs().await?,
         })
     }
@@ -539,38 +783,6 @@ impl Database {
                          LIMIT ?
                      )",
                 )
-                .bind(CLEANUP_BATCH_SIZE)
-                .execute(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .rows_affected();
-            if count == 0 {
-                break;
-            }
-            deleted = deleted.saturating_add(count);
-        }
-        Ok(deleted)
-    }
-
-    pub(crate) async fn prune_scan_job_events(&self) -> Result<u64, StorageError> {
-        let mut deleted = 0_u64;
-        loop {
-            let count = self
-                .query(
-                    "DELETE FROM scan_job_events
-                     WHERE id IN (
-                         SELECT id
-                         FROM scan_job_events
-                         WHERE level = 'INFO'
-                            OR (level IN ('WARN', 'ERROR')
-                                AND created_at < unixepoch() - ?)
-                         LIMIT ?
-                     )",
-                )
-                .bind(SCAN_EVENT_RETENTION_SECONDS)
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await

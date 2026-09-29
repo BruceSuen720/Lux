@@ -694,44 +694,6 @@ impl Database {
             })
     }
 
-    pub(crate) async fn list_audit_events(
-        &self,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<StoredAuditEvent>, StorageError> {
-        self.query(
-            "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
-                    ae.event_type, ae.target_type, ae.target_id,
-                    ae.metadata_json, ae.created_at
-             FROM audit_events ae
-             LEFT JOIN users u ON u.id = ae.actor_user_id
-             ORDER BY ae.created_at DESC, ae.id DESC
-             LIMIT ? OFFSET ?",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredAuditEvent {
-                    id: row.get("id"),
-                    actor_user_id: row.get("actor_user_id"),
-                    actor_username: row.get("actor_username"),
-                    event_type: row.get("event_type"),
-                    target_type: row.get("target_type"),
-                    target_id: row.get("target_id"),
-                    metadata_json: row.get("metadata_json"),
-                    created_at: row.get("created_at"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn list_activity_events(
         &self,
         limit: i64,
@@ -777,57 +739,6 @@ impl Database {
                 created_at: event.created_at,
             })
             .collect::<Vec<_>>();
-        let database_events = self
-            .query(
-                "WITH ranked_activity AS (
-                 SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
-                        ae.event_type, ae.target_type, ae.target_id,
-                        mi.title AS target_title, ae.metadata_json, ae.created_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY CASE
-                                WHEN ae.event_type = 'AUTH_LOGIN' THEN 'AUTH'
-                                ELSE 'PLAYBACK'
-                            END
-                            ORDER BY ae.created_at DESC, ae.id DESC
-                        ) AS category_rank
-                 FROM audit_events ae
-                 LEFT JOIN users u ON u.id = ae.actor_user_id
-                 LEFT JOIN media_items mi ON mi.id = ae.target_id
-                 WHERE ae.event_type IN (
-                     'AUTH_LOGIN', 'PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED'
-                 )
-             )
-             SELECT id, actor_user_id, actor_username, event_type, target_type, target_id,
-                    target_title, metadata_json, created_at
-             FROM ranked_activity
-             WHERE category_rank <= ?
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?",
-            )
-            .bind(category_limit)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| StoredActivityEvent {
-                        id: row.get("id"),
-                        actor_user_id: row.get("actor_user_id"),
-                        actor_username: row.get("actor_username"),
-                        event_type: row.get("event_type"),
-                        target_type: row.get("target_type"),
-                        target_id: row.get("target_id"),
-                        target_title: row.get("target_title"),
-                        metadata_json: row.get("metadata_json"),
-                        created_at: row.get("created_at"),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        events.extend(database_events);
         events.sort_by(|left, right| {
             right
                 .created_at

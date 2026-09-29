@@ -134,6 +134,10 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     .bind(&item_id)
     .execute(database.pool())
     .await?;
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 1);
+    sqlx::query("DROP TABLE audit_events")
+        .execute(database.pool())
+        .await?;
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
         .header("X-Emby-Token", &token)

@@ -10,6 +10,7 @@ use luxd::{
     },
     config::Config,
     library::LibraryKind,
+    observability::logs::LogStore,
     storage::Database,
 };
 use uuid::Uuid;
@@ -940,7 +941,8 @@ async fn generated_episode_thumbnail_skips_a_canonical_path_owned_by_fanart()
 async fn ffmpeg_failure_does_not_fail_the_completed_scan() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
-    let database = Database::connect(&config(temp_dir.path())).await?;
+    let configuration = config(temp_dir.path());
+    let database = Database::connect(&configuration).await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -967,14 +969,11 @@ async fn ffmpeg_failure_does_not_fail_the_completed_scan() -> Result<(), Box<dyn
         .fetch_one(database.pool())
         .await?;
     assert_eq!(status, "COMPLETED");
-    let event: (String, String) = sqlx::query_as(
-        "SELECT level, event_code FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'THUMBNAIL_FAILED'",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(event, ("WARN".to_owned(), "THUMBNAIL_FAILED".to_owned()));
+    let (_, events) = LogStore::new(&configuration.config_dir)
+        .list_scan_job_events(&job.id, None, Some("THUMBNAIL_FAILED"), 0, 10)
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].level, "WARN");
     Ok(())
 }
 

@@ -63,9 +63,9 @@ use crate::{
         ManifestDeltaBatchCommit, ManifestDiscoveryCommitResult, ManifestPostprocessingTargetPage,
         NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewItemMetadataCompletenessCheck,
         NewItemMetadataCompletenessResult, NewMediaItem, NewMediaSource, NewMovieFile,
-        NewScanJobEvent, NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, NewScanManifestIndexedFile, NewScanManifestPositiveIndex,
-        NewScanManifestRoot, NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
+        NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
+        NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
+        NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
         NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
         StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
@@ -4605,7 +4605,7 @@ pub struct ScanJobService {
     metadata_reidentify: Option<MetadataReidentifyService>,
     home: Option<HomeService>,
     webhooks: Option<WebhookService>,
-    log_store: Option<LogStore>,
+    log_store: LogStore,
     resources: ResourceMetrics,
     default_scan_concurrency: usize,
     scan_concurrency_override: Option<usize>,
@@ -5191,6 +5191,7 @@ pub struct IncrementalScanChange {
 
 impl ScanJobService {
     pub fn new(database: Database) -> Self {
+        let log_store = database.log_store();
         Self {
             scanner: LibraryScanner::new(database.clone()),
             database,
@@ -5205,7 +5206,7 @@ impl ScanJobService {
             metadata_reidentify: None,
             home: None,
             webhooks: None,
-            log_store: None,
+            log_store,
             resources: ResourceMetrics::new(),
             default_scan_concurrency: usize::try_from(
                 scan_concurrency_from_env().unwrap_or(DEFAULT_SCAN_CONCURRENCY),
@@ -5240,7 +5241,7 @@ impl ScanJobService {
     }
 
     pub fn with_log_store(mut self, log_store: LogStore) -> Self {
-        self.log_store = Some(log_store);
+        self.log_store = log_store;
         self
     }
 
@@ -12120,30 +12121,17 @@ impl ScanJobService {
         details_json: &str,
     ) {
         let id = Uuid::now_v7().to_string();
-        if let Some(log_store) = self.log_store.as_ref() {
-            if let Err(error) = log_store
-                .append_scan_job_event(&id, job_id, level, event_code, message, details_json)
-                .await
-            {
-                tracing::error!(
-                    job_id,
-                    event_code,
-                    error_kind = ?error.kind(),
-                    "failed to persist scan job log event"
-                );
-            }
-        } else {
-            let _ = self
-                .database
-                .append_scan_job_event(NewScanJobEvent {
-                    id: &id,
-                    job_id,
-                    level,
-                    event_code,
-                    message,
-                    details_json,
-                })
-                .await;
+        if let Err(error) = self
+            .log_store
+            .append_scan_job_event(&id, job_id, level, event_code, message, details_json)
+            .await
+        {
+            tracing::error!(
+                job_id,
+                event_code,
+                error_kind = ?error.kind(),
+                "failed to persist scan job log event"
+            );
         }
         self.admin_events.publish(AdminEventScope::Jobs);
     }

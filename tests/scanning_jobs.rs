@@ -1,6 +1,6 @@
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use common::{TestScraper, TestScraperConfig};
 use luxd::{
@@ -23,9 +23,20 @@ use luxd::{
     config::Config,
     domain::ids::UserId,
     library::LibraryKind,
+    observability::logs::{LogStore, ScanJobLogEvent},
     storage::Database,
 };
 use tokio::sync::Semaphore;
+
+async fn scan_job_log_events(
+    config_dir: &Path,
+    job_id: &str,
+) -> Result<Vec<ScanJobLogEvent>, Box<dyn std::error::Error>> {
+    let (_, events) = LogStore::new(config_dir)
+        .list_scan_job_events(job_id, None, None, 0, 1_000)
+        .await?;
+    Ok(events)
+}
 
 async fn wait_for_local_metadata_batches(
     database: &Database,
@@ -392,15 +403,16 @@ async fn homevideos_scan_imports_same_name_nfo_without_reclassifying_or_queueing
         .fetch_one(database.pool())
         .await?;
     assert_eq!(metadata_jobs, 0);
-    let auto_match_events: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_job_events
-         WHERE job_id = ? AND event_code IN (
-             'METADATA_AUTO_MATCH_QUEUED', 'METADATA_AUTO_MATCH_QUEUE_FAILED'
-         )",
-    )
-    .bind(&incremental.id)
-    .fetch_one(database.pool())
-    .await?;
+    let auto_match_events = scan_job_log_events(&config.config_dir, &incremental.id)
+        .await?
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_code.as_str(),
+                "METADATA_AUTO_MATCH_QUEUED" | "METADATA_AUTO_MATCH_QUEUE_FAILED"
+            )
+        })
+        .count();
     assert_eq!(auto_match_events, 0);
 
     assert!(matches!(
@@ -3248,27 +3260,24 @@ async fn scan_job_commits_positive_manifest_indexes_during_discovery()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(root_cursor, None);
-    let event_codes: Vec<String> = sqlx::query_scalar(
-        "SELECT event_code FROM scan_job_events WHERE job_id = ? ORDER BY created_at, id",
-    )
-    .bind(&job.id)
-    .fetch_all(database.pool())
-    .await?;
-    assert!(event_codes.is_empty());
+    let scan_events = scan_job_log_events(&config.config_dir, &job.id).await?;
+    assert!(
+        scan_events
+            .iter()
+            .any(|event| event.event_code == "JOB_CREATED")
+    );
 
     let cancel_job = next_worker.create_movie_scan_job(library.id).await?;
     next_worker.cancel(&cancel_job.id).await?;
     let cancelled = next_worker.run_batch(&cancel_job.id, 1).await?;
     assert_eq!(cancelled.status, "CANCELLED");
     assert!(cancelled.completed);
-    let cancel_events: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'JOB_CANCELLED'",
-    )
-    .bind(&cancel_job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(cancel_events, 0);
+    let cancel_events = scan_job_log_events(&config.config_dir, &cancel_job.id).await?;
+    assert!(
+        cancel_events
+            .iter()
+            .any(|event| event.event_code == "JOB_CANCELLED")
+    );
     let cancelled_work: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
             .bind(&cancel_job.id)
@@ -4004,14 +4013,13 @@ async fn cancelling_a_pending_scan_finishes_immediately_and_cleans_work()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(cancel_requested, 1);
-    let event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_job_events
-         WHERE job_id = ?",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(event_count, 0);
+    let events = scan_job_log_events(&config.config_dir, &job.id).await?;
+    assert!(events.iter().any(|event| event.event_code == "JOB_CREATED"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_code == "JOB_CANCELLED")
+    );
     Ok(())
 }
 
@@ -5322,10 +5330,8 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
             .is_err()
     );
 
-    let postprocessing_failure: (String, String, i64, i64) = sqlx::query_as(
-        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready,
-                (SELECT COUNT(*) FROM scan_job_events event
-                 WHERE event.job_id = job.id AND event.event_code = 'POSTPROCESSING_FAILED')
+    let postprocessing_failure: (String, String, i64) = sqlx::query_as(
+        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready
          FROM scan_jobs job
          JOIN scan_manifests manifest ON manifest.job_id = job.id
          WHERE job.id = ?",
@@ -5335,7 +5341,13 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
     .await?;
     assert_eq!(
         postprocessing_failure,
-        ("COMPLETED".to_owned(), "IDLE".to_owned(), 0, 1)
+        ("COMPLETED".to_owned(), "IDLE".to_owned(), 0)
+    );
+    let log_events = scan_job_log_events(&config.config_dir, &reconciliation.id).await?;
+    assert!(
+        log_events
+            .iter()
+            .any(|event| { event.event_code == "POSTPROCESSING_FAILED" && event.level == "ERROR" })
     );
 
     tokio::fs::remove_dir_all(&root).await?;
@@ -5855,14 +5867,12 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
             .fetch_one(database.pool())
             .await?;
     assert_eq!(remaining_targets, 0);
-    let info_events: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_job_events
-         WHERE job_id = ? AND level = 'INFO'",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(info_events, 0);
+    let log_events = scan_job_log_events(&config.config_dir, &job.id).await?;
+    assert!(
+        log_events
+            .iter()
+            .any(|event| { event.level == "INFO" && event.event_code == "JOB_CREATED" })
+    );
     Ok(())
 }
 
@@ -6187,14 +6197,12 @@ async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(target_state, "FAILED");
-    let postprocessing_failed_event: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'POSTPROCESSING_FAILED'",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(postprocessing_failed_event, 1);
+    let log_events = scan_job_log_events(&config.config_dir, &job.id).await?;
+    assert!(
+        log_events
+            .iter()
+            .any(|event| { event.event_code == "POSTPROCESSING_FAILED" && event.level == "ERROR" })
+    );
 
     fs::write(
         &fake_ffprobe,
@@ -6273,14 +6281,12 @@ async fn pending_postprocessing_targets_make_scan_retryable()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(status, "COMPLETED");
-    let event_code: String = sqlx::query_scalar(
-        "SELECT event_code FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'POSTPROCESSING_FAILED'",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(event_code, "POSTPROCESSING_FAILED");
+    let log_events = scan_job_log_events(&config.config_dir, &job.id).await?;
+    assert!(
+        log_events
+            .iter()
+            .any(|event| { event.event_code == "POSTPROCESSING_FAILED" && event.level == "ERROR" })
+    );
     Ok(())
 }
 

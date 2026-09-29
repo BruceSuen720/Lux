@@ -19,6 +19,7 @@ use luxd::{
     auth::sessions::WebAuthService,
     config::{Config, DatabaseConfiguration, PostgresConnection},
     domain::ids::{LibraryId, UserId},
+    observability::logs::LogStore,
     storage::Database,
 };
 use serde_json::json;
@@ -1209,11 +1210,9 @@ async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
     fs::write(root.join("Restore.Movie.2024.mkv"), b"replacement root")?;
 
     assert!(jobs.run_to_completion(&job.id, 100, None).await.is_err());
-    let failed_checkpoint: (String, String, i64, String, i64) = sqlx::query_as(
+    let failed_checkpoint: (String, String, i64, String) = sqlx::query_as(
         "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready,
-                root.postprocessing_target_stage,
-                (SELECT COUNT(*) FROM scan_job_events event
-                 WHERE event.job_id = job.id AND event.event_code = 'POSTPROCESSING_FAILED')
+                root.postprocessing_target_stage
          FROM scan_jobs job
          JOIN scan_manifests manifest ON manifest.job_id = job.id
          JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
@@ -1229,8 +1228,15 @@ async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
             "IDLE".to_owned(),
             0,
             "NEW".to_owned(),
-            1,
         )
+    );
+    let (_, events) = LogStore::new(&config.config_dir)
+        .list_scan_job_events(&job.id, None, None, 0, 100)
+        .await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.event_code == "POSTPROCESSING_FAILED" && event.level == "ERROR" })
     );
 
     fs::remove_dir_all(&root)?;

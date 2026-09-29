@@ -1,8 +1,8 @@
 use std::{env, error::Error};
 
 use luxd::{
-    application::{libraries::LibraryService, scanner::ScanJobService},
-    config::{Config, DatabaseConfiguration, PostgresConnection},
+    application::{libraries::LibraryService, setup::SetupService},
+    config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
     observability::logs::{LogDateRange, LogExport, LogStore, export_logs},
     storage::Database,
@@ -36,10 +36,23 @@ async fn create_scan_job_in(
     libraries
         .add_root(library.id, root.to_str().ok_or("non-UTF-8 root")?)
         .await?;
-    let job = ScanJobService::new(database.clone())
-        .create_movie_scan_job(library.id)
+    let job_id = Uuid::now_v7().to_string();
+    let insert_sql = match database.backend() {
+        DatabaseBackend::Sqlite => {
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', 'migration-test')"
+        }
+        DatabaseBackend::Postgres => {
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES ($1, $2, 'RECONCILE_LIBRARY', 'PENDING', 'migration-test')"
+        }
+    };
+    sqlx::query(insert_sql)
+        .bind(&job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
         .await?;
-    Ok(job.id)
+    Ok(job_id)
 }
 
 fn postgres_connection(database: String) -> PostgresConnection {
@@ -100,7 +113,7 @@ async fn drop_postgres_test_database(database_name: &str) -> Result<(), Box<dyn 
     Ok(())
 }
 
-async fn run_postgres_scan_event_migration(
+async fn run_postgres_log_migration(
     config: &Config,
     database_configuration: &DatabaseConfiguration,
 ) -> Result<(), Box<dyn Error>> {
@@ -111,6 +124,9 @@ async fn run_postgres_scan_event_migration(
             &database,
         )
         .await?;
+        let admin = SetupService::new(database.clone())?
+            .complete("postgres-admin", "Postgres Admin", "correct password")
+            .await?;
         sqlx::query(
             "INSERT INTO scan_job_events
                 (id, job_id, level, event_code, message, details_json, created_at)
@@ -144,6 +160,40 @@ async fn run_postgres_scan_event_migration(
         let details: Value = serde_json::from_str(&events[0].details_json)?;
         assert_eq!(details["attempt"], 2);
         assert_eq!(details["token"], "[REDACTED]");
+
+        sqlx::query(
+            "INSERT INTO audit_events
+                (id, actor_user_id, event_type, target_type, target_id, metadata_json, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind("postgres-legacy-audit")
+        .bind(admin.id.to_string())
+        .bind("USER_CREATED")
+        .bind("user")
+        .bind(admin.id.to_string())
+        .bind(r#"{"action":"legacy","apiKey":"must-not-leak"}"#)
+        .bind(1_700_000_002_i64)
+        .execute(database.pool())
+        .await?;
+        assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 1);
+        let remaining_audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(remaining_audit, 0);
+        let (audit_total, audit_events) = LogStore::new(&config.config_dir)
+            .list_audit_events(0, 10)
+            .await?;
+        assert_eq!(audit_total, 1);
+        assert_eq!(audit_events[0].id, "postgres-legacy-audit");
+        assert_eq!(
+            audit_events[0].actor_username.as_deref(),
+            Some("postgres-admin")
+        );
+        assert_eq!(audit_events[0].target_type.as_deref(), Some("user"));
+        assert_eq!(audit_events[0].created_at, 1_700_000_002);
+        let audit_metadata: Value = serde_json::from_str(&audit_events[0].metadata_json)?;
+        assert_eq!(audit_metadata["action"], "legacy");
+        assert_eq!(audit_metadata["apiKey"], "[REDACTED]");
         Ok(())
     }
     .await;
@@ -180,23 +230,273 @@ async fn insert_legacy_event(
 async fn scan_event_migration_without_database_history_is_a_noop() -> Result<(), Box<dyn Error>> {
     let (_temp_dir, _config, database, _job_id) = create_scan_job().await?;
     assert_eq!(database.migrate_legacy_scan_job_events_to_logs().await?, 0);
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 0);
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_events")
         .fetch_one(database.pool())
         .await?;
     assert_eq!(remaining, 0);
+    let remaining_audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining_audit, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_log_migrations_skip_log_tables_on_later_starts() -> Result<(), Box<dyn Error>> {
+    let (_temp_dir, _config, database, _job_id) = create_scan_job().await?;
+    assert_eq!(database.migrate_legacy_scan_job_events_to_logs().await?, 0);
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 0);
+    sqlx::query("DROP TABLE scan_job_events")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP TABLE audit_events")
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(database.migrate_legacy_scan_job_events_to_logs().await?, 0);
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_audit_events_are_migrated_and_activity_remains_readable()
+-> Result<(), Box<dyn Error>> {
+    let (_temp_dir, config, database, _job_id) = create_scan_job().await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("admin", "Admin", "correct password")
+        .await?;
+    for (id, event_type, created_at) in [
+        ("legacy-audit-operation", "USER_CREATED", 1_700_000_011_i64),
+        ("legacy-audit-login", "AUTH_LOGIN", 1_700_000_012_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_events
+                (id, actor_user_id, event_type, target_type, target_id, metadata_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(admin.id.to_string())
+        .bind(event_type)
+        .bind("user")
+        .bind(admin.id.to_string())
+        .bind(r#"{"action":"legacy","token":"must-not-leak","apiKey":"must-not-leak-either"}"#)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 2);
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 0);
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining, 0);
+
+    let (total, events) = LogStore::new(&config.config_dir)
+        .list_audit_events(0, 20)
+        .await?;
+    assert_eq!(total, 2);
+    let migrated = events
+        .iter()
+        .find(|event| event.id == "legacy-audit-operation")
+        .ok_or("migrated admin audit record not found")?;
+    assert_eq!(
+        migrated.actor_user_id.as_deref(),
+        Some(admin.id.to_string().as_str())
+    );
+    assert_eq!(migrated.actor_username.as_deref(), Some("admin"));
+    assert_eq!(migrated.event_type, "USER_CREATED");
+    assert_eq!(migrated.target_type.as_deref(), Some("user"));
+    assert_eq!(
+        migrated.target_id.as_deref(),
+        Some(admin.id.to_string().as_str())
+    );
+    assert_eq!(migrated.created_at, 1_700_000_011);
+    let metadata: Value = serde_json::from_str(&migrated.metadata_json)?;
+    assert_eq!(metadata["action"], "legacy");
+    assert_eq!(metadata["token"], "[REDACTED]");
+    assert_eq!(metadata["apiKey"], "[REDACTED]");
+
+    let activity = LogStore::new(&config.config_dir)
+        .list_activity_events(24)
+        .await?;
+    assert!(
+        activity
+            .iter()
+            .any(|event| { event.id == "legacy-audit-login" && event.event_type == "AUTH_LOGIN" })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_migration_preserves_database_rows_when_log_writes_fail() -> Result<(), Box<dyn Error>>
+{
+    let (_temp_dir, config, database, _job_id) = create_scan_job().await?;
+    sqlx::query(
+        "INSERT INTO audit_events (id, event_type, metadata_json, created_at)
+         VALUES ('legacy-audit-retry', 'SETTINGS_UPDATED', '{}', 1700000013)",
+    )
+    .execute(database.pool())
+    .await?;
+    let blocked_log_directory = config.config_dir.join("logs");
+    tokio::fs::write(&blocked_log_directory, b"not a directory").await?;
+
+    assert!(
+        database
+            .migrate_legacy_audit_events_to_logs()
+            .await
+            .is_err()
+    );
+    let preserved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE id = 'legacy-audit-retry'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved, 1);
+
+    tokio::fs::remove_file(&blocked_log_directory).await?;
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 1);
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 0);
+    let (_, events) = LogStore::new(&config.config_dir)
+        .list_audit_events(0, 20)
+        .await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.id == "legacy-audit-retry")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_legacy_json_is_not_discarded_before_source_rows_are_deleted()
+-> Result<(), Box<dyn Error>> {
+    let (_temp_dir, config, database, job_id) = create_scan_job().await?;
+    sqlx::query(
+        "INSERT INTO scan_job_events
+            (id, job_id, level, event_code, message, details_json, created_at)
+         VALUES ('legacy-invalid-details', ?, 'WARN', 'SCAN_IO', 'legacy event', '{\"token\":\"bad', 1700000020)",
+    )
+    .bind(&job_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_events (id, event_type, metadata_json, created_at)
+         VALUES ('legacy-invalid-metadata', 'SETTINGS_UPDATED', '{\"apiKey\":\"bad', 1700000021)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert!(
+        database
+            .migrate_legacy_scan_job_events_to_logs()
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .migrate_legacy_audit_events_to_logs()
+            .await
+            .is_err()
+    );
+    let preserved_scan: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events WHERE id = 'legacy-invalid-details'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let preserved_audit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE id = 'legacy-invalid-metadata'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preserved_scan, 1);
+    assert_eq!(preserved_audit, 1);
+
+    sqlx::query("UPDATE scan_job_events SET details_json = ? WHERE id = ?")
+        .bind(r#"{"token":"repaired-secret","action":"repaired"}"#)
+        .bind("legacy-invalid-details")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE audit_events SET metadata_json = ? WHERE id = ?")
+        .bind(r#"{"apiKey":"repaired-key","action":"repaired"}"#)
+        .bind("legacy-invalid-metadata")
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(database.migrate_legacy_scan_job_events_to_logs().await?, 1);
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 1);
+    let (_, scan_events) = LogStore::new(&config.config_dir)
+        .list_scan_job_events(&job_id, None, None, 0, 10)
+        .await?;
+    let scan_details: Value = serde_json::from_str(&scan_events[0].details_json)?;
+    assert_eq!(scan_details["token"], "[REDACTED]");
+    assert_eq!(scan_details["action"], "repaired");
+    let (_, audit_events) = LogStore::new(&config.config_dir)
+        .list_audit_events(0, 10)
+        .await?;
+    let audit_metadata: Value = serde_json::from_str(&audit_events[0].metadata_json)?;
+    assert_eq!(audit_metadata["apiKey"], "[REDACTED]");
+    assert_eq!(audit_metadata["action"], "repaired");
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_migration_respects_archive_retention_across_date_batches()
+-> Result<(), Box<dyn Error>> {
+    let (_temp_dir, config, database, _job_id) = create_scan_job().await?;
+    let first_event_at = 1_700_000_000_i64;
+    for day in 0..22 {
+        sqlx::query(
+            "INSERT INTO audit_events (id, event_type, metadata_json, created_at)
+             VALUES (?, 'SETTINGS_UPDATED', ?, ?)",
+        )
+        .bind(format!("legacy-audit-retention-{day:02}"))
+        .bind(serde_json::json!({ "day": day }).to_string())
+        .bind(first_event_at + day * 86_400)
+        .execute(database.pool())
+        .await?;
+    }
+
+    assert_eq!(database.migrate_legacy_audit_events_to_logs().await?, 22);
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining, 0);
+    let archive_dir = config.config_dir.join("logs").join("archive");
+    let mut archives = tokio::fs::read_dir(archive_dir).await?;
+    let mut archive_count = 0;
+    while archives.next_entry().await?.is_some() {
+        archive_count += 1;
+    }
+    assert_eq!(archive_count, 20);
+
+    let (total, events) = LogStore::new(&config.config_dir)
+        .list_audit_events(0, 100)
+        .await?;
+    assert_eq!(total, 21);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.id.starts_with("legacy-audit-retention-"))
+            .count(),
+        21
+    );
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_legacy_scan_events_are_migrated_to_config_logs() -> Result<(), Box<dyn Error>> {
+async fn postgres_legacy_scan_and_audit_events_are_migrated_to_config_logs()
+-> Result<(), Box<dyn Error>> {
     let (database_configuration, database_name) = create_postgres_test_database().await?;
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
-    let result = run_postgres_scan_event_migration(&config, &database_configuration).await;
+    let result = run_postgres_log_migration(&config, &database_configuration).await;
     drop_postgres_test_database(&database_name).await?;
     result?;
     Ok(())
