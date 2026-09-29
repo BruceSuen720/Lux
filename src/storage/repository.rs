@@ -21,6 +21,9 @@ use uuid::Uuid;
 mod catalog;
 #[path = "database_cleanup.rs"]
 mod database_cleanup;
+#[path = "database_diagnostics.rs"]
+mod database_diagnostics;
+pub use database_diagnostics::DatabaseDiagnosticsSnapshot;
 #[path = "device_pairings.rs"]
 mod device_pairings;
 #[path = "emby_migration.rs"]

@@ -630,6 +630,14 @@ export type AdminHealth = {
   }>;
 };
 
+export type AdminDatabaseDiagnosticsStatus = {
+  status: "WAITING" | "RUNNING" | "READY" | "FAILED";
+  scheduledAt?: number | null;
+  startedAt?: number | null;
+  completedAt?: number | null;
+  errorCode?: string | null;
+};
+
 export type AdminDashboard = {
   server: {
     name: string;

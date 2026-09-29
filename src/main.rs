@@ -87,8 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker();
-    let app = app_with_state(app_state);
-
     // A large existing library can contain hundreds of thousands of episodes.
     // Repairing their legacy identities is a one-time background operation and
     // must not block the HTTP listener from becoming available.
@@ -115,6 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
+    app_state.start_database_diagnostics();
+    let app = app_with_state(app_state);
 
     let serve_result = axum::serve(
         listener,

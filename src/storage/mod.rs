@@ -25,7 +25,8 @@ pub(crate) struct ItemMetadataCompletenessCommit {
 
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 pub use repository::{
-    Database, DatabaseLifecycleCleanupReport, PersonListOptions, PersonSort, StorageError,
+    Database, DatabaseDiagnosticsSnapshot, DatabaseLifecycleCleanupReport, PersonListOptions,
+    PersonSort, StorageError,
 };
 
 #[allow(unused_imports)]
