@@ -894,9 +894,6 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
         config_dir: temp_dir.path().join("config"),
     };
     let media_root = temp_dir.path().join("Movies");
-    let movie_dir = media_root.join("Broken Poster Insert (2026)");
-    tokio::fs::create_dir_all(&movie_dir).await?;
-    tokio::fs::write(movie_dir.join("Broken.Poster.Insert.2026.mkv"), b"movie").await?;
     let mut poster_png = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         1,
@@ -904,7 +901,19 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
         image::Rgba([255, 0, 0, 255]),
     ))
     .write_to(&mut poster_png, image::ImageFormat::Png)?;
-    tokio::fs::write(movie_dir.join("poster.png"), poster_png.into_inner()).await?;
+    tokio::fs::create_dir_all(&media_root).await?;
+    for media_name in [
+        "First.Poster.Insert.2026",
+        "Second.Poster.Insert.2026",
+        "Third.Poster.Insert.2026",
+    ] {
+        tokio::fs::write(media_root.join(format!("{media_name}.mkv")), b"movie").await?;
+        tokio::fs::write(
+            media_root.join(format!("{media_name}-poster.png")),
+            poster_png.get_ref(),
+        )
+        .await?;
+    }
 
     let database = Database::connect(&config).await?;
     let libraries = LibraryService::new(database.clone());
@@ -918,6 +927,8 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
         "CREATE TRIGGER fail_local_poster_insert
          BEFORE INSERT ON item_images
          WHEN NEW.image_type = 'POSTER'
+           AND (SELECT COUNT(*) FROM item_images
+                WHERE source = 'LOCAL' AND image_type = 'POSTER') >= 2
          BEGIN SELECT RAISE(ABORT, 'injected poster insert failure'); END",
     )
     .execute(database.pool())
@@ -928,28 +939,72 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
 
-    let batch = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let batch_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let batch: Option<(String, Option<i64>)> = sqlx::query_as(
-                "SELECT status, images_completed_at FROM scan_local_metadata_batches
+            let batch: Option<(String, Option<i64>, i64)> = sqlx::query_as(
+                "SELECT id, images_completed_at, source_count FROM scan_local_metadata_batches
                  WHERE job_id = ? ORDER BY created_at, id LIMIT 1",
             )
             .bind(&job.id)
             .fetch_optional(database.pool())
             .await?;
-            if batch
-                .as_ref()
-                .is_some_and(|(status, _)| status == "FAILED" || status == "COMPLETED")
-            {
-                return Ok::<_, sqlx::Error>(batch);
+            if let Some((id, images_completed_at, source_count)) = batch {
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM scan_local_metadata_batches WHERE id = ?",
+                )
+                .bind(&id)
+                .fetch_one(database.pool())
+                .await?;
+                if status == "FAILED" {
+                    assert!(
+                        source_count >= 3,
+                        "all movie image sources should share the outbox page"
+                    );
+                    assert_eq!(images_completed_at, None);
+                    return Ok::<_, sqlx::Error>(id);
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await??;
-    let (status, images_completed_at) = batch.ok_or("scan produced no local metadata batch")?;
+    let image_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE source = 'LOCAL'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        image_count, 1,
+        "failure must roll back the second image page but preserve the early first poster"
+    );
 
-    assert_eq!(status, "FAILED");
-    assert_eq!(images_completed_at, None);
+    sqlx::query("DROP TRIGGER fail_local_poster_insert")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_batches
+         SET next_attempt_at = 0, updated_at = unixepoch() WHERE id = ? AND status = 'FAILED'",
+    )
+    .bind(&batch_id)
+    .execute(database.pool())
+    .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM scan_local_metadata_batches WHERE id = ?")
+                    .bind(&batch_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if status == "COMPLETED" {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let image_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE source = 'LOCAL'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(image_count, 3, "retry should index all local posters");
     Ok(())
 }
