@@ -2117,6 +2117,19 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-library-override-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--lux-subtle); font-size: .68rem; }
 .lux-library-dialog-backdrop { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 8px; background: rgba(0,0,0,.68); }
 .lux-library-dialog { display: flex; flex-direction: column; width: min(720px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow: hidden; border: 1px solid var(--lux-line); border-radius: 16px; color: var(--lux-text); background: rgba(15,15,18,.98); box-shadow: 0 25px 80px rgba(0,0,0,.58); backdrop-filter: blur(20px); }
+.lux-library-delete-backdrop { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 16px; background: rgba(0,0,0,.72); backdrop-filter: blur(8px); }
+.lux-library-delete-dialog { width: min(440px, 100%); overflow: hidden; border: 1px solid var(--lux-line); border-radius: 16px; color: var(--lux-text); background: var(--lux-surface-strong); box-shadow: 0 28px 80px rgba(0,0,0,.56); }
+.lux-library-delete-dialog:focus { outline: none; }
+.lux-library-delete-heading { display: flex; align-items: center; gap: 14px; padding: 22px 24px 15px; }
+.lux-library-delete-icon { display: grid; place-items: center; flex: 0 0 auto; width: 44px; height: 44px; border: 1px solid rgba(243,170,184,.34); border-radius: 12px; color: #f3aab8; background: rgba(170,53,77,.15); }
+.lux-library-delete-heading h2 { margin: 0; color: #fff; font-size: 1.08rem; letter-spacing: -.02em; }
+.lux-library-delete-body { padding: 0 24px 22px; }
+.lux-library-delete-body > p:first-child { margin: 0; color: var(--lux-muted); font-size: .84rem; line-height: 1.65; overflow-wrap: anywhere; }
+.lux-library-delete-body > p:first-child strong { color: var(--lux-text); font-weight: 650; }
+.lux-library-delete-body > .lux-error-copy { margin: 12px 0 0; line-height: 1.5; }
+.lux-library-delete-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 23px; }
+.lux-library-delete-actions .lux-button { min-width: 108px; }
+.lux-library-delete-dialog button:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: 3px; }
 .lux-library-create-dialog { width: min(520px, calc(100vw - 32px)); }
 .lux-library-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: var(--lux-dialog-header-padding); }
 .lux-library-dialog-header h2 { margin: 7px 0 0; color: #fff; font-size: 1.1rem; }
@@ -2704,6 +2717,9 @@ html[data-lux-theme="light"] .lux-library-strategy-toggle,
 html[data-lux-theme="light"] .lux-library-override-modes label { background: rgba(28,28,34,.025); }
 html[data-lux-theme="light"] .lux-library-strategy-toggle:hover { background: rgba(28,28,34,.06); }
 html[data-lux-theme="light"] .lux-library-dialog { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.98); box-shadow: 0 25px 80px rgba(30,30,38,.2); }
+html[data-lux-theme="light"] .lux-library-delete-dialog { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.98); box-shadow: 0 28px 80px rgba(30,30,38,.2); }
+html[data-lux-theme="light"] .lux-library-delete-heading h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-library-delete-body > p:first-child { color: var(--lux-muted); }
 html[data-lux-theme="light"] .lux-library-dialog-header h2,
 html[data-lux-theme="light"] .lux-library-dialog-section h3 { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog input,

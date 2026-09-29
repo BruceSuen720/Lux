@@ -6,6 +6,7 @@ import {
   Folder,
   Image,
   Languages,
+  LoaderCircle,
   ListPlus,
   MinusCircle,
   MoreHorizontal,
@@ -15,6 +16,7 @@ import {
   Save,
   Settings2,
   Sparkles,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -402,6 +404,8 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   const queryClient = useQueryClient();
   const menuRef = useRef<HTMLDivElement>(null);
   const dialogCloseRef = useRef<HTMLButtonElement>(null);
+  const deleteDialogRef = useRef<HTMLElement>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
   const [rootPath, setRootPath] = useState("");
   const [rootError, setRootError] = useState("");
@@ -410,6 +414,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   const [chapterSourceId, setChapterSourceId] = useState(library.chapterSourceId ?? "");
   const [menuOpen, setMenuOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [editName, setEditName] = useState(library.name);
   const [editKind, setEditKind] = useState(library.kind);
   const [editError, setEditError] = useState("");
@@ -435,6 +440,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
     mutationFn: () => api.deleteAdminLibrary(library.id),
     onSuccess: () => {
       setRemoveError("");
+      setDeleteOpen(false);
       queryClient.setQueryData<{ libraries?: AdminLibrary[] }>(queryKeys.adminLibraries, (data) => data
         ? { ...data, libraries: (data.libraries ?? []).filter((item) => item.id !== library.id) }
         : data);
@@ -455,6 +461,31 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   useEffect(() => {
     if (editOpen) dialogCloseRef.current?.focus();
   }, [editOpen]);
+
+  function closeDeleteDialog() {
+    if (remove.isPending) return;
+    setDeleteOpen(false);
+    menuRef.current?.querySelector<HTMLButtonElement>(".lux-admin-library-overflow")?.focus();
+  }
+
+  useEffect(() => {
+    if (!deleteOpen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    if (remove.isPending) deleteDialogRef.current?.focus();
+    else deleteCancelRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !remove.isPending) {
+        event.preventDefault();
+        closeDeleteDialog();
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [deleteOpen, remove.isPending]);
 
   const openEdit = () => {
     setMenuOpen(false);
@@ -494,10 +525,8 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   };
   const deleteLibrary = () => {
     setMenuOpen(false);
-    if (window.confirm(`确定删除媒体库“${library.name}”？`)) {
-      setRemoveError("");
-      remove.mutate();
-    }
+    setRemoveError("");
+    setDeleteOpen(true);
   };
 
   return (
@@ -509,7 +538,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
         <button className="lux-admin-library-overflow" type="button" aria-label={`打开 ${library.name} 操作菜单`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={20} /></button>
       </div>
       <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots.length > 1 ? `${library.roots.length}个文件夹` : library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
-      {removeError ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
+      {removeError && !deleteOpen ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
       {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>
@@ -544,6 +573,53 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
             <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>媒体库图像</h3><span>JPEG、PNG、WebP，最大 5 MiB</span></div><div className="lux-library-cover-editor"><div className="lux-library-cover-preview">{library.coverImageUrl ? <img src={library.coverImageUrl} alt="" /> : <Image size={24} aria-hidden="true" />}</div><input ref={coverInputRef} className="lux-visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label={`${library.name} 封面图片`} onChange={selectCover} /><button className="lux-library-toolbar-button" type="button" onClick={() => coverInputRef.current?.click()} disabled={uploadCover.isPending}><Upload size={15} /> {uploadCover.isPending ? "上传中…" : library.coverImageUrl ? "替换封面" : "上传封面"}</button>{coverError ? <p className="lux-error-copy">{coverError}</p> : null}</div></section>
           </div>
         </div>
+      </div> : null}
+      {deleteOpen ? <div className="lux-library-delete-backdrop" role="presentation" onMouseDown={(event) => { if (!remove.isPending && event.target === event.currentTarget) closeDeleteDialog(); }}>
+        <section
+          ref={deleteDialogRef}
+          className="lux-library-delete-dialog"
+          role="alertdialog"
+          aria-modal="true"
+          aria-busy={remove.isPending}
+          aria-labelledby={`delete-library-title-${library.id}`}
+          aria-describedby={`delete-library-description-${library.id}`}
+          tabIndex={-1}
+          onKeyDown={(event) => {
+            if (event.key === "Tab") {
+              const buttons = event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)");
+              if (buttons.length === 0) {
+                event.preventDefault();
+                event.currentTarget.focus();
+                return;
+              }
+              const first = buttons.item(0);
+              const last = buttons.item(buttons.length - 1);
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last?.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first?.focus();
+              }
+            }
+          }}
+        >
+          <header className="lux-library-delete-heading">
+            <span className="lux-library-delete-icon" aria-hidden="true"><Trash2 size={21} /></span>
+            <h2 id={`delete-library-title-${library.id}`}>删除媒体库</h2>
+          </header>
+          <div className="lux-library-delete-body">
+            <p id={`delete-library-description-${library.id}`}>确定删除媒体库“<strong>{library.name}</strong>”？</p>
+            {removeError ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
+            <div className="lux-library-delete-actions">
+              <button ref={deleteCancelRef} className="lux-button lux-button-secondary" data-action="delete-cancel" type="button" disabled={remove.isPending} onClick={closeDeleteDialog}>取消</button>
+              <button className="lux-button lux-button-danger" data-action="delete-confirm" type="button" disabled={remove.isPending} onClick={() => remove.mutate()}>
+                {remove.isPending ? <LoaderCircle className="lux-spin" size={16} /> : <Trash2 size={16} />}
+                {remove.isPending ? "删除中…" : "确认删除"}
+              </button>
+            </div>
+          </div>
+        </section>
       </div> : null}
     </article>
   );

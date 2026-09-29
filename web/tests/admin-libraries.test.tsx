@@ -468,9 +468,32 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="menu"]')?.textContent).toContain("扫描媒体库文件");
   });
 
+  it("opens a Lux-styled delete confirmation and lets the admin cancel", async () => {
+    const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockResolvedValue(undefined);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    const removeAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("移除"));
+    await act(async () => removeAction?.click());
+
+    const dialog = container.querySelector('[role="alertdialog"]');
+    expect(nativeConfirm).not.toHaveBeenCalled();
+    expect(dialog?.classList.contains("lux-library-delete-dialog")).toBe(true);
+    expect(dialog?.textContent).toContain("确定删除媒体库“01每日更新”？");
+
+    await act(async () => container.querySelector<HTMLButtonElement>("[data-action='delete-cancel']")?.click());
+
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(deleteLibrary).not.toHaveBeenCalled();
+  });
+
   it("shows why a library could not be deleted", async () => {
     const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockRejectedValue(new Error("媒体库仍有扫描任务运行"));
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     await renderPage();
 
     await act(async () => {
@@ -482,10 +505,14 @@ describe("AdminLibrariesPage library cards", () => {
 
     await act(async () => {
       removeAction?.click();
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[data-action='delete-confirm']")?.click();
       await vi.waitFor(() => expect(deleteLibrary).toHaveBeenCalledWith("library-1"));
     });
 
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("媒体库仍有扫描任务运行");
+    expect(container.querySelector('[role="alertdialog"] [role="alert"]')?.textContent).toContain("媒体库仍有扫描任务运行");
+    expect(nativeConfirm).not.toHaveBeenCalled();
     expect(container.textContent).toContain("01每日更新");
   });
 
@@ -495,7 +522,7 @@ describe("AdminLibrariesPage library cards", () => {
     const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockImplementation(async (libraryId) => {
       listedLibraries = listedLibraries.filter((item) => item.id !== libraryId);
     });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     await renderPage();
 
     await act(async () => {
@@ -503,12 +530,14 @@ describe("AdminLibrariesPage library cards", () => {
     });
     const removeAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
       .find((button) => button.textContent?.includes("移除"));
+    await act(async () => removeAction?.click());
     await act(async () => {
-      removeAction?.click();
+      container.querySelector<HTMLButtonElement>("[data-action='delete-confirm']")?.click();
       await vi.waitFor(() => expect(deleteLibrary).toHaveBeenCalledWith("library-1"));
     });
 
     expect(container.querySelector(".lux-admin-library-card")).toBeNull();
+    expect(nativeConfirm).not.toHaveBeenCalled();
     expect(container.textContent).toContain("还没有媒体库");
   });
 
