@@ -134,7 +134,44 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 154);
+    assert_eq!(database.schema_version().await?, 155);
+    for index_name in [
+        "idx_danmaku_match_job_items_media_source_id",
+        "idx_chapter_detection_job_items_source_id",
+        "idx_chapter_detection_job_items_item_id",
+        "idx_chapter_detection_job_items_season_id",
+        "idx_reconciliation_scan_entries_library_root_id",
+        "idx_scan_job_paths_library_root_id",
+        "idx_emby_migration_import_records_lux_item_id",
+        "idx_user_item_state_item_id",
+        "idx_playback_sessions_item_id",
+        "idx_chapter_detection_jobs_library_id",
+        "idx_strm_probe_jobs_library_id",
+        "idx_web_playback_sessions_item_id",
+        "idx_danmaku_match_jobs_library_id",
+        "idx_scan_manifest_roots_library_root_id",
+        "idx_library_cover_jobs_library_id",
+        "idx_user_library_order_library_id",
+        "idx_scan_local_metadata_batches_library_root_id",
+        "idx_scan_manifest_deltas_manifest_root_id",
+    ] {
+        let index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_class idx
+                 JOIN pg_namespace ns ON ns.oid = idx.relnamespace
+                 JOIN pg_index ix ON ix.indexrelid = idx.oid
+                 WHERE ns.nspname = current_schema()
+                   AND idx.relname = $1
+                   AND ix.indisvalid
+                   AND ix.indisready
+             )",
+        )
+        .bind(index_name)
+        .fetch_one(database.pool())
+        .await?;
+        assert!(index_exists, "missing library-delete cascade index {index_name}");
+    }
     insert_postgres_homevideos_video(&database).await?;
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
@@ -689,7 +726,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 154);
+    assert_eq!(database.schema_version().await?, 155);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -1989,7 +2026,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 154);
+    assert_eq!(database.schema_version().await?, 155);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
