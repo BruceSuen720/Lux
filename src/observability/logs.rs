@@ -41,6 +41,28 @@ pub struct ScanJobLogEvent {
     pub created_at: i64,
 }
 
+#[derive(Debug)]
+pub struct AuditLogEvent {
+    pub id: String,
+    pub actor_user_id: Option<String>,
+    pub actor_username: Option<String>,
+    pub event_type: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
+    pub metadata_json: String,
+    pub created_at: i64,
+}
+
+pub(crate) struct NewAuditLogEvent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) actor_user_id: Option<&'a str>,
+    pub(crate) actor_username: Option<&'a str>,
+    pub(crate) event_type: &'a str,
+    pub(crate) target_type: Option<&'a str>,
+    pub(crate) target_id: Option<&'a str>,
+    pub(crate) metadata_json: &'a str,
+}
+
 impl LogStore {
     pub fn new(config_dir: &Path) -> Self {
         let manager_key = config_dir.to_path_buf();
@@ -158,7 +180,11 @@ impl LogStore {
         let job_id = job_id.to_owned();
         let level = level.map(str::to_owned);
         let event_code = event_code.map(str::to_owned);
+        let manager = Arc::clone(&self.manager);
         tokio::task::spawn_blocking(move || {
+            let _manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
             read_scan_job_events(
                 &log_dir,
                 &archive_dir,
@@ -171,6 +197,47 @@ impl LogStore {
         })
         .await
         .map_err(|error| io::Error::other(format!("任务日志读取任务失败: {error}")))?
+    }
+
+    pub(crate) async fn append_audit_event(&self, event: NewAuditLogEvent<'_>) -> io::Result<()> {
+        let metadata = serde_json::from_str::<Value>(event.metadata_json)
+            .map(redact_sensitive_log_values)
+            .unwrap_or_else(|_| serde_json::json!({ "invalid": true }));
+        let created_at = OffsetDateTime::now_utc();
+        self.append_json(serde_json::json!({
+            "recordType": "admin_audit_event",
+            "id": event.id,
+            "actorUserId": event.actor_user_id,
+            "actorUsername": event.actor_username,
+            "eventType": event.event_type,
+            "targetType": event.target_type,
+            "targetId": event.target_id,
+            "metadata": metadata,
+            "timestamp": created_at
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| created_at.unix_timestamp().to_string()),
+            "createdAt": created_at.unix_timestamp(),
+        }))
+        .await
+    }
+
+    pub async fn list_audit_events(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> io::Result<(i64, Vec<AuditLogEvent>)> {
+        self.initialize().await?;
+        let log_dir = log_dir(&self.config_dir);
+        let archive_dir = archive_dir(&self.config_dir);
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let _manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            read_audit_events(&log_dir, &archive_dir, offset, limit, None)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("审计日志读取任务失败: {error}")))?
     }
 
     pub(crate) fn writer(&self) -> LogWriter {
@@ -368,6 +435,117 @@ fn read_scan_job_event_lines<R: io::BufRead>(
             message,
             details_json,
             created_at,
+        });
+    }
+}
+
+fn read_audit_events(
+    log_dir: &Path,
+    archive_dir: &Path,
+    offset: i64,
+    limit: i64,
+    event_types: Option<&[&str]>,
+) -> io::Result<(i64, Vec<AuditLogEvent>)> {
+    let mut events = Vec::new();
+    let active_entries = match fs::read_dir(log_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = active_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if name.starts_with("lux.") && name.ends_with(".log") {
+                read_audit_event_lines(
+                    io::BufReader::new(fs::File::open(path)?),
+                    event_types,
+                    &mut events,
+                )?;
+            }
+        }
+    }
+    let archive_entries = match fs::read_dir(archive_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = archive_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".log.zip"))
+            {
+                continue;
+            }
+            let mut archive = ZipArchive::new(fs::File::open(path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            for index in 0..archive.len() {
+                let member = archive
+                    .by_index(index)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if member.name().ends_with(".log") {
+                    read_audit_event_lines(io::BufReader::new(member), event_types, &mut events)?;
+                }
+            }
+        }
+    }
+    events.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let total = i64::try_from(events.len()).unwrap_or(i64::MAX);
+    let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    let count = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    Ok((total, events.into_iter().skip(start).take(count).collect()))
+}
+
+fn read_audit_event_lines<R: io::BufRead>(
+    mut reader: R,
+    event_types: Option<&[&str]>,
+    events: &mut Vec<AuditLogEvent>,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if record["recordType"] != "admin_audit_event" {
+            continue;
+        }
+        let Some(id) = record["id"].as_str() else {
+            continue;
+        };
+        let Some(event_type) = record["eventType"].as_str() else {
+            continue;
+        };
+        if event_types.is_some_and(|allowed| !allowed.contains(&event_type)) {
+            continue;
+        }
+        let metadata_json =
+            serde_json::to_string(&record["metadata"]).unwrap_or_else(|_| "{}".to_owned());
+        events.push(AuditLogEvent {
+            id: id.to_owned(),
+            actor_user_id: record["actorUserId"].as_str().map(str::to_owned),
+            actor_username: record["actorUsername"].as_str().map(str::to_owned),
+            event_type: event_type.to_owned(),
+            target_type: record["targetType"].as_str().map(str::to_owned),
+            target_id: record["targetId"].as_str().map(str::to_owned),
+            metadata_json,
+            created_at: record["createdAt"].as_i64().unwrap_or_default(),
         });
     }
 }
@@ -736,10 +914,18 @@ pub async fn export_logs(
     config_dir: &Path,
     range: LogDateRange,
 ) -> Result<LogExport, LogExportError> {
+    let store = LogStore::new(config_dir);
+    store.initialize().await.map_err(LogExportError::Io)?;
     let config_dir = config_dir.to_path_buf();
-    let files = tokio::task::spawn_blocking(move || read_log_files(&config_dir, range))
-        .await
-        .map_err(|error| LogExportError::Worker(error.to_string()))??;
+    let manager = Arc::clone(&store.manager);
+    let files = tokio::task::spawn_blocking(move || {
+        let _manager = manager
+            .lock()
+            .map_err(|_| LogExportError::Worker("日志 writer 状态不可用".to_owned()))?;
+        read_log_files(&config_dir, range)
+    })
+    .await
+    .map_err(|error| LogExportError::Worker(error.to_string()))??;
     if files.is_empty() {
         return Err(LogExportError::NoLogs);
     }
@@ -970,10 +1156,11 @@ mod tests {
     use std::{fs, io, sync::Arc};
 
     use super::{
-        LogDateRange, LogExportError, LogManager, LogStore, archive_dir, log_dir, log_file_name,
-        parse_date, read_scan_job_events, verify_archive,
+        LogDateRange, LogExportError, LogManager, LogStore, NewAuditLogEvent, archive_dir, log_dir,
+        log_file_name, parse_date, read_audit_events, read_scan_job_events, verify_archive,
     };
-    use time::{Date, Month};
+    use serde_json::Value;
+    use time::{Date, Month, OffsetDateTime};
 
     #[test]
     fn daily_file_name_is_utc_date_based() {
@@ -1105,6 +1292,70 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "event-2");
         assert_eq!(events[0].created_at, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_events_are_file_backed_and_redacted() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = LogStore::open(temp_dir.path()).await?;
+        store
+            .append_audit_event(NewAuditLogEvent {
+                id: "audit-1",
+                actor_user_id: Some("user-1"),
+                actor_username: Some("admin"),
+                event_type: "SETTINGS_UPDATED",
+                target_type: Some("settings"),
+                target_id: None,
+                metadata_json: r#"{"apiKey":"must-not-be-saved","remoteIp":"192.0.2.4"}"#,
+            })
+            .await?;
+
+        let (total, events) = store.list_audit_events(0, 10).await?;
+        assert_eq!(total, 1);
+        assert_eq!(events[0].actor_username.as_deref(), Some("admin"));
+        assert_eq!(events[0].event_type, "SETTINGS_UPDATED");
+        assert_eq!(
+            serde_json::from_str::<Value>(&events[0].metadata_json).map_err(io::Error::other)?["apiKey"],
+            "[REDACTED]"
+        );
+        let log_file =
+            log_dir(temp_dir.path()).join(log_file_name(OffsetDateTime::now_utc().date()));
+        assert!(!fs::read_to_string(log_file)?.contains("must-not-be-saved"));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_event_query_reads_archived_jsonl_segments() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let date = Date::from_calendar_date(2026, Month::August, 9).unwrap();
+        let mut manager = LogManager::open_with_limits(temp_dir.path(), date, 1, 20)?;
+        let record = serde_json::json!({
+            "recordType": "admin_audit_event",
+            "id": "audit-archived",
+            "actorUserId": "user-1",
+            "actorUsername": "admin",
+            "eventType": "SETTINGS_UPDATED",
+            "targetType": "settings",
+            "targetId": null,
+            "metadata": {"auth": "admin_api_key"},
+            "createdAt": 2,
+        });
+        let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
+        line.push(b'\n');
+        manager.write_line_for_date(date, &line)?;
+
+        let (total, events) = read_audit_events(
+            &log_dir(temp_dir.path()),
+            &archive_dir(temp_dir.path()),
+            0,
+            10,
+            None,
+        )?;
+        assert_eq!(total, 1);
+        assert_eq!(events[0].id, "audit-archived");
+        assert_eq!(events[0].actor_username.as_deref(), Some("admin"));
+        assert_eq!(events[0].event_type, "SETTINGS_UPDATED");
         Ok(())
     }
 }

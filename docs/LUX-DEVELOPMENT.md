@@ -7501,40 +7501,76 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-309、LUX-232。明确不做：不迁出 `scan_jobs` 的执行状态、进度或恢复游标。
 
-#### LUX-311：管理员审计事件与近期活动文件化
+#### LUX-311：管理员操作审计文件化
 
-将管理员审计事件写入 LUX-309 的 JSONL 文件层；`/api/v1/admin/audit`、`/api/v1/admin/logs` 和管理仪表盘近期活动从文件读取。旧的 `audit_events` 不再接收新日志。
-
-验收：
-
-- [ ] 管理审计 JSONL 包含稳定事件 ID、时间、actor、eventType、target 和脱敏 metadata；共享 API Key 元数据继续脱敏。
-- [ ] 两个管理员审计读取端点保持现有分页、权限和响应字段；仪表盘近期登录/播放活动可从文件正确读取并关联可用媒体标题。
-- [ ] 新审计事件不会写入 `audit_events`；播放历史、媒体状态、通知投递状态等业务记录仍留在数据库。
-- [ ] 自动化测试覆盖审计写入、分页/排序、近期活动、数据库无新审计事件及共享 API Key 脱敏。
-
-验证：`cargo test --locked --test users --test admin_health --test web_playback`、`cargo fmt --all -- --check`。
-
-预计文件：`src/observability/logs.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`tests/users.rs`、`tests/admin_health.rs`。
-
-依赖：LUX-309。明确不做：不迁出用户播放进度、播放历史或通知工作状态。
-
-#### LUX-312：历史数据库日志迁出与清理
-
-首次启动时把已有 `scan_job_events` 和 `audit_events` 记录安全导出到 `/config/logs/`，确认文件写入成功后删除对应数据库日志行。清理必须可重试，不能因为中断而先丢失数据库中的剩余历史；完成后移除扫描事件的 7 天数据库清理策略和文件读取中的旧数据库回退。
+管理员操作审计事件写入 LUX-309 的 JSONL 文件层；`/api/v1/admin/audit` 与兼容的 `/api/v1/admin/logs` 从活动日志及压缩归档读取。迁移前数据库中的历史审计事件保留回退读取，直到 LUX-315 迁出。
 
 验收：
 
-- [ ] 升级现有 SQLite 和 PostgreSQL 数据库时，旧任务事件、管理员审计事件按原 ID、时间和字段导出为 JSONL；不改变任何任务执行状态或业务关系。
-- [ ] 导出文件完成并确认可读后才删除数据库日志行；中断重启不会丢数据，重复执行不会产生可见重复事件。
-- [ ] 清理成功后两个日志表没有历史行，运行时也不再向这两个表写入或查询日志；表结构可以保留为空，不新增 schema migration。
-- [ ] 超出 20 个包保留量的历史日志按 LUX-309 的 FIFO 策略淘汰；剩余最新日志可从任务/审计 API 查询。
-- [ ] 测试覆盖空库、旧 SQLite 数据、导出失败/中断重试、数据库清空、幂等执行；PostgreSQL 路径在可用的集成环境验证。
+- [x] 管理审计 JSONL 包含稳定事件 ID、时间、actor、eventType、target 和脱敏 metadata；共享 API Key 元数据继续脱敏。
+- [x] 两个管理员审计读取端点保持现有分页、权限和响应字段，按时间与事件 ID 倒序合并文件记录及升级前的数据库历史。
+- [x] 新管理员操作审计不会写入 `audit_events`；登录/播放近期活动仍由 LUX-312 处理。
+- [x] 自动化测试覆盖管理员操作记录、两个 API 路由、共享 API Key 脱敏和数据库中没有新管理员操作事件。
 
-验证：`cargo test --locked --test log_migration --test job_events_api --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
+验证：`cargo test --locked --test users --test admin_api_key`、`cargo fmt --all -- --check`。
+
+文件：`src/observability/logs.rs`、`src/api/admin_handlers.rs`、`tests/users.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：管理员操作审计新写入 JSONL，`/admin/audit` 与兼容 `/admin/logs` 合并读取文件事件和数据库历史，按时间及 ID 排序；共享 API Key 只记录认证类型标记，不泄露 Key。`cargo test --locked --test users --test admin_api_key` 5 项及审计落盘/脱敏和归档单测通过；`cargo fmt --all -- --check` 与 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
+依赖：LUX-309。明确不做：不改变登录/播放活动、播放进度和业务播放历史。
+
+#### LUX-312：登录/播放活动文件化与仪表盘读取
+
+登录及播放活动日志写入同一 JSONL LogStore。仪表盘近期活动从文件读取，再关联数据库中仍存在的用户/媒体展示信息；用户播放进度和播放历史继续留在业务表中。
+
+验收：
+
+- [ ] `AUTH_LOGIN`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_STOPPED` 活动写入配置目录日志，不再新增到 `audit_events`。
+- [ ] 仪表盘近期活动保持现有类型、24 条上限、分类配额、字段合同和倒序；删除用户/媒体后仍能安全展示。
+- [ ] 播放会话、播放进度、业务播放事件、Webhook 投递状态仍按原合同留在数据库。
+- [ ] 测试覆盖登录/播放活动文件记录、数据库无新活动审计行、媒体标题/用户关联、仪表盘权限与响应。
+
+验证：`cargo test --locked --test web_playback --test admin_health --test users`、`cargo fmt --all -- --check`。
+
+预计文件：`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`tests/web_playback.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：LUX-311。明确不做：不迁移旧 `audit_events` 历史记录。
+
+#### LUX-313：历史任务事件迁出数据库
+
+升级时将既有 `scan_job_events` 安全导出到 `/config/logs/`，文件写入并确认可读后才删除对应数据库行。清理可重试且不触及 `scan_jobs` 状态、进度或恢复游标。
+
+验收：
+
+- [ ] SQLite 与 PostgreSQL 历史任务事件保留原 ID、jobId、级别、事件代码、消息、详情和时间写入 JSONL。
+- [ ] 文件完整持久化并验证后才删除对应数据库行；中断重启可继续，重复执行不产生可见重复事件。
+- [ ] 迁移后任务事件 API 可读历史文件记录；不更改任务状态、进度、取消、重试或恢复语义。
+- [ ] 测试覆盖无历史、SQLite 历史、失败重试、幂等和任务状态不变；PostgreSQL 在可用集成环境验证。
+
+验证：`cargo test --locked --test log_migration --test job_events_api`、`cargo fmt --all -- --check`。
 
 预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`tests/log_migration.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
 
-依赖：LUX-310、LUX-311。明确不做：不删除旧 migration 文件，不移除空表定义，不搬迁任务控制状态和业务事件。
+依赖：LUX-310。明确不做：不清理旧管理员审计事件，不迁出扫描控制状态。
+
+#### LUX-314：历史管理员审计迁出与数据库日志停写
+
+升级时将既有 `audit_events` 导出至日志目录，确认文件持久且可读后才清理数据库记录。迁移完成后移除任务/审计日志 API 对数据库的历史回退和数据库事件留存清理；表结构保留为空。
+
+验收：
+
+- [ ] SQLite 与 PostgreSQL 既有审计记录保留 ID、actor、目标、脱敏 metadata 和时间迁入 JSONL。
+- [ ] 写入校验后才删除对应历史行；迁移失败重试不丢记录、不重复展示。
+- [ ] 两个日志表没有运行时写入/查询；任务控制状态、播放状态和业务关系保持原样。
+- [ ] 文件日志 API 与仪表盘能读新旧记录；归档继续遵守 20 包 FIFO 保留。
+- [ ] 测试覆盖旧审计历史迁移、失败重试、幂等和表清理；最终执行 build、all-targets、fmt、Clippy 与 `uname -m` 完成门。
+
+验证：`cargo test --locked --test log_migration --test job_events_api --test users --test web_playback`、`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
+
+预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`src/storage/users.rs`、`tests/log_migration.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：LUX-312、LUX-313。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
 
 ## 26. 风险与缓解
 

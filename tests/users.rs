@@ -23,7 +23,11 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
-        config, database, setup, web_auth, emby_auth,
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -307,6 +311,59 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
             .iter()
             .any(|event| event["eventType"] == "USER_DELETED")
     );
+
+    let compatibility_logs = client
+        .get(format!("{base_url}/api/v1/admin/logs?pageSize=100"))
+        .header(COOKIE, &manager_cookie)
+        .send()
+        .await?;
+    assert_eq!(compatibility_logs.status(), reqwest::StatusCode::OK);
+    let compatibility_events = compatibility_logs.json::<Value>().await?["events"]
+        .as_array()
+        .cloned()
+        .ok_or("missing compatibility audit events")?;
+    assert!(
+        compatibility_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_CREATED")
+    );
+    assert!(compatibility_events.windows(2).all(|pair| {
+        let previous_time = pair[0]["createdAt"].as_i64().unwrap_or_default();
+        let next_time = pair[1]["createdAt"].as_i64().unwrap_or_default();
+        previous_time > next_time
+            || (previous_time == next_time
+                && pair[0]["id"].as_str().unwrap_or_default()
+                    >= pair[1]["id"].as_str().unwrap_or_default())
+    }));
+    let database_admin_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events
+         WHERE event_type IN ('USER_CREATED', 'USER_UPDATED', 'USER_DISABLED', 'USER_DELETED')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(database_admin_audit_count, 0);
+
+    let mut page_ids = Vec::new();
+    for page in [1, 2] {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/admin/audit?page={page}&pageSize=1"
+            ))
+            .header(COOKIE, &manager_cookie)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await?;
+        let events = body["events"].as_array().ok_or("missing audit page")?;
+        assert_eq!(events.len(), 1);
+        page_ids.push(
+            events[0]["id"]
+                .as_str()
+                .ok_or("missing audit event ID")?
+                .to_owned(),
+        );
+    }
+    assert_ne!(page_ids[0], page_ids[1]);
 
     server.abort();
     Ok(())

@@ -4225,43 +4225,57 @@ pub(crate) async fn record_audit_event(
     target_id: Option<&str>,
     metadata_json: &str,
 ) {
-    let Some(database) = state.database.as_ref() else {
+    if state.database.is_none() {
+        return;
+    }
+    let (actor_user_id, actor_username, metadata_json) =
+        if let Some(candidate) = lux_api_key_from_headers(headers) {
+            let Some(service) = state.admin_api_key.as_ref() else {
+                return;
+            };
+            let Ok(Some(_)) = service.resolve(&candidate).await else {
+                return;
+            };
+            (None, None, audit_metadata_for_shared_api_key(metadata_json))
+        } else {
+            let (Some(auth), Some(session_token)) =
+                (state.auth.as_ref(), request_cookie(headers, "lux_session"))
+            else {
+                return;
+            };
+            let Ok(Some(session)) = auth.resolve(&session_token).await else {
+                return;
+            };
+            (
+                Some(session.user.id.to_string()),
+                Some(session.user.username_normalized.clone()),
+                metadata_json.to_owned(),
+            )
+        };
+    let Some(config_dir) = state.config_dir.as_deref() else {
         return;
     };
-    let (actor_user_id, metadata_json) = if let Some(candidate) = lux_api_key_from_headers(headers)
-    {
-        let Some(service) = state.admin_api_key.as_ref() else {
-            return;
-        };
-        let Ok(Some(_)) = service.resolve(&candidate).await else {
-            return;
-        };
-        (None, audit_metadata_for_shared_api_key(metadata_json))
-    } else {
-        let (Some(auth), Some(session_token)) =
-            (state.auth.as_ref(), request_cookie(headers, "lux_session"))
-        else {
-            return;
-        };
-        let Ok(Some(session)) = auth.resolve(&session_token).await else {
-            return;
-        };
-        (Some(session.user.id.to_string()), metadata_json.to_owned())
-    };
-    if database
-        .insert_audit_event(crate::storage::NewAuditEvent {
+    let event_id = Uuid::now_v7().to_string();
+    match crate::observability::logs::LogStore::new(config_dir)
+        .append_audit_event(crate::observability::logs::NewAuditLogEvent {
+            id: &event_id,
             actor_user_id: actor_user_id.as_deref(),
+            actor_username: actor_username.as_deref(),
             event_type,
             target_type,
             target_id,
             metadata_json: &metadata_json,
         })
         .await
-        .is_ok()
     {
-        state
+        Ok(()) => state
             .admin_events
-            .publish(admin_event_scope_for_audit(event_type));
+            .publish(admin_event_scope_for_audit(event_type)),
+        Err(error) => tracing::error!(
+            event_type,
+            error_kind = ?error.kind(),
+            "failed to persist admin audit event"
+        ),
     }
 }
 
@@ -4505,25 +4519,81 @@ pub(crate) async fn admin_list_audit(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match database.list_audit_events(offset, limit).await {
-        Ok(events) => Json(json!({
-            "events": events.iter().map(|event| json!({
-                "id": event.id,
-                "actorUserId": event.actor_user_id,
-                "actorUsername": event.actor_username,
-                "eventType": event.event_type,
-                "targetType": event.target_type,
-                "targetId": event.target_id,
-                "metadata": serde_json::from_str::<Value>(&event.metadata_json)
-                    .unwrap_or_else(|_| json!({})),
-                "createdAt": event.created_at,
-            })).collect::<Vec<_>>(),
-            "page": offset / limit + 1,
-            "pageSize": limit,
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(prefix_limit) = offset.checked_add(limit) else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "分页参数超出范围",
+        )
+        .into_response();
+    };
+    let file_events = match crate::observability::logs::LogStore::new(config_dir)
+        .list_audit_events(0, prefix_limit)
+        .await
+    {
+        Ok((_, events)) => events,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let database_events = match database.list_audit_events(0, prefix_limit).await {
+        Ok(events) => events,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut events = file_events
+        .into_iter()
+        .map(|event| {
+            (
+                event.created_at,
+                event.id.clone(),
+                json!({
+                    "id": event.id,
+                    "actorUserId": event.actor_user_id,
+                    "actorUsername": event.actor_username,
+                    "eventType": event.event_type,
+                    "targetType": event.target_type,
+                    "targetId": event.target_id,
+                    "metadata": serde_json::from_str::<Value>(&event.metadata_json)
+                        .unwrap_or_else(|_| json!({})),
+                    "createdAt": event.created_at,
+                }),
+            )
+        })
+        .chain(database_events.into_iter().map(|event| {
+            (
+                event.created_at,
+                event.id.clone(),
+                json!({
+                    "id": event.id,
+                    "actorUserId": event.actor_user_id,
+                    "actorUsername": event.actor_username,
+                    "eventType": event.event_type,
+                    "targetType": event.target_type,
+                    "targetId": event.target_id,
+                    "metadata": serde_json::from_str::<Value>(&event.metadata_json)
+                        .unwrap_or_else(|_| json!({})),
+                    "createdAt": event.created_at,
+                }),
+            )
         }))
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let mut seen_ids = HashSet::with_capacity(events.len());
+    events.retain(|(_, id, _)| seen_ids.insert(id.clone()));
+    let page = events
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .map(|(_, _, event)| event)
+        .collect::<Vec<_>>();
+    Json(json!({
+        "events": page,
+        "page": offset / limit + 1,
+        "pageSize": limit,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn admin_list_people_index_rebuild(
