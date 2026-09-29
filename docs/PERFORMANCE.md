@@ -972,3 +972,44 @@ LUX-275 双后端严格阶段门仍开放。以上数据库结果仅代表本机
 六轮汇总首扫中位数快约 6.5%，但样本受缓存变热和运行顺序影响。最后三轮采用反序交错运行，首扫中位数为 5,390→5,188 ms（快约 3.7%），三组中两组更快、一组慢约 3.8%；该子集更适合作为稳定收益估计。相同子集的 target 为 1,907→1,897 ms，重扫为 2,977→3,059 ms，前台 p95 为 292→292 ms，batch p95 为 733→731 ms。累计 `transaction_commit` 等待的中位数从 78.9 ms（5 个有效基线样本）降至 2.35 ms（6 个候选样本）；首个基线样本没有该阶段记录。WAL 与 DML 没有可辨变化。
 
 PostgreSQL 的 `SET LOCAL` 在事务结束时恢复；metadata 写事务和 SQLite 不受影响。异步提交不会破坏数据库一致性，但异常退出可能丢失近期已确认而 WAL 尚未落盘的整笔事务，不只是相同时间长度对应的部分工作。PostgreSQL 16 文档说明默认 `wal_writer_delay = 200ms` 时，延迟上限可达三倍该值；具体丢失哪些事务取决于 WAL 刷盘时序。[WAL 配置文档](https://www.postgresql.org/docs/16/runtime-config-wal.html)；[`SET LOCAL` 文档](https://www.postgresql.org/docs/16/sql-set.html)。Lux 启动时会将未完成扫描标记取消，不自动续跑；异常退出后需重新发起扫描。基于扫描数据可通过重扫重建，保留此 PostgreSQL-only 局部设置。结果仅代表本机 ARM64 和本地 PostgreSQL 容器，不外推 NAS/x86_64，也不关闭 LUX-275 全阶段性能门。
+
+### LUX-304 progressive poster workflow: 1k/10k SQLite/PostgreSQL A/B
+
+2026-09-29 在 Mac16,10 / 16 GiB / ARM64（`uname -m=arm64`）交错运行基线与候选 release 性能测试。基线为 LUX-295 前的 `6424ab12`；`lux_270_manifest_job_scan_benchmark` 的扫描 A/B 候选是 `d88b46f6`，poster-worker 候选为 `d9ad36e3`（增加本批父目录路径缓存）。fixture 使用 `lux-catalog-fixture-v1`，1,000 文件 / 100 目录和 10,000 文件 / 200 目录，视频内容 SHA-256 均为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。SQLite 使用 `synchronous=FULL`、关闭 100 ms 锁采样；PostgreSQL 为 Docker 16.15，每轮新建 disposable 数据库并保留锁采样。用户目录 p95 为 50 个并发 `GET /api/v1/libraries/{id}/items` 请求；管理库列表 p95 单独统计。
+
+`lux_270_manifest_job_scan_benchmark` 的中位数：
+
+| 后端 / 文件数 | rounds B/C | 首扫索引 ms B→C | target ms B→C | 无变化重扫 ms B→C | 用户目录 p95 ms B→C | 管理库列表 p95 ms B→C | DML B/C |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SQLite / 1k | 8 / 8 | 48.5 → 48 | 7 → 7 | 255.5 → 325.5 | 42.5 → 46 | 206.5 → 268.5 | 37 / 37 |
+| PostgreSQL / 1k | 8 / 8 | 166 → 170.5 | 29.5 → 29 | 319.5 → 391 | 72.5 → 77 | 234 → 290.5 | 37 / 37 |
+| SQLite / 10k | 5 / 5 | 369 → 355 | 82 → 81 | 315 → 388 | 85 → 90 | 221 → 281 | 85 / 85 |
+| PostgreSQL / 10k | 6 / 6 | 879 → 892.5 | 243.5 → 239 | 390.5 → 443 | 99 → 102.5 | 259 → 315.5 | 79 / 79 |
+
+索引完成中位数变化均在 5% 内，target 物化持平；不变重扫在候选中较慢。用户目录列表 p95 的绝对差为约 3.5–5 ms，管理库列表 p95 回退更明显，应与实际媒体浏览接口区分。poster-worker 基准另将本地图片写入并行纳入测量，不把本地队列耗时并入索引时间。
+
+poster-worker A/B 使用每个 movie 一张有效 1×1 PNG。候选父目录快照缓存降低重复 `read_dir`；baseline 使用旧本地图片后处理，候选用独立 outbox worker：
+
+| 后端 / 文件数 | 首 poster ms B→C | scan job 完成 ms B→C | 本地 poster queue 完成 ms B→C | 目录 p95（写入期间 B→C） | 目录 p95（队列完成后 B→C） |
+|---|---:|---:|---:|---:|---:|
+| SQLite / 1k | 134 → 111 | 449 → 196 | 450 → 406 | 254 → 295 | 29 → 41 |
+| PostgreSQL / 1k | 314 → 194 | 2,990 → 360 | 2,992 → 2,432 | 266 → 315 | 50 → 50 |
+| SQLite / 10k | 1,028 → 347 | 9,338 → 1,000 | 9,365 → 5,580 | 259 → 301 | 29 → 37 |
+| PostgreSQL / 10k | 1,719 → 603 | 59,866 → 2,314 | 59,875 → 37,345 | 261 → 326 | 55 → 58 |
+
+候选 scan job 可先返回，poster worker 留在后台；10k fixture 首张 poster 提前约 0.7–1.1 s，完整本地 poster 队列比基线快约 30–38%。父目录缓存单独 A/B 将候选 10k poster queue 从 7.15→5.58 s（SQLite）、51.65→37.35 s（PostgreSQL）。扫描期间 50 并发目录 p95 为 0.295–0.326 s，poster 队列完成后的 p95 为 0.036–0.058 s；扫描期间 p95 相对旧流程增加约 40–65 ms。每 16 项让出 2/10 ms 的限速实验没有稳定改善 p95，且延长队列，未保留。当前 p95 仍低于 0.4 s，但 LUX-275/LUX-304 的 5% 回退门尚未满足；LUX-305/306 随后按有界 item image write 批次减少写事务并复测，结果见下文。结果只代表本机 ARM64 与 PostgreSQL 16.15，不能外推到 NAS/x86_64；阶段 23 尚未通过性能门。
+
+### LUX-306 批量本地图片写入 A/B：1k/10k SQLite/PostgreSQL
+
+2026-09-29 在 Mac16,10 / 16 GiB / ARM64（`uname -m=arm64`），以 LUX-305 提交 `245d2f83` 为基线、LUX-306 worker 提交 `1bedd2e1` 为候选，对同一 1k/10k poster-worker fixture 在 SQLite 与 Docker PostgreSQL 16.15 上各交错运行三轮。每个 movie 有一张有效 1×1 PNG；每轮扫描期间及队列完成后各测 50 个并发 `GET /api/v1/libraries/{id}/items` 请求的 p95。表中为三轮中位数，单位 ms；首 poster 与 scan job 时间由 20 ms 轮询观察。候选每页最多准备并原子写入 16 个 movie，首个 movie 仍走单项快速路径。
+
+| 后端 / 文件数 | 首 poster B→C | scan job 完成 B→C | local poster queue 完成 B→C | 活动扫描目录 p95 B→C | 队列完成后目录 p95 B→C |
+|---|---:|---:|---:|---:|---:|
+| SQLite / 1k | 105 → 109 | 134 → 128 | 417 → 321（快 23.0%） | 305 → 314（+3.0%） | 37 → 37 |
+| SQLite / 10k | 382 → 282 | 1,084 → 883 | 5,648 → 4,685（快 17.1%） | 310 → 317（+2.3%） | 36 → 36 |
+| PostgreSQL / 1k | 192 → 209 | 351 → 365 | 2,647 → 574（快 78.3%） | 321 → 320（−0.3%） | 57 → 53 |
+| PostgreSQL / 10k | 654 → 658 | 2,211 → 2,212 | 36,667 → 13,003（快 64.5%） | 351 → 328（−6.6%） | 59 → 63（+4 ms） |
+
+候选四组均在剩余 poster queue 完成前结束 scan job；本地队列中位数四组均缩短。首 poster 中位数在 SQLite/1k、PostgreSQL/1k、PostgreSQL/10k 分别变化 +4、+17、+4 ms，处于 20 ms 观察粒度内；SQLite/10k 提前 100 ms。活动扫描期间目录 p95 四组回退均低于 5% 门槛。10k PostgreSQL 队列完成后的 p95 中位数从 59 增至 63 ms（+4 ms、+6.8%），该差异单独保留记录，不计入活动扫描期间 p95 门槛。
+
+一次额外的 SQLite/1k 基准候选运行触发了 poster 必须早于 scan 完成的断言；该次未留下时间样本。加入具体时间的断言错误信息后，诊断复跑通过，且正式三轮均通过。该失败被如实记录，不并入正式三轮统计。以上仅是本机 ARM64 与本地 PostgreSQL 容器 A/B，不外推到 NAS/x86_64，也不代表部署后或真实客户端验收；阶段 23 总体验收仍开放。

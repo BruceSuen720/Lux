@@ -7215,14 +7215,189 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite/PostgreSQL migration 均可从空库升级；回填状态约束、根路径级联与 claim 索引一致。
-- [ ] 同一根路径重复登记幂等；分页稳定有界；只有当前游标匹配时才能推进，失败/重启保留当前页。
-- [ ] 没有可处理来源时可持久完成；已删除/缺失或无媒体 source 的条目不产生回填候选。
-- [ ] SQLite 与真实 PostgreSQL 存储合同覆盖登记、领取、推进、失败恢复、完成和根删除。
+- [x] SQLite/PostgreSQL migration 均可从空库升级；回填状态约束、根路径级联与 claim 索引一致。
+- [x] 同一根路径重复登记幂等；分页稳定有界；只有当前游标和 attempt 匹配时才能推进，失败/重启保留当前页。
+- [x] 没有可处理来源时可持久完成；已删除/缺失或无媒体 source 的条目不产生回填候选；空根完成后领取器继续查找后续根。
+- [x] SQLite 与真实 PostgreSQL 存储合同覆盖登记、并发领取、推进、失败恢复、完成和根删除。
 
 依赖：LUX-295。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_backfill`、真实 PostgreSQL 对应 ignored 存储合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
 
 预计文件：`migrations/0154_scan_local_metadata_backfill.sql`、`migrations-postgres/0154_scan_local_metadata_backfill.sql`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：新增根级 durable backfill 游标和按 filesystem entry ID 的最多 16 项候选页；候选只包含仍有有效媒体 source 的非 missing 文件。空/无效根在同一次领取中被完成并跳过；失败和 RUNNING 恢复保持当前游标，提交与失败操作同时比较 cursor 和 attempt。SQLite 定向存储测试 1 项、真实 PostgreSQL 合同 1 项通过，覆盖空根优先、多根继续领取、并发 claim 去重、失败重试、重启恢复、旧 attempt/旧 cursor 拒写及根删除级联；`cargo fmt --all -- --check` 和 `cargo clippy --locked --lib -- -D warnings` 通过。该项只提供存储能力，后台回填消费者与启动/扫描入口登记由后续任务接入。
+
+#### LUX-297：既有资源本地海报/NFO 回填消费者
+
+范围：将 LUX-296 的根级持久游标接入现有 `start_local_metadata_outbox_worker`。worker 启动时幂等登记已存在的媒体根路径并恢复中断回填；每轮优先领取 workflow 3 新增/变化 outbox，只有新队列暂时为空时才领取一个最多 16 个 filesystem entry 的低优先级回填页。回填页复用同一套本地图片登记与 NFO 读取逻辑，先处理图片、再异步处理 NFO；任一阶段失败或进程中断均保留当前游标并退避重试。成功图片登记立即使主页投影失效。回填不调用 provider，不等待扫描索引或缩略图屏障，也不混入 scan job 进度。本任务不做能力级缺失判定/FILL_MISSING，不实现浏览器 SSE 更新。
+
+验收：
+
+- [x] worker 启动时注册现存 roots、恢复 RUNNING 回填页；worker 重复启动不会重复创建消费者。
+- [x] 全库本地回填最多一次领取有界页；workflow 3 新 outbox 始终优先，图片登记先于 NFO，后续索引不等待回填完成。
+- [x] 已完成索引且未变化的旧媒体，在没有新扫描 outbox 的情况下也能登记本地 poster 与 NFO；任务不发网络请求。
+- [x] 图片或 NFO 错误使当前页退避重试，不推进游标；worker 重启后从当前页恢复。
+- [x] SQLite 集成测试覆盖旧资源 poster/NFO 登记、无在线任务、失败后游标不前进及重试恢复；worker 领取代码先查新 outbox，再查低优先级 backfill。
+
+依赖：LUX-295、LUX-296。验证：`cargo test --locked --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/scanner.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`tests/scanned_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：现有本地 metadata worker 启动时恢复中断回填并幂等登记数据库中的 roots；队列每次先检查 workflow 3 outbox，再取最多 16 个旧文件 entry。回填复用既有本地图片/NFO enricher，图片阶段完成即失效主页投影，NFO 在有界任务集合中继续；只有两阶段成功才提交游标。worker 不持有 scraper，也不把 backfill 加入扫描完成屏障。新增测试证明无新 outbox 时旧资源仍补出 poster 和 NFO、没有创建 FILL_MISSING job；NFO 写入失败后游标不前进，恢复后同页成功。`scanned_metadata` 11 项、`scanned_series_metadata` 2 项通过；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。全量 fixture 性能对比与浏览器实时刷新仍留在阶段 23 总体验收。
+
+#### LUX-298：渐进扫描查询刷新与本地媒体合并通知
+
+范围：复用现有 `HomeService::invalidate` 和 `UserEventHub` 的 `home` SSE scope/1 秒合并窗口。每次 workflow 3 正向索引事务成功提交后，同步使首页缓存代次失效，再发布首页/媒体库失效通知；本地 outbox 与旧资源回填完成图片登记、NFO 更新后也失效首页缓存并发布同类通知。失败/回滚的索引事务不发事件。图片部分成功后即使同页后续能力失败也要通知；多文件和扫描/worker 并发变化合并发送，不按条目发事件。workflow 1/2 继续保留扫描期间首页稳定快照语义。Lux Web 的 `useUserEvents` 已监听 `home` 并失效首页与媒体库查询，本任务不更改 SSE payload、Emby API 或前端协议。
+
+验收：
+
+- [x] 安全正向索引提交后，扫描仍处于 DISCOVERING 时能收到 `home` 事件；事务失败不发事件。
+- [x] 收到事件后再次读取首页不会命中提交前缓存；workflow 1/2 的最终刷新合同不变。
+- [x] 新 outbox 与既有资源 backfill 的 poster/NFO 持久化后触发同一 `home` 事件；图片部分成功且页面可见时不被后续 NFO 失败吞掉通知。
+- [x] 通知沿用 `UserEventHub` 合并，批量扫描不会按每个媒体/图片生成独立 SSE 消息；连接重建仍依靠既有 open 事件重新取数。
+- [x] SQLite 测试覆盖事件在扫描结束前到达和回填 poster 后到达；已有 Web SSE scope/query invalidation 测试保持通过。
+
+依赖：LUX-294、LUX-295、LUX-297。验证：`cargo test --locked --test scanning_jobs --test scanned_metadata`、`pnpm --dir web test`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/scanner.rs`、`tests/scanning_jobs.rs`、`tests/scanned_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。Web listener 和 SSE query invalidation 已存在，经现有 `web/tests/lux-shell.test.tsx` 验证；若源码检查发现协议不匹配，再将 Web 修正拆成独立任务。
+
+结果（2026-09-28）：workflow 3 正向索引事务提交后先同步失效 HomeService 缓存，再发送合并的 `home` SSE；outbox/backfill 图片与 NFO更新也刷新缓存并复用同一事件，scan terminal 改为合并发布，workflow 1/2 继续使用旧扫描期稳定快照路径。测试证明事件在 manifest 仍 DISCOVERING 时到达、回填 poster 后到达，注入索引事务失败没有事件；既有 Web SSE listener 和 query invalidation 测试未改且通过。`scanning_jobs` 81 项、`scanned_metadata` 11 项、progressive Home 单测 1 项通过；Web 75 个 Vitest 文件/526 项和样式 Node 测试通过；`cargo build --locked`、fmt、all-target clippy 通过。migration 升级使一项扫描测试的预期 schema version 从 153 更新为 154。
+
+#### LUX-299：本地完整性能力检查批量领取存储
+
+范围：为已有 `item_metadata_completeness` 增加有界的批量 prepare-and-claim 操作，供本地检查 worker 在一次短事务中准备并领取 item+capability+input fingerprint。新增或版本变化、FAILED/CANCELLED 的能力重置为 PENDING 并原子进入 RUNNING；同 fingerprint 的 READY 结果保持不动，同 fingerprint 的 RUNNING 不重复领取。保留现有逐项接口和 `complete_local_metadata_and_enqueue_fill_missing` 的事务合同；本任务不计算字段/图片缺失，不调用 provider，也不连接扫描 worker。
+
+验收：
+
+- [x] 一批检查有硬上限、拒绝空/超限 fingerprint 与重复 item+capability；新/变化/可重试能力原子进入 RUNNING。
+- [x] 同版本 READY 不重置，已经 RUNNING 的同版本能力不会被第二 worker 重领；旧 fingerprint 结果仍被完成 CAS 拒绝。
+- [x] 返回本次实际领取的输入位置，使调用者只为领取成功的检查提交结果。
+- [x] SQLite 与真实 PostgreSQL 合同覆盖批量 prepare/claim、版本替换、重复/并发 claim、失败恢复及完成 CAS。
+
+依赖：LUX-292、LUX-293。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_completeness`、真实 PostgreSQL 对应 ignored 存储合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：新增最多 512 项的单事务 completeness prepare/claim 操作，按输入位置返回本 worker 实际领取的检查；相同 READY/RUNNING fingerprint 不重领，新版本和 FAILED/CANCELLED 可重置后领取。SQLite 定向存储用例与真实 PostgreSQL storage contract 各 1 项通过，覆盖并发双领取、同版本去重、版本换代、失败恢复和旧 fingerprint 拒写；`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。能力判定与扫描 worker 接线继续由后续任务实现。
+
+#### LUX-300：从 MetadataRequestPlan 计算能力级本地缺失
+
+范围：在现有 `MetadataSelectionService` 请求计划基础上增加纯本地 completeness 视图，分别返回 METADATA、各个启用图片类型、CREDITS、EXTERNAL_IDS、TRAILERS 的实际 missing/available，以及输入 fingerprint 和“当前按计划可请求”的标记。缺失图像按类型记录，不把多个图像合并成一个布尔值。复用现有 FILL_MISSING 字段集合、NFO projection、图片策略、锁定字段与 attempt history；区分实际缺失与当前可请求状态。VIDEO/HOMEVIDEOS/FOLDER 等禁止在线识别的类型不产生自动补缺能力。本任务只提供计算合同，不写完整性表、不入队、不调用 provider，也不连接扫描 worker。
+
+验收：
+
+- [x] 无 provider 网络调用时能对支持类型返回每项实际缺失状态；关闭的图片能力不会生成可自动请求项，poster/fanart 等分别标记。
+- [x] 实际缺失独立于 UNAVAILABLE/冷却记录；requestable 视图尊重这些记录，并复用手动 FILL_MISSING 请求规则。
+- [x] 字段锁定、继承/回退图片与本地 NFO projection 沿用现有 selection 判断；不适用的媒体类型不伪造完整请求计划。
+- [x] 输入 fingerprint 随当前元数据、有效图像能力与策略变化而变化；一致输入产生稳定指纹。
+- [x] 单测覆盖缺少/已有/关闭图像类型、锁定字段、NFO、Unavailable 和不支持类型。
+
+依赖：LUX-299。验证：`cargo test --locked --lib application::candidates::tests::<本地完整性计划用例>`、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：`MetadataRequestPlan` 额外保留每种图像类型的 missing mask；`MetadataSelectionService` 现在可将当前本地值拆成 METADATA、单图能力、CREDITS、EXTERNAL_IDS、TRAILERS，并分别给出实际缺失与按已有 attempt history 仍可请求的计划。实际与可请求计划共享一次本地字段/NFO/图片读取，fingerprint 由当前本地投影与两类计划的稳定摘要生成。纯计划用例覆盖单图策略、Unavailable、fingerprint 换代、锁定字段/NFO 现有逻辑和 VIDEO 排除；不发请求、不写数据库。定向 candidates 单测 1 项、`reidentify` integration 12 项、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。扫描 worker 尚未调用该计划，留给下一项接线任务。
+
+#### LUX-301：扫描本地完成后保存能力级缺失
+
+范围：将 `MetadataSelectionService` 注入现有 local metadata worker。仅在本地图片与 NFO 检查都成功后，为该批条目计算 LUX-300 的 completeness plan，通过 LUX-299 批量 claim，把每项能力 READY/missing 结果写入 `item_metadata_completeness`。重复输入 fingerprint 幂等；过期检查不得回写。全量 outbox 与既有资源 backfill 共用同一流程；本地读取失败不写 READY/missing。本任务暂不传入自动补缺 item IDs，也不创建 `FILL_MISSING` job，不访问 provider。
+
+验收：
+
+- [x] 生产 `ScanJobService` 获得现有 MetadataSelectionService；两类本地队列成功后均写能力状态，unsupported 类型安全跳过。
+- [x] 图片/NFO 任一失败时不产生该页的 READY/missing 结果；完整输入版本变化时旧结果不能覆盖新检查。
+- [x] poster 已有标为 available、仅 poster 缺失标为 missing；媒体字段按本地 NFO 与锁定规则判定，重复扫描不重置同版本 READY。
+- [x] 本地缺失记录不会直接创建在线 job，worker 本身不调用 scraper。
+- [x] SQLite 测试覆盖新 outbox 与 old-item backfill；PostgreSQL 存储合同复用 LUX-299 批量 claim/CAS。
+
+依赖：LUX-295、LUX-297、LUX-299、LUX-300。验证：`cargo test --locked --lib application::scanner::tests::local_metadata_worker_persists_capability_missing`、`cargo test --locked --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/scanner.rs`、`src/api/legacy.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-28）：生产 API startup 将现有 MetadataSelectionService 注入 local metadata worker；图片与 NFO 全部成功后，为每个支持条目批量 prepare/claim capability，再用 LUX-293 事务保存 READY/available 或 READY/missing，自动入队候选仍留空。真实旧资源 backfill 与 workflow 3 outbox 都有用例：poster 存在记为 available、METADATA 缺失写入 missing；NFO 故障期间没有 completeness READY，重试成功后才写入；未产生 FILL_MISSING job。`scanned_metadata` 11 项、`scanned_series_metadata` 2 项、scanner completeness 集成单测 1 项通过；`cargo build --locked`、fmt 与 all-target clippy 通过。P6 的独立自动调度由下一任务接线。
+
+#### LUX-302：策略感知的缺失结果与 FILL_MISSING 存储事务
+
+范围：扩展既有本地完整性与 FILL_MISSING 原子存储接口。调用者可以显式覆盖媒体库 `scan_missing_metadata_auto_match_enabled`（供实时增量任务传入创建时保存的策略），未传入时继续使用全量/backfill 策略。合格 item 的 eligible 列表即使没有新鲜 READY 结果，也可依据同事务中当前已确认 missing 的完整性行调度，解决策略开启或 scraper 安装后重放旧缺失标记的路径。仍复用既有任务表、active job 去重、支持类型过滤和每个 job 最多 100 项；本任务不连接扫描 worker、selection plan 或 provider。
+
+验收：
+
+- [x] READY/missing 新结果与对应 `FILL_MISSING` job 同事务提交；回滚不留下单边状态。
+- [x] 默认策略取 `scan_missing_metadata_auto_match_enabled`；显式 true/false 覆盖只作用于当前调用。
+- [x] 对没有新鲜完整性结果但已有 READY/missing 状态的 eligible item 可安全重放；活跃任务去重且每个 job 有界最多 100 项。
+- [x] 自动调度只包含未删除的 MOVIE/SERIES/SEASON/EPISODE；HOMEVIDEOS/VIDEO/FOLDER 不进入在线 job。
+- [x] SQLite 与真实 PostgreSQL 测试覆盖开关覆盖、已有 missing 重放、失败事务、active job 去重和任务分页合同。
+
+依赖：LUX-293、LUX-299。验证：`cargo test --locked --lib storage::repository::repository_tests::progressive_scan_metadata_dispatch_is_atomic_and_deduplicated`、真实 PostgreSQL completeness/storage 合同、`cargo fmt --all -- --check`、`cargo clippy --locked --lib -- -D warnings`。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：存储事务支持本次调用的策略覆盖，并可只凭现有 READY/missing 状态重新派发；事务失败不会留下单边完整性状态，活跃 job 按 item 去重。SQLite 和真实 PostgreSQL 合同均通过；103 项边界用例确认 FOLDER 与已删除资源不入队，101 个可调度 item 被分页为 100 + 1。SQLite 定向测试、PostgreSQL ignored 合同、`cargo fmt --all -- --check` 与 `cargo clippy --locked --lib -- -D warnings` 通过。LUX-303 扫描 worker 接线继续作为独立任务处理。
+
+#### LUX-303：本地缺失计划的独立 FILL_MISSING 调度接线
+
+范围：将 `MetadataReidentifyService` 接入本地 completeness worker。workflow 3 outbox/backfill 与实时增量扫描的 per-job 本地目标 worker 都在本地图片和 NFO 检查成功后计算 LUX-300 completeness plan、通过 LUX-299 领取检查，并将 READY/missing 与合格 `FILL_MISSING` job 交给 LUX-302 原子提交。只有实际缺失、requestable plan 有工作、当前入口策略允许且存在所选 scraper 时才派发；无 provider、关闭策略或只有 UNAVAILABLE/cooling 能力时仍保存真实缺失。全量/backfill 使用 scan missing 开关；INCREMENTAL_SCAN 使用 job 创建时持久化的 `auto_metadata_match`，不能被扫描期间的媒体库开关变化覆盖。实时增量已由本地 completeness worker 逐项派发时，扫描终点不再重复创建另一批 changed-item FILL_MISSING job。workflow 3 不创建扫描末尾整库 FILL_MISSING；完成本地页后立即 spawn 现有 reidentify worker，不等在线任务。进程重启沿用项目现有未完成任务取消/重试合同，不自动恢复 metadata jobs。workflow 1/2 原终点流程保持不变。
+
+验收：
+
+- [x] Workflow 3 outbox/backfill 和增量 target worker 在本地处理成功后都持久化能力级 READY/missing；本地失败时不写完成状态。
+- [x] 全量/backfill 与增量分别服从库策略和 job 创建时的策略快照；策略关闭时只记录 missing，不排在线 job；打开时只派发本轮缺失条目。
+- [x] 增量本地 worker 派发后，扫描终点不重复创建 changed-item FILL_MISSING job；workflow 3 不创建整库重复任务。
+- [x] 无 provider、unsupported type、计划完整或 only unavailable/cooling 时不入队；provider 网络只由现有独立 job worker 发起。
+- [x] 新 job 不阻塞本地 worker 或扫描完成；活动任务去重，执行前沿用现有 FILL_MISSING 二次检查和只补空值语义。
+- [x] 测试覆盖配置 provider 后按需入队、job 与扫描并行、实时/全量策略隔离、无 provider 不请求和在线结果后页面通知。
+
+依赖：LUX-293、LUX-295、LUX-297、LUX-298、LUX-300、LUX-301、LUX-302。验证：`cargo test --locked --lib application::scanner::tests::local_metadata_worker_dispatches_fill_missing_without_blocking_scan`、`cargo test --locked --test reidentify --test scanned_metadata --test scanned_series_metadata`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/application/reidentify.rs`、`src/api/legacy.rs`、`docs/LUX-DEVELOPMENT.md`。相关行为测试放在 scanner/reidentify 内部模块。
+
+结果（2026-09-29）：workflow 3 outbox/backfill 与实时增量本地目标 worker 现在共用能力级完整性事务。增量 enricher 返回成功处理的 item IDs，本地图片/NFO完成后才写 READY/missing；入队使用 job 保存的自动补全策略，并检查当前 item 是否有选定 scraper。增量任务终点不再重复创建另一批 FILL_MISSING；provider job 独立运行，扫描先完成，任务结束后发出 home 更新事件。增量集成测试覆盖创建时开关快照、关闭时只保存缺失和不重复入队；原 outbox 测试覆盖慢 provider、扫描与刮削并行。
+
+验证通过：scanner completeness/dispatch/incremental 三个定向单测；`reidentify` 12 项、`scanned_metadata` 11 项、`scanned_series_metadata` 2 项、`scanning_jobs` 81 项；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+#### LUX-304：阶段 23 1k/10k 扫描与本地海报性能测量
+
+范围：用 `lux_270_manifest_job_scan_benchmark` 对 1,000 与 10,000 文件 fixture 做 SQLite/PostgreSQL 基线 A/B，使用同一生成器、相同数据库参数和当前 ARM64 环境，基线为 LUX-295 前的 `6424ab12`，候选为本分支提交。每个大小/后端/版本至少交错运行三轮，记录首扫索引、无变化重扫、target 物化、用户媒体目录列表 p95、管理库列表 p95、事务/队列和 WAL/SQLite 锁指标。新增 ignored poster-worker 基准，在相同规模 fixture 为每个电影生成有效的本地海报文件，测量首条索引可查、首张本地 poster、扫描 job 完成、全量本地 poster 队列完成、扫描期间与 poster 队列完成后的媒体目录列表 p95；本地 worker 与刮削 job 的耗时分开记录。候选本地图片索引在每批 source 内缓存父目录路径快照，避免同目录电影逐项重复 `read_dir`。若发现索引或用户媒体目录 p95 稳定回退超过 5%，记录结果并建立阶段内的专门修复任务；在修复复测通过前，不关闭阶段 23。该本机 ARM64 / PostgreSQL 版本只作为同机 A/B，不外推为 NAS/x86_64 性能结论。
+
+验收：
+
+- [x] 1k/10k SQLite 与 PostgreSQL 基线/候选均有至少三轮交错记录，包含环境、提交、fixture、参数和 p50/p95。
+- [x] poster-worker 基准证明条目索引后可读、首张本地 poster 在扫描 job 完成前写入；完整 poster 队列时间与扫描期间/队列完成后的媒体目录列表 p95 分开报告。
+- [x] 用户媒体目录 p95、管理库列表 p95、索引耗时、target 物化和不变重扫分开记录；超过阈值的指标已拆为后续任务，不与在线刮削耗时混算。
+- [x] `docs/PERFORMANCE.md` 记录本机架构、PostgreSQL 版本和受限结论；阶段 23 的通过门仍开放。
+
+依赖：LUX-303。验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --release --test performance lux_270_manifest_job_scan_benchmark -- --ignored --nocapture --test-threads=1`；`LUX-304` poster-worker ignored 基准；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/metadata.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：Mac16,10 / 16 GiB / ARM64，PostgreSQL 16.15。`lux_270_manifest_job_scan_benchmark` 使用同版 fixture：1k SQLite/PostgreSQL 各 8 轮，10k SQLite 5 轮、PostgreSQL 6 轮；索引中位数分别为 SQLite 48.5→48 ms / 369→355 ms、PostgreSQL 166→170.5 ms / 879→892.5 ms，均未回退 5%；DML 计数保持 37（1k）/ 79–85（10k），target 中位数持平。poster-worker A/B：候选首 poster 由基线 134→111 ms（SQLite 1k）、1028→347 ms（SQLite 10k）、314→194 ms（PostgreSQL 1k）、1719→603 ms（PostgreSQL 10k）；候选 scan job 提前返回并让本地队列继续在后台完成。目录快照缓存将候选 10k 本地海报队列完成从 7.15→5.58 s（SQLite）、51.65→37.35 s（PostgreSQL）。扫描期间的 50 并发目录列表 p95 为 0.295–0.326 s，队列完成后的 p95 为 0.036–0.058 s；两毫秒与十毫秒的 scan-active 延迟实验没有稳定改善 p95 且延长队列，未保留。A/B 的后台 worker 并发 p95 仍高于旧流程，因此 LUX-305/306 继续处理 bounded image-write 批次；阶段 23 不在本任务中关闭。
+
+#### LUX-305：本地图片存储批次接口与事务合同
+
+范围：新增有界 `item_images` 多 item 批量写入事务，单批最多 16 个 item，语句行数遵循 SQLite/PostgreSQL 参数上限；图片行更新与 `poster_fallback_required` 清理在同一事务内提交。保持 `(item_id, image_type, image_index)` 幂等 upsert、路径/内容变化检测和 LOCAL source 语义。若一项写入失败，整批回滚，不得留下部分海报或已清除的 fallback 标记。本任务仅增加 storage contract，不接入扫描 worker，不改变图片发现和在线刮削策略。
+
+验收：
+
+- [x] SQLite 与真实 PostgreSQL 覆盖多 item 图片插入、重复幂等、路径变化更新、poster fallback 更新和事务失败回滚。
+- [x] 空批次不打开写事务；单个 item 的多图 index 保序；每条 SQL 写入有界。
+- [x] `cargo fmt --all -- --check`、定向 SQLite/PostgreSQL storage 合同通过；all-target clippy 将在 LUX-306 合并验证。
+
+依赖：LUX-304。预计文件：`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：新增 `ItemImageBatchInsert` 与有界 `insert_item_images_batch_at_indices`，一次事务最多接收 16 个 item，并按每条 SQL 最多 64 张图片分页插入；poster fallback 清理与图片 upsert 同一事务提交。SQLite 与真实 PostgreSQL 均验证多图 index、幂等重复、poster 路径变化、空页无 SQL、17 item 拒绝和触发器注入回滚时图片/fallback 均无部分提交。LUX-306 将把该事务接入 outbox movie image worker 并重新测量队列和 p95。
+
+#### LUX-306：本地海报 worker 使用批量图片事务并复测 p95
+
+范围：将 LUX-305 批次接口接入 workflow 3 本地 movie poster worker。先读取并准备最多 16 个 item 的图片，再原子写入该页；本地 NFO、metadata completeness、FILL_MISSING 派发和系列 artwork 次序保持不变。benchmark 重新运行同一 1k/10k SQLite/PostgreSQL poster-worker fixture，测量首 poster、scan job 完成、队列完成、扫描期间与队列完成后的媒体目录 p95。若 worker 写入仍使用户媒体目录 p95 稳定回退超过 5%，继续调整批次大小并交错重测；不得让扫描等待 online FILL_MISSING。
+
+验收：
+
+- [x] poster 首次可见时间在 20 ms 观察粒度内无回退，local queue 完成时间四组均缩短；扫描 job 先于剩余后台队列完成，网络刮削保持独立。
+- [x] SQLite/PostgreSQL 完整性和失败重试合同通过；scanner 与 local metadata 行为测试通过。
+- [x] 同 fixture 双后端 A/B 记录 p95 和 1k/10k 队列规模；活动扫描期间用户媒体目录 p95 回退门通过，结果写入 `docs/PERFORMANCE.md`。
+
+依赖：LUX-303、LUX-304、LUX-305。预计文件：`src/application/metadata.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：workflow 3 本地 movie poster worker 首个 item 保留快速路径，其余 item 每 16 个组成一页，经 LUX-305 原子批量图片事务写入；系列 artwork 路径、NFO 顺序和网络刮削策略未改。失败重试回归用触发器令第二页写入失败，确认该页无部分 poster 落库、stage 不标记完成，重试后 3 个 poster 全部入库。相关 Rust 目标 `scanned_metadata`、`scanned_series_metadata`、`scanning_jobs` 共 94 项通过。性能结果见 `docs/PERFORMANCE.md`：四组 local poster queue 中位数缩短 17.1%–78.3%，活动扫描期间 p95 最大回退 3.0%；队列完成后的 10k PostgreSQL p95 有 +4 ms 变化，已保留说明。性能数据仅代表本机 ARM64 与本地 PostgreSQL 16.15，不能外推 NAS/x86_64。此前全目标验证中的 `metadata_selection::completed_scan_automatically_matches_and_writes_metadata` 实际是 workflow 2 旧自动匹配合同，却使用默认 workflow 3 manifest，导致读取不到旧 `metadata_reidentify_jobs` 记录并报 `RowNotFound`；现已明确设为 workflow 2 并改名。修正后 `cargo test --locked --test metadata_selection` 29 项通过。最终 `cargo test --locked --all-targets` 的 582 项库测试通过，但在无关的 `emby_auth` 目标因 3 个用户名大小写断言失败而停止（实际返回小写，断言期待首字母大写）；需作为独立问题处理。此前 build、fmt、clippy 门禁通过。
 
 #### 阶段 23 总体验收与阶段门
 

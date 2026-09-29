@@ -7,6 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
@@ -57,6 +58,14 @@ pub(crate) struct MetadataRequestPlan {
     pub(crate) needs_external_ids: bool,
     pub(crate) needs_trailers: bool,
     pub(crate) image_policy: Option<ImageSelectionPolicy>,
+    pub(crate) missing_image_mask: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalMetadataCompletenessPlan {
+    pub(crate) input_fingerprint: Vec<u8>,
+    pub(crate) capabilities: Vec<(String, bool)>,
+    pub(crate) has_requestable_capability: bool,
 }
 
 impl MetadataRequestPlan {
@@ -68,6 +77,7 @@ impl MetadataRequestPlan {
             needs_external_ids: true,
             needs_trailers: true,
             image_policy: None,
+            missing_image_mask: 0,
         }
     }
 
@@ -104,7 +114,72 @@ fn metadata_request_plan(
         needs_trailers: matches!(current.item_type.as_str(), "MOVIE" | "SERIES")
             && details.is_none_or(|details| details.trailers.is_empty()),
         image_policy: None,
+        missing_image_mask: 0,
     }
+}
+
+fn completeness_capabilities(
+    current: &StoredMediaMetadata,
+    plan: MetadataRequestPlan,
+) -> Vec<(String, bool)> {
+    if fill_missing_fields(&current.item_type).is_none() {
+        return Vec::new();
+    }
+    let mut capabilities = vec![("METADATA".to_owned(), plan.needs_metadata)];
+    if let Some(image_policy) = plan.image_policy {
+        for image_type in image_policy.enabled_types() {
+            let missing = SCRAPER_IMAGE_TYPES
+                .iter()
+                .position(|candidate| *candidate == image_type)
+                .is_some_and(|index| plan.missing_image_mask & (1_u16 << index) != 0);
+            capabilities.push((image_type.to_owned(), missing));
+        }
+    }
+    if matches!(current.item_type.as_str(), "MOVIE" | "SERIES") {
+        capabilities.push(("CREDITS".to_owned(), plan.needs_credits));
+        capabilities.push(("TRAILERS".to_owned(), plan.needs_trailers));
+    }
+    if current.item_type == "MOVIE" {
+        capabilities.push(("EXTERNAL_IDS".to_owned(), plan.needs_external_ids));
+    }
+    capabilities
+}
+
+fn metadata_completeness_fingerprint(
+    item_id: &str,
+    current: &StoredMediaMetadata,
+    actual_plan: MetadataRequestPlan,
+    requestable_plan: MetadataRequestPlan,
+) -> Vec<u8> {
+    let input = format!("{item_id}\n{current:?}\n{actual_plan:?}\n{requestable_plan:?}");
+    Sha256::digest(input.as_bytes()).to_vec()
+}
+
+fn metadata_request_plan_has_work(plan: MetadataRequestPlan) -> bool {
+    plan.needs_metadata
+        || plan.needs_images
+        || plan.needs_credits
+        || plan.needs_external_ids
+        || plan.needs_trailers
+}
+
+fn local_metadata_completeness_plan(
+    item_id: &str,
+    current: &StoredMediaMetadata,
+    actual_plan: MetadataRequestPlan,
+    requestable_plan: MetadataRequestPlan,
+) -> Option<LocalMetadataCompletenessPlan> {
+    fill_missing_fields(&current.item_type)?;
+    Some(LocalMetadataCompletenessPlan {
+        input_fingerprint: metadata_completeness_fingerprint(
+            item_id,
+            current,
+            actual_plan,
+            requestable_plan,
+        ),
+        capabilities: completeness_capabilities(current, actual_plan),
+        has_requestable_capability: metadata_request_plan_has_work(requestable_plan),
+    })
 }
 
 fn credits_are_missing(
@@ -1886,8 +1961,10 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        self.fill_missing_request_plan_for_current_with_options(item_id, current, false)
-            .await
+        Ok(self
+            .fill_missing_request_plans_for_current(item_id, current)
+            .await?
+            .1)
     }
 
     pub(crate) async fn fallback_request_plan_for_current(
@@ -1895,8 +1972,29 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        self.fill_missing_request_plan_for_current_with_options(item_id, current, true)
-            .await
+        Ok(self
+            .fill_missing_request_plans_for_current(item_id, current)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn local_metadata_completeness_plan(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+    ) -> Result<Option<LocalMetadataCompletenessPlan>, MetadataSelectionError> {
+        if fill_missing_fields(&current.item_type).is_none() {
+            return Ok(None);
+        }
+        let (actual_plan, requestable_plan) = self
+            .fill_missing_request_plans_for_current(item_id, current)
+            .await?;
+        Ok(local_metadata_completeness_plan(
+            item_id,
+            current,
+            actual_plan,
+            requestable_plan,
+        ))
     }
 
     pub(crate) async fn supplemental_request_plan(
@@ -1931,14 +2029,13 @@ impl MetadataSelectionService {
             .any(|image_type| !local_image_types.contains(*image_type)))
     }
 
-    async fn fill_missing_request_plan_for_current_with_options(
+    async fn fill_missing_request_plans_for_current(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
-        ignore_attempt_history: bool,
-    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+    ) -> Result<(MetadataRequestPlan, MetadataRequestPlan), MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
-            return Ok(MetadataRequestPlan::full());
+            return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full()));
         }
         let image_policy = self.image_selection_policy(item_id).await?;
         let capability_states = self
@@ -1960,13 +2057,21 @@ impl MetadataSelectionService {
         } else {
             self.images.local_image_types(item_id, &image_types).await?
         };
-        let mut images_missing = false;
+        let mut actual_missing_image_mask = 0_u16;
+        let mut requestable_missing_image_mask = 0_u16;
         for image_type in image_types {
             if local_image_types.contains(image_type) {
                 continue;
             }
-            let explicitly_unavailable = !ignore_attempt_history
-                && !image_attempt_identities.is_empty()
+            let Some(index) = SCRAPER_IMAGE_TYPES
+                .iter()
+                .position(|candidate| *candidate == image_type)
+            else {
+                continue;
+            };
+            let image_mask = 1_u16 << index;
+            actual_missing_image_mask |= image_mask;
+            let explicitly_unavailable = !image_attempt_identities.is_empty()
                 && image_attempt_identities
                     .iter()
                     .all(|(source, provider_id)| {
@@ -1976,8 +2081,7 @@ impl MetadataSelectionService {
                         ))
                     });
             if !explicitly_unavailable {
-                images_missing = true;
-                break;
+                requestable_missing_image_mask |= image_mask;
             }
         }
         let details = current.nfo_metadata_json.as_deref().and_then(|value| {
@@ -2002,34 +2106,46 @@ impl MetadataSelectionService {
             }
             _ => false,
         };
-        let mut plan =
-            metadata_request_plan(current, images_missing, credits_missing, details.as_ref());
-        plan.image_policy = Some(image_policy);
+        let mut actual_plan = metadata_request_plan(
+            current,
+            actual_missing_image_mask != 0,
+            credits_missing,
+            details.as_ref(),
+        );
+        actual_plan.image_policy = Some(image_policy);
+        actual_plan.missing_image_mask = actual_missing_image_mask;
+        let mut requestable_plan = metadata_request_plan(
+            current,
+            requestable_missing_image_mask != 0,
+            credits_missing,
+            details.as_ref(),
+        );
+        requestable_plan.image_policy = Some(image_policy);
+        requestable_plan.missing_image_mask = requestable_missing_image_mask;
         let capability_identity = selected_capability_identity(current);
-        if !ignore_attempt_history {
-            plan.needs_credits = plan.needs_credits
-                && capability_needs_request(
-                    &capability_states,
-                    capability_identity.as_ref(),
-                    CAPABILITY_CREDITS,
-                );
-            plan.needs_external_ids = plan.needs_external_ids
-                && capability_needs_request(
-                    &capability_states,
-                    capability_identity.as_ref(),
-                    CAPABILITY_EXTERNAL_IDS,
-                );
-            plan.needs_trailers = plan.needs_trailers
-                && capability_needs_request(
-                    &capability_states,
-                    capability_identity.as_ref(),
-                    CAPABILITY_TRAILERS,
-                );
-        }
+        requestable_plan.needs_credits = requestable_plan.needs_credits
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_CREDITS,
+            );
+        requestable_plan.needs_external_ids = requestable_plan.needs_external_ids
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_EXTERNAL_IDS,
+            );
+        requestable_plan.needs_trailers = requestable_plan.needs_trailers
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_TRAILERS,
+            );
         if !has_selected_provider_id(current) {
-            plan.needs_metadata = true;
+            actual_plan.needs_metadata = true;
+            requestable_plan.needs_metadata = true;
         }
-        Ok(plan)
+        Ok((actual_plan, requestable_plan))
     }
 
     pub async fn select(
@@ -3590,10 +3706,12 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
+        ACTOR_METADATA_FETCH_CONCURRENCY, MetadataRequestPlan, SCRAPER_IMAGE_TYPES,
+        candidate_actors, capability_needs_request, completeness_capabilities, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        merge_actor_values, merge_supplemental_movie_nfo, metadata_match_score,
-        metadata_request_plan, parse_image_selection_policy, selected_scraper_provider_id,
+        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
+        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
+        parse_image_selection_policy, selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3601,7 +3719,7 @@ mod tests {
         ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
         ScraperSearchRequest, ScraperSearchResponse, ScraperTrailersResponse,
     };
-    use crate::storage::StoredMediaMetadata;
+    use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
     use serde_json::json;
     use std::sync::{
         Arc,
@@ -3759,7 +3877,7 @@ mod tests {
 
     #[test]
     fn fill_missing_request_plan_only_keeps_missing_capabilities() {
-        let current = StoredMediaMetadata {
+        let mut current = StoredMediaMetadata {
             item_type: "MOVIE".to_owned(),
             title: "Example Movie".to_owned(),
             original_title: Some("Example Movie".to_owned()),
@@ -3812,6 +3930,118 @@ mod tests {
         assert!(!plan.needs_credits);
         assert!(!plan.needs_external_ids);
         assert!(!plan.needs_trailers);
+
+        let poster_index = SCRAPER_IMAGE_TYPES
+            .iter()
+            .position(|image_type| *image_type == "POSTER")
+            .expect("poster capability index");
+        let fanart_index = SCRAPER_IMAGE_TYPES
+            .iter()
+            .position(|image_type| *image_type == "FANART")
+            .expect("fanart capability index");
+        let mut actual_plan = plan;
+        actual_plan.image_policy = Some(default_image_selection_policy());
+        actual_plan.missing_image_mask = (1_u16 << poster_index) | (1_u16 << fanart_index);
+        let mut requestable_plan = actual_plan;
+        requestable_plan.missing_image_mask = 1_u16 << poster_index;
+        requestable_plan.needs_images = true;
+
+        let completeness =
+            local_metadata_completeness_plan("movie-1", &current, actual_plan, requestable_plan)
+                .expect("movie completeness plan is supported");
+        assert!(completeness.has_requestable_capability);
+        assert_eq!(completeness.input_fingerprint.len(), 32);
+        assert!(
+            completeness
+                .capabilities
+                .contains(&("POSTER".to_owned(), true))
+        );
+        assert!(
+            completeness
+                .capabilities
+                .contains(&("FANART".to_owned(), true))
+        );
+        assert!(
+            completeness
+                .capabilities
+                .contains(&("METADATA".to_owned(), false))
+        );
+        assert_eq!(
+            completeness.input_fingerprint,
+            metadata_completeness_fingerprint("movie-1", &current, actual_plan, requestable_plan,)
+        );
+
+        let mut poster_disabled_policy = default_image_selection_policy();
+        poster_disabled_policy.poster = false;
+        let mut poster_disabled_plan = actual_plan;
+        poster_disabled_plan.image_policy = Some(poster_disabled_policy);
+        let disabled_capabilities = completeness_capabilities(&current, poster_disabled_plan);
+        assert!(
+            !disabled_capabilities
+                .iter()
+                .any(|(capability, _)| capability == "POSTER")
+        );
+        assert!(disabled_capabilities.contains(&("FANART".to_owned(), true)));
+        assert_ne!(
+            metadata_completeness_fingerprint("movie-1", &current, actual_plan, requestable_plan,),
+            metadata_completeness_fingerprint(
+                "movie-1",
+                &current,
+                poster_disabled_plan,
+                requestable_plan,
+            ),
+            "an image policy change updates the input fingerprint"
+        );
+
+        let no_requestable_image_plan = local_metadata_completeness_plan(
+            "movie-1",
+            &current,
+            actual_plan,
+            MetadataRequestPlan {
+                needs_images: false,
+                missing_image_mask: 0,
+                ..actual_plan
+            },
+        )
+        .expect("movie completeness plan is supported");
+        assert!(
+            no_requestable_image_plan
+                .capabilities
+                .contains(&("POSTER".to_owned(), true))
+        );
+        assert!(!no_requestable_image_plan.has_requestable_capability);
+        let unavailable_attempts = [StoredMetadataCapabilityAttempt {
+            provider: "tmdb".to_owned(),
+            provider_id: "1".to_owned(),
+            capability: "CREDITS".to_owned(),
+            status: "UNAVAILABLE".to_owned(),
+            next_retry_at: None,
+        }];
+        let identity = ("tmdb".to_owned(), "1".to_owned());
+        assert!(!capability_needs_request(
+            &unavailable_attempts,
+            Some(&identity),
+            "CREDITS"
+        ));
+        assert!(capability_needs_request(
+            &unavailable_attempts,
+            Some(&identity),
+            "TRAILERS"
+        ));
+
+        let first_fingerprint = completeness.input_fingerprint;
+        current.overview = Some("Updated local overview".to_owned());
+        assert_ne!(
+            first_fingerprint,
+            metadata_completeness_fingerprint("movie-1", &current, actual_plan, requestable_plan,),
+            "current local metadata changes the input fingerprint"
+        );
+        current.item_type = "VIDEO".to_owned();
+        assert!(
+            local_metadata_completeness_plan("movie-1", &current, actual_plan, requestable_plan,)
+                .is_none(),
+            "unsupported video types do not create online completeness plans"
+        );
     }
 
     #[test]

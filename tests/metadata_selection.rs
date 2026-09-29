@@ -2280,7 +2280,7 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
 }
 
 #[tokio::test]
-async fn completed_scan_automatically_matches_and_writes_metadata()
+async fn workflow_two_scan_automatically_matches_and_writes_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
@@ -2365,6 +2365,10 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     let scan_jobs = luxd::application::scanner::ScanJobService::new(fixture.database.clone());
     let scan_job = scan_jobs
         .create_movie_scan_job_with_metadata(library_id.parse()?, true)
+        .await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 2 WHERE job_id = ?")
+        .bind(&scan_job.id)
+        .execute(fixture.database.pool())
         .await?;
     let metadata_started = Instant::now();
     scan_jobs

@@ -5710,6 +5710,145 @@ impl Database {
         Ok(inserted_count)
     }
 
+    #[allow(dead_code)] // LUX-306 routes the local poster worker through this bounded writer.
+    pub(crate) async fn insert_item_images_batch_at_indices(
+        &self,
+        items: &[ItemImageBatchInsert],
+    ) -> Result<usize, StorageError> {
+        const MAX_ITEMS_PER_BATCH: usize = 16;
+        const MAX_IMAGE_ROWS_PER_STATEMENT: usize = 64;
+
+        if items.is_empty() {
+            return Ok(0);
+        }
+        if items.len() > MAX_ITEMS_PER_BATCH {
+            return Err(StorageError::Conflict(
+                "local image item batch exceeds the storage limit".to_owned(),
+            ));
+        }
+        let mut item_ids = std::collections::HashSet::with_capacity(items.len());
+        let mut image_keys = std::collections::HashSet::new();
+        let mut image_count = 0_usize;
+        for item in items {
+            if item.item_id.trim().is_empty() || !item_ids.insert(item.item_id.as_str()) {
+                return Err(StorageError::Conflict(
+                    "local image item batch contains an invalid or duplicate item id".to_owned(),
+                ));
+            }
+            for image in &item.images {
+                if image.image_type.trim().is_empty()
+                    || image.image_index < 0
+                    || !image_keys.insert((
+                        item.item_id.as_str(),
+                        image.image_type.as_str(),
+                        image.image_index,
+                    ))
+                {
+                    return Err(StorageError::Conflict(
+                        "local image batch contains an invalid or duplicate image key".to_owned(),
+                    ));
+                }
+                image_count = image_count.saturating_add(1);
+            }
+        }
+        if image_count == 0 && !items.iter().any(|item| item.clear_poster_fallback) {
+            return Ok(0);
+        }
+
+        let mut image_rows = Vec::with_capacity(image_count);
+        for item in items {
+            image_rows.extend(item.images.iter().map(|image| (&item.item_id, image)));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let mut inserted_count = 0_usize;
+        for batch in image_rows.chunks(MAX_IMAGE_ROWS_PER_STATEMENT) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO item_images (
+                    id, item_id, image_type, image_index, local_path, width, height,
+                    file_size, content_tag, source, source_url
+                ) VALUES {values}
+                ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
+                    id = excluded.id,
+                    local_path = excluded.local_path,
+                    width = excluded.width,
+                    height = excluded.height,
+                    file_size = excluded.file_size,
+                    content_tag = excluded.content_tag,
+                    source = excluded.source,
+                    source_url = excluded.source_url,
+                    updated_at = unixepoch()
+                WHERE item_images.local_path <> excluded.local_path
+                   OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
+                   OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
+                   OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
+                   OR item_images.source <> excluded.source
+                   OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (item_id, image) in batch {
+                statement = statement
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(item_id.as_str())
+                    .bind(&image.image_type)
+                    .bind(image.image_index)
+                    .bind(&image.local_path)
+                    .bind(image.width)
+                    .bind(image.height)
+                    .bind(image.file_size)
+                    .bind(&image.content_tag)
+                    .bind(&image.source)
+                    .bind(image.source_url.as_deref());
+            }
+            let result = statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            inserted_count = inserted_count.saturating_add(result.rows_affected() as usize);
+        }
+
+        let fallback_item_ids = items
+            .iter()
+            .filter(|item| item.clear_poster_fallback)
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>();
+        if !fallback_item_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", fallback_item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE media_items SET poster_fallback_required = 0
+                 WHERE id IN ({placeholders}) AND poster_fallback_required <> 0"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in fallback_item_ids {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted_count)
+    }
+
     pub(crate) async fn set_poster_fallback_required(
         &self,
         item_id: &str,

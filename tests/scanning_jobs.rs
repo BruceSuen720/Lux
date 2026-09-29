@@ -6,6 +6,7 @@ use common::{TestScraper, TestScraperConfig};
 use luxd::{
     application::{
         access::{AccessPrincipal, MediaAccessService},
+        admin_events::{UserEventHub, UserEventScope},
         catalog::{CatalogFilter, CatalogService},
         libraries::LibraryService,
         nfo::LocalNfoMetadataStore,
@@ -1752,7 +1753,9 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
 
-    let jobs = ScanJobService::new(database.clone());
+    let user_events = UserEventHub::new();
+    let mut user_event_receiver = user_events.subscribe();
+    let jobs = ScanJobService::new(database.clone()).with_user_events(user_events);
     let job = jobs.create_movie_scan_job(library.id).await?;
     let discovery_mode: String =
         sqlx::query_scalar("SELECT discovery_mode FROM scan_manifests WHERE job_id = ?")
@@ -1818,6 +1821,11 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
             assert!(
                 visible_items < 64,
                 "indexing should remain bounded per batch"
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), user_event_receiver.recv()).await??,
+                UserEventScope::Home,
+                "a committed positive batch notifies home before discovery ends"
             );
             break;
         }
@@ -1949,9 +1957,12 @@ async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
 
-    let jobs = ScanJobService::new(database.clone());
+    let user_events = UserEventHub::new();
+    let mut user_event_receiver = user_events.subscribe();
+    let jobs = ScanJobService::new(database.clone()).with_user_events(user_events);
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_batch(&job.id, 100).await?;
+    while user_event_receiver.try_recv().is_ok() {}
     sqlx::query(
         "CREATE TRIGGER reject_scan_local_metadata_batch
          BEFORE INSERT ON scan_local_metadata_batches
@@ -1960,6 +1971,7 @@ async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
     .execute(database.pool())
     .await?;
     assert!(jobs.run_batch(&job.id, 100).await.is_err());
+    assert!(user_event_receiver.try_recv().is_err());
     sqlx::query("DROP TRIGGER reject_scan_local_metadata_batch")
         .execute(database.pool())
         .await?;
@@ -2301,7 +2313,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 153);
+    assert_eq!(database.schema_version().await?, 154);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)

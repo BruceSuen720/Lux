@@ -27,6 +27,7 @@ mod device_pairings;
 mod emby_migration;
 #[path = "jobs.rs"]
 mod jobs;
+pub(crate) use jobs::StoredScanLocalMetadataBackfillPage;
 #[path = "library.rs"]
 mod library;
 #[path = "media.rs"]
@@ -2501,6 +2502,13 @@ pub(crate) struct ItemImageInsert {
     pub(crate) content_tag: String,
     pub(crate) source: String,
     pub(crate) source_url: Option<String>,
+}
+
+#[allow(dead_code)] // LUX-306 consumes this storage contract from the local image worker.
+pub(crate) struct ItemImageBatchInsert {
+    pub(crate) item_id: String,
+    pub(crate) images: Vec<ItemImageInsert>,
+    pub(crate) clear_poster_fallback: bool,
 }
 
 pub(crate) struct MetadataImageAttemptUpdate<'a> {

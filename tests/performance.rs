@@ -25,6 +25,7 @@ use luxd::{
         candidates::MetadataSelectionService,
         images::ImageWriteService,
         libraries::LibraryService,
+        nfo::LocalNfoMetadataStore,
         probe::{FfprobeRunner, MediaProbeService},
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::{LibraryScanner, ScanJobService},
@@ -1709,6 +1710,279 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         serde_json::to_string(&serde_json::Value::Object(report))?
     );
 
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "run with scripts/run-performance.sh for the LUX-304 progressive poster gate"]
+async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let media_root = PathBuf::from(env::var("LUX_PERF_MEDIA_ROOT")?);
+    let file_count: usize = env::var("LUX_PERF_FILE_COUNT")?.parse()?;
+    assert!(
+        file_count >= 100,
+        "LUX-304 requires at least one full batch"
+    );
+    let fixture_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(media_root.join(".lux-fixture.json"))?)?;
+    let directory_count = fixture_manifest["directoryCount"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or("fixture directoryCount is missing or invalid")?;
+    let files_per_directory = file_count.div_ceil(directory_count);
+    for index in 0..file_count {
+        let bucket = index / files_per_directory;
+        let year = 2000 + index % 100;
+        let media_stem = format!("Fixture.Movie.{index:06}.{year}");
+        let poster_path = media_root
+            .join(format!("bucket-{bucket:04}"))
+            .join(format!("{media_stem}-poster.png"));
+        fs::write(poster_path, METADATA_BENCHMARK_PNG)?;
+    }
+
+    let backend = env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    let database_configuration = match backend.as_str() {
+        "sqlite" => DatabaseConfiguration::Sqlite,
+        "postgres" => {
+            let database = match env::var("POSTGRES_TEST_DATABASE") {
+                Ok(database)
+                    if !database.is_empty()
+                        && !matches!(database.as_str(), "postgres" | "template0" | "template1") =>
+                {
+                    database
+                }
+                _ => {
+                    return Err(
+                        "POSTGRES_TEST_DATABASE must name a disposable non-system database".into(),
+                    );
+                }
+            };
+            DatabaseConfiguration::Postgres(PostgresConnection {
+                host: env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: env::var("POSTGRES_TEST_PORT")
+                    .unwrap_or_else(|_| "55432".to_owned())
+                    .parse()?,
+                database,
+                username: env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+                password: env::var("POSTGRES_TEST_PASSWORD")
+                    .unwrap_or_else(|_| "lux-test-password".to_owned()),
+                ssl_mode: "disable".to_owned(),
+            })
+        }
+        unsupported => {
+            return Err(format!(
+                "unsupported LUX_PERF_BACKEND {unsupported:?}; expected sqlite or postgres"
+            )
+            .into());
+        }
+    };
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(&config, &database_configuration).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Admin", "performance-only password")
+        .await?;
+    let library_id_placeholder = if backend == "postgres" { "$1" } else { "?" };
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("LUX-304 Progressive Posters", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 fixture path")?,
+        )
+        .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(FOREGROUND_REQUESTS)
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "admin",
+            "password": "performance-only password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = format!(
+        "lux_session={}",
+        cookie_value(login.headers(), "lux_session")
+    );
+    let jobs = ScanJobService::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+    let scan_job = jobs.create_movie_scan_job(library.id).await?;
+    let scan_started = Instant::now();
+    let observation_database = database.clone();
+    let observation_library_id = library.id.to_string();
+    let observation_started = scan_started;
+    let first_visibility_handle = tokio::spawn(async move {
+        let mut first_item_visible_ms = None;
+        let mut first_poster_indexed_ms = None;
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            if first_item_visible_ms.is_none()
+                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                    "SELECT id FROM media_items
+                     WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE' LIMIT 1"
+                )))
+                .bind(&observation_library_id)
+                .fetch_optional(observation_database.pool())
+                .await?
+                .is_some()
+            {
+                first_item_visible_ms = Some(observation_started.elapsed().as_millis());
+            }
+            if first_poster_indexed_ms.is_none()
+                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                    "SELECT image.item_id FROM item_images image
+                     JOIN media_items item ON item.id = image.item_id
+                     WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
+                       AND image.source = 'LOCAL' LIMIT 1"
+                )))
+                .bind(&observation_library_id)
+                .fetch_optional(observation_database.pool())
+                .await?
+                .is_some()
+            {
+                first_poster_indexed_ms = Some(observation_started.elapsed().as_millis());
+            }
+            if let (Some(first_item_visible_ms), Some(first_poster_indexed_ms)) =
+                (first_item_visible_ms, first_poster_indexed_ms)
+            {
+                return Ok::<_, sqlx::Error>((first_item_visible_ms, first_poster_indexed_ms));
+            }
+            if Instant::now() >= deadline {
+                return Err(sqlx::Error::Protocol(
+                    "LUX-304 first item/poster visibility timed out".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let scan_worker = jobs.clone();
+    let scan_job_id = scan_job.id.clone();
+    let scan_handle =
+        tokio::spawn(async move { scan_worker.run_to_completion(&scan_job_id, 500, None).await });
+    tokio::task::yield_now().await;
+    let scan_running_at_api_start = !scan_handle.is_finished();
+    let api_client = client.clone();
+    let catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
+        library.id
+    );
+    let api_url = catalog_list_url.clone();
+    let api_cookies = cookies.clone();
+    let catalog_list_handle = tokio::spawn(async move {
+        measure_get_requests(
+            &api_client,
+            &api_url,
+            &api_cookies,
+            "LUX-304 progressive catalog list",
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    scan_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+    let scan_job_completion_ms = scan_started.elapsed().as_millis();
+    let (first_item_visible_ms, first_poster_indexed_ms) = first_visibility_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+    let catalog_list_ms = catalog_list_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(std::io::Error::other)?;
+    let catalog_list_p95_ms = percentile(&catalog_list_ms, 95);
+
+    let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
+    let local_poster_queue_ms = loop {
+        let poster_item_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(DISTINCT image.item_id) FROM item_images image
+             JOIN media_items item ON item.id = image.item_id
+             WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
+               AND image.source = 'LOCAL'"
+        )))
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        if poster_item_count >= i64::try_from(file_count).unwrap_or(i64::MAX) {
+            break scan_started.elapsed().as_millis();
+        }
+        if Instant::now() >= poster_queue_deadline {
+            return Err(format!(
+                "LUX-304 local poster queue timed out: {poster_item_count}/{file_count}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let catalog_list_after_queue_ms = measure_get_requests(
+        &client,
+        &catalog_list_url,
+        &cookies,
+        "LUX-304 catalog list after local posters",
+    )
+    .await?;
+    let catalog_list_after_queue_p95_ms = percentile(&catalog_list_after_queue_ms, 95);
+    let online_fill_missing_job_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM metadata_reidentify_jobs
+         WHERE library_id = {library_id_placeholder} AND mode = 'FILL_MISSING'"
+    )))
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let require_detached_poster_queue = env::var("LUX_PERF_REQUIRE_DETACHED_POSTER_QUEUE")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    assert_eq!(online_fill_missing_job_count, 0);
+    assert!(scan_running_at_api_start);
+    assert!(first_item_visible_ms <= scan_job_completion_ms);
+    assert!(
+        first_poster_indexed_ms <= scan_job_completion_ms,
+        "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
+    );
+    if require_detached_poster_queue {
+        assert!(scan_job_completion_ms < local_poster_queue_ms);
+    }
+    println!(
+        "LUX-304 POSTER RESULT {}",
+        serde_json::to_string(&json!({
+            "commit": luxd::COMMIT,
+            "architecture": std::env::consts::ARCH,
+            "databaseBackend": backend,
+            "fileCount": file_count,
+            "directoryCount": directory_count,
+            "scanJobCompletionMs": scan_job_completion_ms,
+            "firstItemVisibleMs": first_item_visible_ms,
+            "firstPosterIndexedMs": first_poster_indexed_ms,
+            "catalogListP95DuringScanMs": catalog_list_p95_ms,
+            "catalogListRequestCount": catalog_list_ms.len(),
+            "catalogListP95AfterPosterQueueMs": catalog_list_after_queue_p95_ms,
+            "catalogListAfterPosterQueueRequestCount": catalog_list_after_queue_ms.len(),
+            "scanRunningAtApiStart": scan_running_at_api_start,
+            "localPosterQueueCompleteMs": local_poster_queue_ms,
+            "onlineFillMissingJobCount": online_fill_missing_job_count,
+        }))?
+    );
     server.abort();
     Ok(())
 }

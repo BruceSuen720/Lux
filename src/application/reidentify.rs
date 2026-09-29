@@ -990,6 +990,22 @@ impl MetadataReidentifyService {
         Ok(Some(clients))
     }
 
+    pub(crate) async fn has_selected_scraper_for_item(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, MetadataReidentifyError> {
+        if self.selection.is_none() {
+            return Ok(false);
+        }
+        if self.resolver.is_none() {
+            return Ok(!self.scraper.provider_key().trim().is_empty());
+        }
+        self.providers_for_item(item_id, true)
+            .await
+            .map(|providers| providers.is_some_and(|providers| !providers.is_empty()))
+            .map_err(MetadataReidentifyError::Scraper)
+    }
+
     async fn refresh_with_scraper_roles(
         &self,
         item_id: &str,

@@ -10,7 +10,10 @@ use crate::{
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
-    storage::NewItemMetadataCompletenessResult,
+    storage::{
+        ItemImageBatchInsert, ItemImageInsert, NewItemMetadataCompletenessCheck,
+        NewItemMetadataCompletenessResult,
+    },
 };
 
 async fn refresh_recommendation_stats(database: &Database) {
@@ -989,6 +992,356 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
 }
 
 #[tokio::test]
+async fn progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    for name in [
+        "First.Movie.2023.mkv",
+        "Second.Movie.2024.mkv",
+        "Third.Movie.2025.mkv",
+        "Fourth.Movie.2026.mkv",
+    ] {
+        tokio::fs::write(media_root.join(name), b"video")
+            .await
+            .expect("movie file");
+    }
+    tokio::fs::write(media_root.join("notes.txt"), b"not media")
+        .await
+        .expect("non-media file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Backfill", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    let root_id = root.root.id.to_string();
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index media files");
+
+    let expected_ids = database
+        .query_scalar::<String>(
+            "SELECT entry.id
+             FROM filesystem_entries entry
+             JOIN media_sources source ON source.filesystem_entry_id = entry.id
+             JOIN media_items item ON item.id = source.item_id
+             WHERE entry.library_root_id = ? AND entry.entry_kind = 'FILE'
+               AND entry.is_missing = 0 AND item.removed_at IS NULL
+             ORDER BY entry.id",
+        )
+        .bind(&root_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read media source entry ids");
+    assert_eq!(expected_ids.len(), 4, "the text file is not a media source");
+    sqlx::query("UPDATE filesystem_entries SET is_missing = 1 WHERE id = ?")
+        .bind(&expected_ids[0])
+        .execute(database.pool())
+        .await
+        .expect("mark one entry missing");
+    sqlx::query(
+        "UPDATE media_items SET removed_at = unixepoch()
+         WHERE id = (SELECT item_id FROM media_sources WHERE filesystem_entry_id = ?)",
+    )
+    .bind(&expected_ids[1])
+    .execute(database.pool())
+    .await
+    .expect("remove one source item");
+
+    assert_eq!(
+        database
+            .ensure_scan_local_metadata_backfill_roots()
+            .await
+            .expect("register existing roots"),
+        1
+    );
+    assert!(
+        !database
+            .ensure_scan_local_metadata_backfill_root(&root_id)
+            .await
+            .expect("register existing root again"),
+        "root registration is idempotent"
+    );
+    assert_eq!(
+        database
+            .ensure_scan_local_metadata_backfill_roots()
+            .await
+            .expect("register roots again"),
+        0
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(0)
+            .await
+            .is_err(),
+        "a zero-sized page is invalid"
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(17)
+            .await
+            .is_err(),
+        "the public storage limit caps backfill windows"
+    );
+
+    let first = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim first page")
+        .expect("first page exists");
+    assert_eq!(first.library_root_id, root_id);
+    assert_eq!(first.entry_ids.len(), 1);
+    assert!(first.has_more);
+    assert_eq!(first.cursor_entry_id, None);
+    assert_eq!(first.attempts, 1);
+    assert_eq!(first.entry_ids[0], expected_ids[2]);
+
+    assert!(
+        database
+            .fail_scan_local_metadata_backfill_page(
+                &first,
+                "temporary local failure",
+                Some(i64::MAX),
+            )
+            .await
+            .expect("persist page failure")
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await
+            .expect("check retry delay")
+            .is_none(),
+        "failed page remains deferred"
+    );
+    sqlx::query(
+        "UPDATE scan_local_metadata_backfills SET next_attempt_at = 0 WHERE library_root_id = ?",
+    )
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("make retry due");
+    let retried = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim retry")
+        .expect("retry page exists");
+    assert_eq!(retried.entry_ids, first.entry_ids);
+    assert_eq!(retried.cursor_entry_id, first.cursor_entry_id);
+    assert_eq!(retried.attempts, 2);
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&first)
+            .await
+            .expect("reject stale worker completion"),
+        "an old attempt cannot advance the retry cursor"
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = ?
+             WHERE library_root_id = ?",
+        )
+        .bind(&expected_ids[0])
+        .bind(&root_id)
+        .execute(database.pool())
+        .await
+        .expect("simulate a cursor change during the claimed attempt");
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&retried)
+            .await
+            .expect("reject mismatched cursor CAS"),
+        "a page cannot advance a cursor that changed during its attempt"
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = NULL
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await
+        .expect("restore the claimed page cursor");
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&retried)
+            .await
+            .expect("advance first page")
+    );
+
+    let second = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim second page")
+        .expect("second page exists");
+    assert_eq!(
+        second.cursor_entry_id.as_deref(),
+        Some(first.entry_ids[0].as_str())
+    );
+    assert_eq!(second.entry_ids, vec![expected_ids[3].clone()]);
+    assert!(!second.has_more);
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_backfills()
+            .await
+            .expect("recover interrupted page"),
+        1
+    );
+    let recovered = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("claim recovered page")
+        .expect("recovered page exists");
+    assert_eq!(recovered.entry_ids, second.entry_ids);
+    assert_eq!(recovered.cursor_entry_id, second.cursor_entry_id);
+    assert_eq!(recovered.attempts, 4);
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&recovered)
+            .await
+            .expect("complete backfill")
+    );
+    let completed_status: String = database
+        .query_scalar("SELECT status FROM scan_local_metadata_backfills WHERE library_root_id = ?")
+        .bind(&root_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read completed status");
+    assert_eq!(completed_status, "COMPLETED");
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await
+            .expect("check completed root")
+            .is_none()
+    );
+
+    let empty_root_path = temp_dir.path().join("Empty");
+    tokio::fs::create_dir_all(&empty_root_path)
+        .await
+        .expect("empty root directory");
+    let empty_library = libraries
+        .create_library("Empty backfill", LibraryKind::Movie, false)
+        .await
+        .expect("empty library");
+    let empty_root = libraries
+        .add_root(
+            empty_library.id,
+            empty_root_path.to_str().expect("empty root path"),
+        )
+        .await
+        .expect("empty library root");
+    let empty_root_id = empty_root.root.id.to_string();
+    assert!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&empty_root_id)
+            .await
+            .expect("register empty root")
+    );
+
+    let populated_root_path = temp_dir.path().join("Populated");
+    tokio::fs::create_dir_all(&populated_root_path)
+        .await
+        .expect("populated root directory");
+    tokio::fs::write(populated_root_path.join("Later.Movie.2026.mkv"), b"video")
+        .await
+        .expect("populated root media file");
+    let populated_library = libraries
+        .create_library("Populated backfill", LibraryKind::Movie, false)
+        .await
+        .expect("populated library");
+    let populated_root = libraries
+        .add_root(
+            populated_library.id,
+            populated_root_path.to_str().expect("populated root path"),
+        )
+        .await
+        .expect("populated library root");
+    let populated_root_id = populated_root.root.id.to_string();
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(populated_library.id)
+        .await
+        .expect("index populated root");
+    assert!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&populated_root_id)
+            .await
+            .expect("register populated root")
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET updated_at = 0
+             WHERE library_root_id = ?",
+        )
+        .bind(&empty_root_id)
+        .execute(database.pool())
+        .await
+        .expect("order empty root first");
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET updated_at = 1
+             WHERE library_root_id = ?",
+        )
+        .bind(&populated_root_id)
+        .execute(database.pool())
+        .await
+        .expect("order populated root second");
+    let populated_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await
+        .expect("skip empty root and keep claiming")
+        .expect("populated root page remains claimable");
+    assert_eq!(populated_page.library_root_id, populated_root_id);
+    assert_eq!(populated_page.entry_ids.len(), 1);
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&populated_page)
+            .await
+            .expect("complete populated root")
+    );
+    let empty_status: String = database
+        .query_scalar("SELECT status FROM scan_local_metadata_backfills WHERE library_root_id = ?")
+        .bind(&empty_root_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read empty-root status");
+    assert_eq!(empty_status, "COMPLETED");
+
+    database
+        .query("DELETE FROM library_roots WHERE id = ?")
+        .bind(&empty_root_id)
+        .execute(database.pool())
+        .await
+        .expect("delete empty root");
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+            )
+            .bind(&empty_root_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("check root cascade"),
+        0
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -1345,6 +1698,775 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
 }
 
 #[tokio::test]
+async fn progressive_scan_metadata_completeness_batches_are_atomic_and_versioned() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Batch Claims (2024)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Batch.Claims.2024.mkv"), b"movie")
+        .await
+        .expect("movie file");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Completeness claims", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index item");
+    let item_id = database
+        .query_scalar::<String>(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("movie item");
+    let fingerprint_v1 = b"batch-input-v1";
+    let checks = [
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: fingerprint_v1,
+        },
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: fingerprint_v1,
+        },
+    ];
+
+    let (claimed_a, claimed_b) = tokio::join!(
+        database.prepare_and_claim_item_metadata_completeness_checks(&checks),
+        database.prepare_and_claim_item_metadata_completeness_checks(&checks),
+    );
+    let claimed_a = claimed_a.expect("first batch claim");
+    let claimed_b = claimed_b.expect("concurrent batch claim");
+    assert_eq!(claimed_a.len() + claimed_b.len(), 2);
+    assert!(
+        claimed_a.is_empty() || claimed_b.is_empty(),
+        "concurrent workers cannot claim one input twice"
+    );
+
+    let library_id = library.id.to_string();
+    let ready_results = [
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: fingerprint_v1,
+            is_missing: true,
+            checked_at: 1_000,
+        },
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: fingerprint_v1,
+            is_missing: false,
+            checked_at: 1_000,
+        },
+    ];
+    let completed = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &ready_results, &[])
+        .await
+        .expect("save local results without dispatch");
+    assert_eq!(completed.updated_count, 2);
+    assert!(completed.scheduled_job_ids.is_empty());
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&checks)
+            .await
+            .expect("same completed input stays ready")
+            .is_empty()
+    );
+
+    let fingerprint_v2 = b"batch-input-v2";
+    let replacement = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint_v2,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&replacement)
+            .await
+            .expect("replace changed input version"),
+        vec![0]
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                fingerprint_v1,
+                true,
+                1_001,
+            )
+            .await
+            .expect("reject stale worker result")
+    );
+    let replacement_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint_v2,
+        is_missing: false,
+        checked_at: 1_002,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(&library_id, &replacement_result, &[])
+            .await
+            .expect("complete replacement version")
+            .updated_count,
+        1
+    );
+
+    let retry_fingerprint = b"batch-retry-input";
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await
+            .expect("claim retry check"),
+        vec![0]
+    );
+    assert!(
+        database
+            .fail_item_metadata_completeness_check(
+                &item_id,
+                "BACKDROP",
+                retry_fingerprint,
+                Some(2_000),
+                "temporary local error",
+            )
+            .await
+            .expect("fail local capability")
+    );
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await
+            .expect("retry failed check"),
+        vec![0]
+    );
+    let retry_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+        is_missing: false,
+        checked_at: 2_001,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(&library_id, &retry_result, &[])
+            .await
+            .expect("complete failed check retry")
+            .updated_count,
+        1
+    );
+
+    let duplicate_checks = [checks[0], checks[0]];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&duplicate_checks)
+            .await
+            .is_err()
+    );
+    let empty_fingerprint = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: &[],
+    }];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&empty_fingerprint)
+            .await
+            .is_err()
+    );
+    let oversized_fingerprint = vec![0; 257];
+    let oversized_fingerprint_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: &oversized_fingerprint,
+    }];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&oversized_fingerprint_check)
+            .await
+            .is_err()
+    );
+    let oversized_checks = vec![checks[0]; 513];
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&oversized_checks)
+            .await
+            .is_err()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for directory in ["Batch First (2024)", "Batch Second (2024)"] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("movie directory");
+        tokio::fs::write(
+            movie_dir.join(format!("{}.mkv", directory.replace(' ', "."))),
+            b"video",
+        )
+        .await
+        .expect("movie file");
+    }
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Local image batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movies");
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("movie ids");
+    assert_eq!(item_ids.len(), 2);
+
+    for item_id in &item_ids {
+        database
+            .set_poster_fallback_required(item_id, true)
+            .await
+            .expect("require fallback before poster write");
+    }
+    let make_image = |image_type: &str, index: i64, path: &str, tag: &str| ItemImageInsert {
+        image_type: image_type.to_owned(),
+        image_index: index,
+        local_path: path.to_owned(),
+        file_size: 128,
+        width: Some(64),
+        height: Some(96),
+        content_tag: tag.to_owned(),
+        source: "LOCAL".to_owned(),
+        source_url: None,
+    };
+    let batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: vec![
+                make_image("POSTER", 0, "/media/first/poster.jpg", "first-poster-v1"),
+                make_image("FANART", 0, "/media/first/fanart.jpg", "first-fanart-v1"),
+                make_image("FANART", 1, "/media/first/fanart-2.jpg", "first-fanart-v2"),
+            ],
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/second/poster.jpg",
+                "second-poster-v1",
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&batch)
+            .await
+            .expect("insert images for both items"),
+        4
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await
+            .expect("count ordered fanart"),
+        2
+    );
+    let fallback: Vec<i64> = database
+        .query_scalar(
+            "SELECT poster_fallback_required FROM media_items
+             WHERE id IN (?, ?) ORDER BY title",
+        )
+        .bind(&item_ids[0])
+        .bind(&item_ids[1])
+        .fetch_all(database.pool())
+        .await
+        .expect("read fallback flags");
+    assert_eq!(fallback, vec![0, 0]);
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&batch)
+            .await
+            .expect("repeat identical images"),
+        0,
+        "identical content is an idempotent upsert"
+    );
+    let changed_poster_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![make_image(
+            "POSTER",
+            0,
+            "/media/first/poster-updated.jpg",
+            "first-poster-v2",
+        )],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&changed_poster_batch)
+            .await
+            .expect("update changed poster path"),
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT local_path FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await
+            .expect("read updated poster path"),
+        "/media/first/poster-updated.jpg"
+    );
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&[])
+            .await
+            .expect("empty page is a no-op"),
+        0
+    );
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
+                item_id: item_ids[0].clone(),
+                images: Vec::new(),
+                clear_poster_fallback: false,
+            }])
+            .await
+            .expect("image-less item page is a no-op"),
+        0
+    );
+    assert_eq!(database.query_count(), 0);
+    let oversized_batch = (0..17)
+        .map(|index| ItemImageBatchInsert {
+            item_id: format!("item-{index}"),
+            images: Vec::new(),
+            clear_poster_fallback: false,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&oversized_batch)
+            .await
+            .is_err(),
+        "a storage page cannot exceed sixteen items"
+    );
+
+    let second_item_id = item_ids[1].clone();
+    let trigger_sql = format!(
+        "CREATE TRIGGER reject_second_local_image
+         BEFORE INSERT ON item_images
+         WHEN NEW.item_id = '{second_item_id}' AND NEW.local_path LIKE '%reject%'
+         BEGIN SELECT RAISE(ABORT, 'injected image batch failure'); END"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await
+        .expect("install failure trigger");
+    for item_id in &item_ids {
+        database
+            .set_poster_fallback_required(item_id, true)
+            .await
+            .expect("restore fallback before rollback test");
+    }
+    let failing_batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/first/poster-failed.jpg",
+                "first-poster-v3",
+            )],
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "LOGO",
+                0,
+                "/media/second/reject-logo.jpg",
+                "reject-logo",
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&failing_batch)
+            .await
+            .is_err(),
+        "a single image failure rolls back the complete item page"
+    );
+    sqlx::query("DROP TRIGGER reject_second_local_image")
+        .execute(database.pool())
+        .await
+        .expect("drop failure trigger");
+    let first_image_path: String = database
+        .query_scalar(
+            "SELECT local_path FROM item_images
+             WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+        )
+        .bind(&item_ids[0])
+        .fetch_one(database.pool())
+        .await
+        .expect("read first image after rollback");
+    assert_eq!(first_image_path, "/media/first/poster-updated.jpg");
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'LOGO'",
+            )
+            .bind(&item_ids[1])
+            .fetch_one(database.pool())
+            .await
+            .expect("count rolled-back logo"),
+        0
+    );
+    let fallback: Vec<i64> = database
+        .query_scalar(
+            "SELECT poster_fallback_required FROM media_items
+             WHERE id IN (?, ?) ORDER BY title",
+        )
+        .bind(&item_ids[0])
+        .bind(&item_ids[1])
+        .fetch_all(database.pool())
+        .await
+        .expect("read rolled-back fallback flags");
+    assert_eq!(fallback, vec![1, 1]);
+    database.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_local_item_image_batch_is_bounded_idempotent_and_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection
+    };
+    let database =
+        Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
+            .await?;
+    let media_root = temp_dir.path().join("Movies");
+    for directory in [
+        "Postgres Batch First (2024)",
+        "Postgres Batch Second (2024)",
+    ] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("{}.mkv", directory.replace(' ', "."))),
+            b"video",
+        )
+        .await?;
+    }
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Postgres local image batch", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(item_ids.len(), 2);
+    for item_id in &item_ids {
+        database.set_poster_fallback_required(item_id, true).await?;
+    }
+    let make_image = |image_type: &str, index: i64, path: String, tag: String| ItemImageInsert {
+        image_type: image_type.to_owned(),
+        image_index: index,
+        local_path: path,
+        file_size: 128,
+        width: Some(64),
+        height: Some(96),
+        content_tag: tag,
+        source: "LOCAL".to_owned(),
+        source_url: None,
+    };
+    let mut first_images = vec![make_image(
+        "POSTER",
+        0,
+        "/media/first/poster.jpg".to_owned(),
+        "poster-v1".to_owned(),
+    )];
+    first_images.extend((0..65).map(|index| {
+        make_image(
+            "FANART",
+            index,
+            format!("/media/first/fanart-{index}.jpg"),
+            format!("fanart-v{index}"),
+        )
+    }));
+    let batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: first_images,
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/second/poster.jpg".to_owned(),
+                "poster-v1".to_owned(),
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert_eq!(
+        database.insert_item_images_batch_at_indices(&batch).await?,
+        67
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await?,
+        65
+    );
+    assert_eq!(
+        database.insert_item_images_batch_at_indices(&batch).await?,
+        0
+    );
+    let changed_poster_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![make_image(
+            "POSTER",
+            0,
+            "/media/first/poster-updated.jpg".to_owned(),
+            "poster-v2".to_owned(),
+        )],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&changed_poster_batch)
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT local_path FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await?,
+        "/media/first/poster-updated.jpg"
+    );
+    let empty_batch: [ItemImageBatchInsert; 0] = [];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&empty_batch)
+            .await?,
+        0
+    );
+
+    let oversized = (0..17)
+        .map(|index| ItemImageBatchInsert {
+            item_id: format!("postgres-item-{index}"),
+            images: Vec::new(),
+            clear_poster_fallback: false,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&oversized)
+            .await
+            .is_err()
+    );
+
+    let trigger_function = format!(
+        "CREATE FUNCTION reject_postgres_local_image_batch() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.item_id = '{second_item}' AND NEW.local_path LIKE '%reject%' THEN
+                 RAISE EXCEPTION 'injected image batch failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+        second_item = item_ids[1],
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_function))
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_postgres_local_image_batch
+         BEFORE INSERT ON item_images
+         FOR EACH ROW EXECUTE FUNCTION reject_postgres_local_image_batch()",
+    )
+    .execute(database.pool())
+    .await?;
+    for item_id in &item_ids {
+        database.set_poster_fallback_required(item_id, true).await?;
+    }
+    let failing_batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/first/poster-failed.jpg".to_owned(),
+                "poster-v3".to_owned(),
+            )],
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "LOGO",
+                0,
+                "/media/second/reject-logo.jpg".to_owned(),
+                "reject-logo".to_owned(),
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&failing_batch)
+            .await
+            .is_err()
+    );
+    sqlx::query("DROP TRIGGER reject_postgres_local_image_batch ON item_images")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION reject_postgres_local_image_batch()")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT local_path FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await?,
+        "/media/first/poster-updated.jpg"
+    );
+    let fallback: Vec<i64> = database
+        .query_scalar(
+            "SELECT poster_fallback_required FROM media_items
+             WHERE id IN (?, ?) ORDER BY title",
+        )
+        .bind(&item_ids[0])
+        .bind(&item_ids[1])
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(fallback, vec![1, 1]);
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -1352,7 +2474,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         config_dir: temp_dir.path().join("config"),
     };
     let media_root = temp_dir.path().join("Movies");
-    for directory in ["First Movie (2025)", "Second Movie (2025)"] {
+    for directory in [
+        "First Movie (2025)",
+        "Second Movie (2025)",
+        "Third Movie (2025)",
+        "Replay Movie (2025)",
+    ] {
         let movie_dir = media_root.join(directory);
         tokio::fs::create_dir_all(&movie_dir)
             .await
@@ -1384,7 +2511,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .fetch_all(database.pool())
         .await
         .expect("indexed movies");
-    assert_eq!(item_ids.len(), 2);
+    assert_eq!(item_ids.len(), 4);
     let library_id = library.id.to_string();
 
     sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
@@ -1392,7 +2519,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .execute(database.pool())
         .await
         .expect("disable scan auto-match");
-    let poster_fingerprints = [b"poster-v1".to_vec(), b"poster-v2".to_vec()];
+    let poster_fingerprints = [
+        b"poster-v1".to_vec(),
+        b"poster-v2".to_vec(),
+        b"poster-v3".to_vec(),
+        b"poster-v4".to_vec(),
+    ];
     let mut poster_results = Vec::new();
     for (item_id, fingerprint) in item_ids.iter().zip(&poster_fingerprints) {
         assert!(
@@ -1419,7 +2551,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &poster_results, &item_ids)
         .await
         .expect("persist missing posters while auto-match is disabled");
-    assert_eq!(disabled.updated_count, 2);
+    assert_eq!(disabled.updated_count, 4);
     assert!(disabled.scheduled_job_ids.is_empty());
     for item_id in &item_ids {
         let completeness = database
@@ -1436,6 +2568,149 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .execute(database.pool())
         .await
         .expect("enable scan auto-match");
+
+    let incremental_disabled_fingerprint = b"incremental-disabled";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_ids[0],
+                "EXTERNAL_IDS",
+                incremental_disabled_fingerprint,
+            )
+            .await
+            .expect("prepare disabled incremental capability")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_ids[0],
+                "EXTERNAL_IDS",
+                incremental_disabled_fingerprint,
+            )
+            .await
+            .expect("claim disabled incremental capability")
+    );
+    let incremental_disabled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[0],
+        capability: "EXTERNAL_IDS",
+        input_fingerprint: incremental_disabled_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let incremental_disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &incremental_disabled_result,
+            std::slice::from_ref(&item_ids[0]),
+            Some(false),
+        )
+        .await
+        .expect("incremental job policy overrides enabled full-scan policy");
+    assert_eq!(incremental_disabled.updated_count, 1);
+    assert!(incremental_disabled.scheduled_job_ids.is_empty());
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("disable full-scan policy");
+    let incremental_enabled_fingerprint = b"incremental-enabled";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_ids[2],
+                "TRAILERS",
+                incremental_enabled_fingerprint,
+            )
+            .await
+            .expect("prepare enabled incremental capability")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_ids[2],
+                "TRAILERS",
+                incremental_enabled_fingerprint,
+            )
+            .await
+            .expect("claim enabled incremental capability")
+    );
+    let incremental_enabled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[2],
+        capability: "TRAILERS",
+        input_fingerprint: incremental_enabled_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let incremental_enabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &incremental_enabled_result,
+            std::slice::from_ref(&item_ids[2]),
+            Some(true),
+        )
+        .await
+        .expect("incremental job policy can enable auto-match for its sources");
+    assert_eq!(incremental_enabled.scheduled_job_ids.len(), 1);
+
+    let replay_fingerprint = b"replay-without-new-result";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_ids[3], "POSTER", replay_fingerprint,)
+            .await
+            .expect("prepare replay poster")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_ids[3], "POSTER", replay_fingerprint,)
+            .await
+            .expect("claim replay poster")
+    );
+    let replay_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[3],
+        capability: "POSTER",
+        input_fingerprint: replay_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let policy_disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &replay_result,
+            std::slice::from_ref(&item_ids[3]),
+            Some(false),
+        )
+        .await
+        .expect("persist missing without scheduling when the call disables auto-match");
+    assert_eq!(policy_disabled.updated_count, 1);
+    assert!(policy_disabled.scheduled_job_ids.is_empty());
+    let replayed_without_new_result = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("schedule an already-confirmed missing poster after policy changes");
+    assert_eq!(replayed_without_new_result.updated_count, 0);
+    assert_eq!(replayed_without_new_result.scheduled_job_ids.len(), 1);
+    let replayed_active_job = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("deduplicate replay against the active fill-missing job");
+    assert!(replayed_active_job.scheduled_job_ids.is_empty());
+
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await
+        .expect("restore full-scan policy");
     database
         .create_metadata_reidentify_job(
             "manual-fill-missing",
@@ -1445,7 +2720,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .await
         .expect("create active manual fill-missing job");
 
-    let backdrop_fingerprints = [b"backdrop-v1".to_vec(), b"backdrop-v2".to_vec()];
+    let backdrop_fingerprints = [
+        b"backdrop-v1".to_vec(),
+        b"backdrop-v2".to_vec(),
+        b"backdrop-v3".to_vec(),
+        b"backdrop-v4".to_vec(),
+    ];
     let mut backdrop_results = Vec::new();
     for (item_id, fingerprint) in item_ids.iter().zip(&backdrop_fingerprints) {
         assert!(
@@ -1506,7 +2786,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
         .await
         .expect("atomically persist and schedule missing backdrops");
-    assert_eq!(scheduled.updated_count, 2);
+    assert_eq!(scheduled.updated_count, 4);
     assert_eq!(scheduled.scheduled_job_ids.len(), 1);
     let scheduled_job_id = &scheduled.scheduled_job_ids[0];
     let job: (String, String, i64, String) = database
@@ -1544,7 +2824,12 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(replayed.updated_count, 0);
     assert!(replayed.scheduled_job_ids.is_empty());
 
-    let still_fingerprints = [b"still-v1".to_vec(), b"still-v2".to_vec()];
+    let still_fingerprints = [
+        b"still-v1".to_vec(),
+        b"still-v2".to_vec(),
+        b"still-v3".to_vec(),
+        b"still-v4".to_vec(),
+    ];
     let duplicate_results = item_ids
         .iter()
         .zip(&still_fingerprints)
@@ -1586,7 +2871,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         )
         .await
         .expect("reuse active fill-missing jobs");
-    assert_eq!(deduplicated.updated_count, 2);
+    assert_eq!(deduplicated.updated_count, 4);
     assert!(deduplicated.scheduled_job_ids.is_empty());
     assert_eq!(
         database
@@ -1596,9 +2881,130 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             .fetch_one(database.pool())
             .await
             .expect("count fill-missing jobs"),
-        2,
-        "the manual active job plus one eligible automatic job are retained"
+        4,
+        "replay, manual, and incremental-policy jobs plus one eligible auto job are retained"
     );
+
+    let pagination_root_path = temp_dir.path().join("Pagination Movies");
+    for index in 0..103 {
+        let directory = format!("Pagination Movie {index:03} (2025)");
+        let movie_dir = pagination_root_path.join(&directory);
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("pagination movie directory");
+        tokio::fs::write(
+            movie_dir.join(format!("Pagination.Movie.{index:03}.2025.mkv")),
+            b"video",
+        )
+        .await
+        .expect("pagination movie file");
+    }
+    let pagination_library = libraries
+        .create_library("Progressive dispatch pagination", LibraryKind::Movie, false)
+        .await
+        .expect("pagination library");
+    libraries
+        .add_root(
+            pagination_library.id,
+            pagination_root_path.to_str().expect("pagination root"),
+        )
+        .await
+        .expect("pagination library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(pagination_library.id)
+        .await
+        .expect("index pagination movies");
+    let pagination_library_id = pagination_library.id.to_string();
+    let pagination_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read pagination movies");
+    assert_eq!(pagination_item_ids.len(), 103);
+    let unsupported_item_id = &pagination_item_ids[0];
+    let removed_item_id = &pagination_item_ids[1];
+    database
+        .query("UPDATE media_items SET item_type = 'FOLDER' WHERE id = ?")
+        .bind(unsupported_item_id)
+        .execute(database.pool())
+        .await
+        .expect("mark one item type as unsupported for automatic metadata jobs");
+    database
+        .query("UPDATE media_items SET removed_at = 1 WHERE id = ?")
+        .bind(removed_item_id)
+        .execute(database.pool())
+        .await
+        .expect("mark one item removed before metadata completion");
+    let pagination_fingerprint = b"pagination-input-v1";
+    let pagination_checks = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&pagination_checks)
+            .await
+            .expect("claim pagination completeness checks")
+            .len(),
+        103
+    );
+    let pagination_results = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+            is_missing: true,
+            checked_at: 13,
+        })
+        .collect::<Vec<_>>();
+    let pagination_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &pagination_library_id,
+            &pagination_results,
+            &pagination_item_ids,
+            Some(true),
+        )
+        .await
+        .expect("enqueue pagination jobs");
+    assert_eq!(pagination_dispatch.updated_count, 102);
+    assert_eq!(pagination_dispatch.scheduled_job_ids.len(), 2);
+    let pagination_job_counts: Vec<i64> = database
+        .query_scalar(
+            "SELECT total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING' ORDER BY total_count DESC",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read pagination job sizes");
+    assert_eq!(pagination_job_counts, vec![100, 1]);
+    let pagination_job_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT job_items.item_id FROM metadata_reidentify_job_items job_items
+             JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+             WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("read paginated job items");
+    assert_eq!(pagination_job_item_ids.len(), 101);
+    assert!(!pagination_job_item_ids.contains(unsupported_item_id));
+    assert!(!pagination_job_item_ids.contains(removed_item_id));
+    let removed_completeness = database
+        .find_item_metadata_completeness(removed_item_id, "POSTER")
+        .await
+        .expect("read removed item completeness")
+        .expect("removed item completeness row");
+    assert_eq!(removed_completeness.local_state, "RUNNING");
 
     database.close().await;
 }
@@ -1650,6 +3056,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let movie_dir = media_root.join("Postgres Movie (2025)");
     tokio::fs::create_dir_all(&movie_dir).await?;
     tokio::fs::write(movie_dir.join("Postgres.Movie.2025.mkv"), b"video").await?;
+    tokio::fs::write(media_root.join("Second.Postgres.Movie.2026.mkv"), b"video").await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Postgres progressive", LibraryKind::Movie, false)
@@ -1664,13 +3071,329 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     LibraryScanner::new(database.clone())
         .scan_movie_library(library.id)
         .await?;
-    let item_id = database
-        .query_scalar::<String>(
-            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
         )
         .bind(library.id.to_string())
-        .fetch_one(database.pool())
+        .fetch_all(database.pool())
         .await?;
+    assert_eq!(item_ids.len(), 2);
+    let item_id = item_ids[0].clone();
+    let replay_item_id = item_ids[1].clone();
+
+    let completeness_fingerprint_v1 = b"postgres-batch-input-v1";
+    let completeness_checks = [
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: completeness_fingerprint_v1,
+        },
+        NewItemMetadataCompletenessCheck {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: completeness_fingerprint_v1,
+        },
+    ];
+    let (check_a, check_b) = tokio::join!(
+        database.prepare_and_claim_item_metadata_completeness_checks(&completeness_checks),
+        database.prepare_and_claim_item_metadata_completeness_checks(&completeness_checks),
+    );
+    let check_a = check_a?;
+    let check_b = check_b?;
+    assert_eq!(check_a.len() + check_b.len(), 2);
+    assert!(check_a.is_empty() || check_b.is_empty());
+    let completeness_results = [
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: completeness_fingerprint_v1,
+            is_missing: true,
+            checked_at: 1_000,
+        },
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: completeness_fingerprint_v1,
+            is_missing: false,
+            checked_at: 1_000,
+        },
+    ];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library.id.to_string(),
+                &completeness_results,
+                &[],
+            )
+            .await?
+            .updated_count,
+        2
+    );
+    assert!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&completeness_checks)
+            .await?
+            .is_empty()
+    );
+
+    let library_id = library.id.to_string();
+    database
+        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let replay_fingerprint = b"postgres-replay-without-new-result";
+    assert!(database
+        .prepare_item_metadata_completeness_check(
+            &replay_item_id,
+            "POSTER",
+            replay_fingerprint,
+        )
+        .await?);
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&replay_item_id, "POSTER", replay_fingerprint,)
+            .await?
+    );
+    let replay_result = [NewItemMetadataCompletenessResult {
+        item_id: &replay_item_id,
+        capability: "POSTER",
+        input_fingerprint: replay_fingerprint,
+        is_missing: true,
+        checked_at: 1_001,
+    }];
+    let policy_disabled = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &replay_result,
+            std::slice::from_ref(&replay_item_id),
+            Some(false),
+        )
+        .await?;
+    assert_eq!(policy_disabled.updated_count, 1);
+    assert!(policy_disabled.scheduled_job_ids.is_empty());
+    let default_policy_replay = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    assert!(default_policy_replay.scheduled_job_ids.is_empty());
+    let enabled_policy_replay = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+            Some(true),
+        )
+        .await?;
+    assert_eq!(enabled_policy_replay.updated_count, 0);
+    assert_eq!(enabled_policy_replay.scheduled_job_ids.len(), 1);
+    let duplicate_policy_replay = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+            Some(true),
+        )
+        .await?;
+    assert!(duplicate_policy_replay.scheduled_job_ids.is_empty());
+    database
+        .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let completeness_fingerprint_v2 = b"postgres-batch-input-v2";
+    let replacement_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: completeness_fingerprint_v2,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&replacement_check)
+            .await?,
+        vec![0]
+    );
+    assert!(
+        !database
+            .finish_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                completeness_fingerprint_v1,
+                true,
+                1_001,
+            )
+            .await?
+    );
+    let retry_fingerprint = b"postgres-batch-retry";
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+    }];
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await?,
+        vec![0]
+    );
+    assert!(
+        database
+            .fail_item_metadata_completeness_check(
+                &item_id,
+                "BACKDROP",
+                retry_fingerprint,
+                Some(2_000),
+                "temporary local error",
+            )
+            .await?
+    );
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&retry_check)
+            .await?,
+        vec![0]
+    );
+    let retry_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "BACKDROP",
+        input_fingerprint: retry_fingerprint,
+        is_missing: false,
+        checked_at: 2_001,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library.id.to_string(),
+                &retry_result,
+                &[],
+            )
+            .await?
+            .updated_count,
+        1
+    );
+
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        1
+    );
+    let (claim_a, claim_b) = tokio::join!(
+        database.claim_next_scan_local_metadata_backfill_page(1),
+        database.claim_next_scan_local_metadata_backfill_page(1),
+    );
+    let mut claimed_pages = [claim_a?, claim_b?].into_iter().flatten();
+    let backfill_page = claimed_pages
+        .next()
+        .ok_or("PostgreSQL backfill page was not claimable")?;
+    assert!(
+        claimed_pages.next().is_none(),
+        "concurrent PostgreSQL claimers cannot claim the same root page twice"
+    );
+    assert_eq!(backfill_page.library_root_id, root_id);
+    assert_eq!(backfill_page.entry_ids.len(), 1);
+    assert!(backfill_page.has_more);
+    assert!(
+        database
+            .fail_scan_local_metadata_backfill_page(
+                &backfill_page,
+                "temporary local failure",
+                Some(i64::MAX),
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await?
+            .is_none()
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET next_attempt_at = 0
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    let retry_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await?
+        .ok_or("failed PostgreSQL page did not retry")?;
+    assert_eq!(retry_page.entry_ids, backfill_page.entry_ids);
+    assert_eq!(retry_page.cursor_entry_id, backfill_page.cursor_entry_id);
+    assert_eq!(retry_page.attempts, 2);
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&backfill_page)
+            .await?
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = 'stale-cursor'
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&retry_page)
+            .await?
+    );
+    database
+        .query(
+            "UPDATE scan_local_metadata_backfills SET cursor_entry_id = NULL
+             WHERE library_root_id = ?",
+        )
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&retry_page)
+            .await?
+    );
+    let second_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await?
+        .ok_or("second PostgreSQL page was not claimable")?;
+    assert_eq!(
+        second_page.cursor_entry_id,
+        retry_page.entry_ids.first().cloned()
+    );
+    assert!(!second_page.has_more);
+    assert_eq!(
+        database
+            .requeue_interrupted_scan_local_metadata_backfills()
+            .await?,
+        1
+    );
+    let recovered_page = database
+        .claim_next_scan_local_metadata_backfill_page(1)
+        .await?
+        .ok_or("interrupted PostgreSQL page was not recovered")?;
+    assert_eq!(recovered_page.entry_ids, second_page.entry_ids);
+    assert_eq!(recovered_page.cursor_entry_id, second_page.cursor_entry_id);
+    assert_eq!(recovered_page.attempts, 4);
+    assert!(
+        !database
+            .complete_scan_local_metadata_backfill_page(&second_page)
+            .await?
+    );
+    assert!(
+        database
+            .complete_scan_local_metadata_backfill_page(&recovered_page)
+            .await?
+    );
+    assert!(
+        !database
+            .ensure_scan_local_metadata_backfill_root(&root_id)
+            .await?
+    );
 
     let source_ids = vec!["postgres-source".to_owned()];
     let batch = NewScanLocalMetadataBatch {
@@ -1795,8 +3518,8 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let missing = database
         .list_confirmed_missing_metadata("POSTER", None, 10)
         .await?;
-    assert_eq!(missing.len(), 1);
-    assert_eq!(missing[0].item_id, item_id);
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().any(|entry| entry.item_id == item_id));
 
     let dispatch_fingerprint = b"postgres-dispatch-v1";
     assert!(
@@ -1809,7 +3532,6 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             .claim_item_metadata_completeness_check(&item_id, "BACKDROP", dispatch_fingerprint)
             .await?
     );
-    let library_id = library.id.to_string();
     let dispatch_results = [NewItemMetadataCompletenessResult {
         item_id: &item_id,
         capability: "BACKDROP",
@@ -1924,7 +3646,155 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             )
             .fetch_one(database.pool())
             .await?,
-        1
+        2
+    );
+
+    let pagination_root_path = temp_dir.path().join("Pagination Movies");
+    for index in 0..103 {
+        let directory = format!("Pagination Movie {index:03} (2025)");
+        let movie_dir = pagination_root_path.join(&directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Pagination.Movie.{index:03}.2025.mkv")),
+            b"video",
+        )
+        .await?;
+    }
+    let pagination_library = libraries
+        .create_library("Postgres dispatch pagination", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            pagination_library.id,
+            pagination_root_path
+                .to_str()
+                .ok_or("non-UTF8 pagination root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(pagination_library.id)
+        .await?;
+    let pagination_library_id = pagination_library.id.to_string();
+    let pagination_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(pagination_item_ids.len(), 103);
+    let unsupported_item_id = &pagination_item_ids[0];
+    let removed_item_id = &pagination_item_ids[1];
+    database
+        .query("UPDATE media_items SET item_type = 'FOLDER' WHERE id = ?")
+        .bind(unsupported_item_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query("UPDATE media_items SET removed_at = 1 WHERE id = ?")
+        .bind(removed_item_id)
+        .execute(database.pool())
+        .await?;
+    let pagination_fingerprint = b"postgres-pagination-input-v1";
+    let pagination_checks = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        database
+            .prepare_and_claim_item_metadata_completeness_checks(&pagination_checks)
+            .await?
+            .len(),
+        103
+    );
+    let pagination_results = pagination_item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: pagination_fingerprint,
+            is_missing: true,
+            checked_at: 1_004,
+        })
+        .collect::<Vec<_>>();
+    let pagination_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &pagination_library_id,
+            &pagination_results,
+            &pagination_item_ids,
+            Some(true),
+        )
+        .await?;
+    assert_eq!(pagination_dispatch.updated_count, 102);
+    assert_eq!(pagination_dispatch.scheduled_job_ids.len(), 2);
+    let pagination_job_counts: Vec<i64> = database
+        .query_scalar(
+            "SELECT total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING' ORDER BY total_count DESC",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(pagination_job_counts, vec![100, 1]);
+    let pagination_job_item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT job_items.item_id FROM metadata_reidentify_job_items job_items
+             JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+             WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'",
+        )
+        .bind(&pagination_library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(pagination_job_item_ids.len(), 101);
+    assert!(!pagination_job_item_ids.contains(unsupported_item_id));
+    assert!(!pagination_job_item_ids.contains(removed_item_id));
+    let removed_completeness = database
+        .find_item_metadata_completeness(removed_item_id, "POSTER")
+        .await?
+        .ok_or("missing removed item completeness row")?;
+    assert_eq!(removed_completeness.local_state, "RUNNING");
+
+    let empty_root_path = temp_dir.path().join("Empty");
+    tokio::fs::create_dir_all(&empty_root_path).await?;
+    let empty_library = libraries
+        .create_library("Postgres empty backfill", LibraryKind::Movie, false)
+        .await?;
+    let empty_root = libraries
+        .add_root(
+            empty_library.id,
+            empty_root_path.to_str().ok_or("non-UTF8 empty root")?,
+        )
+        .await?;
+    let empty_root_id = empty_root.root.id.to_string();
+    assert!(
+        database
+            .ensure_scan_local_metadata_backfill_root(&empty_root_id)
+            .await?
+    );
+    assert!(
+        database
+            .claim_next_scan_local_metadata_backfill_page(1)
+            .await?
+            .is_none()
+    );
+    database
+        .query("DELETE FROM library_roots WHERE id = ?")
+        .bind(&empty_root_id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+            )
+            .bind(&empty_root_id)
+            .fetch_one(database.pool())
+            .await?,
+        0
     );
 
     database.close().await;

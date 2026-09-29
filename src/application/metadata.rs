@@ -20,8 +20,8 @@ use crate::{
     },
     domain::ids::LibraryId,
     storage::{
-        Database, ItemImageInsert, MediaMetadataUpdate, StorageError, StoredMediaSourcePath,
-        StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
+        Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
+        StoredMediaSourcePath, StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
     },
 };
 
@@ -30,6 +30,7 @@ pub const DEFAULT_SCAN_JOB_METADATA_BATCH_SIZE: usize = 16;
 const MIN_SCAN_JOB_METADATA_BATCH_SIZE: usize = 8;
 const MAX_SCAN_JOB_METADATA_BATCH_SIZE: usize = 32;
 const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
+const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn local_image_read_permits() -> Arc<Semaphore> {
@@ -898,15 +899,19 @@ impl MetadataEnricher {
             .await?;
         let (movies, _, episodes) = split_scan_local_metadata_sources(sources);
         let mut report = MetadataReport::default();
-        for source in movies {
-            report.items_processed += 1;
-            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self.index_movie_images(&source.item_id, &media_path).await {
-                Ok(images_found) => report.images_found += images_found,
-                Err(error) => {
-                    tracing::warn!(item_id = %source.item_id, %error, "local movie images failed");
-                    report.mark_item_failed(&source.item_id);
-                }
+        let mut directory_cache = DirectoryPathCache::default();
+        if let Some((first_movie, remaining_movies)) = movies.split_first() {
+            // Publish the first poster as soon as it is ready. Later pages use the
+            // bounded multi-item transaction to reduce SQLite/PostgreSQL write churn.
+            self.index_scan_local_movie_image_page(
+                std::slice::from_ref(first_movie),
+                &mut directory_cache,
+                &mut report,
+            )
+            .await?;
+            for page in remaining_movies.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
+                self.index_scan_local_movie_image_page(page, &mut directory_cache, &mut report)
+                    .await?;
             }
         }
         let mut series_context = SeriesEnrichmentContext::tracking_hierarchy();
@@ -918,6 +923,30 @@ impl MetadataEnricher {
         )
         .await;
         Ok(report)
+    }
+
+    async fn index_scan_local_movie_image_page(
+        &self,
+        sources: &[StoredMediaSourcePath],
+        directory_cache: &mut DirectoryPathCache,
+        report: &mut MetadataReport,
+    ) -> Result<(), MetadataError> {
+        let mut items = Vec::with_capacity(sources.len());
+        for source in sources {
+            report.items_processed += 1;
+            if let Some(item) =
+                prepare_scan_local_movie_image_batch_item(source, directory_cache, report).await
+            {
+                items.push(item);
+            }
+        }
+        if !items.is_empty() {
+            report.images_found += self
+                .database
+                .insert_item_images_batch_at_indices(&items)
+                .await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn enrich_scan_local_metadata_batch_nfo(
@@ -1004,6 +1033,9 @@ impl MetadataEnricher {
                     "DONE",
                 )
                 .await?;
+            report
+                .locally_enriched_item_ids
+                .extend(completed_item_ids.iter().cloned());
             return Ok(report);
         }
 
@@ -1043,6 +1075,9 @@ impl MetadataEnricher {
                     "DONE",
                 )
                 .await?;
+            report
+                .locally_enriched_item_ids
+                .extend(completed_item_ids.iter().cloned());
             return Ok(report);
         }
 
@@ -1084,6 +1119,9 @@ impl MetadataEnricher {
                 "DONE",
             )
             .await?;
+        report
+            .locally_enriched_item_ids
+            .extend(completed_item_ids.iter().cloned());
         Ok(report)
     }
 
@@ -1147,6 +1185,7 @@ impl MetadataEnricher {
         sources: Vec<StoredMediaSourcePath>,
         report: &mut MetadataReport,
     ) {
+        let mut directory_cache = DirectoryPathCache::default();
         for source in sources {
             report.items_processed += 1;
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
@@ -1169,7 +1208,10 @@ impl MetadataEnricher {
                 }
             }
 
-            match self.index_movie_images(&source.item_id, &media_path).await {
+            match self
+                .index_movie_images(&source.item_id, &media_path, &mut directory_cache)
+                .await
+            {
                 Ok(images_found) => report.images_found += images_found,
                 Err(error) => {
                     tracing::warn!(
@@ -1257,14 +1299,16 @@ impl MetadataEnricher {
         &self,
         item_id: &str,
         media_path: &Path,
+        directory_cache: &mut DirectoryPathCache,
     ) -> Result<usize, MetadataError> {
-        let image_paths =
-            read_directory_paths(media_path.parent().unwrap_or(Path::new("."))).await?;
+        let image_paths = directory_cache
+            .get(media_path.parent().unwrap_or(Path::new(".")))
+            .await?;
         let images =
             if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
-                find_local_images_for_media(image_paths, media_stem)
+                find_local_images_for_media(image_paths.iter(), media_stem)
             } else {
-                find_local_images(image_paths)
+                find_local_images(image_paths.iter())
             };
         let has_primary_artwork = images
             .iter()
@@ -1763,6 +1807,67 @@ impl MetadataEnricher {
     }
 }
 
+async fn prepare_scan_local_movie_image_batch_item(
+    source: &StoredMediaSourcePath,
+    directory_cache: &mut DirectoryPathCache,
+    report: &mut MetadataReport,
+) -> Option<ItemImageBatchInsert> {
+    let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
+    let image_paths = match directory_cache
+        .get(media_path.parent().unwrap_or(Path::new(".")))
+        .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(item_id = %source.item_id, %error, "local movie image directory failed");
+            report.mark_item_failed(&source.item_id);
+            return None;
+        }
+    };
+    let images = if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
+        find_local_images_for_media(image_paths.iter(), media_stem)
+    } else {
+        find_local_images(image_paths.iter())
+    };
+    let clear_poster_fallback = images
+        .iter()
+        .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+    let prepared = prepare_local_images(images).await;
+    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut records = Vec::new();
+    for result in prepared {
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    item_id = %source.item_id,
+                    path = %error.path.display(),
+                    error = %error.error,
+                    "local movie image could not be read; skipping image"
+                );
+                continue;
+            }
+        };
+        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        records.push(ItemImageInsert {
+            image_type: prepared.image.image_type.as_str().to_owned(),
+            image_index,
+            local_path: prepared.image.path.to_string_lossy().into_owned(),
+            file_size: prepared.file_size,
+            width: prepared.dimensions.map(|(width, _)| width),
+            height: prepared.dimensions.map(|(_, height)| height),
+            content_tag: prepared.content_tag,
+            source: "LOCAL".to_owned(),
+            source_url: None,
+        });
+    }
+    Some(ItemImageBatchInsert {
+        item_id: source.item_id.clone(),
+        images: records,
+        clear_poster_fallback,
+    })
+}
+
 fn next_local_image_index(indexes: &mut BTreeMap<&'static str, i64>, image_type: ImageType) -> i64 {
     let key = image_type.as_str();
     if image_type != ImageType::Fanart {
@@ -1879,6 +1984,7 @@ pub struct MetadataReport {
     pub nfo_skipped: usize,
     pub images_found: usize,
     pub items_processed: usize,
+    pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
 }
 
@@ -1889,6 +1995,8 @@ impl MetadataReport {
         self.nfo_skipped += other.nfo_skipped;
         self.images_found += other.images_found;
         self.items_processed += other.items_processed;
+        self.locally_enriched_item_ids
+            .extend(other.locally_enriched_item_ids);
         for item_id in other.failed_item_ids {
             self.mark_item_failed(&item_id);
         }

@@ -9,6 +9,13 @@ pub(crate) struct NewItemMetadataCompletenessResult<'a> {
     pub(crate) checked_at: i64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct NewItemMetadataCompletenessCheck<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) capability: &'a str,
+    pub(crate) input_fingerprint: &'a [u8],
+}
+
 #[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
 #[derive(Debug, Default)]
 pub(crate) struct ItemMetadataCompletenessCommit {
@@ -29,15 +36,15 @@ pub(crate) use repository::{
     EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch, EmbyMigrationItemPageBatch,
     EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
-    EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove, ItemImageInsert,
-    ItemImageMetadata, LibrarySettingsUpdate, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
-    ManifestDeltaBatchCommit, ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult,
-    ManifestExistingFileUpdate, ManifestPostprocessingTargetBatchResult,
-    ManifestPostprocessingTargetPage, MediaMetadataUpdate, MediaProbeUpdate, MediaStreamUpdate,
-    MetadataCapabilityResult, MetadataImageAttemptUpdate, MigrationMediaIdentityLookup,
-    MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent, NewChapterDetectionJob,
-    NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob, NewDanmakuTrack,
-    NewDeviceAccessToken, NewDevicePairing, NewEmbyMigrationJob, NewEpisodeFile,
+    EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
+    ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata, LibrarySettingsUpdate,
+    MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, ManifestDeltaBatchCommit,
+    ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult, ManifestExistingFileUpdate,
+    ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage, MediaMetadataUpdate,
+    MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataImageAttemptUpdate,
+    MigrationMediaIdentityLookup, MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent,
+    NewChapterDetectionJob, NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob,
+    NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing, NewEmbyMigrationJob, NewEpisodeFile,
     NewFilesystemEntry, NewHierarchyItem, NewLibrary, NewLibraryRoot, NewMediaChapterMarker,
     NewMediaItem, NewMediaSource, NewMetadataCandidate, NewMovieFile, NewNotificationDestination,
     NewNotificationEvent, NewPersonCredit, NewPlaybackEvent, NewScanJobEvent,
@@ -69,9 +76,9 @@ pub(crate) use repository::{
     StoredPersonCredit, StoredPersonIdentityMove, StoredPersonIndexRebuildJob,
     StoredPersonMatchCandidate, StoredPlaybackHistoryEvent, StoredPlaybackSession,
     StoredPlaybackSource, StoredReconciliationScanEntry, StoredScanJob, StoredScanJobCounts,
-    StoredScanJobEvent, StoredScanJobPath, StoredScanLocalMetadataBatch,
-    StoredScanLocalMetadataSource, StoredScanManifest, StoredScanManifestDelta,
-    StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
+    StoredScanJobEvent, StoredScanJobPath, StoredScanLocalMetadataBackfillPage,
+    StoredScanLocalMetadataBatch, StoredScanLocalMetadataSource, StoredScanManifest,
+    StoredScanManifestDelta, StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
     StoredScanManifestFilesystemBaseline, StoredScanManifestPostprocessingRoot,
     StoredScanManifestRemovalCandidate, StoredScheduledTaskConfig, StoredScheduledTaskPlan,
     StoredScheduledTaskPlanLibrary, StoredSeriesMetadataSource, StoredStrmMediaSource,
