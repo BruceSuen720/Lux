@@ -8,7 +8,7 @@ use luxd::{
     config::Config,
     discovery::{DiscoveryConfig, DiscoveryService},
     observability,
-    storage::Database,
+    storage::{Database, StorageError},
 };
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::watch};
@@ -34,6 +34,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let schema_version = database.schema_version().await?;
     info!(schema_version, "database migrations applied");
+    let migrated_scan_events = match database.migrate_legacy_scan_job_events_to_logs().await {
+        Ok(migrated) => migrated,
+        Err(error) => {
+            let error_code = match &error {
+                StorageError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    "CONFIG_LOG_PERMISSION_DENIED"
+                }
+                StorageError::Io { .. } => "CONFIG_LOG_WRITE_FAILED",
+                StorageError::Sqlx { .. } => "DATABASE_LOG_MIGRATION_FAILED",
+                _ => "LOG_MIGRATION_FAILED",
+            };
+            error!(
+                error_code,
+                "legacy scan event migration failed; startup stopped"
+            );
+            return Err(std::io::Error::other("legacy scan event migration failed").into());
+        }
+    };
+    if migrated_scan_events > 0 {
+        info!(
+            migrated_scan_events,
+            "legacy scan events migrated to config logs"
+        );
+    }
     match luxd::application::image_repairs::repair_episode_image_path_conflicts(&database).await {
         Ok(report) if report.repaired > 0 || report.skipped > 0 => {
             info!(

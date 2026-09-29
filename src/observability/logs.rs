@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt, fs,
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
@@ -144,7 +144,17 @@ impl LogStore {
                 let mut line = serde_json::to_vec(&record)
                     .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
                 line.push(b'\n');
-                manager.write_line(&line)?;
+                let record_date = record["timestamp"]
+                    .as_str()
+                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                    .or_else(|| {
+                        record["createdAt"]
+                            .as_i64()
+                            .and_then(|value| OffsetDateTime::from_unix_timestamp(value).ok())
+                    })
+                    .map(|value| value.date())
+                    .unwrap_or_else(|| OffsetDateTime::now_utc().date());
+                manager.write_line_for_date(record_date, &line)?;
             }
             if let Some(file) = manager.active_file.as_mut() {
                 file.flush()?;
@@ -154,6 +164,45 @@ impl LogStore {
         })
         .await
         .map_err(|error| io::Error::other(format!("日志批量写入任务失败: {error}")))?
+    }
+
+    pub(crate) async fn existing_scan_job_event_ids(
+        &self,
+        expected_ids: &[String],
+    ) -> io::Result<HashSet<String>> {
+        if expected_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        self.initialize().await?;
+        let log_dir = log_dir(&self.config_dir);
+        let archive_dir = archive_dir(&self.config_dir);
+        let expected_ids = expected_ids.iter().cloned().collect::<HashSet<_>>();
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let _manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            read_scan_job_event_ids(&log_dir, &archive_dir, &expected_ids)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("任务日志索引读取失败: {error}")))?
+    }
+
+    pub(crate) async fn verify_scan_job_event_ids(
+        &self,
+        expected_ids: &[String],
+    ) -> io::Result<()> {
+        let persisted_ids = self.existing_scan_job_event_ids(expected_ids).await?;
+        if expected_ids
+            .iter()
+            .any(|expected_id| !persisted_ids.contains(expected_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "任务日志文件缺少本批次事件记录",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn append_scan_job_event(
@@ -291,7 +340,7 @@ impl LogStore {
     }
 }
 
-fn redact_sensitive_log_values(mut value: Value) -> Value {
+pub(crate) fn redact_sensitive_log_values(mut value: Value) -> Value {
     match &mut value {
         Value::Object(object) => {
             for (key, value) in object.iter_mut() {
@@ -427,11 +476,108 @@ fn read_scan_job_events(
             .cmp(&left.created_at)
             .then_with(|| right.id.cmp(&left.id))
     });
+    let mut seen_ids = std::collections::HashSet::with_capacity(events.len());
+    events.retain(|event| seen_ids.insert(event.id.clone()));
     let total = i64::try_from(events.len()).unwrap_or(i64::MAX);
     let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
     let count = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
     let page = events.into_iter().skip(start).take(count).collect();
     Ok((total, page))
+}
+
+fn read_scan_job_event_ids(
+    log_dir: &Path,
+    archive_dir: &Path,
+    expected_ids: &HashSet<String>,
+) -> io::Result<HashSet<String>> {
+    let mut found_ids = HashSet::with_capacity(expected_ids.len());
+    let active_entries = match fs::read_dir(log_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = active_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if name.starts_with("lux.") && name.ends_with(".log") {
+                read_scan_job_event_ids_from_lines(
+                    io::BufReader::new(fs::File::open(path)?),
+                    expected_ids,
+                    &mut found_ids,
+                )?;
+                if found_ids.len() == expected_ids.len() {
+                    return Ok(found_ids);
+                }
+            }
+        }
+    }
+    let archive_entries = match fs::read_dir(archive_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entries) = archive_entries {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".log.zip"))
+            {
+                continue;
+            }
+            let mut archive = ZipArchive::new(fs::File::open(path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            for index in 0..archive.len() {
+                let member = archive
+                    .by_index(index)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if member.name().ends_with(".log") {
+                    read_scan_job_event_ids_from_lines(
+                        io::BufReader::new(member),
+                        expected_ids,
+                        &mut found_ids,
+                    )?;
+                    if found_ids.len() == expected_ids.len() {
+                        return Ok(found_ids);
+                    }
+                }
+            }
+        }
+    }
+    Ok(found_ids)
+}
+
+fn read_scan_job_event_ids_from_lines<R: io::BufRead>(
+    mut reader: R,
+    expected_ids: &HashSet<String>,
+    found_ids: &mut HashSet<String>,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if record["recordType"] == "scan_job_event"
+            && let Some(id) = record["id"].as_str()
+            && expected_ids.contains(id)
+        {
+            found_ids.insert(id.to_owned());
+            if found_ids.len() == expected_ids.len() {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn read_scan_job_event_lines<R: io::BufRead>(
@@ -1496,6 +1642,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_job_event_persistence_verification_rejects_missing_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = LogStore::open(temp_dir.path()).await?;
+        store
+            .append_scan_job_event(
+                "persisted-event",
+                "job-1",
+                "INFO",
+                "JOB_CREATED",
+                "created",
+                "{}",
+            )
+            .await?;
+
+        assert!(
+            store
+                .verify_scan_job_event_ids(&[
+                    "persisted-event".to_owned(),
+                    "missing-event".to_owned(),
+                ])
+                .await
+                .is_err()
+        );
+        store
+            .verify_scan_job_event_ids(&["persisted-event".to_owned()])
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn jsonl_batch_writer_is_durable_and_retries_after_a_write_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
@@ -1504,9 +1681,10 @@ mod tests {
         let blocked_log_dir = log_dir(&config_dir);
         fs::write(&blocked_log_dir, b"block directory creation")?;
         let store = LogStore::new(&config_dir);
+        let now = OffsetDateTime::now_utc();
         let records = vec![
-            serde_json::json!({"recordType":"migration-test","id":"one","createdAt":1}),
-            serde_json::json!({"recordType":"migration-test","id":"two","createdAt":2}),
+            serde_json::json!({"recordType":"migration-test","id":"one","createdAt":now.unix_timestamp()}),
+            serde_json::json!({"recordType":"migration-test","id":"two","createdAt":now.unix_timestamp()}),
         ];
         assert!(
             store
@@ -1517,7 +1695,7 @@ mod tests {
 
         fs::remove_file(blocked_log_dir)?;
         store.append_json_batch_and_sync(records).await?;
-        let date = OffsetDateTime::now_utc().date();
+        let date = now.date();
         let LogExport::Daily { contents, .. } =
             export_logs(&config_dir, LogDateRange::new(date, date)?).await?
         else {

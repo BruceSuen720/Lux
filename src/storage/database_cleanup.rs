@@ -1,10 +1,12 @@
 use super::*;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const DATABASE_CLEANUP_MARKER: &str = "database_lifecycle_cleanup_v1";
 const DATABASE_CLEANUP_PENDING: &str = "PENDING";
 const DATABASE_CLEANUP_RUNNING: &str = "RUNNING";
 const DATABASE_CLEANUP_COMPLETED: &str = "COMPLETED";
 const CLEANUP_BATCH_SIZE: i64 = 1_000;
+const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES;
 const SCAN_EVENT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -20,6 +22,159 @@ pub struct DatabaseLifecycleCleanupReport {
 }
 
 impl Database {
+    pub async fn migrate_legacy_scan_job_events_to_logs(&self) -> Result<u64, StorageError> {
+        let source_event_count: i64 = self
+            .query_scalar("SELECT COUNT(*) FROM scan_job_events")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if source_event_count == 0 {
+            return Ok(0);
+        }
+        let mut migrated = 0_u64;
+        loop {
+            let rows = self
+                .query(
+                    "SELECT id, job_id, level, event_code, message, details_json, created_at
+                     FROM scan_job_events
+                     ORDER BY created_at, id
+                     LIMIT ?",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+
+            // Keep a batch within one UTC day so archive retention cannot prune an
+            // earlier part of the batch before its database rows are acknowledged.
+            let batch_date = rows.first().and_then(|row| {
+                let created_at: i64 = row.get("created_at");
+                OffsetDateTime::from_unix_timestamp(created_at)
+                    .ok()
+                    .map(|timestamp| timestamp.date())
+            });
+            let mut ids = Vec::with_capacity(rows.len());
+            let mut records = Vec::with_capacity(rows.len());
+            let mut batch_bytes = 0_u64;
+            for row in rows {
+                let id: String = row.get("id");
+                let job_id: String = row.get("job_id");
+                let level: String = row.get("level");
+                let event_code: String = row.get("event_code");
+                let message: String = row.get("message");
+                let details_json: String = row.get("details_json");
+                let created_at: i64 = row.get("created_at");
+                let event_date = OffsetDateTime::from_unix_timestamp(created_at)
+                    .ok()
+                    .map(|timestamp| timestamp.date());
+                if batch_date.is_some() && event_date != batch_date
+                    || batch_date.is_none() && !ids.is_empty()
+                {
+                    break;
+                }
+
+                let details = serde_json::from_str::<serde_json::Value>(&details_json)
+                    .map(crate::observability::logs::redact_sensitive_log_values)
+                    .unwrap_or_else(|_| serde_json::json!({ "invalid": true }));
+                let message = crate::observability::logs::redact_sensitive_log_values(
+                    serde_json::Value::String(message),
+                )
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+                let timestamp = OffsetDateTime::from_unix_timestamp(created_at)
+                    .ok()
+                    .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+                    .unwrap_or_else(|| created_at.to_string());
+                let record = serde_json::json!({
+                    "recordType": "scan_job_event",
+                    "id": id.clone(),
+                    "jobId": job_id,
+                    "level": level,
+                    "eventCode": event_code,
+                    "message": message,
+                    "details": details,
+                    "timestamp": timestamp,
+                    "createdAt": created_at,
+                });
+                let record_bytes = u64::try_from(
+                    serde_json::to_vec(&record)
+                        .map_err(|source| StorageError::Io {
+                            path: self.path.clone(),
+                            source: std::io::Error::other(source),
+                        })?
+                        .len()
+                        .saturating_add(1),
+                )
+                .unwrap_or(u64::MAX);
+                if !ids.is_empty()
+                    && batch_bytes.saturating_add(record_bytes) > MAX_LOG_MIGRATION_BATCH_BYTES
+                {
+                    break;
+                }
+                ids.push(id);
+                batch_bytes = batch_bytes.saturating_add(record_bytes);
+                records.push(record);
+            }
+
+            let existing_event_ids = self
+                .log_store
+                .existing_scan_job_event_ids(&ids)
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            records.retain(|record| {
+                record["id"]
+                    .as_str()
+                    .is_none_or(|id| !existing_event_ids.contains(id))
+            });
+            self.log_store
+                .append_json_batch_and_sync(records)
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.log_store
+                .verify_scan_job_event_ids(&ids)
+                .await
+                .map_err(|source| StorageError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete_query = format!("DELETE FROM scan_job_events WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(delete_query));
+            for id in &ids {
+                statement = statement.bind(id);
+            }
+            let deleted = statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            migrated = migrated.saturating_add(deleted);
+        }
+        Ok(migrated)
+    }
+
     /// Runs the one-time cleanup installed by the database lifecycle migration.
     ///
     /// The marker is claimed atomically and only marked completed after every

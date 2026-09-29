@@ -7582,14 +7582,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite 与 PostgreSQL 历史任务事件保留原 ID、jobId、级别、事件代码、消息、详情和时间写入 JSONL。
-- [ ] 文件完整持久化并验证后才删除对应数据库行；中断重启可继续，重复执行不产生可见重复事件。
-- [ ] 迁移后任务事件 API 可读历史文件记录；不更改任务状态、进度、取消、重试或恢复语义。
-- [ ] 测试覆盖无历史、SQLite 历史、失败重试、幂等和任务状态不变；PostgreSQL 在可用集成环境验证。
+- [x] SQLite 与 PostgreSQL 历史任务事件保留原 ID、jobId、级别、事件代码、消息、详情和时间写入 JSONL。
+- [x] 文件完整持久化并验证后才删除对应数据库行；中断重启可继续，重复执行不产生可见重复事件。
+- [x] 迁移后任务事件 API 可读历史文件记录；不更改任务状态、进度、取消、重试或恢复语义。
+- [x] 测试覆盖无历史、SQLite 历史、失败重试、幂等和任务状态不变；PostgreSQL 在可用集成环境验证。
 
 验证：`cargo test --locked --test log_migration --test job_events_api`、`cargo fmt --all -- --check`。
 
-预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`tests/log_migration.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`src/observability/logs.rs`、`tests/log_migration.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：服务启动时按 UTC 日期和不超过单段 50 MiB 的字节量分批迁出 `scan_job_events`，每批 JSONL `sync_all` 后从活动文件和保留归档回读本批 ID，确认齐全才删除数据库行。重试只索引当前批次 ID，已落盘记录不会重复追加；失败批次可重试。日期/字节分批避免保留策略删除尚未校验的批内事件。SQLite 覆盖空历史、字段/扫描状态保持、失败重试、幂等及 22 日 FIFO 保留；PostgreSQL 隔离数据库合同测试通过。`cargo test --locked --test log_migration --test job_events_api` 4 项迁移测试和 1 项 API 测试通过；PostgreSQL 忽略测试单独启用后通过；LogStore 单测 12 项、格式检查通过。
 
 依赖：LUX-310、LUX-313、LUX-314。明确不做：不清理旧管理员审计事件，不迁出扫描控制状态。
 
