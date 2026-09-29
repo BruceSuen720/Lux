@@ -1,7 +1,7 @@
 use luxd::{
     application::{
         libraries::LibraryService,
-        scanner::{LibraryScanner, compute_file_fingerprint, parse_movie_filename},
+        scanner::{LibraryScanner, ScanJobService, compute_file_fingerprint, parse_movie_filename},
     },
     config::Config,
     library::LibraryKind,
@@ -286,6 +286,149 @@ async fn movie_scan_groups_chinese_source_variants_into_one_item()
         editions,
         vec![Some("有码 C".to_owned()), Some("破解 C".to_owned())]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for code in ["ADN-610", "ADN-723"] {
+        let movie_dir = media_root.join(code);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(format!("{code}.mp4")), b"base").await?;
+        tokio::fs::write(movie_dir.join(format!("{code}-C.mp4")), b"variant").await?;
+    }
+    let alternate_dir = media_root.join("ADN-725");
+    tokio::fs::create_dir_all(&alternate_dir).await?;
+    tokio::fs::write(alternate_dir.join("ADN-725.mp4"), b"base").await?;
+    tokio::fs::write(
+        alternate_dir.join("ADN-725-Alternate-Cut.mp4"),
+        b"alternate version",
+    )
+    .await?;
+    let unpaired_dir = media_root.join("Unpaired");
+    tokio::fs::create_dir_all(&unpaired_dir).await?;
+    tokio::fs::write(unpaired_dir.join("ADN-999-Alternate.mp4"), b"unpaired").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF-8 media root")?,
+        )
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let movies: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT item.title, COUNT(source.id)
+         FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         WHERE item.library_id = ? AND item.item_type = 'MOVIE' AND item.removed_at IS NULL
+         GROUP BY item.id
+         ORDER BY item.title",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        movies,
+        vec![
+            ("ADN 610".to_owned(), 2),
+            ("ADN 723".to_owned(), 2),
+            ("ADN 725".to_owned(), 2),
+            ("ADN 999 Alternate".to_owned(), 1),
+        ]
+    );
+
+    let editions: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT entry.relative_path, source.edition_name
+         FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         ORDER BY entry.relative_path",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        editions,
+        vec![
+            ("ADN-610/ADN-610-C.mp4".to_owned(), Some("C".to_owned())),
+            ("ADN-610/ADN-610.mp4".to_owned(), None),
+            ("ADN-723/ADN-723-C.mp4".to_owned(), Some("C".to_owned())),
+            ("ADN-723/ADN-723.mp4".to_owned(), None),
+            (
+                "ADN-725/ADN-725-Alternate-Cut.mp4".to_owned(),
+                Some("Alternate-Cut".to_owned()),
+            ),
+            ("ADN-725/ADN-725.mp4".to_owned(), None),
+            ("Unpaired/ADN-999-Alternate.mp4".to_owned(), None),
+        ]
+    );
+
+    for code in ["ADN-610", "ADN-723"] {
+        let legacy_item_id = format!("legacy-{code}");
+        let legacy_title = format!("{} C", code.replace('-', " "));
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, original_title,
+                identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(&legacy_item_id)
+        .bind(library.id.to_string())
+        .bind(&legacy_title)
+        .bind(legacy_title.to_lowercase())
+        .bind(&legacy_title)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE media_sources SET item_id = ?, edition_name = NULL
+             WHERE filesystem_entry_id = (
+                 SELECT id FROM filesystem_entries
+                 WHERE library_root_id = ? AND relative_path = ?
+             )",
+        )
+        .bind(&legacy_item_id)
+        .bind(root.id.to_string())
+        .bind(format!("{code}/{code}-C.mp4"))
+        .execute(database.pool())
+        .await?;
+    }
+
+    let repair = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&repair.id, 100, None).await?;
+    let removed_legacy_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE id IN (?, ?) AND removed_at IS NOT NULL",
+    )
+    .bind("legacy-ADN-610")
+    .bind("legacy-ADN-723")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_legacy_items, 2);
+
+    sqlx::query("UPDATE media_sources SET probe_status = 'READY'")
+        .execute(database.pool())
+        .await?;
+    let repeated = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&repeated.id, 100, None).await?;
+    let probe_statuses: Vec<String> =
+        sqlx::query_scalar("SELECT probe_status FROM media_sources ORDER BY id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(probe_statuses, vec!["READY".to_owned(); 7]);
     Ok(())
 }
 

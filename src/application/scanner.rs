@@ -40,7 +40,7 @@ use crate::{
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{
             MediaKind, clean_title, has_multi_part_marker, has_source_variant_marker,
-            parse_media_name,
+            parse_media_name, parse_media_name_with_variant_suffix,
         },
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
@@ -1530,7 +1530,17 @@ async fn prepare_manifest_observation(
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return ManifestDeltaPreparation::Unstable { delta_id };
         };
-        let Some(prepared_filename) = prepare_manifest_filename(file_name, filename_input) else {
+        let inferred_suffix = if filename_input.is_movie() {
+            infer_sibling_movie_variant_suffix(&path).await
+        } else {
+            None
+        };
+        let prepared_filename = if let Some(suffix) = inferred_suffix.as_deref() {
+            prepare_manifest_filename_with_variant_suffix(file_name, filename_input, Some(suffix))
+        } else {
+            prepare_manifest_filename(file_name, filename_input)
+        };
+        let Some(prepared_filename) = prepared_filename else {
             return ManifestDeltaPreparation::Unstable { delta_id };
         };
         Some(prepared_filename)
@@ -3275,10 +3285,12 @@ impl LibraryScanner {
         let mut grouped_paths = Vec::<Vec<(usize, PathBuf)>>::new();
         let mut group_indexes = HashMap::<String, usize>::new();
         for (index, path) in paths.iter().cloned().enumerate() {
+            let inferred_suffix = infer_sibling_movie_variant_suffix(&path).await;
             let group_key = reconciliation_regular_group_key(
                 &root.id,
                 &path,
                 MixedClassification::Movie,
+                inferred_suffix.as_deref(),
                 index,
             );
             let group_index = *group_indexes.entry(group_key).or_insert_with(|| {
@@ -3360,7 +3372,10 @@ impl LibraryScanner {
             return Ok(None);
         }
         // CD-part and version-marker entries need the regular path to refresh their identity.
-        if has_multi_part_marker(file_name) || has_source_variant_marker(file_name) {
+        if has_multi_part_marker(file_name)
+            || has_source_variant_marker(file_name)
+            || infer_sibling_movie_variant_suffix(path).await.is_some()
+        {
             return Ok(None);
         }
         Ok(Some((
@@ -3851,7 +3866,12 @@ impl LibraryScanner {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
         };
-        let Some(parsed_name) = parse_movie_filename(file_name) else {
+        let inferred_suffix = infer_sibling_movie_variant_suffix(path).await;
+        let parsed_name = inferred_suffix
+            .as_deref()
+            .and_then(|suffix| parse_movie_filename_with_variant_suffix(file_name, suffix))
+            .or_else(|| parse_movie_filename(file_name));
+        let Some(parsed_name) = parsed_name else {
             return Ok(None);
         };
         let provider_ids = match folder_provider_ids {
@@ -4332,7 +4352,12 @@ impl LibraryScanner {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(ScanReport::default());
         };
-        let Some(parsed_name) = parse_movie_filename(file_name) else {
+        let inferred_suffix = infer_sibling_movie_variant_suffix(path).await;
+        let parsed_name = inferred_suffix
+            .as_deref()
+            .and_then(|suffix| parse_movie_filename_with_variant_suffix(file_name, suffix))
+            .or_else(|| parse_movie_filename(file_name));
+        let Some(parsed_name) = parsed_name else {
             return Ok(ScanReport::default());
         };
         let provider_ids = movie_provider_ids(path, &parsed_name.provider_ids);
@@ -4388,7 +4413,8 @@ impl LibraryScanner {
                 .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, item_id)
                 .await?;
         }
-        if !has_multi_part_marker(file_name)
+        if inferred_suffix.is_none()
+            && !has_multi_part_marker(file_name)
             && !has_source_variant_marker(file_name)
             && let Some(existing_entry) = existing_entry.as_ref()
         {
@@ -6457,15 +6483,43 @@ impl ScanJobService {
                 if !baseline.is_missing
                     && baseline.fingerprint.as_deref() == Some(observation.fingerprint.as_slice())
                 {
-                    seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
-                        filesystem_entry_id: baseline.id.clone(),
-                        relative_path: observation.relative_path.clone(),
-                        fingerprint: observation.fingerprint.clone(),
-                    });
-                    if is_media || is_sidecar {
-                        unchanged_paths.push(observation.relative_path.clone());
+                    let inferred_suffix = if is_media && library_kind == "MOVIE" {
+                        infer_sibling_movie_variant_suffix(&path).await
+                    } else {
+                        None
+                    };
+                    let variant_identity_is_current =
+                        match inferred_suffix.as_deref().and_then(|suffix| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .and_then(|name| {
+                                    parse_movie_filename_with_variant_suffix(name, suffix)
+                                })
+                        }) {
+                            Some(parsed) => {
+                                self.database
+                                    .scan_manifest_movie_variant_identity_is_current(
+                                        &root.id,
+                                        &observation.relative_path,
+                                        &parsed.sort_title,
+                                        parsed.production_year.map(i64::from),
+                                        parsed.edition_name.as_deref(),
+                                    )
+                                    .await?
+                            }
+                            None => false,
+                        };
+                    if inferred_suffix.is_none() || variant_identity_is_current {
+                        seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
+                            filesystem_entry_id: baseline.id.clone(),
+                            relative_path: observation.relative_path.clone(),
+                            fingerprint: observation.fingerprint.clone(),
+                        });
+                        if is_media || is_sidecar {
+                            unchanged_paths.push(observation.relative_path.clone());
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
             if !is_media && !is_sidecar {
@@ -6991,6 +7045,15 @@ impl ScanJobService {
         let has_positive_indexes = stored_chunks
             .iter()
             .any(|chunk| !chunk.positive_indexes.is_empty());
+        let legacy_variant_paths = stored_chunks
+            .iter()
+            .flat_map(|chunk| chunk.positive_indexes.iter())
+            .filter(|positive| positive.delta_kind != "ADD")
+            .filter_map(|positive| match &positive.file {
+                NewScanManifestIndexedFile::Movie(file) => Some(file.relative_path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let transaction_started = Instant::now();
         let commit_result = self
             .database
@@ -7009,7 +7072,16 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
-                self.publish_home_after_manifest_commit(&result).await;
+                let movie_identity_reassigned = self
+                    .reconcile_legacy_movie_variant_paths(
+                        job_id,
+                        &root.id,
+                        Path::new(&root.canonical_path),
+                        &legacy_variant_paths,
+                    )
+                    .await?;
+                self.publish_home_after_manifest_commit(&result, movie_identity_reassigned)
+                    .await;
                 if result.local_metadata_batches_changed {
                     self.notify_local_metadata_outbox_worker();
                 }
@@ -7030,6 +7102,37 @@ impl ScanJobService {
         }
     }
 
+    async fn reconcile_legacy_movie_variant_paths(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        root_path: &Path,
+        relative_paths: &[String],
+    ) -> Result<bool, ScannerError> {
+        if relative_paths.is_empty() {
+            return Ok(false);
+        }
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Ok(false);
+        };
+        let Some(root) = self.database.find_library_root(library_root_id).await? else {
+            return Ok(false);
+        };
+        let mut movie_identity_reassigned = false;
+        for relative_path in relative_paths {
+            let path = root_path.join(relative_path);
+            if infer_sibling_movie_variant_suffix(&path).await.is_none() {
+                continue;
+            }
+            let report = self
+                .scanner
+                .scan_movie_file(&job.library_id, &root, root_path, &path, &job.generation)
+                .await?;
+            movie_identity_reassigned |= report.changed_files > 0;
+        }
+        Ok(movie_identity_reassigned)
+    }
+
     async fn commit_scan_manifest_discovery_chunk(
         &self,
         chunk: &NewScanManifestDiscoveryChunk<'_>,
@@ -7041,7 +7144,7 @@ impl ScanJobService {
     ) -> Result<Option<ManifestDiscoveryCommitResult>, ScannerError> {
         if stream_files_during_discovery && chunk.positive_indexes.is_empty() {
             verify_manifest_directory_observation(
-                root_path,
+                root_path.clone(),
                 root_observation,
                 directory_observation,
             )
@@ -7069,7 +7172,25 @@ impl ScanJobService {
         }
         match commit_result {
             Ok(result) => {
-                self.publish_home_after_manifest_commit(&result).await;
+                let legacy_variant_paths = chunk
+                    .positive_indexes
+                    .iter()
+                    .filter(|positive| positive.delta_kind != "ADD")
+                    .filter_map(|positive| match &positive.file {
+                        NewScanManifestIndexedFile::Movie(file) => Some(file.relative_path.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let movie_identity_reassigned = self
+                    .reconcile_legacy_movie_variant_paths(
+                        chunk.job_id,
+                        chunk.library_root_id,
+                        &root_path,
+                        &legacy_variant_paths,
+                    )
+                    .await?;
+                self.publish_home_after_manifest_commit(&result, movie_identity_reassigned)
+                    .await;
                 if result.local_metadata_batches_changed {
                     self.notify_local_metadata_outbox_worker();
                 }
@@ -7093,10 +7214,15 @@ impl ScanJobService {
         }
     }
 
-    async fn publish_home_after_manifest_commit(&self, result: &ManifestDiscoveryCommitResult) {
+    async fn publish_home_after_manifest_commit(
+        &self,
+        result: &ManifestDiscoveryCommitResult,
+        additional_content_changed: bool,
+    ) {
         if result.created_items == 0
             && !result.local_metadata_batches_changed
             && !result.metadata_targets_changed
+            && !additional_content_changed
         {
             return;
         }
@@ -9613,10 +9739,16 @@ impl ScanJobService {
         let mut grouped_regular_works = Vec::<Vec<(usize, ReconciliationRegularWork)>>::new();
         let mut regular_group_indexes = HashMap::<String, usize>::new();
         for (regular_index, work) in regular_works.iter().cloned().enumerate() {
+            let inferred_suffix = if matches!(work.classification, MixedClassification::Movie) {
+                infer_sibling_movie_variant_suffix(&work.path).await
+            } else {
+                None
+            };
             let group_key = reconciliation_regular_group_key(
                 &work.root.id,
                 &work.path,
                 work.classification,
+                inferred_suffix.as_deref(),
                 work.index,
             );
             let group_index = *regular_group_indexes.entry(group_key).or_insert_with(|| {
@@ -12035,13 +12167,18 @@ fn reconciliation_regular_group_key(
     root_id: &str,
     path: &Path,
     classification: MixedClassification,
+    inferred_suffix: Option<&str>,
     fallback_index: usize,
 ) -> String {
     let parsed_key = match classification {
         MixedClassification::Movie => path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(parse_movie_filename)
+            .and_then(|name| {
+                inferred_suffix
+                    .and_then(|suffix| parse_movie_filename_with_variant_suffix(name, suffix))
+                    .or_else(|| parse_movie_filename(name))
+            })
             .map(|parsed| {
                 format!(
                     "movie:{}:{:?}:{:?}",
@@ -12677,6 +12814,20 @@ fn prepare_manifest_filename(
     filename: &str,
     input: ManifestFilenameInput,
 ) -> Option<PreparedManifestFilename> {
+    prepare_manifest_filename_with_variant_suffix(filename, input, None)
+}
+
+fn prepare_manifest_filename_with_variant_suffix(
+    filename: &str,
+    input: ManifestFilenameInput,
+    inferred_suffix: Option<&str>,
+) -> Option<PreparedManifestFilename> {
+    if input.is_movie()
+        && let Some(suffix) = inferred_suffix
+    {
+        return parse_movie_filename_with_variant_suffix(filename, suffix)
+            .map(PreparedManifestFilename::Movie);
+    }
     match input {
         ManifestFilenameInput::MovieLibrary => {
             let parsed_name = parse_movie_filename(filename);
@@ -12860,6 +13011,22 @@ pub fn parse_movie_filename(filename: &str) -> Option<ParsedMovieFilename> {
         edition_name: parsed.edition_name,
         quality_label: parsed.quality_label,
         provider_ids: parsed.provider_ids,
+    })
+}
+
+fn parse_movie_filename_with_variant_suffix(
+    filename: &str,
+    suffix: &str,
+) -> Option<ParsedMovieFilename> {
+    parse_media_name_with_variant_suffix(filename, MediaKind::Movie, Some(suffix)).map(|parsed| {
+        ParsedMovieFilename {
+            title: parsed.title,
+            sort_title: parsed.sort_title,
+            production_year: parsed.production_year,
+            edition_name: parsed.edition_name,
+            quality_label: parsed.quality_label,
+            provider_ids: parsed.provider_ids,
+        }
     })
 }
 
@@ -13099,6 +13266,66 @@ impl FileBatchWalker {
     }
 }
 
+fn trailing_hyphen_variant_candidates(filename: &str) -> Option<Vec<(&str, &str)>> {
+    let stem = Path::new(filename).file_stem()?.to_str()?;
+    if has_multi_part_marker(filename) || has_source_variant_marker(filename) {
+        return None;
+    }
+    let candidates = stem
+        .match_indices('-')
+        .filter_map(|(index, _)| {
+            let base = &stem[..index];
+            let suffix = &stem[index + 1..];
+            (!base.is_empty()
+                && !suffix.is_empty()
+                && suffix.trim() == suffix
+                && suffix.chars().any(char::is_alphanumeric)
+                && suffix.chars().all(|character| {
+                    character.is_alphanumeric()
+                        || matches!(character, '-' | '_' | '.' | ' ' | '\'' | '’')
+                }))
+            .then_some((base, suffix))
+        })
+        .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+async fn infer_sibling_movie_variant_suffix(path: &Path) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    let candidates = trailing_hyphen_variant_candidates(filename)?;
+    let directory = path.parent()?;
+    let mut extensions = Vec::with_capacity(7);
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        extensions.push(extension.to_owned());
+    }
+    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
+        if !extensions.iter().any(|existing| existing == extension) {
+            extensions.push(extension.to_owned());
+        }
+    }
+    let mut matched_suffixes = HashSet::new();
+    for (base, suffix) in candidates.iter().rev() {
+        for extension in &extensions {
+            let sibling = directory.join(format!("{base}.{extension}"));
+            if fs::symlink_metadata(sibling)
+                .await
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                matched_suffixes.insert(*suffix);
+                break;
+            }
+        }
+        if matched_suffixes.len() > 1 {
+            return None;
+        }
+    }
+    if matched_suffixes.len() == 1 {
+        matched_suffixes.into_iter().next().map(str::to_owned)
+    } else {
+        None
+    }
+}
+
 fn is_supported_movie_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -13276,7 +13503,8 @@ mod tests {
         MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
         NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
         ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
-        configured_scan_concurrency, is_lite_manifest_discovery, manifest_file_observation_matches,
+        configured_scan_concurrency, infer_sibling_movie_variant_suffix,
+        is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
         normalize_incremental_path, parse_episode_filename, parse_movie_filename,
         prepare_manifest_filename, read_manifest_strm_target, safe_scan_activity_label,
@@ -13517,6 +13745,221 @@ mod tests {
             mixed_episode,
             PreparedManifestFilename::Episode(parsed) if parsed.season == 1 && parsed.episode == 2
         ));
+    }
+
+    #[tokio::test]
+    async fn movie_manifest_groups_generic_suffixes_with_exact_sibling_bases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        for code in ["ADN-610", "ADN-723"] {
+            let movie_dir = media_root.join(code);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{code}.mp4")), b"base").await?;
+            tokio::fs::write(movie_dir.join(format!("{code}-C.mp4")), b"variant").await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF-8 media root")?,
+            )
+            .await?
+            .root;
+
+        let jobs = ScanJobService::new(database.clone());
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        jobs.run_to_completion(&job.id, 100, None).await?;
+
+        let movies: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT item.title, COUNT(source.id)
+             FROM media_items item
+             JOIN media_sources source ON source.item_id = item.id
+             WHERE item.library_id = ? AND item.item_type = 'MOVIE' AND item.removed_at IS NULL
+             GROUP BY item.id
+             ORDER BY item.title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        let editions: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT entry.relative_path, source.edition_name
+             FROM media_sources source
+             JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+             ORDER BY entry.relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            editions,
+            vec![
+                ("ADN-610/ADN-610-C.mp4".to_owned(), Some("C".to_owned())),
+                ("ADN-610/ADN-610.mp4".to_owned(), None),
+                ("ADN-723/ADN-723-C.mp4".to_owned(), Some("C".to_owned())),
+                ("ADN-723/ADN-723.mp4".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            movies,
+            vec![("ADN 610".to_owned(), 2), ("ADN 723".to_owned(), 2)]
+        );
+
+        for code in ["ADN-610", "ADN-723"] {
+            let legacy_item_id = format!("legacy-{code}");
+            let legacy_title = format!("{} C", code.replace('-', " "));
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, original_title,
+                    identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(&legacy_item_id)
+            .bind(library.id.to_string())
+            .bind(&legacy_title)
+            .bind(legacy_title.to_lowercase())
+            .bind(&legacy_title)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "UPDATE media_sources SET item_id = ?, edition_name = NULL
+                 WHERE filesystem_entry_id = (
+                     SELECT id FROM filesystem_entries
+                     WHERE library_root_id = ? AND relative_path = ?
+                 )",
+            )
+            .bind(&legacy_item_id)
+            .bind(root.id.to_string())
+            .bind(format!("{code}/{code}-C.mp4"))
+            .execute(database.pool())
+            .await?;
+        }
+
+        let rescan = jobs.create_movie_scan_job(library.id).await?;
+        jobs.run_to_completion(&rescan.id, 100, None).await?;
+        let movies: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT item.title, COUNT(source.id)
+             FROM media_items item
+             JOIN media_sources source ON source.item_id = item.id
+             WHERE item.library_id = ? AND item.item_type = 'MOVIE' AND item.removed_at IS NULL
+             GROUP BY item.id
+             ORDER BY item.title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            movies,
+            vec![("ADN 610".to_owned(), 2), ("ADN 723".to_owned(), 2)]
+        );
+        let removed_legacy_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE id IN (?, ?) AND removed_at IS NOT NULL",
+        )
+        .bind("legacy-ADN-610")
+        .bind("legacy-ADN-723")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(removed_legacy_items, 2);
+
+        sqlx::query("UPDATE media_sources SET probe_status = 'READY'")
+            .execute(database.pool())
+            .await?;
+        let scan_again = jobs.create_movie_scan_job(library.id).await?;
+        jobs.run_to_completion(&scan_again.id, 100, None).await?;
+        let probe_statuses: Vec<String> =
+            sqlx::query_scalar("SELECT probe_status FROM media_sources ORDER BY id")
+                .fetch_all(database.pool())
+                .await?;
+        assert_eq!(probe_statuses, vec!["READY".to_owned(); 4]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inferred_variant_requires_a_regular_base_video_in_the_same_directory() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let variant_dir = temp_dir.path().join("Variants");
+        let other_dir = temp_dir.path().join("Other");
+        tokio::fs::create_dir_all(&variant_dir)
+            .await
+            .expect("variant directory");
+        tokio::fs::create_dir_all(&other_dir)
+            .await
+            .expect("other directory");
+        let variant_path = variant_dir.join("ADN-610-Alternate.mp4");
+        tokio::fs::write(&variant_path, b"variant")
+            .await
+            .expect("variant file");
+        tokio::fs::write(other_dir.join("ADN-610.mp4"), b"base elsewhere")
+            .await
+            .expect("base in a different directory");
+
+        assert_eq!(
+            infer_sibling_movie_variant_suffix(&variant_path).await,
+            None
+        );
+
+        tokio::fs::write(variant_dir.join("ADN-610.mkv"), b"base")
+            .await
+            .expect("base video with a different supported extension");
+        assert_eq!(
+            infer_sibling_movie_variant_suffix(&variant_path)
+                .await
+                .as_deref(),
+            Some("Alternate")
+        );
+
+        let provider_tagged = variant_dir.join("ADN-610-C [tmdbid=123].mp4");
+        tokio::fs::write(&provider_tagged, b"provider tagged")
+            .await
+            .expect("tagged filename");
+        assert_eq!(
+            infer_sibling_movie_variant_suffix(&provider_tagged).await,
+            None,
+            "provider ID tags must not be mistaken for variant suffixes"
+        );
+        tokio::fs::remove_file(&provider_tagged)
+            .await
+            .expect("remove provider tagged filename");
+
+        tokio::fs::remove_file(&variant_path)
+            .await
+            .expect("remove competing base candidate");
+        let multi_hyphen_variant = variant_dir.join("ADN-610-Alternate-Cut.mp4");
+        tokio::fs::write(&multi_hyphen_variant, b"multi-hyphen variant")
+            .await
+            .expect("multi-hyphen variant file");
+        assert_eq!(
+            infer_sibling_movie_variant_suffix(&multi_hyphen_variant)
+                .await
+                .as_deref(),
+            Some("Alternate-Cut")
+        );
+
+        tokio::fs::write(&variant_path, b"variant")
+            .await
+            .expect("restore competing variant file");
+        tokio::fs::write(variant_dir.join("ADN.mp4"), b"ambiguous base")
+            .await
+            .expect("second possible exact base");
+        assert_eq!(
+            infer_sibling_movie_variant_suffix(&variant_path).await,
+            None,
+            "more than one exact prefix match must not be guessed"
+        );
     }
 
     #[test]

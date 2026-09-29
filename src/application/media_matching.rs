@@ -21,13 +21,30 @@ pub struct ParsedMediaName {
 }
 
 pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName> {
+    parse_media_name_with_variant_suffix(input, kind, None)
+}
+
+pub(crate) fn parse_media_name_with_variant_suffix(
+    input: &str,
+    kind: MediaKind,
+    inferred_suffix: Option<&str>,
+) -> Option<ParsedMediaName> {
     let stem = Path::new(input).file_stem()?.to_str()?.trim();
     if stem.is_empty() {
         return None;
     }
     let (stem_without_provider_ids, provider_ids) = strip_provider_id_tags(stem);
-    let (stem_without_source_variant, source_variant) =
-        strip_source_variant_suffix(&stem_without_provider_ids);
+    let (stem_without_source_variant, source_variant) = if let Some(suffix) = inferred_suffix {
+        let marker = format!("-{suffix}");
+        let stem_without_provider_ids = stem_without_provider_ids.trim_end();
+        let stem_without_source_variant = stem_without_provider_ids.strip_suffix(&marker)?;
+        (
+            stem_without_source_variant.to_owned(),
+            Some(suffix.to_owned()),
+        )
+    } else {
+        strip_source_variant_suffix(&stem_without_provider_ids)
+    };
     let normalized = normalize_separators(&stem_without_source_variant);
     let words = normalized.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() {
@@ -539,4 +556,29 @@ fn is_cjk(character: char) -> bool {
         character as u32,
         0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MediaKind, parse_media_name, parse_media_name_with_variant_suffix};
+
+    #[test]
+    fn inferred_variant_suffixes_are_generic_and_only_applied_when_supplied() {
+        for (filename, suffix, expected_title) in [
+            ("ADN-610-C.mp4", "C", "ADN 610"),
+            ("ADN-723-Alternate.mp4", "Alternate", "ADN 723"),
+        ] {
+            let parsed =
+                parse_media_name_with_variant_suffix(filename, MediaKind::Movie, Some(suffix))
+                    .expect("paired movie variant parses");
+
+            assert_eq!(parsed.title, expected_title);
+            assert_eq!(parsed.edition_name.as_deref(), Some(suffix));
+        }
+
+        let unpaired = parse_media_name("ADN-610-C.mp4", MediaKind::Movie)
+            .expect("unpaired filename stays a movie");
+        assert_eq!(unpaired.title, "ADN 610 C");
+        assert_eq!(unpaired.edition_name, None);
+    }
 }
