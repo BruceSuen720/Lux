@@ -9,6 +9,7 @@ import { AccountPage } from "../src/features/account/AccountPage";
 import { LuxShell } from "../src/components/layout/LuxShell";
 import { api } from "../src/lib/api/client";
 import { accountSettingsStorageKey, applyAccountTheme, DEFAULT_ACCOUNT_SETTINGS, moveLibrary, readAccountSettings } from "../src/features/account/account-settings";
+import { calculateAvatarCrop } from "../src/features/account/avatar-image";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -17,6 +18,36 @@ const user = {
   usernameNormalized: "owner",
   displayName: "影院主人",
 };
+
+function mockAvatarImageProcessing(width = 600, height = 900) {
+  const bitmap = { width, height, close: vi.fn() };
+  const drawImage = vi.fn();
+  const arc = vi.fn();
+  const fill = vi.fn();
+  const beginPath = vi.fn();
+  const context = { drawImage, arc, fill, beginPath, globalCompositeOperation: "source-over" };
+  vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue(bitmap));
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as unknown as CanvasRenderingContext2D);
+  vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => {
+    callback(new Blob(["cropped avatar"], { type: "image/png" }));
+  });
+  return { drawImage, arc, context, bitmap };
+}
+
+describe("avatar crop geometry", () => {
+  it("centers a square crop and moves it within the source image bounds", () => {
+    expect(calculateAvatarCrop(400, 800, { zoom: 1, horizontal: 0, vertical: 0 })).toEqual({
+      x: 0,
+      y: 200,
+      size: 400,
+    });
+    expect(calculateAvatarCrop(400, 800, { zoom: 2, horizontal: 1, vertical: -1 })).toEqual({
+      x: 200,
+      y: 0,
+      size: 200,
+    });
+  });
+});
 
 describe("account settings", () => {
   let container: HTMLDivElement;
@@ -43,6 +74,7 @@ describe("account settings", () => {
     act(() => root.unmount());
     container.remove();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("provides safe defaults and keeps the library order within its list", () => {
@@ -242,6 +274,7 @@ describe("account settings", () => {
 
   it("uploads an avatar to the server only after the user explicitly saves it", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { drawImage, arc, context } = mockAvatarImageProcessing();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ avatarUrl: "/api/v1/auth/avatar" }), { status: 200 }),
     );
@@ -279,6 +312,16 @@ describe("account settings", () => {
       expect(button).toBeTruthy();
       expect(button?.disabled).toBe(false);
     });
+    const zoom = container.querySelector<HTMLInputElement>('[aria-label="头像缩放"]');
+    const verticalPosition = container.querySelector<HTMLInputElement>('[aria-label="头像垂直位置"]');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(zoom, "2");
+      zoom?.dispatchEvent(new Event("input", { bubbles: true }));
+      zoom?.dispatchEvent(new Event("change", { bubbles: true }));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(verticalPosition, "0.25");
+      verticalPosition?.dispatchEvent(new Event("input", { bubbles: true }));
+      verticalPosition?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
     const saveButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
       .find((button) => button.textContent?.includes("保存头像"));
 
@@ -291,11 +334,56 @@ describe("account settings", () => {
       "/api/v1/auth/avatar",
       expect.objectContaining({ method: "PUT", credentials: "same-origin" }),
     );
+    expect(drawImage).toHaveBeenCalledWith(expect.anything(), 150, 375, 300, 300, 0, 0, 512, 512);
+    expect(context.globalCompositeOperation).toBe("destination-in");
+    expect(arc).toHaveBeenCalledWith(256, 256, 256, 0, Math.PI * 2);
+    expect(context.fill).toHaveBeenCalledOnce();
+    const uploadBody = fetchMock.mock.calls.find(([url]) => url === "/api/v1/auth/avatar")?.[1]?.body;
+    expect(uploadBody).toBeInstanceOf(File);
+    expect((uploadBody as File).type).toBe("image/png");
+    expect((uploadBody as File).name).toBe("avatar.png");
     expect(container.querySelector<HTMLImageElement>(".lux-avatar img")?.getAttribute("src")).toMatch(
       /^\/api\/v1\/auth\/avatar\?v=\d+$/,
     );
     expect(localStorage.getItem("lux.account.avatar:user-1")).toBeNull();
     expect(container.textContent).toContain("头像已保存");
+  });
+
+  it("lets the user adjust the avatar crop before saving a non-square image", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/account"]}>
+            <Routes>
+              <Route element={<LuxShell user={user} />}>
+                <Route path="/account" element={<AccountPage user={user} />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const file = new File(["portrait"], "portrait.png", { type: "image/png" });
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+
+    await act(async () => {
+      input?.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector('[aria-label="头像裁切预览"]')).not.toBeNull();
+    expect(container.querySelector<HTMLInputElement>('[aria-label="头像缩放"]')?.type).toBe("range");
+    expect(container.querySelector<HTMLInputElement>('[aria-label="头像水平位置"]')?.type).toBe("range");
+    expect(container.querySelector<HTMLInputElement>('[aria-label="头像垂直位置"]')?.type).toBe("range");
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="重置头像裁切"]')).not.toBeNull();
+    expect(container.textContent).toContain("保存后会生成透明边缘的圆形头像。");
   });
 
   it("persists a changed theme and reorders libraries from an accessible control", async () => {

@@ -19,6 +19,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
 import { useAvatar } from "../../components/layout/LuxShell";
+import { calculateAvatarCrop, cropAvatarImage, DEFAULT_AVATAR_CROP, type AvatarCrop } from "./avatar-image";
 import {
   applyAccountTheme,
   applyAccountAccent,
@@ -42,7 +43,10 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
   const [pendingAvatarUrl, setPendingAvatarUrl] = useState<string | null>(null);
   const [pendingAvatarFile, setPendingAvatarFile] = useState<File | null>(null);
+  const [pendingAvatarDimensions, setPendingAvatarDimensions] = useState<{ width: number; height: number } | null>(null);
+  const [avatarCrop, setAvatarCrop] = useState<AvatarCrop>(DEFAULT_AVATAR_CROP);
   const [avatarReading, setAvatarReading] = useState(false);
+  const [avatarPreparing, setAvatarPreparing] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
   const [accountNotice, setAccountNotice] = useState<string | null>(null);
   const [libraryOrderNotice, setLibraryOrderNotice] = useState<string | null>(null);
@@ -188,6 +192,8 @@ export function AccountPage({ user }: { user: LuxUser }) {
     if (!file) return;
     setAvatarNotice(null);
     setPendingAvatarFile(file);
+    setPendingAvatarDimensions(null);
+    setAvatarCrop(DEFAULT_AVATAR_CROP);
     setAvatarReading(true);
     const reader = new FileReader();
     reader.onload = () => {
@@ -208,14 +214,34 @@ export function AccountPage({ user }: { user: LuxUser }) {
     reader.readAsDataURL(file);
   };
 
-  const saveAvatar = () => {
-    if (!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarUpload.isPending) return;
-    avatarUpload.mutate(pendingAvatarFile);
+  const saveAvatar = async () => {
+    if (!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarPreparing || avatarUpload.isPending) return;
+    setAvatarPreparing(true);
+    try {
+      avatarUpload.mutate(await cropAvatarImage(pendingAvatarFile, avatarCrop));
+    } catch (error) {
+      setAvatarNotice(error instanceof Error ? `头像处理失败：${error.message}` : "头像图片处理失败，请重试。");
+    } finally {
+      setAvatarPreparing(false);
+    }
   };
 
   const displayName = user.displayName || user.usernameNormalized;
   const initials = displayName.slice(0, 1).toUpperCase();
   const displayedAvatarUrl = pendingAvatarUrl ?? (avatarImageFailed ? null : avatarUrl);
+  const cropPreviewSize = 144;
+  const cropPreviewStyle = pendingAvatarDimensions
+    ? (() => {
+      const crop = calculateAvatarCrop(pendingAvatarDimensions.width, pendingAvatarDimensions.height, avatarCrop);
+      const scale = cropPreviewSize / crop.size;
+      return {
+        width: `${pendingAvatarDimensions.width * scale}px`,
+        height: `${pendingAvatarDimensions.height * scale}px`,
+        left: `${-crop.x * scale}px`,
+        top: `${-crop.y * scale}px`,
+      };
+    })()
+    : undefined;
 
   return (
     <section className="lux-page lux-account-page">
@@ -403,25 +429,90 @@ export function AccountPage({ user }: { user: LuxUser }) {
               </div>
               <div>
                 <strong>头像</strong>
-                <p>使用 JPG、PNG 或 WebP 图片，建议使用正方形图片。</p>
+                <p>使用 JPG、PNG 或 WebP 图片，可调整圆形头像中的取景位置和大小。</p>
                 <div className="lux-account-avatar-actions">
                   <label className="lux-upload-button">
                     <span>{displayedAvatarUrl ? "更换头像" : "选择头像"}</span>
                     <input
                       type="file"
                       accept="image/jpeg,image/png,image/webp"
-                      onChange={(event) => selectAvatar(event.target.files?.[0])}
+                      onChange={(event) => {
+                        selectAvatar(event.target.files?.[0]);
+                        event.currentTarget.value = "";
+                      }}
                     />
                   </label>
                   <button
                     className="lux-button lux-button-compact lux-button-secondary"
                     type="button"
                     onClick={saveAvatar}
-                    disabled={!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarUpload.isPending}
+                    disabled={!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarPreparing || avatarUpload.isPending}
                   >
-                    {avatarUpload.isPending ? "保存中…" : avatarReading ? "读取中…" : "保存头像"}
+                    {avatarUpload.isPending ? "保存中…" : avatarPreparing ? "裁切中…" : avatarReading ? "读取中…" : "保存头像"}
                   </button>
                 </div>
+                {pendingAvatarUrl ? (
+                  <div className="lux-account-avatar-cropper">
+                    <div className="lux-avatar-crop-preview" role="img" aria-label="头像裁切预览">
+                      <img
+                        src={pendingAvatarUrl}
+                        alt=""
+                        onLoad={(event) => setPendingAvatarDimensions({
+                          width: event.currentTarget.naturalWidth,
+                          height: event.currentTarget.naturalHeight,
+                        })}
+                        style={cropPreviewStyle}
+                      />
+                    </div>
+                    <div className="lux-avatar-crop-controls">
+                      <label>
+                        <span>缩放 <output>{avatarCrop.zoom.toFixed(2)}×</output></span>
+                        <input
+                          type="range"
+                          aria-label="头像缩放"
+                          min="1"
+                          max="3"
+                          step="0.05"
+                          value={avatarCrop.zoom}
+                          onChange={(event) => setAvatarCrop((current) => ({ ...current, zoom: Number(event.target.value) }))}
+                        />
+                      </label>
+                      <label>
+                        <span>水平位置</span>
+                        <input
+                          type="range"
+                          aria-label="头像水平位置"
+                          min="-1"
+                          max="1"
+                          step="0.01"
+                          value={avatarCrop.horizontal}
+                          onChange={(event) => setAvatarCrop((current) => ({ ...current, horizontal: Number(event.target.value) }))}
+                        />
+                      </label>
+                      <label>
+                        <span>垂直位置</span>
+                        <input
+                          type="range"
+                          aria-label="头像垂直位置"
+                          min="-1"
+                          max="1"
+                          step="0.01"
+                          value={avatarCrop.vertical}
+                          onChange={(event) => setAvatarCrop((current) => ({ ...current, vertical: Number(event.target.value) }))}
+                        />
+                      </label>
+                      <button
+                        className="lux-avatar-crop-reset"
+                        type="button"
+                        aria-label="重置头像裁切"
+                        onClick={() => setAvatarCrop(DEFAULT_AVATAR_CROP)}
+                      >
+                        重置
+                      </button>
+                      <small>保存后会生成透明边缘的圆形头像。</small>
+                    </div>
+                  </div>
+                ) : null}
                 {avatarNotice ? <p className="lux-account-notice" role="status">{avatarNotice}</p> : null}
               </div>
             </div>
