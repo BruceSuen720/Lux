@@ -10,7 +10,10 @@ use crate::{
     },
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
-    storage::{NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult},
+    storage::{
+        ItemImageBatchInsert, ItemImageInsert, NewItemMetadataCompletenessCheck,
+        NewItemMetadataCompletenessResult,
+    },
 };
 
 async fn refresh_recommendation_stats(database: &Database) {
@@ -1915,6 +1918,552 @@ async fn progressive_scan_metadata_completeness_batches_are_atomic_and_versioned
             .is_err()
     );
     database.close().await;
+}
+
+#[tokio::test]
+async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for directory in ["Batch First (2024)", "Batch Second (2024)"] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir)
+            .await
+            .expect("movie directory");
+        tokio::fs::write(
+            movie_dir.join(format!("{}.mkv", directory.replace(' ', "."))),
+            b"video",
+        )
+        .await
+        .expect("movie file");
+    }
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Local image batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movies");
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("movie ids");
+    assert_eq!(item_ids.len(), 2);
+
+    for item_id in &item_ids {
+        database
+            .set_poster_fallback_required(item_id, true)
+            .await
+            .expect("require fallback before poster write");
+    }
+    let make_image = |image_type: &str, index: i64, path: &str, tag: &str| ItemImageInsert {
+        image_type: image_type.to_owned(),
+        image_index: index,
+        local_path: path.to_owned(),
+        file_size: 128,
+        width: Some(64),
+        height: Some(96),
+        content_tag: tag.to_owned(),
+        source: "LOCAL".to_owned(),
+        source_url: None,
+    };
+    let batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: vec![
+                make_image("POSTER", 0, "/media/first/poster.jpg", "first-poster-v1"),
+                make_image("FANART", 0, "/media/first/fanart.jpg", "first-fanart-v1"),
+                make_image("FANART", 1, "/media/first/fanart-2.jpg", "first-fanart-v2"),
+            ],
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/second/poster.jpg",
+                "second-poster-v1",
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&batch)
+            .await
+            .expect("insert images for both items"),
+        4
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await
+            .expect("count ordered fanart"),
+        2
+    );
+    let fallback: Vec<i64> = database
+        .query_scalar(
+            "SELECT poster_fallback_required FROM media_items
+             WHERE id IN (?, ?) ORDER BY title",
+        )
+        .bind(&item_ids[0])
+        .bind(&item_ids[1])
+        .fetch_all(database.pool())
+        .await
+        .expect("read fallback flags");
+    assert_eq!(fallback, vec![0, 0]);
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&batch)
+            .await
+            .expect("repeat identical images"),
+        0,
+        "identical content is an idempotent upsert"
+    );
+    let changed_poster_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![make_image(
+            "POSTER",
+            0,
+            "/media/first/poster-updated.jpg",
+            "first-poster-v2",
+        )],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&changed_poster_batch)
+            .await
+            .expect("update changed poster path"),
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT local_path FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await
+            .expect("read updated poster path"),
+        "/media/first/poster-updated.jpg"
+    );
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&[])
+            .await
+            .expect("empty page is a no-op"),
+        0
+    );
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
+                item_id: item_ids[0].clone(),
+                images: Vec::new(),
+                clear_poster_fallback: false,
+            }])
+            .await
+            .expect("image-less item page is a no-op"),
+        0
+    );
+    assert_eq!(database.query_count(), 0);
+    let oversized_batch = (0..17)
+        .map(|index| ItemImageBatchInsert {
+            item_id: format!("item-{index}"),
+            images: Vec::new(),
+            clear_poster_fallback: false,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&oversized_batch)
+            .await
+            .is_err(),
+        "a storage page cannot exceed sixteen items"
+    );
+
+    let second_item_id = item_ids[1].clone();
+    let trigger_sql = format!(
+        "CREATE TRIGGER reject_second_local_image
+         BEFORE INSERT ON item_images
+         WHEN NEW.item_id = '{second_item_id}' AND NEW.local_path LIKE '%reject%'
+         BEGIN SELECT RAISE(ABORT, 'injected image batch failure'); END"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await
+        .expect("install failure trigger");
+    for item_id in &item_ids {
+        database
+            .set_poster_fallback_required(item_id, true)
+            .await
+            .expect("restore fallback before rollback test");
+    }
+    let failing_batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/first/poster-failed.jpg",
+                "first-poster-v3",
+            )],
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "LOGO",
+                0,
+                "/media/second/reject-logo.jpg",
+                "reject-logo",
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&failing_batch)
+            .await
+            .is_err(),
+        "a single image failure rolls back the complete item page"
+    );
+    sqlx::query("DROP TRIGGER reject_second_local_image")
+        .execute(database.pool())
+        .await
+        .expect("drop failure trigger");
+    let first_image_path: String = database
+        .query_scalar(
+            "SELECT local_path FROM item_images
+             WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+        )
+        .bind(&item_ids[0])
+        .fetch_one(database.pool())
+        .await
+        .expect("read first image after rollback");
+    assert_eq!(first_image_path, "/media/first/poster-updated.jpg");
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'LOGO'",
+            )
+            .bind(&item_ids[1])
+            .fetch_one(database.pool())
+            .await
+            .expect("count rolled-back logo"),
+        0
+    );
+    let fallback: Vec<i64> = database
+        .query_scalar(
+            "SELECT poster_fallback_required FROM media_items
+             WHERE id IN (?, ?) ORDER BY title",
+        )
+        .bind(&item_ids[0])
+        .bind(&item_ids[1])
+        .fetch_all(database.pool())
+        .await
+        .expect("read rolled-back fallback flags");
+    assert_eq!(fallback, vec![1, 1]);
+    database.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_local_item_image_batch_is_bounded_idempotent_and_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection
+    };
+    let database =
+        Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
+            .await?;
+    let media_root = temp_dir.path().join("Movies");
+    for directory in [
+        "Postgres Batch First (2024)",
+        "Postgres Batch Second (2024)",
+    ] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("{}.mkv", directory.replace(' ', "."))),
+            b"video",
+        )
+        .await?;
+    }
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Postgres local image batch", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(item_ids.len(), 2);
+    for item_id in &item_ids {
+        database.set_poster_fallback_required(item_id, true).await?;
+    }
+    let make_image = |image_type: &str, index: i64, path: String, tag: String| ItemImageInsert {
+        image_type: image_type.to_owned(),
+        image_index: index,
+        local_path: path,
+        file_size: 128,
+        width: Some(64),
+        height: Some(96),
+        content_tag: tag,
+        source: "LOCAL".to_owned(),
+        source_url: None,
+    };
+    let mut first_images = vec![make_image(
+        "POSTER",
+        0,
+        "/media/first/poster.jpg".to_owned(),
+        "poster-v1".to_owned(),
+    )];
+    first_images.extend((0..65).map(|index| {
+        make_image(
+            "FANART",
+            index,
+            format!("/media/first/fanart-{index}.jpg"),
+            format!("fanart-v{index}"),
+        )
+    }));
+    let batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: first_images,
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/second/poster.jpg".to_owned(),
+                "poster-v1".to_owned(),
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert_eq!(
+        database.insert_item_images_batch_at_indices(&batch).await?,
+        67
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await?,
+        65
+    );
+    assert_eq!(
+        database.insert_item_images_batch_at_indices(&batch).await?,
+        0
+    );
+    let changed_poster_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![make_image(
+            "POSTER",
+            0,
+            "/media/first/poster-updated.jpg".to_owned(),
+            "poster-v2".to_owned(),
+        )],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&changed_poster_batch)
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT local_path FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await?,
+        "/media/first/poster-updated.jpg"
+    );
+    let empty_batch: [ItemImageBatchInsert; 0] = [];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&empty_batch)
+            .await?,
+        0
+    );
+
+    let oversized = (0..17)
+        .map(|index| ItemImageBatchInsert {
+            item_id: format!("postgres-item-{index}"),
+            images: Vec::new(),
+            clear_poster_fallback: false,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&oversized)
+            .await
+            .is_err()
+    );
+
+    let trigger_function = format!(
+        "CREATE FUNCTION reject_postgres_local_image_batch() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.item_id = '{second_item}' AND NEW.local_path LIKE '%reject%' THEN
+                 RAISE EXCEPTION 'injected image batch failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+        second_item = item_ids[1],
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_function))
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_postgres_local_image_batch
+         BEFORE INSERT ON item_images
+         FOR EACH ROW EXECUTE FUNCTION reject_postgres_local_image_batch()",
+    )
+    .execute(database.pool())
+    .await?;
+    for item_id in &item_ids {
+        database.set_poster_fallback_required(item_id, true).await?;
+    }
+    let failing_batch = [
+        ItemImageBatchInsert {
+            item_id: item_ids[0].clone(),
+            images: vec![make_image(
+                "POSTER",
+                0,
+                "/media/first/poster-failed.jpg".to_owned(),
+                "poster-v3".to_owned(),
+            )],
+            clear_poster_fallback: true,
+        },
+        ItemImageBatchInsert {
+            item_id: item_ids[1].clone(),
+            images: vec![make_image(
+                "LOGO",
+                0,
+                "/media/second/reject-logo.jpg".to_owned(),
+                "reject-logo".to_owned(),
+            )],
+            clear_poster_fallback: true,
+        },
+    ];
+    assert!(
+        database
+            .insert_item_images_batch_at_indices(&failing_batch)
+            .await
+            .is_err()
+    );
+    sqlx::query("DROP TRIGGER reject_postgres_local_image_batch ON item_images")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION reject_postgres_local_image_batch()")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT local_path FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+            )
+            .bind(&item_ids[0])
+            .fetch_one(database.pool())
+            .await?,
+        "/media/first/poster-updated.jpg"
+    );
+    let fallback: Vec<i64> = database
+        .query_scalar(
+            "SELECT poster_fallback_required FROM media_items
+             WHERE id IN (?, ?) ORDER BY title",
+        )
+        .bind(&item_ids[0])
+        .bind(&item_ids[1])
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(fallback, vec![1, 1]);
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    Ok(())
 }
 
 #[tokio::test]

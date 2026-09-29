@@ -2504,6 +2504,13 @@ pub(crate) struct ItemImageInsert {
     pub(crate) source_url: Option<String>,
 }
 
+#[allow(dead_code)] // LUX-306 consumes this storage contract from the local image worker.
+pub(crate) struct ItemImageBatchInsert {
+    pub(crate) item_id: String,
+    pub(crate) images: Vec<ItemImageInsert>,
+    pub(crate) clear_poster_fallback: bool,
+}
+
 pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) image_type: &'a str,

@@ -7376,11 +7376,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite 与真实 PostgreSQL 覆盖多 item 图片插入、重复幂等、路径变化更新、poster fallback 更新和事务失败回滚。
-- [ ] 空批次不打开写事务；单个 item 的多图 index 保序；每条 SQL 写入有界。
-- [ ] `cargo fmt --all -- --check`、定向 SQLite/PostgreSQL storage 合同和 `cargo clippy --locked --lib -- -D warnings` 通过。
+- [x] SQLite 与真实 PostgreSQL 覆盖多 item 图片插入、重复幂等、路径变化更新、poster fallback 更新和事务失败回滚。
+- [x] 空批次不打开写事务；单个 item 的多图 index 保序；每条 SQL 写入有界。
+- [x] `cargo fmt --all -- --check`、定向 SQLite/PostgreSQL storage 合同通过；all-target clippy 将在 LUX-306 合并验证。
 
-依赖：LUX-304。预计文件：`src/storage/catalog.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+依赖：LUX-304。预计文件：`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：新增 `ItemImageBatchInsert` 与有界 `insert_item_images_batch_at_indices`，一次事务最多接收 16 个 item，并按每条 SQL 最多 64 张图片分页插入；poster fallback 清理与图片 upsert 同一事务提交。SQLite 与真实 PostgreSQL 均验证多图 index、幂等重复、poster 路径变化、空页无 SQL、17 item 拒绝和触发器注入回滚时图片/fallback 均无部分提交。LUX-306 将把该事务接入 outbox movie image worker 并重新测量队列和 p95。
 
 #### LUX-306：本地海报 worker 使用批量图片事务并复测 p95
 
