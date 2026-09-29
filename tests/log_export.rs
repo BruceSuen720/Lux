@@ -1,5 +1,5 @@
 use std::{
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     time::Duration,
 };
 
@@ -8,6 +8,7 @@ use luxd::{
     application::setup::SetupService,
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
+    observability::logs::{LogDateRange, LogExport, export_logs},
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -172,5 +173,33 @@ async fn admin_can_export_selected_daily_logs_but_viewer_cannot()
     assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn daily_log_export_reads_archived_segments() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let log_dir = temp_dir.path().join("config").join("logs");
+    let archive_dir = log_dir.join("archive");
+    tokio::fs::create_dir_all(&archive_dir).await?;
+    let archive_path = archive_dir.join("lux.2026-08-08.part-000001.log.zip");
+    let archive_file = std::fs::File::create(archive_path)?;
+    let mut archive = zip::ZipWriter::new(archive_file);
+    archive.start_file(
+        "lux.2026-08-08.part-000001.log",
+        zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated),
+    )?;
+    archive.write_all(b"{\"message\":\"archived\"}\n")?;
+    archive.finish()?;
+
+    let from = time::Date::from_calendar_date(2026, time::Month::August, 8)?;
+    let range = LogDateRange::new(from, from)?;
+    let export = export_logs(&log_dir.parent().ok_or("missing config directory")?, range).await?;
+    let LogExport::Daily { contents, filename } = export else {
+        return Err("single-day export should remain a raw JSONL file".into());
+    };
+    assert_eq!(filename, "lux.2026-08-08.log");
+    assert_eq!(contents, b"{\"message\":\"archived\"}\n");
     Ok(())
 }

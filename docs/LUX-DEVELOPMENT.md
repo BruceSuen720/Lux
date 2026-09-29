@@ -1729,6 +1729,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 
 - JSON 结构化日志为默认容器输出。
 - Lux 同时将同一份 JSON 结构化日志按 UTC 日期写入配置目录的 `logs/lux.YYYY-MM-DD.log`；日志目录随 `/config` 持久化，容器重启后保留历史文件。管理员选择单日时下载原始 `.log` 文件，选择多日时下载包含每日文件的 ZIP。
+- 活动 JSONL 段达到 50 MiB 或 UTC 日期切换后会压缩到 `/config/logs/archive/`；归档包最多保留 20 个，新包成功验证后才删除最旧包。管理员日志导出按日期合并活动文件和归档分段。
 - 字段包含 timestamp、level、target、requestId、jobId、libraryId、itemId、errorCode、durationMs。
 - 不记录密码、token、Cookie、完整外部 URL。
 - 路径在管理员日志中可显示相对路径；对普通用户不显示磁盘路径。
@@ -7461,12 +7462,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 程序结构化日志通过独立 writer 写入配置目录 JSONL；写文件和压缩不阻塞 Tokio 核心 worker。
-- [ ] 单段在 50 MiB 边界和 UTC 日期切换时安全封存；重启后继续写入正确的当前日期文件。
-- [ ] 每个压缩包包含原始 JSONL 段；压缩包损坏或写入失败不会先删除原日志。
-- [ ] 归档目录最多 20 个包；成功完成第 21 个包后按创建顺序删最旧包。
-- [ ] 管理员按日期导出可读取当前文件和归档成员；单日仍返回 JSONL，多日仍返回 ZIP，日期权限和范围合同不变。
-- [ ] 自动化测试覆盖容量轮转、日期轮转、ZIP 内容、20/21 个归档边界、失败保留和导出读取。
+- [x] 程序结构化日志通过独立 writer 写入配置目录 JSONL；写文件和压缩不阻塞 Tokio 核心 worker。
+- [x] 单段在 50 MiB 边界和 UTC 日期切换时安全封存；重启后继续写入正确的当前日期文件。
+- [x] 每个压缩包包含原始 JSONL 段；压缩包损坏或写入失败不会先删除原日志。
+- [x] 归档目录最多 20 个包；成功完成第 21 个包后按创建顺序删最旧包。
+- [x] 管理员按日期导出可读取当前文件和归档成员；单日仍返回 JSONL，多日仍返回 ZIP，日期权限和范围合同不变。
+- [x] 自动化测试覆盖容量轮转、日期轮转、ZIP 内容、20/21 个归档边界、失败保留和导出读取。
+
+结果（2026-09-29）：JSONL writer 在非阻塞日志线程写入配置目录，按 50 MiB/UTC 日切安全打包，验证归档后执行 20 包 FIFO 清理；日期导出从归档段和活动文件拼回原始 JSONL。`cargo test --locked --lib observability::logs::tests` 6 项、`cargo test --locked --test observability --test log_export` 4 项及 `cargo fmt --all -- --check` 通过。
 
 验证：`cargo test --locked --test observability --test log_export`、`cargo fmt --all -- --check`。
 

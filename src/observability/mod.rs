@@ -3,47 +3,22 @@ pub mod resources;
 
 use std::path::Path;
 
-use tracing_appender::{
-    non_blocking::{NonBlockingBuilder, WorkerGuard},
-    rolling::{RollingFileAppender, Rotation},
-};
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-pub async fn init(config_dir: &Path) -> Option<WorkerGuard> {
-    let log_dir = logs::log_dir(config_dir);
-    if let Err(error) = tokio::fs::create_dir_all(&log_dir).await {
-        eprintln!("Lux file logging unavailable; continuing with stdout logging: {error}");
-        init_stdout();
-        return None;
-    }
-
-    let appender = match tokio::task::spawn_blocking(move || {
-        RollingFileAppender::builder()
-            .rotation(Rotation::DAILY)
-            .filename_prefix("lux")
-            .filename_suffix("log")
-            .build(log_dir)
-    })
-    .await
-    {
-        Ok(Ok(appender)) => appender,
-        Ok(Err(error)) => {
+pub async fn init(config_dir: &Path) -> (Option<WorkerGuard>, Option<logs::LogStore>) {
+    let log_store = match logs::LogStore::open(config_dir).await {
+        Ok(log_store) => log_store,
+        Err(error) => {
             eprintln!("Lux file logging unavailable; continuing with stdout logging: {error}");
             init_stdout();
-            return None;
-        }
-        Err(error) => {
-            eprintln!(
-                "Lux file logging worker unavailable; continuing with stdout logging: {error}"
-            );
-            init_stdout();
-            return None;
+            return (None, None);
         }
     };
 
     let (file_writer, guard) = NonBlockingBuilder::default()
         .thread_name("lux-log-writer")
-        .finish(appender);
+        .finish(log_store.writer());
     let filter = env_filter();
     let stdout_layer = fmt::layer().json().with_writer(std::io::stdout);
     let file_layer = fmt::layer().json().with_writer(file_writer);
@@ -55,9 +30,9 @@ pub async fn init(config_dir: &Path) -> Option<WorkerGuard> {
         .is_err()
     {
         drop(guard);
-        return None;
+        return (None, Some(log_store));
     }
-    Some(guard)
+    (Some(guard), Some(log_store))
 }
 
 fn init_stdout() {

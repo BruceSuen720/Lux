@@ -1,18 +1,348 @@
 use std::{
-    fmt,
-    io::{self, Cursor, Write},
+    fmt, fs,
+    io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
 };
 
+use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
-use tokio::fs;
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub const LOG_DIRECTORY: &str = "logs";
+pub const LOG_ARCHIVE_DIRECTORY: &str = "archive";
 pub const MAX_EXPORT_DAYS: i64 = 31;
+pub const LOG_SEGMENT_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_LOG_ARCHIVES: usize = 20;
 const DEFAULT_EXPORT_DAYS: i64 = 7;
 const MAX_DAILY_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
+
+type SharedLogManager = Arc<StdMutex<Option<LogManager>>>;
+
+/// Cloneable handle for structured JSONL logging and application event records.
+#[derive(Clone)]
+pub struct LogStore {
+    config_dir: PathBuf,
+    manager: SharedLogManager,
+}
+
+impl LogStore {
+    pub fn new(config_dir: &Path) -> Self {
+        Self {
+            config_dir: config_dir.to_path_buf(),
+            manager: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    pub async fn open(config_dir: &Path) -> io::Result<Self> {
+        let store = Self::new(config_dir);
+        store.initialize().await?;
+        Ok(store)
+    }
+
+    async fn initialize(&self) -> io::Result<()> {
+        let manager = Arc::clone(&self.manager);
+        let config_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            if manager.is_none() {
+                *manager = Some(LogManager::open(&config_dir)?);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("日志 writer 初始化任务失败: {error}")))?
+    }
+
+    pub async fn append_json(&self, record: Value) -> io::Result<()> {
+        self.initialize().await?;
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let mut line = serde_json::to_vec(&record)
+                .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
+            line.push(b'\n');
+            let mut manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            let manager = manager
+                .as_mut()
+                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
+            manager.write_line(&line)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("日志写入任务失败: {error}")))?
+    }
+
+    pub(crate) fn writer(&self) -> LogWriter {
+        LogWriter {
+            manager: Arc::clone(&self.manager),
+        }
+    }
+}
+
+pub(crate) struct LogWriter {
+    manager: SharedLogManager,
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+        let manager = manager
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "日志 writer 尚未初始化"))?;
+        manager.write_bytes(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+        if let Some(manager) = manager.as_mut() {
+            manager.flush_pending()?;
+        }
+        Ok(())
+    }
+}
+
+struct LogManager {
+    log_dir: PathBuf,
+    archive_dir: PathBuf,
+    active_date: Date,
+    active_path: PathBuf,
+    active_file: Option<fs::File>,
+    active_bytes: u64,
+    pending_bytes: Vec<u8>,
+    segment_limit: u64,
+    archive_limit: usize,
+}
+
+impl LogManager {
+    fn open(config_dir: &Path) -> io::Result<Self> {
+        Self::open_with_limits(
+            config_dir,
+            OffsetDateTime::now_utc().date(),
+            LOG_SEGMENT_BYTES,
+            MAX_LOG_ARCHIVES,
+        )
+    }
+
+    fn open_with_limits(
+        config_dir: &Path,
+        active_date: Date,
+        segment_limit: u64,
+        archive_limit: usize,
+    ) -> io::Result<Self> {
+        let log_dir = log_dir(config_dir);
+        let archive_dir = archive_dir(config_dir);
+        fs::create_dir_all(&archive_dir)?;
+        let active_path = log_dir.join(log_file_name(active_date));
+        let mut manager = Self {
+            log_dir,
+            archive_dir,
+            active_date,
+            active_path,
+            active_file: None,
+            active_bytes: 0,
+            pending_bytes: Vec::new(),
+            segment_limit: segment_limit.max(1),
+            archive_limit,
+        };
+        manager.archive_previous_days(active_date)?;
+        manager.open_active_file()?;
+        if manager.active_bytes >= manager.segment_limit {
+            manager.archive_active()?;
+            manager.open_active_file()?;
+        }
+        manager.prune_archives()?;
+        Ok(manager)
+    }
+
+    fn archive_previous_days(&mut self, active_date: Date) -> io::Result<()> {
+        let entries = fs::read_dir(&self.log_dir)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                let date = parse_daily_log_name(name)?;
+                (date < active_date).then_some((path, date))
+            })
+            .collect::<Vec<_>>();
+        for (path, date) in entries {
+            self.archive_path(&path, date)?;
+        }
+        Ok(())
+    }
+
+    fn open_active_file(&mut self) -> io::Result<()> {
+        fs::create_dir_all(&self.log_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.active_path)?;
+        self.active_bytes = file.metadata()?.len();
+        self.active_file = Some(file);
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.pending_bytes.extend_from_slice(bytes);
+        while let Some(newline) = self.pending_bytes.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending_bytes.drain(..=newline).collect::<Vec<_>>();
+            self.write_line(&line)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        if !self.pending_bytes.is_empty() {
+            let mut line = std::mem::take(&mut self.pending_bytes);
+            if !line.ends_with(b"\n") {
+                line.push(b'\n');
+            }
+            self.write_line(&line)?;
+        }
+        if let Some(file) = self.active_file.as_mut() {
+            file.flush()?;
+        }
+        Ok(())
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+        self.write_line_for_date(OffsetDateTime::now_utc().date(), line)
+    }
+
+    fn write_line_for_date(&mut self, date: Date, line: &[u8]) -> io::Result<()> {
+        if date != self.active_date {
+            self.archive_active()?;
+            self.active_date = date;
+            self.active_path = self.log_dir.join(log_file_name(date));
+            self.open_active_file()?;
+        }
+        let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        if self.active_bytes > 0 && self.active_bytes.saturating_add(line_len) > self.segment_limit
+        {
+            self.archive_active()?;
+            self.open_active_file()?;
+        }
+        let file = self
+            .active_file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("日志活动文件未打开"))?;
+        file.write_all(line)?;
+        self.active_bytes = self.active_bytes.saturating_add(line_len);
+        if self.active_bytes >= self.segment_limit {
+            self.archive_active()?;
+            self.open_active_file()?;
+        }
+        Ok(())
+    }
+
+    fn archive_active(&mut self) -> io::Result<()> {
+        if let Some(mut file) = self.active_file.take() {
+            file.flush()?;
+            file.sync_all()?;
+        }
+        if self.active_bytes > 0 {
+            self.archive_path(&self.active_path.clone(), self.active_date)?;
+        } else if self.active_bytes == 0 {
+            self.active_file = None;
+        }
+        self.active_bytes = 0;
+        Ok(())
+    }
+
+    fn archive_path(&mut self, source_path: &Path, date: Date) -> io::Result<()> {
+        if !source_path.exists() || fs::metadata(source_path)?.len() == 0 {
+            return Ok(());
+        }
+        let sequence = self.next_sequence(date)?;
+        let member_name = log_segment_file_name(date, sequence);
+        let archive_name = format!("{member_name}.zip");
+        let archive_path = self.archive_dir.join(&archive_name);
+        let temp_path = self
+            .archive_dir
+            .join(format!(".{archive_name}.{}.tmp", uuid::Uuid::now_v7()));
+        let temp_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        let result = (|| {
+            let mut writer = ZipWriter::new(temp_file);
+            writer
+                .start_file(
+                    &member_name,
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+                )
+                .map_err(zip_io_error)?;
+            let mut source = fs::File::open(source_path)?;
+            io::copy(&mut source, &mut writer)?;
+            let mut archive_file = writer.finish().map_err(zip_io_error)?;
+            archive_file.flush()?;
+            archive_file.sync_all()?;
+            verify_archive(&temp_path, &member_name)?;
+            if archive_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "日志归档目标已存在",
+                ));
+            }
+            fs::rename(&temp_path, &archive_path)?;
+            fs::remove_file(source_path)?;
+            self.prune_archives()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
+    }
+
+    fn next_sequence(&self, date: Date) -> io::Result<u64> {
+        let prefix = format!("lux.{}.part-", format_log_date(date));
+        let mut next = 1_u64;
+        for entry in fs::read_dir(&self.archive_dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(sequence) = name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".log.zip"))
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                next = next.max(sequence.saturating_add(1));
+            }
+        }
+        Ok(next)
+    }
+
+    fn prune_archives(&self) -> io::Result<()> {
+        let mut archives = fs::read_dir(&self.archive_dir)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".log.zip"))
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        archives.sort();
+        let remove_count = archives.len().saturating_sub(self.archive_limit);
+        for path in archives.into_iter().take(remove_count) {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LogDateRange {
@@ -100,6 +430,10 @@ pub fn log_dir(config_dir: &Path) -> PathBuf {
     config_dir.join(LOG_DIRECTORY)
 }
 
+pub fn archive_dir(config_dir: &Path) -> PathBuf {
+    log_dir(config_dir).join(LOG_ARCHIVE_DIRECTORY)
+}
+
 pub fn log_file_name(date: Date) -> String {
     format!(
         "lux.{:04}-{:02}-{:02}.log",
@@ -113,33 +447,21 @@ pub async fn export_logs(
     config_dir: &Path,
     range: LogDateRange,
 ) -> Result<LogExport, LogExportError> {
-    let directory = log_dir(config_dir);
-    let mut files = Vec::new();
-    let mut total_bytes = 0_u64;
-    for date in range.dates() {
-        let name = log_file_name(date);
-        let path = directory.join(&name);
-        let contents = match fs::read(&path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(LogExportError::Io(error)),
-        };
-        let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-        if size > MAX_DAILY_LOG_BYTES || total_bytes.saturating_add(size) > MAX_EXPORT_BYTES {
-            return Err(LogExportError::ExportTooLarge);
-        }
-        total_bytes = total_bytes.saturating_add(size);
-        files.push((name, contents));
-    }
+    let config_dir = config_dir.to_path_buf();
+    let files = tokio::task::spawn_blocking(move || read_log_files(&config_dir, range))
+        .await
+        .map_err(|error| LogExportError::Worker(error.to_string()))??;
     if files.is_empty() {
         return Err(LogExportError::NoLogs);
     }
 
     if range.from == range.to {
-        return match files.into_iter().next() {
-            Some((filename, contents)) => Ok(LogExport::Daily { contents, filename }),
-            None => Err(LogExportError::NoLogs),
-        };
+        let filename = log_file_name(range.from);
+        let mut contents = Vec::new();
+        for (_, segment) in files {
+            contents.extend_from_slice(&segment);
+        }
+        return Ok(LogExport::Daily { contents, filename });
     }
 
     let filename = format!(
@@ -154,6 +476,130 @@ pub async fn export_logs(
         contents: archive,
         filename,
     })
+}
+
+fn read_log_files(
+    config_dir: &Path,
+    range: LogDateRange,
+) -> Result<Vec<(String, Vec<u8>)>, LogExportError> {
+    let directory = log_dir(config_dir);
+    let archive_directory = archive_dir(config_dir);
+    let mut files = Vec::new();
+    let mut daily_bytes = 0_u64;
+    let mut total_bytes = 0_u64;
+    for date in range.dates() {
+        let date_prefix = format!("lux.{}", format_log_date(date));
+        let mut archived = Vec::new();
+        match fs::read_dir(&archive_directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(LogExportError::Io)?;
+                    let path = entry.path();
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    if !name.starts_with(&format!("{date_prefix}.part-"))
+                        || !name.ends_with(".log.zip")
+                    {
+                        continue;
+                    }
+                    let archive_file = fs::File::open(&path).map_err(LogExportError::Io)?;
+                    let mut archive = ZipArchive::new(archive_file)
+                        .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                    for index in 0..archive.len() {
+                        let mut member = archive
+                            .by_index(index)
+                            .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                        let member_name = member.name().to_owned();
+                        if !member_name.starts_with(&format!("{date_prefix}.part-"))
+                            || !member_name.ends_with(".log")
+                        {
+                            continue;
+                        }
+                        let mut contents = Vec::new();
+                        member
+                            .read_to_end(&mut contents)
+                            .map_err(LogExportError::Io)?;
+                        archived.push((member_name, contents));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LogExportError::Io(error)),
+        }
+        archived.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, contents) in archived {
+            add_export_file(
+                &mut files,
+                &mut daily_bytes,
+                &mut total_bytes,
+                name,
+                contents,
+            )?;
+        }
+
+        let name = log_file_name(date);
+        match fs::read(directory.join(&name)) {
+            Ok(contents) => add_export_file(
+                &mut files,
+                &mut daily_bytes,
+                &mut total_bytes,
+                name,
+                contents,
+            )?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LogExportError::Io(error)),
+        }
+    }
+    Ok(files)
+}
+
+fn add_export_file(
+    files: &mut Vec<(String, Vec<u8>)>,
+    daily_bytes: &mut u64,
+    total_bytes: &mut u64,
+    name: String,
+    contents: Vec<u8>,
+) -> Result<(), LogExportError> {
+    let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    *daily_bytes = daily_bytes.saturating_add(size);
+    *total_bytes = total_bytes.saturating_add(size);
+    if *daily_bytes > MAX_DAILY_LOG_BYTES || *total_bytes > MAX_EXPORT_BYTES {
+        return Err(LogExportError::ExportTooLarge);
+    }
+    files.push((name, contents));
+    Ok(())
+}
+
+fn log_segment_file_name(date: Date, sequence: u64) -> String {
+    format!("lux.{}.part-{sequence:06}.log", format_log_date(date))
+}
+
+fn format_log_date(date: Date) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    )
+}
+
+fn parse_daily_log_name(name: &str) -> Option<Date> {
+    name.strip_prefix("lux.")?
+        .strip_suffix(".log")
+        .and_then(|date| parse_date(date).ok())
+}
+
+fn verify_archive(path: &Path, member_name: &str) -> io::Result<()> {
+    let file = fs::File::open(path)?;
+    let mut archive = ZipArchive::new(file).map_err(zip_io_error)?;
+    let mut member = archive.by_name(member_name).map_err(zip_io_error)?;
+    io::copy(&mut member, &mut io::sink())?;
+    Ok(())
+}
+
+fn zip_io_error(error: zip::result::ZipError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn create_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, LogExportError> {
@@ -232,7 +678,12 @@ fn compact_date(date: Date) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogDateRange, LogExportError, log_file_name, parse_date};
+    use std::{fs, io};
+
+    use super::{
+        LogDateRange, LogExportError, LogManager, archive_dir, log_file_name, parse_date,
+        verify_archive,
+    };
     use time::{Date, Month};
 
     #[test]
@@ -256,5 +707,67 @@ mod tests {
         assert!(parse_date("2026-8-09").is_err());
         assert!(parse_date("2026-02-30").is_err());
         assert!(parse_date("2026-02-09").is_ok());
+    }
+
+    #[test]
+    fn size_rotation_keeps_only_the_newest_archives() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let date = Date::from_calendar_date(2026, Month::August, 9).unwrap();
+        let mut manager = LogManager::open_with_limits(temp_dir.path(), date, 3, 2)?;
+        for _ in 0..3 {
+            manager.write_line_for_date(date, b"x\n\n")?;
+        }
+
+        let archive_dir = archive_dir(temp_dir.path());
+        let mut archives = fs::read_dir(archive_dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        archives.sort();
+        assert_eq!(archives.len(), 2);
+        assert_eq!(
+            archives[0].to_string_lossy(),
+            "lux.2026-08-09.part-000002.log.zip"
+        );
+        assert_eq!(
+            archives[1].to_string_lossy(),
+            "lux.2026-08-09.part-000003.log.zip"
+        );
+        assert!(temp_dir.path().join("logs/lux.2026-08-09.log").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn date_rotation_archives_the_previous_day() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let yesterday = Date::from_calendar_date(2026, Month::August, 8).unwrap();
+        let today = Date::from_calendar_date(2026, Month::August, 9).unwrap();
+        let mut manager = LogManager::open_with_limits(temp_dir.path(), yesterday, 100, 20)?;
+        manager.write_line_for_date(yesterday, b"previous day\n")?;
+        manager.write_line_for_date(today, b"current day\n")?;
+
+        let archive_path = archive_dir(temp_dir.path()).join("lux.2026-08-08.part-000001.log.zip");
+        verify_archive(&archive_path, "lux.2026-08-08.part-000001.log")?;
+        assert_eq!(
+            fs::read(temp_dir.path().join("logs/lux.2026-08-09.log"))?,
+            b"current day\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_archive_keeps_the_original_log_segment() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let date = Date::from_calendar_date(2026, Month::August, 9).unwrap();
+        let mut manager = LogManager::open_with_limits(temp_dir.path(), date, 3, 20)?;
+        let archive_directory = archive_dir(temp_dir.path());
+        fs::remove_dir(&archive_directory)?;
+        fs::write(&archive_directory, b"block archive writes")?;
+
+        assert!(manager.write_line_for_date(date, b"x\n\n").is_err());
+        assert_eq!(
+            fs::read(temp_dir.path().join("logs/lux.2026-08-09.log"))?,
+            b"x\n\n"
+        );
+        Ok(())
     }
 }
