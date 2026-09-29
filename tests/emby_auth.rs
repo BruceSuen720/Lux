@@ -256,6 +256,10 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
     assert_eq!(public_body.as_array().map(Vec::len), Some(1));
     assert_eq!(public_body[0]["Id"], admin.id.to_string());
     assert_eq!(public_body[0]["HasPassword"], true);
+    assert_eq!(public_body[0]["Name"], "Administrator");
+    let public_user_name = public_body[0]["Name"]
+        .as_str()
+        .ok_or("missing public user name")?;
 
     let afuse_login = client
         .post(format!(
@@ -266,7 +270,7 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
             r#"Emby Client="AfuseKt", Device="iPhone", DeviceId="afuse-device", Version="2.9.8.6-fix""#,
         )
         .form(&[
-            ("Username", "ADMIN"),
+            ("Username", public_user_name),
             ("Pw", "correct password"),
             ("appName", "AfuseKt"),
         ])
@@ -364,6 +368,48 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
         .send()
         .await?;
     assert_eq!(after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let users = UserStore::new(database.clone())?;
+    users
+        .create_user(
+            "another-admin-label",
+            "Administrator",
+            "another password",
+            false,
+        )
+        .await?;
+    users
+        .create_user(
+            "display-name-collision",
+            "Admin",
+            "collision password",
+            false,
+        )
+        .await?;
+    let canonical_username_wrong_password = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "admin",
+            "Pw": "collision password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        canonical_username_wrong_password.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let ambiguous_display_name_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": public_user_name,
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        ambiguous_display_name_login.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     Ok(())
 }

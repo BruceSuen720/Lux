@@ -14,6 +14,15 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## Emby 用户列表与登录名兼容（2026-09-29）
+
+Lux 保持 Emby `UserDto.Name` 为账户显示名。`POST /Users/AuthenticateByName` 首先按规范登录用户名验证；若该用户名
+不存在，则允许用与 `Users/Public.Name` 完全相同且唯一的显示名登录。规范用户名优先；若多个账户有相同显示名则拒绝该别名，
+避免把凭据匹配到不确定的账户。登录会话的 `SessionInfo.UserName` 仍是显示名。
+
+`tests/emby_auth.rs` 覆盖从用户列表读取 `Name` 并将其原样提交登录，显示名和登录名不同仍返回 200；两个用户显示名相同时
+该别名返回 401。该自动化结果证明 Lux 服务端协议，与 AVdb 报告的失败条件相符；尚未在部署实例中进行 AVdb 实测。
+
 ## Lux API 用户令牌与首页（2026-09-15）
 
 Lux 自有 API 的媒体、搜索、首页、图片、播放和用户状态接口接受用户级 Emby AccessToken。客户端可发送

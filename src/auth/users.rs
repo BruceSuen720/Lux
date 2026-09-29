@@ -257,6 +257,41 @@ impl UserStore {
             .database
             .find_user_by_username(&username_normalized)
             .await?;
+        self.authenticate_stored_user(stored, password).await
+    }
+
+    pub(crate) async fn authenticate_emby_name(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<UserRecord>, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let stored = self
+            .database
+            .find_user_by_username(&username_normalized)
+            .await?;
+        let stored = if stored.is_some() {
+            stored
+        } else {
+            let mut matching_display_names = self
+                .database
+                .list_users()
+                .await?
+                .into_iter()
+                .filter(|user| user.display_name == username.trim());
+            match (matching_display_names.next(), matching_display_names.next()) {
+                (Some(user), None) => Some(user),
+                _ => None,
+            }
+        };
+        self.authenticate_stored_user(stored, password).await
+    }
+
+    async fn authenticate_stored_user(
+        &self,
+        stored: Option<crate::storage::StoredUser>,
+        password: &str,
+    ) -> Result<Option<UserRecord>, UserStoreError> {
         let stored_hash = stored.as_ref().map(|user| user.password_hash.as_str());
         let password_matches = self.passwords.verify_password(stored_hash, password)?;
 
