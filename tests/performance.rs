@@ -1782,6 +1782,10 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect_with_configuration(&config, &database_configuration).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Admin", "performance-only password")
+        .await?;
     let library_id_placeholder = if backend == "postgres" { "$1" } else { "?" };
     let libraries = LibraryService::new(database.clone());
     let library = libraries
@@ -1793,58 +1797,121 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             media_root.to_str().ok_or("non-utf8 fixture path")?,
         )
         .await?;
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(FOREGROUND_REQUESTS)
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "admin",
+            "password": "performance-only password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = format!(
+        "lux_session={}",
+        cookie_value(login.headers(), "lux_session")
+    );
     let jobs = ScanJobService::new(database.clone())
         .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
     let scan_job = jobs.create_movie_scan_job(library.id).await?;
     let scan_started = Instant::now();
-    let scan_worker = jobs.clone();
-    let scan_job_id = scan_job.id.clone();
-    let scan_handle =
-        tokio::spawn(async move { scan_worker.run_to_completion(&scan_job_id, 500, None).await });
-
-    let mut first_item_visible_ms = None;
-    let mut first_poster_indexed_ms = None;
-    let scan_poll_deadline = Instant::now() + Duration::from_secs(600);
-    while !scan_handle.is_finished() {
-        if first_item_visible_ms.is_none()
-            && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
-                "SELECT id FROM media_items
+    let observation_database = database.clone();
+    let observation_library_id = library.id.to_string();
+    let observation_started = scan_started;
+    let first_visibility_handle = tokio::spawn(async move {
+        let mut first_item_visible_ms = None;
+        let mut first_poster_indexed_ms = None;
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            if first_item_visible_ms.is_none()
+                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                    "SELECT id FROM media_items
                      WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE' LIMIT 1"
-            )))
-            .bind(library.id.to_string())
-            .fetch_optional(database.pool())
-            .await?
-            .is_some()
-        {
-            first_item_visible_ms = Some(scan_started.elapsed().as_millis());
-        }
-        if first_poster_indexed_ms.is_none()
-            && sqlx::query_scalar::<_, String>(
-                sqlx::AssertSqlSafe(format!(
+                )))
+                .bind(&observation_library_id)
+                .fetch_optional(observation_database.pool())
+                .await?
+                .is_some()
+            {
+                first_item_visible_ms = Some(observation_started.elapsed().as_millis());
+            }
+            if first_poster_indexed_ms.is_none()
+                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
                     "SELECT image.item_id FROM item_images image
                      JOIN media_items item ON item.id = image.item_id
                      WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
                        AND image.source = 'LOCAL' LIMIT 1"
-                )),
-            )
-            .bind(library.id.to_string())
-            .fetch_optional(database.pool())
-            .await?
-            .is_some()
-        {
-            first_poster_indexed_ms = Some(scan_started.elapsed().as_millis());
+                )))
+                .bind(&observation_library_id)
+                .fetch_optional(observation_database.pool())
+                .await?
+                .is_some()
+            {
+                first_poster_indexed_ms = Some(observation_started.elapsed().as_millis());
+            }
+            if let (Some(first_item_visible_ms), Some(first_poster_indexed_ms)) =
+                (first_item_visible_ms, first_poster_indexed_ms)
+            {
+                return Ok::<_, sqlx::Error>((first_item_visible_ms, first_poster_indexed_ms));
+            }
+            if Instant::now() >= deadline {
+                return Err(sqlx::Error::Protocol(
+                    "LUX-304 first item/poster visibility timed out".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        if Instant::now() >= scan_poll_deadline {
-            return Err("LUX-304 scan did not complete within 10 minutes".into());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    });
+    let scan_worker = jobs.clone();
+    let scan_job_id = scan_job.id.clone();
+    let scan_handle =
+        tokio::spawn(async move { scan_worker.run_to_completion(&scan_job_id, 500, None).await });
+    tokio::task::yield_now().await;
+    let scan_running_at_api_start = !scan_handle.is_finished();
+    let api_client = client.clone();
+    let catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
+        library.id
+    );
+    let api_url = catalog_list_url.clone();
+    let api_cookies = cookies.clone();
+    let catalog_list_handle = tokio::spawn(async move {
+        measure_get_requests(
+            &api_client,
+            &api_url,
+            &api_cookies,
+            "LUX-304 progressive catalog list",
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
     scan_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let scan_index_ms = scan_started.elapsed().as_millis();
-    let first_item_visible_ms = first_item_visible_ms.ok_or("no movie became index-visible")?;
-    let first_poster_indexed_ms = first_poster_indexed_ms.ok_or("no local poster was indexed")?;
+    let scan_job_completion_ms = scan_started.elapsed().as_millis();
+    let (first_item_visible_ms, first_poster_indexed_ms) = first_visibility_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+    let catalog_list_ms = catalog_list_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(std::io::Error::other)?;
+    let catalog_list_p95_ms = percentile(&catalog_list_ms, 95);
 
     let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
     let local_poster_queue_ms = loop {
@@ -1868,6 +1935,14 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    let catalog_list_after_queue_ms = measure_get_requests(
+        &client,
+        &catalog_list_url,
+        &cookies,
+        "LUX-304 catalog list after local posters",
+    )
+    .await?;
+    let catalog_list_after_queue_p95_ms = percentile(&catalog_list_after_queue_ms, 95);
     let online_fill_missing_job_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM metadata_reidentify_jobs
          WHERE library_id = {library_id_placeholder} AND mode = 'FILL_MISSING'"
@@ -1875,9 +1950,16 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
+    let require_detached_poster_queue = env::var("LUX_PERF_REQUIRE_DETACHED_POSTER_QUEUE")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     assert_eq!(online_fill_missing_job_count, 0);
-    assert!(first_item_visible_ms <= scan_index_ms);
-    assert!(first_poster_indexed_ms <= scan_index_ms);
+    assert!(scan_running_at_api_start);
+    assert!(first_item_visible_ms <= scan_job_completion_ms);
+    assert!(first_poster_indexed_ms <= scan_job_completion_ms);
+    if require_detached_poster_queue {
+        assert!(scan_job_completion_ms < local_poster_queue_ms);
+    }
     println!(
         "LUX-304 POSTER RESULT {}",
         serde_json::to_string(&json!({
@@ -1886,13 +1968,19 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "databaseBackend": backend,
             "fileCount": file_count,
             "directoryCount": directory_count,
-            "scanIndexMs": scan_index_ms,
+            "scanJobCompletionMs": scan_job_completion_ms,
             "firstItemVisibleMs": first_item_visible_ms,
             "firstPosterIndexedMs": first_poster_indexed_ms,
+            "catalogListP95DuringScanMs": catalog_list_p95_ms,
+            "catalogListRequestCount": catalog_list_ms.len(),
+            "catalogListP95AfterPosterQueueMs": catalog_list_after_queue_p95_ms,
+            "catalogListAfterPosterQueueRequestCount": catalog_list_after_queue_ms.len(),
+            "scanRunningAtApiStart": scan_running_at_api_start,
             "localPosterQueueCompleteMs": local_poster_queue_ms,
             "onlineFillMissingJobCount": online_fill_missing_job_count,
         }))?
     );
+    server.abort();
     Ok(())
 }
 

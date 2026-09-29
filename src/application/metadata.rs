@@ -898,10 +898,14 @@ impl MetadataEnricher {
             .await?;
         let (movies, _, episodes) = split_scan_local_metadata_sources(sources);
         let mut report = MetadataReport::default();
+        let mut directory_cache = DirectoryPathCache::default();
         for source in movies {
             report.items_processed += 1;
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self.index_movie_images(&source.item_id, &media_path).await {
+            match self
+                .index_movie_images(&source.item_id, &media_path, &mut directory_cache)
+                .await
+            {
                 Ok(images_found) => report.images_found += images_found,
                 Err(error) => {
                     tracing::warn!(item_id = %source.item_id, %error, "local movie images failed");
@@ -1156,6 +1160,7 @@ impl MetadataEnricher {
         sources: Vec<StoredMediaSourcePath>,
         report: &mut MetadataReport,
     ) {
+        let mut directory_cache = DirectoryPathCache::default();
         for source in sources {
             report.items_processed += 1;
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
@@ -1178,7 +1183,10 @@ impl MetadataEnricher {
                 }
             }
 
-            match self.index_movie_images(&source.item_id, &media_path).await {
+            match self
+                .index_movie_images(&source.item_id, &media_path, &mut directory_cache)
+                .await
+            {
                 Ok(images_found) => report.images_found += images_found,
                 Err(error) => {
                     tracing::warn!(
@@ -1266,14 +1274,16 @@ impl MetadataEnricher {
         &self,
         item_id: &str,
         media_path: &Path,
+        directory_cache: &mut DirectoryPathCache,
     ) -> Result<usize, MetadataError> {
-        let image_paths =
-            read_directory_paths(media_path.parent().unwrap_or(Path::new("."))).await?;
+        let image_paths = directory_cache
+            .get(media_path.parent().unwrap_or(Path::new(".")))
+            .await?;
         let images =
             if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
-                find_local_images_for_media(image_paths, media_stem)
+                find_local_images_for_media(image_paths.iter(), media_stem)
             } else {
-                find_local_images(image_paths)
+                find_local_images(image_paths.iter())
             };
         let has_primary_artwork = images
             .iter()

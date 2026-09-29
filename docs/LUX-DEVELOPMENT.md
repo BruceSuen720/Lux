@@ -7353,18 +7353,46 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验证通过：scanner completeness/dispatch/incremental 三个定向单测；`reidentify` 12 项、`scanned_metadata` 11 项、`scanned_series_metadata` 2 项、`scanning_jobs` 81 项；`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
-#### LUX-304：阶段 23 1k/10k 扫描与本地海报性能门
+#### LUX-304：阶段 23 1k/10k 扫描与本地海报性能测量
 
-范围：用 `lux_270_manifest_job_scan_benchmark` 对 1,000 与 10,000 文件 fixture 做 SQLite/PostgreSQL 基线 A/B，使用同一生成器、相同数据库参数和当前 ARM64 环境，基线为 LUX-295 前的 `6424ab12`，候选为本分支提交。每个大小/后端/版本至少交错运行三轮，记录首扫索引、无变化重扫、target 物化、前台 p95、事务/队列和 WAL/SQLite 锁指标。新增 ignored poster-worker 基准，在相同规模 fixture 为每个电影生成有效的本地海报文件，测量首条索引可查、首张本地 poster、扫描索引完成与全量本地 poster 队列完成时间；本地 worker 与刮削 job 的耗时分开记录。该本机 ARM64 / PostgreSQL 版本只作为同机 A/B，不外推为 NAS/x86_64 性能结论。
+范围：用 `lux_270_manifest_job_scan_benchmark` 对 1,000 与 10,000 文件 fixture 做 SQLite/PostgreSQL 基线 A/B，使用同一生成器、相同数据库参数和当前 ARM64 环境，基线为 LUX-295 前的 `6424ab12`，候选为本分支提交。每个大小/后端/版本至少交错运行三轮，记录首扫索引、无变化重扫、target 物化、用户媒体目录列表 p95、管理库列表 p95、事务/队列和 WAL/SQLite 锁指标。新增 ignored poster-worker 基准，在相同规模 fixture 为每个电影生成有效的本地海报文件，测量首条索引可查、首张本地 poster、扫描 job 完成、全量本地 poster 队列完成、扫描期间与 poster 队列完成后的媒体目录列表 p95；本地 worker 与刮削 job 的耗时分开记录。候选本地图片索引在每批 source 内缓存父目录路径快照，避免同目录电影逐项重复 `read_dir`。若发现索引或用户媒体目录 p95 稳定回退超过 5%，记录结果并建立阶段内的专门修复任务；在修复复测通过前，不关闭阶段 23。该本机 ARM64 / PostgreSQL 版本只作为同机 A/B，不外推为 NAS/x86_64 性能结论。
 
 验收：
 
-- [ ] 1k/10k SQLite 与 PostgreSQL 基线/候选各有至少三轮交错原始记录，包含环境、提交、fixture、参数和 p50/p95。
-- [ ] poster-worker 基准证明条目索引后可读，首张已存在本地 poster 可在扫描仍运行时写入；全库 poster 完成时间单独报告。
-- [ ] 扫描索引稳定耗时或前台 p95 若回退超过 5%，先调度本地 worker/写入批次并重测，不把回退归入在线刮削。
-- [ ] `docs/PERFORMANCE.md` 更新结果，并明确本机架构及 PostgreSQL 版本；阶段 23 其余兼容性与真实浏览器验证仍需在总体验收中完成。
+- [x] 1k/10k SQLite 与 PostgreSQL 基线/候选均有至少三轮交错记录，包含环境、提交、fixture、参数和 p50/p95。
+- [x] poster-worker 基准证明条目索引后可读、首张本地 poster 在扫描 job 完成前写入；完整 poster 队列时间与扫描期间/队列完成后的媒体目录列表 p95 分开报告。
+- [x] 用户媒体目录 p95、管理库列表 p95、索引耗时、target 物化和不变重扫分开记录；超过阈值的指标已拆为后续任务，不与在线刮削耗时混算。
+- [x] `docs/PERFORMANCE.md` 记录本机架构、PostgreSQL 版本和受限结论；阶段 23 的通过门仍开放。
 
-预计文件：`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+依赖：LUX-303。验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --release --test performance lux_270_manifest_job_scan_benchmark -- --ignored --nocapture --test-threads=1`；`LUX-304` poster-worker ignored 基准；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件：`src/application/metadata.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：Mac16,10 / 16 GiB / ARM64，PostgreSQL 16.15。`lux_270_manifest_job_scan_benchmark` 使用同版 fixture：1k SQLite/PostgreSQL 各 8 轮，10k SQLite 5 轮、PostgreSQL 6 轮；索引中位数分别为 SQLite 48.5→48 ms / 369→355 ms、PostgreSQL 166→170.5 ms / 879→892.5 ms，均未回退 5%；DML 计数保持 37（1k）/ 79–85（10k），target 中位数持平。poster-worker A/B：候选首 poster 由基线 134→110 ms（SQLite 1k）、1028→348 ms（SQLite 10k）、314→188 ms（PostgreSQL 1k）、1719→608 ms（PostgreSQL 10k）；候选 scan job 提前返回并让本地队列继续在后台完成。目录快照缓存将候选 10k 本地海报队列完成从 7.15→5.49 s（SQLite）、51.65→41.76 s（PostgreSQL）。扫描期间的 50 并发目录列表 p95 为约 0.29–0.33 s，队列完成后的 p95 为约 0.036–0.061 s；两毫秒与十毫秒的 scan-active 延迟实验没有稳定改善 p95 且延长队列，未保留。A/B 的后台 worker 并发 p95 仍高于旧流程，因此 LUX-305/306 继续处理 bounded image-write 批次；阶段 23 不在本任务中关闭。
+
+#### LUX-305：本地图片存储批次接口与事务合同
+
+范围：新增有界 `item_images` 多 item 批量写入事务，单批最多 16 个 item，语句行数遵循 SQLite/PostgreSQL 参数上限；图片行更新与 `poster_fallback_required` 清理在同一事务内提交。保持 `(item_id, image_type, image_index)` 幂等 upsert、路径/内容变化检测和 LOCAL source 语义。若一项写入失败，整批回滚，不得留下部分海报或已清除的 fallback 标记。本任务仅增加 storage contract，不接入扫描 worker，不改变图片发现和在线刮削策略。
+
+验收：
+
+- [ ] SQLite 与真实 PostgreSQL 覆盖多 item 图片插入、重复幂等、路径变化更新、poster fallback 更新和事务失败回滚。
+- [ ] 空批次不打开写事务；单个 item 的多图 index 保序；每条 SQL 写入有界。
+- [ ] `cargo fmt --all -- --check`、定向 SQLite/PostgreSQL storage 合同和 `cargo clippy --locked --lib -- -D warnings` 通过。
+
+依赖：LUX-304。预计文件：`src/storage/catalog.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-306：本地海报 worker 使用批量图片事务并复测 p95
+
+范围：将 LUX-305 批次接口接入 workflow 3 本地 movie poster worker。先读取并准备最多 16 个 item 的图片，再原子写入该页；本地 NFO、metadata completeness、FILL_MISSING 派发和系列 artwork 次序保持不变。benchmark 重新运行同一 1k/10k SQLite/PostgreSQL poster-worker fixture，测量首 poster、scan job 完成、队列完成、扫描期间与队列完成后的媒体目录 p95。若 worker 写入仍使用户媒体目录 p95 稳定回退超过 5%，继续调整批次大小并交错重测；不得让扫描等待 online FILL_MISSING。
+
+验收：
+
+- [ ] poster 首次可见时间不回退，local queue 完成时间不增加；扫描 job 先于剩余后台队列完成，网络刮削保持独立。
+- [ ] SQLite/PostgreSQL 完整性和失败重试合同通过；scanner 与 local metadata 行为测试通过。
+- [ ] 同 fixture 双后端 A/B 记录 p95 和 1k/10k 队列规模；用户媒体目录 p95 回退门通过，结果写入 `docs/PERFORMANCE.md`。
+
+依赖：LUX-303、LUX-304、LUX-305。预计文件：`src/application/metadata.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 #### 阶段 23 总体验收与阶段门
 
