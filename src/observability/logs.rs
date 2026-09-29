@@ -127,6 +127,35 @@ impl LogStore {
         .map_err(|error| io::Error::other(format!("日志写入任务失败: {error}")))?
     }
 
+    pub(crate) async fn append_json_batch_and_sync(&self, records: Vec<Value>) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.initialize().await?;
+        let manager = Arc::clone(&self.manager);
+        tokio::task::spawn_blocking(move || {
+            let mut manager = manager
+                .lock()
+                .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
+            let manager = manager
+                .as_mut()
+                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
+            for record in records {
+                let mut line = serde_json::to_vec(&record)
+                    .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
+                line.push(b'\n');
+                manager.write_line(&line)?;
+            }
+            if let Some(file) = manager.active_file.as_mut() {
+                file.flush()?;
+                file.sync_all()?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("日志批量写入任务失败: {error}")))?
+    }
+
     pub async fn append_scan_job_event(
         &self,
         id: &str,
@@ -1296,8 +1325,9 @@ mod tests {
     use std::{fs, io, sync::Arc};
 
     use super::{
-        LogDateRange, LogExportError, LogManager, LogStore, NewAuditLogEvent, archive_dir, log_dir,
-        log_file_name, parse_date, read_audit_events, read_scan_job_events, verify_archive,
+        LogDateRange, LogExport, LogExportError, LogManager, LogStore, NewAuditLogEvent,
+        archive_dir, export_logs, log_dir, log_file_name, parse_date, read_audit_events,
+        read_scan_job_events, verify_archive,
     };
     use serde_json::Value;
     use time::{Date, Month, OffsetDateTime};
@@ -1462,6 +1492,46 @@ mod tests {
         let log_file =
             log_dir(temp_dir.path()).join(log_file_name(OffsetDateTime::now_utc().date()));
         assert!(!fs::read_to_string(log_file)?.contains("must-not-be-saved"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jsonl_batch_writer_is_durable_and_retries_after_a_write_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path().join("config");
+        fs::create_dir_all(&config_dir)?;
+        let blocked_log_dir = log_dir(&config_dir);
+        fs::write(&blocked_log_dir, b"block directory creation")?;
+        let store = LogStore::new(&config_dir);
+        let records = vec![
+            serde_json::json!({"recordType":"migration-test","id":"one","createdAt":1}),
+            serde_json::json!({"recordType":"migration-test","id":"two","createdAt":2}),
+        ];
+        assert!(
+            store
+                .append_json_batch_and_sync(records.clone())
+                .await
+                .is_err()
+        );
+
+        fs::remove_file(blocked_log_dir)?;
+        store.append_json_batch_and_sync(records).await?;
+        let date = OffsetDateTime::now_utc().date();
+        let LogExport::Daily { contents, .. } =
+            export_logs(&config_dir, LogDateRange::new(date, date)?).await?
+        else {
+            return Err("single-day export should be raw JSONL".into());
+        };
+        let ids = contents
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice::<Value>)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|record| record["id"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["one", "two"]);
         Ok(())
     }
 

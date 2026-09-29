@@ -66,7 +66,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `POST /api/v1/admin/libraries/{libraryId}/reconcile`：按当前库配置创建并异步执行一次调和扫描；已停用或不存在的媒体库返回 404。
 - `POST /api/v1/admin/jobs/{jobId}/cancel`：请求取消扫描任务，返回 202。
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
-- `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。新事件写入 `/config/logs/` JSONL 文件，查询覆盖活动文件与保留中的压缩归档；升级前的数据库历史由 LUX-312 迁出。
+- `GET /api/v1/admin/jobs/{jobId}/events?page=1&pageSize=100&level=ERROR&eventCode=SCAN_IO`：查看单个任务的结构化生命周期日志，支持级别和稳定事件代码筛选；页大小限制为 1-100。新事件写入 `/config/logs/` JSONL 文件，查询覆盖活动文件与保留中的压缩归档；升级前的数据库历史由 LUX-315 迁出。
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
 - `GET /api/v1/admin/scheduled-tasks?page=1&pageSize=100`：分页查看所有已注册的任务，包含 `ownerType`、媒体库名称、`taskType`、`name`、`description`、`sourceType`、可空 `pluginId`、`schedule`、启用状态、资源限制和更新时间；结果也包含已停用或尚未配置计划的注册项。
 - `PUT /api/v1/admin/scheduled-tasks`：只修改已注册任务的 cron 计划。媒体库任务使用 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "RECONCILIATION_SCAN|METADATA_PARSE", "schedule": "0 3 * * *", "isEnabled": true }`；全局 STRM 任务使用 `{ "ownerType": "GLOBAL", "ownerId": "global", "taskType": "STRM_MEDIA_INFO", "schedule": "0 3 * * *" }`；全局弹幕任务使用相同的 owner 字段和 `taskType: "DANMAKU_MATCH"`，例如 `{ "schedule": "0 2 * * *" }`。媒体库任务传 `schedule: null` 或 `isEnabled: false` 会清空计划；STRM 和 DANMAKU_MATCH 任务的计划必须非空，并会同步回对应插件配置。实时增量扫描（`INCREMENTAL_SCAN`）由文件系统事件触发，不属于此接口管理范围。不存在的注册项返回 404，不会因为管理请求凭空创建任务。写操作需要管理员 Web session 和 CSRF，并与对应的媒体库或插件配置保持同一份配置。Lux 按 UTC 解释 cron 表达式。
@@ -198,7 +198,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
 - `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；`PATCH` 携带 `isDisabled: true` 只禁用账户并保留数据，`DELETE` 永久删除账户及关联数据并返回 204；最后一个启用的服务器管理账户受保护。
 - `GET /api/v1/admin/users/{userId}/libraries`：读取该用户当前可访问的媒体库 ID，用于管理控制台展示 ACL；不返回服务器路径。
-- `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计与近期登录/播放活动。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；迁移前数据库历史仍参与查询，后续由 LUX-315 迁出。
+- `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计与近期登录/播放活动。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；迁移前数据库历史仍参与查询，后续由 LUX-316 迁出。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。
 - `DELETE /api/v1/admin/items/{itemId}`：管理员删除指定媒体源及其同名旁车文件；若媒体文件已被外部删除，仍会清理 Lux 中的媒体源记录，没有其他媒体源时同时标记逻辑条目移除。支持通过 `sourceId` 选择版本，要求 CSRF。

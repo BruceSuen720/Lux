@@ -7557,7 +7557,26 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-312。明确不做：不迁移旧数据库审计历史，不改变业务播放状态。
 
-#### LUX-314：历史任务事件迁出数据库
+#### LUX-314：日志迁移的批量持久写入
+
+为历史任务/审计日志升级迁移提供有界批量 JSONL 写入。批次写入通过与程序日志相同的 LogStore 锁串行化；活动文件写完执行 `sync_all`，达到分段上限的归档仍须完整写入、校验并同步后才移除原始段。
+
+验收：
+
+- [x] 批量记录逐条保持合法 JSONL，不拆分记录；传入的稳定 ID、事件时间和脱敏字段原样保留。
+- [x] 批次全部落盘并同步成功后才向调用方返回成功；任何写入/封存失败返回错误，调用方可以保留数据库源行并重试。
+- [x] 同配置目录多个 LogStore 句柄共用同一 writer 锁；日志轮转、应用事件写入、导出和读取不会交错记录或读到一半归档。
+- [x] 自动化测试覆盖多记录批写、失败后重试及记录 JSONL 完整。
+
+验证：`cargo test --locked --lib observability::logs::tests`、`cargo fmt --all -- --check`。
+
+文件：`src/observability/logs.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：新增迁移用批量 JSONL 持久写入，写入阶段通过共享 writer 锁串行化，批次完成后同步活动段；跨过分段门槛时归档会先校验并同步。故障注入后重试回归通过，确认失败会返回错误且后续批次完整落盘；`cargo fmt --all -- --check` 通过。
+
+依赖：LUX-309。明确不做：不改变日志保留数、任务状态或数据库迁移顺序。
+
+#### LUX-315：历史任务事件迁出数据库
 
 升级时将既有 `scan_job_events` 安全导出到 `/config/logs/`，文件写入并确认可读后才删除对应数据库行。清理可重试且不触及 `scan_jobs` 状态、进度或恢复游标。
 
@@ -7572,9 +7591,9 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`tests/log_migration.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
 
-依赖：LUX-310、LUX-313。明确不做：不清理旧管理员审计事件，不迁出扫描控制状态。
+依赖：LUX-310、LUX-313、LUX-314。明确不做：不清理旧管理员审计事件，不迁出扫描控制状态。
 
-#### LUX-315：历史管理员审计迁出与数据库日志停写
+#### LUX-316：历史管理员审计迁出与数据库日志停写
 
 升级时将既有 `audit_events` 导出至日志目录，确认文件持久且可读后才清理数据库记录。迁移完成后移除任务/审计日志 API 对数据库的历史回退和数据库事件留存清理；表结构保留为空。
 
@@ -7590,7 +7609,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/main.rs`、`src/storage/database_cleanup.rs`、`src/storage/users.rs`、`tests/log_migration.rs`、`docs/LUX-DEVELOPMENT.md`。
 
-依赖：LUX-311、LUX-313、LUX-314。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
+依赖：LUX-311、LUX-312、LUX-313、LUX-315。明确不做：不删除 migration 历史，不改变任何业务事件和任务控制状态。
 
 ## 26. 风险与缓解
 
