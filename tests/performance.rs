@@ -1956,7 +1956,10 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     assert_eq!(online_fill_missing_job_count, 0);
     assert!(scan_running_at_api_start);
     assert!(first_item_visible_ms <= scan_job_completion_ms);
-    assert!(first_poster_indexed_ms <= scan_job_completion_ms);
+    assert!(
+        first_poster_indexed_ms <= scan_job_completion_ms,
+        "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
+    );
     if require_detached_poster_queue {
         assert!(scan_job_completion_ms < local_poster_queue_ms);
     }

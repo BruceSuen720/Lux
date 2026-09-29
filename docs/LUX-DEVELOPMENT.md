@@ -7390,11 +7390,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] poster 首次可见时间不回退，local queue 完成时间不增加；扫描 job 先于剩余后台队列完成，网络刮削保持独立。
-- [ ] SQLite/PostgreSQL 完整性和失败重试合同通过；scanner 与 local metadata 行为测试通过。
-- [ ] 同 fixture 双后端 A/B 记录 p95 和 1k/10k 队列规模；用户媒体目录 p95 回退门通过，结果写入 `docs/PERFORMANCE.md`。
+- [x] poster 首次可见时间在 20 ms 观察粒度内无回退，local queue 完成时间四组均缩短；扫描 job 先于剩余后台队列完成，网络刮削保持独立。
+- [x] SQLite/PostgreSQL 完整性和失败重试合同通过；scanner 与 local metadata 行为测试通过。
+- [x] 同 fixture 双后端 A/B 记录 p95 和 1k/10k 队列规模；活动扫描期间用户媒体目录 p95 回退门通过，结果写入 `docs/PERFORMANCE.md`。
 
 依赖：LUX-303、LUX-304、LUX-305。预计文件：`src/application/metadata.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-09-29）：workflow 3 本地 movie poster worker 首个 item 保留快速路径，其余 item 每 16 个组成一页，经 LUX-305 原子批量图片事务写入；系列 artwork 路径、NFO 顺序和网络刮削策略未改。失败重试回归用触发器令第二页写入失败，确认该页无部分 poster 落库、stage 不标记完成，重试后 3 个 poster 全部入库。相关 Rust 目标 `scanned_metadata`、`scanned_series_metadata`、`scanning_jobs` 共 94 项通过。性能结果见 `docs/PERFORMANCE.md`：四组 local poster queue 中位数缩短 17.1%–78.3%，活动扫描期间 p95 最大回退 3.0%；队列完成后的 10k PostgreSQL p95 有 +4 ms 变化，已保留说明。性能数据仅代表本机 ARM64 与本地 PostgreSQL 16.15，不能外推 NAS/x86_64；最终门禁：build、fmt、clippy 通过；all-targets 已执行，库测试 582 项通过，但在 `metadata_selection::completed_scan_automatically_matches_and_writes_metadata` 因 `RowNotFound` 停止。该用例创建 workflow 3 扫描后仍读取旧 `metadata_reidentify_jobs` 记录；当前 scanner 的 workflow 3 路径不调度此旧 job。单项复现相同，此失败不由 LUX-306 差异引入，保留为全量测试风险。
 
 #### 阶段 23 总体验收与阶段门
 
