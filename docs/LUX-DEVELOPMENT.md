@@ -7368,7 +7368,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/metadata.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
-结果（2026-09-29）：Mac16,10 / 16 GiB / ARM64，PostgreSQL 16.15。`lux_270_manifest_job_scan_benchmark` 使用同版 fixture：1k SQLite/PostgreSQL 各 8 轮，10k SQLite 5 轮、PostgreSQL 6 轮；索引中位数分别为 SQLite 48.5→48 ms / 369→355 ms、PostgreSQL 166→170.5 ms / 879→892.5 ms，均未回退 5%；DML 计数保持 37（1k）/ 79–85（10k），target 中位数持平。poster-worker A/B：候选首 poster 由基线 134→110 ms（SQLite 1k）、1028→348 ms（SQLite 10k）、314→188 ms（PostgreSQL 1k）、1719→608 ms（PostgreSQL 10k）；候选 scan job 提前返回并让本地队列继续在后台完成。目录快照缓存将候选 10k 本地海报队列完成从 7.15→5.49 s（SQLite）、51.65→41.76 s（PostgreSQL）。扫描期间的 50 并发目录列表 p95 为约 0.29–0.33 s，队列完成后的 p95 为约 0.036–0.061 s；两毫秒与十毫秒的 scan-active 延迟实验没有稳定改善 p95 且延长队列，未保留。A/B 的后台 worker 并发 p95 仍高于旧流程，因此 LUX-305/306 继续处理 bounded image-write 批次；阶段 23 不在本任务中关闭。
+结果（2026-09-29）：Mac16,10 / 16 GiB / ARM64，PostgreSQL 16.15。`lux_270_manifest_job_scan_benchmark` 使用同版 fixture：1k SQLite/PostgreSQL 各 8 轮，10k SQLite 5 轮、PostgreSQL 6 轮；索引中位数分别为 SQLite 48.5→48 ms / 369→355 ms、PostgreSQL 166→170.5 ms / 879→892.5 ms，均未回退 5%；DML 计数保持 37（1k）/ 79–85（10k），target 中位数持平。poster-worker A/B：候选首 poster 由基线 134→111 ms（SQLite 1k）、1028→347 ms（SQLite 10k）、314→194 ms（PostgreSQL 1k）、1719→603 ms（PostgreSQL 10k）；候选 scan job 提前返回并让本地队列继续在后台完成。目录快照缓存将候选 10k 本地海报队列完成从 7.15→5.58 s（SQLite）、51.65→37.35 s（PostgreSQL）。扫描期间的 50 并发目录列表 p95 为 0.295–0.326 s，队列完成后的 p95 为 0.036–0.058 s；两毫秒与十毫秒的 scan-active 延迟实验没有稳定改善 p95 且延长队列，未保留。A/B 的后台 worker 并发 p95 仍高于旧流程，因此 LUX-305/306 继续处理 bounded image-write 批次；阶段 23 不在本任务中关闭。
 
 #### LUX-305：本地图片存储批次接口与事务合同
 
