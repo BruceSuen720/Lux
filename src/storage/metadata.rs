@@ -753,49 +753,82 @@ impl Database {
         Ok(pending)
     }
 
-    pub(crate) async fn insert_metadata_candidate(
+    pub(crate) async fn insert_metadata_candidates(
         &self,
-        candidate: NewMetadataCandidate<'_>,
+        candidates: &[NewMetadataCandidate<'_>],
     ) -> Result<(), StorageError> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // A multi-row upsert cannot target the same pending identity more than once in
+        // PostgreSQL. Preserve the old sequential-upsert behavior by keeping the first ID
+        // while selecting the highest-scoring payload (later payload wins ties).
+        let mut unique_candidates = Vec::with_capacity(candidates.len());
+        let mut candidate_indices = HashMap::with_capacity(candidates.len());
+        for candidate in candidates {
+            let identity = (candidate.item_id, candidate.provider, candidate.provider_id);
+            if let Some(index) = candidate_indices.get(&identity).copied() {
+                let existing: &mut NewMetadataCandidate<'_> = &mut unique_candidates[index];
+                if candidate.score >= existing.score {
+                    let id = existing.id;
+                    *existing = *candidate;
+                    existing.id = id;
+                }
+            } else {
+                candidate_indices.insert(identity, unique_candidates.len());
+                unique_candidates.push(*candidate);
+            }
+        }
+
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "INSERT INTO metadata_candidates (
-                id, item_id, provider, provider_id, candidate_json, score, status, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
-            ON CONFLICT (item_id, provider, provider_id) WHERE status = 'PENDING'
-            DO UPDATE SET
-                candidate_json = CASE
-                    WHEN excluded.score >= metadata_candidates.score
-                    THEN excluded.candidate_json
-                    ELSE metadata_candidates.candidate_json
-                END,
-                score = CASE
-                    WHEN excluded.score >= metadata_candidates.score
-                    THEN excluded.score
-                    ELSE metadata_candidates.score
-                END,
-                expires_at = CASE
-                    WHEN excluded.score >= metadata_candidates.score
-                    THEN excluded.expires_at
-                    ELSE metadata_candidates.expires_at
-                END,
-                updated_at = unixepoch()",
-        )
-        .bind(candidate.id)
-        .bind(candidate.item_id)
-        .bind(candidate.provider)
-        .bind(candidate.provider_id)
-        .bind(candidate.candidate_json)
-        .bind(candidate.score)
-        .bind(candidate.expires_at)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        for chunk in unique_candidates.chunks(100) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, 'PENDING', ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO metadata_candidates (
+                    id, item_id, provider, provider_id, candidate_json, score, status, expires_at
+                ) VALUES {values}
+                ON CONFLICT (item_id, provider, provider_id) WHERE status = 'PENDING'
+                DO UPDATE SET
+                    candidate_json = CASE
+                        WHEN excluded.score >= metadata_candidates.score
+                        THEN excluded.candidate_json
+                        ELSE metadata_candidates.candidate_json
+                    END,
+                    score = CASE
+                        WHEN excluded.score >= metadata_candidates.score
+                        THEN excluded.score
+                        ELSE metadata_candidates.score
+                    END,
+                    expires_at = CASE
+                        WHEN excluded.score >= metadata_candidates.score
+                        THEN excluded.expires_at
+                        ELSE metadata_candidates.expires_at
+                    END,
+                    updated_at = unixepoch()"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for candidate in chunk {
+                statement = statement
+                    .bind(candidate.id)
+                    .bind(candidate.item_id)
+                    .bind(candidate.provider)
+                    .bind(candidate.provider_id)
+                    .bind(candidate.candidate_json)
+                    .bind(candidate.score)
+                    .bind(candidate.expires_at);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         transaction
             .commit()
             .await
@@ -902,42 +935,60 @@ impl Database {
         if results.is_empty() {
             return Ok(());
         }
+        let mut unique_results = Vec::with_capacity(results.len());
+        let mut result_indices = HashMap::with_capacity(results.len());
+        for result in results {
+            if let Some(index) = result_indices.get(result.capability).copied() {
+                unique_results[index] = result;
+            } else {
+                result_indices.insert(result.capability, unique_results.len());
+                unique_results.push(result);
+            }
+        }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        for result in results {
-            let status = if result.has_data {
-                "AVAILABLE"
-            } else {
-                "UNAVAILABLE"
-            };
-            let error_code = (!result.has_data).then_some("NO_DATA");
-            self.query(
+        for chunk in unique_results.chunks(100) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, 1, ?, NULL, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO metadata_capability_attempts (
                     item_id, provider, provider_id, capability, status, attempt_count,
                     last_attempt_at, next_retry_at, error_code, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, ?, NULL, ?, ?)
+                ) VALUES {values}
                 ON CONFLICT(item_id, provider, provider_id, capability) DO UPDATE SET
                     status = excluded.status,
                     attempt_count = 1,
                     last_attempt_at = excluded.last_attempt_at,
                     next_retry_at = NULL,
                     error_code = excluded.error_code,
-                    updated_at = excluded.updated_at",
-            )
-            .bind(item_id)
-            .bind(provider)
-            .bind(provider_id)
-            .bind(result.capability)
-            .bind(status)
-            .bind(now)
-            .bind(error_code)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                    updated_at = excluded.updated_at"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for result in chunk {
+                let status = if result.has_data {
+                    "AVAILABLE"
+                } else {
+                    "UNAVAILABLE"
+                };
+                let error_code = (!result.has_data).then_some("NO_DATA");
+                statement = statement
+                    .bind(item_id)
+                    .bind(provider)
+                    .bind(provider_id)
+                    .bind(result.capability)
+                    .bind(status)
+                    .bind(now)
+                    .bind(error_code)
+                    .bind(now);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()
@@ -948,64 +999,101 @@ impl Database {
             })
     }
 
-    pub(crate) async fn record_metadata_capability_failure(
+    pub(crate) async fn record_metadata_capability_failures(
         &self,
         item_id: &str,
         provider: &str,
         provider_id: &str,
-        capability: &str,
+        capabilities: &[&str],
         now: i64,
     ) -> Result<(), StorageError> {
+        if capabilities.is_empty() {
+            return Ok(());
+        }
+        let mut unique_capabilities = Vec::with_capacity(capabilities.len());
+        let mut seen = HashSet::with_capacity(capabilities.len());
+        for capability in capabilities {
+            if seen.insert(*capability) {
+                unique_capabilities.push(*capability);
+            }
+        }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        let previous_attempt_count = self
-            .query_scalar::<i64>(
-                "SELECT attempt_count
+        let mut attempts = HashMap::with_capacity(unique_capabilities.len());
+        for chunk in unique_capabilities.chunks(100) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT capability, attempt_count
                  FROM metadata_capability_attempts
-                 WHERE item_id = ? AND provider = ? AND provider_id = ? AND capability = ?",
+                 WHERE item_id = ? AND provider = ? AND provider_id = ?
+                   AND capability IN ({placeholders})"
+            );
+            let mut statement = self.query_as::<(String, i64)>(sqlx::AssertSqlSafe(query));
+            statement = statement.bind(item_id).bind(provider).bind(provider_id);
+            for capability in chunk {
+                statement = statement.bind(*capability);
+            }
+            let rows = statement
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            attempts.extend(rows);
+        }
+        let retry_rows = unique_capabilities
+            .iter()
+            .map(|capability| {
+                let previous_attempt_count = attempts.get(*capability).copied().unwrap_or_default();
+                let exponent = previous_attempt_count.clamp(0, 5) as u32;
+                let delay = 300_i64
+                    .saturating_mul(1_i64.checked_shl(exponent).unwrap_or(i64::MAX))
+                    .min(86_400);
+                (*capability, now.saturating_add(delay))
+            })
+            .collect::<Vec<_>>();
+        for chunk in retry_rows.chunks(100) {
+            let values = std::iter::repeat_n(
+                "(?, ?, ?, ?, 'FAILED', 1, ?, ?, 'TRANSIENT_FAILURE', ?)",
+                chunk.len(),
             )
-            .bind(item_id)
-            .bind(provider)
-            .bind(provider_id)
-            .bind(capability)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .unwrap_or_default();
-        let exponent = previous_attempt_count.clamp(0, 5) as u32;
-        let delay = 300_i64
-            .saturating_mul(1_i64.checked_shl(exponent).unwrap_or(i64::MAX))
-            .min(86_400);
-        let next_retry_at = now.saturating_add(delay);
-        self.query(
-            "INSERT INTO metadata_capability_attempts (
-                item_id, provider, provider_id, capability, status, attempt_count,
-                last_attempt_at, next_retry_at, error_code, updated_at
-            ) VALUES (?, ?, ?, ?, 'FAILED', 1, ?, ?, 'TRANSIENT_FAILURE', ?)
-            ON CONFLICT(item_id, provider, provider_id, capability) DO UPDATE SET
-                status = 'FAILED',
-                attempt_count = metadata_capability_attempts.attempt_count + 1,
-                last_attempt_at = excluded.last_attempt_at,
-                next_retry_at = excluded.next_retry_at,
-                error_code = excluded.error_code,
-                updated_at = excluded.updated_at",
-        )
-        .bind(item_id)
-        .bind(provider)
-        .bind(provider_id)
-        .bind(capability)
-        .bind(now)
-        .bind(next_retry_at)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+            .collect::<Vec<_>>()
+            .join(", ");
+            let query = format!(
+                "INSERT INTO metadata_capability_attempts (
+                    item_id, provider, provider_id, capability, status, attempt_count,
+                    last_attempt_at, next_retry_at, error_code, updated_at
+                ) VALUES {values}
+                ON CONFLICT(item_id, provider, provider_id, capability) DO UPDATE SET
+                    status = 'FAILED',
+                    attempt_count = metadata_capability_attempts.attempt_count + 1,
+                    last_attempt_at = excluded.last_attempt_at,
+                    next_retry_at = excluded.next_retry_at,
+                    error_code = excluded.error_code,
+                    updated_at = excluded.updated_at"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (capability, next_retry_at) in chunk {
+                statement = statement
+                    .bind(item_id)
+                    .bind(provider)
+                    .bind(provider_id)
+                    .bind(capability)
+                    .bind(now)
+                    .bind(next_retry_at)
+                    .bind(now);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         transaction
             .commit()
             .await
@@ -1120,6 +1208,37 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn list_pending_metadata_candidates_for_item_with_count(
+        &self,
+        item_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMetadataCandidate>, i64), StorageError> {
+        let rows = self
+            .query(
+                "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                        mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                        mi.title AS item_title, COUNT(*) OVER() AS total_count
+                 FROM metadata_candidates mc
+                 JOIN media_items mi ON mi.id = mc.item_id
+                 WHERE mc.item_id = ? AND mc.status = 'PENDING' AND mi.removed_at IS NULL
+                 ORDER BY mc.created_at, mc.id
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(item_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let total = rows.first().map(|row| row.get("total_count")).unwrap_or(0);
+        let candidates = rows.into_iter().map(stored_metadata_candidate).collect();
+        Ok((candidates, total))
     }
 
     pub(crate) async fn find_metadata_candidate(

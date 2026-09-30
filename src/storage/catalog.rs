@@ -5616,44 +5616,66 @@ impl Database {
         Ok(u32::try_from(count.max(1)).unwrap_or(u32::MAX))
     }
 
-    pub(crate) async fn mark_metadata_image_unavailable(
+    pub(crate) async fn mark_metadata_images_unavailable(
         &self,
         item_id: &str,
-        image_type: &str,
-        candidate_key: &str,
+        unavailable: &[MetadataImageUnavailable<'_>],
         now: i64,
     ) -> Result<(), StorageError> {
+        if unavailable.is_empty() {
+            return Ok(());
+        }
+        let mut unique = Vec::with_capacity(unavailable.len());
+        let mut seen = std::collections::HashSet::with_capacity(unavailable.len());
+        for image in unavailable {
+            if seen.insert((image.image_type, image.candidate_key)) {
+                unique.push(image);
+            }
+        }
+
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "INSERT INTO metadata_image_attempts (
-                item_id, image_type, candidate_key, status, attempt_count,
-                last_attempt_at, next_retry_at, claimed_until, error_code, updated_at
-            ) VALUES (?, ?, ?, 'UNAVAILABLE', 1, ?, NULL, NULL, 'NO_IMAGE', ?)
-            ON CONFLICT(item_id, image_type, candidate_key) DO UPDATE SET
-                status = 'UNAVAILABLE',
-                attempt_count = CASE
-                    WHEN metadata_image_attempts.attempt_count < 1 THEN 1
-                    ELSE metadata_image_attempts.attempt_count
-                END,
-                last_attempt_at = excluded.last_attempt_at,
-                next_retry_at = NULL,
-                claimed_until = NULL,
-                error_code = 'NO_IMAGE',
-                updated_at = excluded.updated_at",
-        )
-        .bind(item_id)
-        .bind(image_type)
-        .bind(candidate_key)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        for chunk in unique.chunks(100) {
+            let values = std::iter::repeat_n(
+                "(?, ?, ?, 'UNAVAILABLE', 1, ?, NULL, NULL, 'NO_IMAGE', ?)",
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            let query = format!(
+                "INSERT INTO metadata_image_attempts (
+                    item_id, image_type, candidate_key, status, attempt_count,
+                    last_attempt_at, next_retry_at, claimed_until, error_code, updated_at
+                ) VALUES {values}
+                ON CONFLICT(item_id, image_type, candidate_key) DO UPDATE SET
+                    status = 'UNAVAILABLE',
+                    attempt_count = CASE
+                        WHEN metadata_image_attempts.attempt_count < 1 THEN 1
+                        ELSE metadata_image_attempts.attempt_count
+                    END,
+                    last_attempt_at = excluded.last_attempt_at,
+                    next_retry_at = NULL,
+                    claimed_until = NULL,
+                    error_code = 'NO_IMAGE',
+                    updated_at = excluded.updated_at"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for image in chunk {
+                statement = statement
+                    .bind(item_id)
+                    .bind(image.image_type)
+                    .bind(image.candidate_key)
+                    .bind(now)
+                    .bind(now);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         transaction
             .commit()
             .await

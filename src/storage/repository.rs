@@ -2070,6 +2070,7 @@ pub(crate) struct StoredThumbnailScraperRetry {
     pub(crate) next_retry_at: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) id: &'a str,
     pub(crate) item_id: &'a str,
@@ -2078,6 +2079,11 @@ pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) candidate_json: &'a str,
     pub(crate) score: f64,
     pub(crate) expires_at: Option<i64>,
+}
+
+pub(crate) struct MetadataImageUnavailable<'a> {
+    pub(crate) image_type: &'a str,
+    pub(crate) candidate_key: &'a str,
 }
 
 #[derive(Debug)]

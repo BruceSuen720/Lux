@@ -11,8 +11,8 @@ use crate::{
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
     storage::{
-        ItemImageBatchInsert, ItemImageInsert, NewItemMetadataCompletenessCheck,
-        NewItemMetadataCompletenessResult,
+        ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
+        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMetadataCandidate,
     },
 };
 
@@ -31,6 +31,172 @@ async fn refresh_recommendation_stats(database: &Database) {
             .await
             .expect("refresh recommendation stats")
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_metadata_batch_writes_preserve_upsert_and_retry_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Metadata", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('postgres-metadata-batch-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+
+        let candidates = [
+            NewMetadataCandidate {
+                id: "candidate-first",
+                item_id: "postgres-metadata-batch-item",
+                provider: "tmdb",
+                provider_id: "movie-1",
+                candidate_json: r#"{"title":"lower"}"#,
+                score: 70.0,
+                expires_at: Some(1_000),
+            },
+            NewMetadataCandidate {
+                id: "candidate-second",
+                item_id: "postgres-metadata-batch-item",
+                provider: "tmdb",
+                provider_id: "movie-1",
+                candidate_json: r#"{"title":"higher"}"#,
+                score: 90.0,
+                expires_at: Some(2_000),
+            },
+            NewMetadataCandidate {
+                id: "candidate-other",
+                item_id: "postgres-metadata-batch-item",
+                provider: "tmdb",
+                provider_id: "movie-2",
+                candidate_json: r#"{"title":"other"}"#,
+                score: 60.0,
+                expires_at: Some(3_000),
+            },
+        ];
+        database.reset_query_count();
+        database.insert_metadata_candidates(&candidates).await?;
+        assert_eq!(database.query_count(), 1);
+        let rows: Vec<(String, String, f64)> = sqlx::query_as(
+            "SELECT id, candidate_json, score FROM metadata_candidates
+             WHERE item_id = 'postgres-metadata-batch-item' AND provider_id = 'movie-1'",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(rows, vec![(
+            "candidate-first".to_owned(),
+            r#"{"title":"higher"}"#.to_owned(),
+            90.0,
+        )]);
+
+        let capabilities = [MetadataCapabilityResult {
+            capability: "EXTERNAL_IDS",
+            has_data: false,
+        }];
+        database.reset_query_count();
+        database
+            .record_metadata_capability_results(
+                "postgres-metadata-batch-item",
+                "tmdb",
+                "movie-1",
+                &capabilities,
+                1_000,
+            )
+            .await?;
+        assert_eq!(database.query_count(), 1);
+        database.reset_query_count();
+        database
+            .record_metadata_capability_failures(
+                "postgres-metadata-batch-item",
+                "tmdb",
+                "movie-1",
+                &["EXTERNAL_IDS", "TRAILERS"],
+                2_000,
+            )
+            .await?;
+        assert_eq!(database.query_count(), 2);
+
+        let unavailable = [
+            MetadataImageUnavailable {
+                image_type: "POSTER",
+                candidate_key: "tmdb:movie-1:POSTER",
+            },
+            MetadataImageUnavailable {
+                image_type: "FANART",
+                candidate_key: "tmdb:movie-1:FANART",
+            },
+        ];
+        database.reset_query_count();
+        database
+            .mark_metadata_images_unavailable(
+                "postgres-metadata-batch-item",
+                &unavailable,
+                3_000,
+            )
+            .await?;
+        assert_eq!(database.query_count(), 1);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -5289,6 +5455,304 @@ async fn concurrent_metadata_capability_writes_are_serialized() {
             .expect("metadata writer task should not panic")
             .expect("metadata writes should not fail under concurrency");
     }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_candidate_batch_uses_one_statement_and_preserves_upsert_behavior() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('candidate-batch-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    let candidates = [
+        NewMetadataCandidate {
+            id: "candidate-first-id",
+            item_id: "candidate-batch-item",
+            provider: "tmdb",
+            provider_id: "movie-1",
+            candidate_json: r#"{"title":"Lower score"}"#,
+            score: 70.0,
+            expires_at: Some(1_000),
+        },
+        NewMetadataCandidate {
+            id: "candidate-second-id",
+            item_id: "candidate-batch-item",
+            provider: "tmdb",
+            provider_id: "movie-1",
+            candidate_json: r#"{"title":"Higher score, first result"}"#,
+            score: 90.0,
+            expires_at: Some(2_000),
+        },
+        NewMetadataCandidate {
+            id: "candidate-third-id",
+            item_id: "candidate-batch-item",
+            provider: "tmdb",
+            provider_id: "movie-1",
+            candidate_json: r#"{"title":"Higher score, later tie"}"#,
+            score: 90.0,
+            expires_at: Some(2_500),
+        },
+        NewMetadataCandidate {
+            id: "candidate-other-id",
+            item_id: "candidate-batch-item",
+            provider: "tmdb",
+            provider_id: "movie-2",
+            candidate_json: r#"{"title":"Other candidate"}"#,
+            score: 60.0,
+            expires_at: Some(3_000),
+        },
+    ];
+
+    database.reset_query_count();
+    database
+        .insert_metadata_candidates(&candidates)
+        .await
+        .expect("insert candidate batch");
+    assert_eq!(database.query_count(), 1);
+
+    let rows: Vec<(String, String, String, f64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, provider_id, candidate_json, score, expires_at
+         FROM metadata_candidates
+         WHERE item_id = 'candidate-batch-item'
+         ORDER BY provider_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("candidate rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        (
+            "candidate-first-id".to_owned(),
+            "movie-1".to_owned(),
+            r#"{"title":"Higher score, later tie"}"#.to_owned(),
+            90.0,
+            Some(2_500),
+        )
+    );
+    assert_eq!(rows[1].0, "candidate-other-id");
+    assert_eq!(rows[1].2, r#"{"title":"Other candidate"}"#);
+
+    database.reset_query_count();
+    let (page, total) = database
+        .list_pending_metadata_candidates_for_item_with_count("candidate-batch-item", 0, 1)
+        .await
+        .expect("candidate page with total");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(total, 2);
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_capability_batches_preserve_status_and_retry_backoff() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('capability-batch-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    let capabilities = [
+        MetadataCapabilityResult {
+            capability: "CREDITS",
+            has_data: true,
+        },
+        MetadataCapabilityResult {
+            capability: "EXTERNAL_IDS",
+            has_data: false,
+        },
+        MetadataCapabilityResult {
+            capability: "CREDITS",
+            has_data: false,
+        },
+    ];
+    database.reset_query_count();
+    database
+        .record_metadata_capability_results(
+            "capability-batch-item",
+            "tmdb",
+            "movie-1",
+            &capabilities,
+            1_000,
+        )
+        .await
+        .expect("record capability batch");
+    assert_eq!(database.query_count(), 1);
+    let capability_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT capability, status, attempt_count
+         FROM metadata_capability_attempts
+         WHERE item_id = 'capability-batch-item' AND provider = 'tmdb'
+         ORDER BY capability",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("capability attempts");
+    assert_eq!(
+        capability_rows,
+        vec![
+            ("CREDITS".to_owned(), "UNAVAILABLE".to_owned(), 1),
+            ("EXTERNAL_IDS".to_owned(), "UNAVAILABLE".to_owned(), 1),
+        ]
+    );
+
+    database.reset_query_count();
+    database
+        .record_metadata_capability_failures(
+            "capability-batch-item",
+            "tmdb",
+            "movie-1",
+            &["EXTERNAL_IDS", "TRAILERS"],
+            2_000,
+        )
+        .await
+        .expect("record capability failure batch");
+    assert_eq!(database.query_count(), 2);
+    let failure_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT capability, attempt_count, next_retry_at
+         FROM metadata_capability_attempts
+         WHERE item_id = 'capability-batch-item' AND provider = 'tmdb'
+           AND status = 'FAILED'
+         ORDER BY capability",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("failed capability attempts");
+    assert_eq!(
+        failure_rows,
+        vec![
+            ("EXTERNAL_IDS".to_owned(), 2, Some(2_600)),
+            ("TRAILERS".to_owned(), 1, Some(2_300)),
+        ]
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn unavailable_metadata_image_batch_uses_one_statement_and_preserves_attempt_count() {
+    type MetadataImageAttemptRow = (String, String, i64, i64, Option<i64>, Option<String>, i64);
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('image-attempt-batch-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO metadata_image_attempts (
+                item_id, image_type, candidate_key, status, attempt_count,
+                last_attempt_at, updated_at
+             ) VALUES (
+                'image-attempt-batch-item', 'POSTER', 'tmdb:1:POSTER',
+                'FAILED', 5, 10, 10
+             )",
+    )
+    .execute(database.pool())
+    .await
+    .expect("existing image attempt");
+    let unavailable = [
+        MetadataImageUnavailable {
+            image_type: "POSTER",
+            candidate_key: "tmdb:1:POSTER",
+        },
+        MetadataImageUnavailable {
+            image_type: "FANART",
+            candidate_key: "tmdb:1:FANART",
+        },
+    ];
+
+    database.reset_query_count();
+    database
+        .mark_metadata_images_unavailable("image-attempt-batch-item", &unavailable, 200)
+        .await
+        .expect("mark missing images in one batch");
+    assert_eq!(database.query_count(), 1);
+
+    let rows: Vec<MetadataImageAttemptRow> = sqlx::query_as(
+        "SELECT image_type, status, attempt_count, last_attempt_at,
+                    next_retry_at, error_code, updated_at
+             FROM metadata_image_attempts
+             WHERE item_id = 'image-attempt-batch-item'
+             ORDER BY image_type",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("updated image attempts");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "FANART".to_owned(),
+                "UNAVAILABLE".to_owned(),
+                1,
+                200,
+                None,
+                Some("NO_IMAGE".to_owned()),
+                200,
+            ),
+            (
+                "POSTER".to_owned(),
+                "UNAVAILABLE".to_owned(),
+                5,
+                200,
+                None,
+                Some("NO_IMAGE".to_owned()),
+                200,
+            ),
+        ]
+    );
+
+    database.reset_query_count();
+    database
+        .mark_metadata_images_unavailable("image-attempt-batch-item", &[], 300)
+        .await
+        .expect("empty image batch is a no-op");
+    assert_eq!(database.query_count(), 0);
+
     database.close().await;
 }
 
