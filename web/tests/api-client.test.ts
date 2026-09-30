@@ -120,6 +120,34 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("aborts a stalled home request at its 15-second deadline", async () => {
+    vi.useFakeTimers();
+    let requestSignal: AbortSignal | undefined;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) =>
+      new Promise((_resolve, reject) => {
+        requestSignal = init?.signal as AbortSignal | undefined;
+        requestSignal?.addEventListener("abort", () => {
+          reject(new DOMException("The request was aborted", "AbortError"));
+        }, { once: true });
+      }),
+    );
+
+    try {
+      const request = new LuxApiClient().home();
+      const rejection = request.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(requestSignal?.aborted).toBe(true);
+      await expect(rejection).resolves.toMatchObject({ message: "首页请求超时，请重试" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("decodes chapters scoped to each Lux media source", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

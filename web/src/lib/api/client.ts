@@ -74,6 +74,7 @@ import type {
 
 const csrfCookie = "lux_csrf";
 const csrfTokenStorageKey = "lux_csrf_token";
+const HOME_REQUEST_TIMEOUT_MS = 15_000;
 let inMemoryCsrfToken = "";
 
 export type LibrarySortBy = "Name" | "DateCreated" | "PremiereDate" | "CommunityRating";
@@ -329,8 +330,29 @@ export class LuxApiClient {
     });
   }
 
-  home() {
-    return this.request<HomeResponse>("/api/v1/home");
+  home(signal?: AbortSignal) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort(signal?.reason);
+    if (signal?.aborted) {
+      abortFromCaller();
+    } else {
+      signal?.addEventListener("abort", abortFromCaller, { once: true });
+    }
+    const timeout = globalThis.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, HOME_REQUEST_TIMEOUT_MS);
+
+    return this.request<HomeResponse>("/api/v1/home", { signal: controller.signal })
+      .catch((error: unknown) => {
+        if (timedOut) throw new Error("首页请求超时，请重试");
+        throw error;
+      })
+      .finally(() => {
+        globalThis.clearTimeout(timeout);
+        signal?.removeEventListener("abort", abortFromCaller);
+      });
   }
 
   favorites(page = 1) {

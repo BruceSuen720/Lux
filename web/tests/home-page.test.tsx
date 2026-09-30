@@ -87,6 +87,42 @@ describe("HomePage shelves", () => {
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
 
+  it("replaces a timed-out first-load skeleton with an explicit retry state", async () => {
+    const homeRequest = vi.spyOn(api, "home")
+      .mockRejectedValueOnce(new Error("首页请求超时，请重试"))
+      .mockResolvedValueOnce({ libraries: [], recommended: [], continueWatching: [] });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-skeleton-page")).toBeNull();
+    expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
+    const retry = container.querySelector<HTMLButtonElement>(".lux-page-state button");
+    expect(retry?.textContent).toContain("重试");
+
+    await act(async () => {
+      retry?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(homeRequest).toHaveBeenCalledTimes(2);
+    expect(container.querySelector(".lux-page-state")).toBeNull();
+  });
+
   it("renders homepage library shelves in the current account's saved order", async () => {
     vi.spyOn(api, "home").mockResolvedValue({
       libraries: [

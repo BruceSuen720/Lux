@@ -21,10 +21,11 @@ export function HomePage({ user }: { user: LuxUser }) {
   const cachedHome = useMemo(() => readHomeCache(user.id), [user.id]);
   const home = useQuery({
     queryKey: queryKeys.home,
-    queryFn: () => api.home(),
+    queryFn: ({ signal }) => api.home(signal),
     initialData: cachedHome?.data,
     initialDataUpdatedAt: cachedHome?.savedAt,
     staleTime: 0,
+    retry: false,
     refetchInterval: queryRefreshIntervals.mediaSurface,
     refetchIntervalInBackground: false,
   });
@@ -39,7 +40,15 @@ export function HomePage({ user }: { user: LuxUser }) {
   }, [home.data, queryClient, user.id]);
 
   if (home.isPending && !home.data) return <HomeSkeleton />;
-  if (home.error && !home.data) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
+  if (home.error && !home.data) return (
+    <section className="lux-page-state">
+      <h1>首页加载失败</h1>
+      <p>{home.error.message}</p>
+      <button className="lux-button lux-button-secondary" type="button" onClick={() => void home.refetch()}>
+        重试
+      </button>
+    </section>
+  );
 
   const data = home.data ?? {};
   const libraries = data.libraries ?? [];
