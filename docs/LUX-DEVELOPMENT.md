@@ -7696,18 +7696,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 验收：
 
 - [ ] 官方目录只有一个新 ID `org.lux.login-background`；独立于 `org.lux.tmdb`。
-- [ ] 插件配置单选三种来源；按选择调用唯一 provider。Bing/TMDb 许可确认独立、默认 false；不确认时不访问相应上游。自定义图有单独公开展示许可确认。
-- [ ] Bing/TMDb 的既有行为和 HERO_IMAGE 左侧大图不变；TMDb 只返回混合日榜中首个电影/剧集的有效 backdrop，不回退 poster；自定义模式无外网调用。
-- [ ] manifest `image` 字段只用于 login_background，配置值只接受 SHA-256 opaque ID。上传限 5 MiB、JPEG/PNG/WebP、20 MP，并校验 magic bytes；拒绝伪 MIME、SVG、GIF、畸形/超大内容。替换成功后不保留旧自定义文件；失败回滚仍服务旧图。
-- [ ] 上传端点管理员鉴权+CSRF，服务端固定文件命名，不接受路径/文件名作目标；错误不会覆盖旧图。配置/API/RPC 不泄露文件路径/图片字节。
-- [ ] 精确固定同源图片路由以 MIME、nosniff、ETag 和 revalidation cache headers 提供；未选中、未启用、未确认 `customImageRightsConfirmed`、缺图、错误 hash 或无效状态时不可公开读取；该许可门由 Lux 宿主执行。登录公开 JSON 不包含路径或字节。
+- [x] 插件配置单选三种来源；按选择调用唯一 provider。Bing/TMDb 许可确认独立、默认 false；不确认时不访问相应上游。自定义图有单独公开展示许可确认。
+- [x] Bing/TMDb 的既有行为和 HERO_IMAGE 左侧大图不变；TMDb 只返回混合日榜中首个电影/剧集的有效 backdrop，不回退 poster；自定义模式无外网调用。
+- [x] manifest `image` 字段只用于 login_background，配置值只接受 SHA-256 opaque ID。上传限 5 MiB、JPEG/PNG/WebP、20 MP，并校验 magic bytes；拒绝伪 MIME、SVG、GIF、畸形/超大内容。替换成功后不保留旧自定义文件；失败回滚仍服务旧图。
+- [x] 上传端点管理员鉴权+CSRF，服务端固定文件命名，不接受路径/文件名作目标；错误不会覆盖旧图。配置/API/RPC 不泄露文件路径/图片字节。
+- [x] 精确固定同源图片路由以 MIME、nosniff、ETag 和 revalidation cache headers 提供；未选中、未启用、未确认 `customImageRightsConfirmed`、缺图、错误 hash 或无效状态时不可公开读取；该许可门由 Lux 宿主执行。登录公开 JSON 不包含路径或字节。
 - [ ] 新插件双架构包和目录校验成功后，从目录移除旧 Bing/TMDb ID 并删除两者现存 GitHub Releases 与 release tags（Bing 0.1.0、TMDb 0.1.0/0.1.1 全部资产）；不改 Git 历史、不自动卸载任何用户服务器中的已安装文件。
 - [ ] 提供手动迁移说明：安装新包、选择旧来源对应模式、重新单独确认许可、切换服务器背景来源、验证成功后管理员自行卸载旧包；不继承旧许可同意。
-- [ ] 覆盖来源选择、两项许可门、mock HTTP、恶意/超限上传、原子替换失败、CSRF/未授权、条件 GET/HEAD、未激活资源 404、fallback、双架构打包。
+- [x] 覆盖来源选择、两项许可门、mock HTTP、恶意/超限上传、原子替换失败、CSRF/未授权、条件 GET/HEAD、未激活资源 404、fallback、双架构打包。
 
 验证：Lux 定向协议/插件/背景资源测试、fmt、Clippy、Web 定向 Vitest/build/Playwright；Lux-plugins mock HTTP/目录测试、fmt/Clippy 与 x86_64/aarch64 release workflow。主索引和旧 Release/tag 清理需在 cutover 后实时核验；部署验证与 CI 分开记录。
 
-阶段：A SDK/宿主安全托管及全目标质量门已于 2026-09-30 通过；原 shutdown 集成测试门限从 10 秒调整到 30 秒（本机冷启动实测约 12 秒），连续定向和完整 all-targets 验证通过。项目所有者已要求修复后继续，当前进入阶段 B（设置 UI 与统一插件）。阶段 B 完成后停止等待正式切换确认；阶段 C 发布新插件、更新目录，再按精确 ID 删除旧 Release/tag。增量与文件预算见 `docs/LUX-317-PLAN.md`。
+阶段：A SDK/宿主安全托管及全目标质量门已于 2026-09-30 通过；原 shutdown 集成测试门限从 10 秒调整到 30 秒（本机冷启动实测约 12 秒），连续定向和完整 all-targets 验证通过。阶段 B（设置 UI 与统一插件）已于 2026-09-30 完成并通过：Lux Web 全量测试 540 项及构建通过，Lux-plugins GitHub Actions run `36738619827` 的 x86_64/aarch64 测试、Clippy、构建、ZIP/manifest/hash 校验全部成功。统一插件分支 `codex/unified-login-background` 已推送；活动 `plugins.json`、正式 Release 与旧包/tag 未改。阶段 B 结束后按阶段门等待项目所有者确认，再进入阶段 C（正式目录切换、旧 Release/tag 清理及手动迁移说明）。完整验证边界见 `docs/LUX-317-PLAN.md`。
 
 明确不做：多图/轮播、任意 URL/路径、插件读宿主文件、图片服务端代理/CDN/转码、媒体库写入、许可同意自动迁移、远程卸载已装插件或重写 Git 历史。
 

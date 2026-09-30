@@ -23,7 +23,7 @@
 
 ## 增量与阶段门
 
-### 阶段 A：SDK 和 host-owned 图片资源（当前）
+### 阶段 A：SDK 和 host-owned 图片资源（已通过）
 
 1. SDK image field、digest config validator、fixed same-origin route allowlist；协议测试及 Plugin SDK 文档。
 2. `login_background_assets` 应用服务：size/format/dimensions/hash、安全路径、临时写入/rename、回滚、旧资源清理、ETag。service 单测先行。
@@ -31,13 +31,13 @@
 
 阶段 A 验证：`cargo test --locked --test plugin_protocol --test plugins --test login_background` 加新 asset-service integration target；`cargo fmt --all -- --check`；变更 crate 的 Clippy。结束后停下，等项目所有者确认，再进入阶段 B。
 
-### 阶段 B：配置 UI 与统一 provider
+### 阶段 B：配置 UI 与统一 provider（已通过；2026-09-30）
 
 4. Admin Plugins 通用配置页 image 字段：单选/替换、已上传状态、许可/公开告知、错误与无障碍 feedback；API types/client/tests。
 5. Lux-plugins 新 unified binary+manifest；复用现 Bing/TMDb 行为及 mock 测试；模式选择单一，许可确认分别 fail closed，custom 不联网。
 6. 新插件 validation pipeline: x86_64/aarch64 binaries 与 ZIP manifest/hash 校验。新 Release 可用前不删除旧 packages。
 
-阶段 B 验证：Web 定向 Vitest/build；Rust provider tests/clippy/fmt；plugin catalog tests 和双架构 CI。结束后停下等待 cutover 确认。
+阶段 B 验证：Web 全量测试（75 个文件、540 项）及 build 通过；插件 Rust provider/SDK 测试、fmt、所选 Clippy、共享 TMDb client tests、Python 登录背景 catalog/fixture tests 通过；GitHub Actions run [36738619827](https://github.com/Qoo-330ml/Lux-plugins/actions/runs/36738619827) 的 x86_64/aarch64 build、ZIP manifest/binary hash 校验与 artifact upload 全部成功。Playwright 验证因本机 Lux API 未运行，不能证明登录态 Admin Plugins 页面实际交互。结束后停在阶段 C 前，等待项目所有者 cutover 确认。
 
 ### 阶段 C：active catalog 与旧 release 清理
 
@@ -87,3 +87,17 @@ let is_custom_asset = manifest.id == UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID
 全局阶段门：最初 `tests/shutdown.rs::unix::luxd_exits_cleanly_on_sigterm_after_startup` 在 10 秒内未观测到 child listener；相同失败在干净的 `test` branch control worktree 可复现。临时打开 stdout 后，startup log 证明迁移、恢复任务清理及 HTTP bind 总共约 12 秒，早于 30 秒测试门限正常启动；同一二进制手动运行也能返回 health 200。根因是 shutdown 测试 10 秒启动门限小于本机冷启动耗时，将其只调整为 30 秒。没有更改服务启动行为。调整后 `cargo test --locked --test shutdown ... -- --exact` 连续通过两次；完整 `cargo test --locked --all-targets -- --test-threads=1` 完成且集成目标通过，638 个 library tests 通过、10 个环境/性能专项标记 ignored。结合 `cargo build --locked`、全目标 Clippy、fmt 和 diff 检查，阶段 A 全局门通过。项目所有者要求“修复然后继续”，因此进入阶段 B。
 
 Lux 主工作目录里有并行任务的未提交修改；LUX-317 在独立 managed worktree 实现，只精确暂存本任务文件。
+
+### 阶段 B 实施记录
+
+- Lux Web API：增加原始图片上传 client 与响应类型；`AdminPluginsPage` 渲染 manifest 声明的单图替换、上传状态/错误，以及各自独立且默认关闭的 Bing、TMDb、自定义公开展示许可确认。普通 JSON 配置保存不提交宿主管理的 image hash。相关 API/UI 定向测试 80 项通过。
+- Lux-plugins SDK：只允许 `org.lux.login-background` 声明一个可选、非敏感、无默认值的 image 字段，并导出固定 same-origin 资源路径。
+- 新插件 `org.lux.login-background`：配置选择 `BING_DAILY`、`TMDB_TRENDING`、`CUSTOM_IMAGE`；每次仅运行所选 provider。Bing 复用 `HPImageArchive` 行为；TMDb 复用内嵌 fallback key 并只读取 `/3/trending/all/day` 首个有效电影/剧集 backdrop；自定义模式仅返回宿主托管图片路由，使用 HERO_IMAGE 全幅布局且不创建网络 client。
+- Lux-plugins provider/SDK 测试 25 项通过，Bing/TMDb mock HTTP 均通过；fmt、所选 Clippy、共享 TMDb client tests 及登录背景 catalog/fixture tests 通过。
+- 插件工作树的分支 `codex/unified-login-background` 已推送；workflow run `36738619827` 成功完成 x86_64/aarch64 构建、测试、Clippy、ZIP/manifest/hash 校验与 artifact upload。没有更新活动 `plugins.json`、发布 Release、删除旧包或旧 tag。
+- Lux Web 全量测试最终 75 个文件、540 项通过；有一次首次全量运行的首页轮播 aria-current 断言失败，单测复跑及随后完整重跑通过。`pnpm --dir web build` 与锁文件安装通过；Playwright 因本机没有 Lux API (`127.0.0.1:8097`) 只能验证到前端壳层，登录态插件配置页的真实浏览器流程尚未证实。
+- 外部仓库整个 `test_release_workflow.py` 有一个既有 webhook manifest 断言 `KeyError: bodyTemplate`；其余五个方法单独通过。登录背景专用 Python catalog/fixture suite 全部通过。
+
+阶段 B 阶段门已通过。外部仓库全量 `test_release_workflow.py` 单独运行仍有一个与本任务无关的 webhook 旧断言 `KeyError: bodyTemplate`；该 workflow 不调用此脚本，登录背景专用 Python suite 与双架构 CI 均通过。首次 Web 全量测试曾有一次首页轮播异步断言失败，定向复跑和随后完整重跑通过。Playwright 访问本机前端时，由于 Lux API `127.0.0.1:8097` 未运行，收到 setup status 500；真实登录态配置页交互未验证。
+
+阶段 C 尚未开始：没有改动活动 `plugins.json`/`index.json`，没有创建正式 Release，也没有删除旧 release/tag/package。等待项目所有者明确确认 cutover。
