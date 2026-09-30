@@ -351,12 +351,13 @@ impl PluginManifest {
             }
             if field.input_type == "image"
                 && (self.plugin_type != PLUGIN_TYPE_LOGIN_BACKGROUND
+                    || self.id != UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID
                     || field.required
                     || field.sensitive
                     || field.default_value.is_some())
             {
                 return Err(PluginManifestError::Invalid(
-                    "image config fields must be optional, non-sensitive login background fields"
+                    "image config fields are reserved for the optional, non-sensitive unified login background plugin"
                         .to_owned(),
                 ));
             }
@@ -410,6 +411,17 @@ impl PluginManifest {
                     }
                 }
             }
+        }
+        if self
+            .config_fields
+            .iter()
+            .filter(|field| field.input_type == "image")
+            .count()
+            > 1
+        {
+            return Err(PluginManifestError::Invalid(
+                "login background plugins may declare only one image config field".to_owned(),
+            ));
         }
         if self.scheduled_tasks.len() > 32 {
             return Err(PluginManifestError::Invalid(

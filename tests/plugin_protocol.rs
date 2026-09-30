@@ -204,6 +204,51 @@ fn accepts_an_image_config_field_only_for_login_background_plugins() {
     .expect("login background plugin may declare a managed image field");
     assert_eq!(login_background.config_fields[0].input_type, "image");
 
+    let separate_provider = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.other-login-background",
+        "name": "Separate background provider",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "configFields": [{
+            "key": "customImage",
+            "label": "Custom image",
+            "type": "image"
+        }],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }));
+    assert!(
+        separate_provider.is_err(),
+        "host image upload belongs to one first-party plugin"
+    );
+
+    let multiple_images = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background",
+        "name": "Lux Login Background",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "configFields": [
+            {"key": "customImage", "label": "Custom image", "type": "image"},
+            {"key": "alternateImage", "label": "Alternate image", "type": "image"}
+        ],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }));
+    assert!(
+        multiple_images.is_err(),
+        "the first-party plugin stores one image asset"
+    );
+
     let metadata = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,
         "id": "org.lux.metadata-image-upload",

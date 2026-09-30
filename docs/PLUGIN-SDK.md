@@ -262,7 +262,7 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 `{ "value": "...", "label": "..." }`。`number` 可以声明 `minimum`、`maximum` 和
 `defaultValue`。select 可以声明 `optionsSource`，当前支持 `media-libraries`，由 Lux 根据当前
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
-`image` 字段必须可选、非敏感且无 defaultValue，仅允许 `login_background` 插件声明。它表示 Lux 宿主托管的单个图片资产，不是普通文件路径或图片 URL 输入框。其配置值只能是 `sha256:<64 位小写十六进制>` opaque asset ID；只通过管理员图片上传 API 创建/替换，插件不会收到本地路径或图片字节。
+`image` 字段必须可选、非敏感且无 defaultValue，且只允许 `org.lux.login-background` 在 `login_background` manifest 中声明一个。它表示 Lux 宿主托管的单个图片资产，不是普通文件路径或图片 URL 输入框。其配置值只能是 `sha256:<64 位小写十六进制>` opaque asset ID；只通过管理员图片上传 API 创建/替换，插件不会收到本地路径或图片字节。
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。片头片尾插件不得用 `libraryIds` 配置媒体库归属；
 媒体库通过 Lux API 的 `chapterSourceId` 选择数据源。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
 
