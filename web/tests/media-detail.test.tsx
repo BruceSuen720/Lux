@@ -1088,6 +1088,7 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(audioSelect?.disabled).toBe(false);
     expect(subtitleSelect?.disabled).toBe(false);
     await act(async () => audioSelect?.click());
+    expect(document.querySelector(".lux-select-menu.lux-track-select-menu")).not.toBeNull();
     const chineseAudioOption = [...document.querySelectorAll<HTMLButtonElement>("[role=option]")]
       .find((button) => button.textContent?.includes("国语"));
     await act(async () => chineseAudioOption?.click());
