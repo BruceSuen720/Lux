@@ -25,76 +25,62 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "WITH requested_libraries(library_id) AS (
-             VALUES {values}
+        "WITH episode_latest_by_root AS MATERIALIZED (
+             SELECT episode_roots.root_id, MAX(episode.added_at) AS latest_added_at
+             FROM media_items episode
+             CROSS JOIN LATERAL (
+                 VALUES (episode.series_id), (episode.parent_id)
+             ) AS episode_roots(root_id)
+             WHERE episode.item_type = 'EPISODE'
+               AND episode.removed_at IS NULL
+               AND episode.has_available_source = 1
+               AND episode_roots.root_id IS NOT NULL
+             GROUP BY episode_roots.root_id
+         ), requested_libraries(library_id) AS (
+             SELECT DISTINCT library_id FROM (VALUES {values}) requested(library_id)
+         ), home_candidates AS MATERIALIZED (
+             SELECT mi.id, mi.library_id, mi.sort_title,
+                    CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+                        episode_latest_by_root.latest_added_at, mi.added_at
+                    ) ELSE mi.added_at END AS latest_added_at
+             FROM media_items mi
+             JOIN requested_libraries requested ON requested.library_id = mi.library_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             LEFT JOIN episode_latest_by_root ON episode_latest_by_root.root_id = mi.id
+             WHERE mi.removed_at IS NULL
+               AND (
+                   (mi.item_type IN ('MOVIE', 'SERIES') AND mi.has_available_source = 1)
+                   OR (
+                       mi.item_type = 'SERIES'
+                       AND mi.has_available_source = 0
+                       AND (
+                           EXISTS (
+                               SELECT 1 FROM media_items visible_child
+                               WHERE visible_child.removed_at IS NULL
+                                 AND visible_child.has_available_source = 1
+                                 AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM collection_items visible_collection_item
+                               JOIN collections visible_collection
+                                 ON visible_collection.id = visible_collection_item.collection_id
+                               JOIN media_items visible_child
+                                 ON visible_child.id = visible_collection_item.item_id
+                               WHERE visible_collection.item_id = mi.id
+                                 AND visible_child.removed_at IS NULL
+                                 AND visible_child.has_available_source = 1
+                           )
+                       )
+                   )
+               )
          ), selected AS (
              SELECT requested.library_id, recent.id, recent.latest_added_at
              FROM requested_libraries requested
              CROSS JOIN LATERAL (
-                 SELECT visible.id, visible.latest_added_at, visible.sort_title
-                 FROM (
-                     (SELECT mi.id,
-                             CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
-                                 (SELECT MAX(child.added_at)
-                                  FROM media_items child
-                                  WHERE child.item_type = 'EPISODE'
-                                    AND child.removed_at IS NULL
-                                    AND child.has_available_source = 1
-                                    AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                                 mi.added_at
-                             ) ELSE mi.added_at END AS latest_added_at,
-                             mi.sort_title
-                      FROM media_items mi
-                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                      WHERE mi.library_id = requested.library_id
-                        AND mi.item_type IN ('MOVIE', 'SERIES')
-                        AND mi.removed_at IS NULL
-                        AND mi.has_available_source = 1
-                      ORDER BY latest_added_at DESC, mi.sort_title, mi.id
-                      LIMIT ?)
-                     UNION ALL
-                     (SELECT mi.id,
-                             COALESCE(
-                                 (SELECT MAX(child.added_at)
-                                  FROM media_items child
-                                  WHERE child.item_type = 'EPISODE'
-                                    AND child.removed_at IS NULL
-                                    AND child.has_available_source = 1
-                                    AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                                 mi.added_at
-                             ) AS latest_added_at,
-                             mi.sort_title
-                      FROM media_items mi
-                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                      WHERE mi.library_id = requested.library_id
-                        AND mi.item_type = 'SERIES'
-                        AND mi.removed_at IS NULL
-                        AND mi.has_available_source = 0
-                        AND (
-                            EXISTS (
-                                SELECT 1
-                                FROM media_items visible_child
-                                WHERE visible_child.removed_at IS NULL
-                                  AND visible_child.has_available_source = 1
-                                  AND (visible_child.parent_id = mi.id
-                                       OR visible_child.series_id = mi.id)
-                            )
-                            OR EXISTS (
-                                SELECT 1
-                                FROM collection_items visible_collection_item
-                                JOIN collections visible_collection
-                                  ON visible_collection.id = visible_collection_item.collection_id
-                                JOIN media_items visible_child
-                                  ON visible_child.id = visible_collection_item.item_id
-                                WHERE visible_collection.item_id = mi.id
-                                  AND visible_child.removed_at IS NULL
-                                  AND visible_child.has_available_source = 1
-                            )
-                        )
-                      ORDER BY latest_added_at DESC, mi.sort_title, mi.id
-                      LIMIT ?)
-                 ) visible
-                 ORDER BY visible.latest_added_at DESC, visible.sort_title, visible.id
+                 SELECT candidate.id, candidate.latest_added_at, candidate.sort_title
+                 FROM home_candidates candidate
+                 WHERE candidate.library_id = requested.library_id
+                 ORDER BY candidate.latest_added_at DESC, candidate.sort_title, candidate.id
                  LIMIT ?
              ) recent
          )"
@@ -1158,9 +1144,9 @@ impl Database {
         let mut rows = Vec::new();
         for library_ids in library_ids.chunks(500) {
             let (selection_query, binds) = if self.backend == DatabaseBackend::Postgres {
-                let mut binds = Vec::with_capacity(library_ids.len() + 3);
+                let mut binds = Vec::with_capacity(library_ids.len() + 1);
                 binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
-                binds.extend(std::iter::repeat_n(CatalogBind::Integer(limit), 3));
+                binds.push(CatalogBind::Integer(limit));
                 (
                     postgres_recent_catalog_rows_by_library_query(library_ids.len()),
                     binds,
@@ -6626,8 +6612,20 @@ mod tests {
 
         assert!(query.contains("CROSS JOIN LATERAL"));
         assert!(query.contains("VALUES (?), (?)"));
-        assert_eq!(query.matches("LIMIT ?").count(), 3);
+        assert_eq!(query.matches("LIMIT ?").count(), 1);
         assert!(!query.contains("ROW_NUMBER()"));
+        assert!(query.contains("home_candidates AS MATERIALIZED"));
+    }
+
+    #[test]
+    fn postgres_recent_catalog_aggregates_episode_dates_once() {
+        let query = postgres_recent_catalog_rows_by_library_query(2);
+
+        assert!(query.contains("episode_latest_by_root AS MATERIALIZED"));
+        assert_eq!(query.matches("MAX(episode.added_at)").count(), 1);
+        assert_eq!(query.matches("LEFT JOIN episode_latest_by_root").count(), 1);
+        assert!(query.contains("roots.root_id IS NOT NULL"));
+        assert!(!query.contains("MAX(child.added_at)"));
     }
 
     #[test]
