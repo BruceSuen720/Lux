@@ -1256,9 +1256,9 @@ impl MetadataReidentifyService {
                 .map_err(MetadataReidentifyError::Candidate)?
         };
         if matches!(mode, MetadataRefreshMode::Reidentify) {
-            return Ok(RefreshItemOutcome::Confirmed(
-                i64::try_from(page.items.len()).unwrap_or(i64::MAX),
-            ));
+            return Ok(RefreshItemOutcome::Confirmed(candidate_count_for_page(
+                &page,
+            )));
         }
         let Some(selection) = self.selection.as_ref() else {
             return Err(MetadataReidentifyError::SelectionUnavailable);
@@ -1323,7 +1323,7 @@ impl MetadataReidentifyService {
                 "actor metadata enrichment queue is full"
             );
         }
-        let candidate_count = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
+        let candidate_count = candidate_count_for_page(&page);
         Ok(if needs_review {
             RefreshItemOutcome::NeedsReview(candidate_count)
         } else {
@@ -1548,6 +1548,10 @@ fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCan
     (candidate.score >= AUTO_MATCH_MIN_SCORE).then_some(candidate)
 }
 
+fn candidate_count_for_page(page: &MetadataCandidatePage) -> i64 {
+    page.total.max(0).min(page.limit.max(0))
+}
+
 fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
     let mut best = None;
     for candidate in page
@@ -1656,8 +1660,8 @@ mod tests {
     use super::{
         AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage,
         MetadataCandidateView, MetadataRequestPlan, best_automatic_candidate,
-        metadata_global_permits, metadata_request_plan_is_complete, metadata_worker_concurrency,
-        metadata_worker_default_concurrency,
+        candidate_count_for_page, metadata_global_permits, metadata_request_plan_is_complete,
+        metadata_worker_concurrency, metadata_worker_default_concurrency,
     };
     use crate::{
         application::{
@@ -2527,6 +2531,22 @@ mod tests {
         };
 
         assert!(best_automatic_candidate(&page).is_none());
+    }
+
+    #[test]
+    fn automatic_candidate_summary_preserves_page_bounded_candidate_counts() {
+        let page = MetadataCandidatePage {
+            items: vec![candidate("best", 95.0), candidate("second", 90.0)],
+            total: 60,
+            offset: 0,
+            limit: 50,
+        };
+
+        assert_eq!(candidate_count_for_page(&page), 50);
+        assert_eq!(
+            candidate_count_for_page(&MetadataCandidatePage { total: 1, ..page }),
+            1
+        );
     }
 
     #[test]

@@ -311,17 +311,37 @@ impl MetadataCandidateService {
         item_id: &str,
         current: &StoredMediaMetadata,
         reuse_current_snapshot: bool,
+        automatic_match: bool,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        if reuse_current_snapshot {
-            return self.list_pending_for_current(item_id, current).await;
+        let refreshed_current;
+        let current = if reuse_current_snapshot {
+            current
+        } else {
+            refreshed_current = self
+                .database
+                .find_media_item_metadata(item_id)
+                .await?
+                .ok_or(MetadataCandidateError::ItemNotFound)?;
+            &refreshed_current
+        };
+        if automatic_match {
+            let limit = 50;
+            let (rows, total) = self
+                .database
+                .list_best_pending_metadata_candidates_for_item(item_id, limit, 2)
+                .await?;
+            let items = rows
+                .into_iter()
+                .map(|row| candidate_view(row, Some(current)))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(MetadataCandidatePage {
+                items,
+                total,
+                offset: 0,
+                limit,
+            });
         }
-        let refreshed_current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
-            .ok_or(MetadataCandidateError::ItemNotFound)?;
-        self.list_pending_for_current(item_id, &refreshed_current)
-            .await
+        self.list_pending_for_current(item_id, current).await
     }
 
     pub async fn search_and_store(
@@ -442,6 +462,10 @@ impl MetadataCandidateService {
             plan,
             current,
         } = options;
+        let automatic_match = matches!(
+            mode,
+            CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
+        );
         let reuse_current_snapshot = current.is_some();
         let fetched_current = if current.is_none() {
             Some(
@@ -477,6 +501,7 @@ impl MetadataCandidateService {
                             current,
                             plan,
                             reuse_current_snapshot,
+                            automatic_match,
                         },
                     )
                     .await;
@@ -986,7 +1011,7 @@ impl MetadataCandidateService {
         }
         self.store_candidates(item_id, current, pending_candidates)
             .await?;
-        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot, automatic_match)
             .await
     }
 
@@ -1121,6 +1146,7 @@ impl MetadataCandidateService {
             current,
             plan,
             reuse_current_snapshot,
+            automatic_match,
         } = context;
         let item_type = match current.item_type.as_str() {
             "SEASON" => ScraperItemType::Season,
@@ -1294,7 +1320,7 @@ impl MetadataCandidateService {
         }
         self.store_candidates(item_id, current, stored_candidates)
             .await?;
-        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot, automatic_match)
             .await
     }
 
@@ -1537,6 +1563,7 @@ struct CandidateSearchContext<'a> {
     current: &'a StoredMediaMetadata,
     plan: MetadataRequestPlan,
     reuse_current_snapshot: bool,
+    automatic_match: bool,
 }
 
 struct ParentProvider {

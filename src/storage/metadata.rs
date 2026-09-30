@@ -1241,6 +1241,55 @@ impl Database {
         Ok((candidates, total))
     }
 
+    pub(crate) async fn list_best_pending_metadata_candidates_for_item(
+        &self,
+        item_id: &str,
+        page_window: i64,
+        result_limit: i64,
+    ) -> Result<(Vec<StoredMetadataCandidate>, i64), StorageError> {
+        const MAX_PAGE_WINDOW: i64 = 50;
+        const MAX_RESULT_LIMIT: i64 = 2;
+
+        let page_window = page_window.clamp(1, MAX_PAGE_WINDOW);
+        let result_limit = result_limit.clamp(1, MAX_RESULT_LIMIT);
+        let rows = self
+            .query(
+                "WITH pending AS (
+                     SELECT mc.id, mc.item_id, mc.score, mc.created_at,
+                            COUNT(*) OVER() AS total_count,
+                            ROW_NUMBER() OVER(ORDER BY mc.created_at, mc.id) AS page_position
+                     FROM metadata_candidates mc
+                     JOIN media_items mi ON mi.id = mc.item_id
+                     WHERE mc.item_id = ? AND mc.status = 'PENDING' AND mi.removed_at IS NULL
+                 ), ranked AS (
+                     SELECT id, item_id, score, created_at, total_count,
+                            ROW_NUMBER() OVER(ORDER BY score DESC, created_at, id) AS score_position
+                     FROM pending
+                     WHERE page_position <= ?
+                 )
+                 SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                        mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                        mi.title AS item_title, ranked.total_count
+                 FROM ranked
+                 JOIN metadata_candidates mc ON mc.id = ranked.id
+                 JOIN media_items mi ON mi.id = mc.item_id
+                 WHERE ranked.score_position <= ?
+                 ORDER BY ranked.score DESC, ranked.created_at, ranked.id",
+            )
+            .bind(item_id)
+            .bind(page_window)
+            .bind(result_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let total = rows.first().map(|row| row.get("total_count")).unwrap_or(0);
+        let candidates = rows.into_iter().map(stored_metadata_candidate).collect();
+        Ok((candidates, total))
+    }
+
     pub(crate) async fn find_metadata_candidate(
         &self,
         item_id: &str,

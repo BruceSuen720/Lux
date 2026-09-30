@@ -5285,6 +5285,69 @@ async fn pending_metadata_candidates_load_current_items_in_one_batch() {
 }
 
 #[tokio::test]
+async fn automatic_candidate_summary_keeps_the_best_results_from_the_existing_page_window() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Automatic candidate summary", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('automatic-summary-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+
+    for index in 0..60 {
+        let score = match index {
+            49 => 99.0,
+            40 => 98.0,
+            59 => 100.0,
+            _ => index as f64,
+        };
+        database
+            .query(
+                "INSERT INTO metadata_candidates (
+                    id, item_id, provider, provider_id, candidate_json, score, status
+                 ) VALUES (?, 'automatic-summary-item', 'tmdb', ?, '{}', ?, 'PENDING')",
+            )
+            .bind(format!("candidate-{index:03}"))
+            .bind(format!("movie-{index}"))
+            .bind(score)
+            .execute(database.pool())
+            .await
+            .expect("metadata candidate");
+    }
+
+    database.reset_query_count();
+    let (candidates, total_count) = database
+        .list_best_pending_metadata_candidates_for_item("automatic-summary-item", 50, 2)
+        .await
+        .expect("automatic candidate summary");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(total_count, 60);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        ["candidate-049", "candidate-040"],
+        "the summary ranks only the same first-50 page the previous loader exposed"
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn collection_refresh_uses_provider_index_and_batch_insert() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
