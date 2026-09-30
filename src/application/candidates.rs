@@ -306,6 +306,24 @@ impl MetadataCandidateService {
         })
     }
 
+    async fn list_pending_after_search(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+        reuse_current_snapshot: bool,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        if reuse_current_snapshot {
+            return self.list_pending_for_current(item_id, current).await;
+        }
+        let refreshed_current = self
+            .database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        self.list_pending_for_current(item_id, &refreshed_current)
+            .await
+    }
+
     pub async fn search_and_store(
         &self,
         item_id: &str,
@@ -424,6 +442,7 @@ impl MetadataCandidateService {
             plan,
             current,
         } = options;
+        let reuse_current_snapshot = current.is_some();
         let fetched_current = if current.is_none() {
             Some(
                 self.database
@@ -449,7 +468,17 @@ impl MetadataCandidateService {
             "SERIES" => MediaKind::Series,
             "SEASON" | "EPISODE" => {
                 return self
-                    .search_child_and_store(item_id, query, year, current, scraper, plan)
+                    .search_child_and_store(
+                        item_id,
+                        query,
+                        year,
+                        scraper,
+                        CandidateSearchContext {
+                            current,
+                            plan,
+                            reuse_current_snapshot,
+                        },
+                    )
                     .await;
             }
             _ => return Err(MetadataCandidateError::InvalidSearch),
@@ -957,7 +986,8 @@ impl MetadataCandidateService {
         }
         self.store_candidates(item_id, current, pending_candidates)
             .await?;
-        self.list_pending_for_current(item_id, current).await
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+            .await
     }
 
     async fn reuse_unexpired_automatic_candidates(
@@ -1084,10 +1114,14 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        current: &StoredMediaMetadata,
         scraper: &ScraperProvider,
-        plan: MetadataRequestPlan,
+        context: CandidateSearchContext<'_>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let CandidateSearchContext {
+            current,
+            plan,
+            reuse_current_snapshot,
+        } = context;
         let item_type = match current.item_type.as_str() {
             "SEASON" => ScraperItemType::Season,
             "EPISODE" => ScraperItemType::Episode,
@@ -1260,7 +1294,8 @@ impl MetadataCandidateService {
         }
         self.store_candidates(item_id, current, stored_candidates)
             .await?;
-        self.list_pending_for_current(item_id, current).await
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+            .await
     }
 
     async fn parent_providers(
@@ -1496,6 +1531,12 @@ struct CandidateSearchOptions<'a> {
     mode: CandidateSearchMode,
     plan: MetadataRequestPlan,
     current: Option<&'a StoredMediaMetadata>,
+}
+
+struct CandidateSearchContext<'a> {
+    current: &'a StoredMediaMetadata,
+    plan: MetadataRequestPlan,
+    reuse_current_snapshot: bool,
 }
 
 struct ParentProvider {
