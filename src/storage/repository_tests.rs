@@ -243,6 +243,131 @@ async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users
 }
 
 #[tokio::test]
+async fn home_resume_page_returns_items_and_total_with_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let admin = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Home resume", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let user_id = admin.id.to_string();
+    let library_id = library.id.to_string();
+    for item_id in ["resume-one", "resume-two"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 2000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, is_played, position_ticks, last_played_at
+             ) VALUES (?, ?, 0, 1000000000, 1)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("resume state");
+    }
+
+    database.reset_query_count();
+    let (rows, total) = database
+        .list_resume_items_with_total(
+            &ResumeItemsQuery {
+                user_id: &user_id,
+                library_ids: std::slice::from_ref(&library_id),
+                item_types: &["MOVIE"],
+                played_percent: 90,
+                minimum_ticks: 0,
+                offset: 0,
+                limit: 1,
+            },
+            true,
+        )
+        .await
+        .expect("home resume page");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(total, 2);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item_id, "resume-one");
+
+    database.reset_query_count();
+    let (past_end, total) = database
+        .list_resume_items_with_total(
+            &ResumeItemsQuery {
+                user_id: &user_id,
+                library_ids: std::slice::from_ref(&library_id),
+                item_types: &["MOVIE"],
+                played_percent: 90,
+                minimum_ticks: 0,
+                offset: 10,
+                limit: 1,
+            },
+            true,
+        )
+        .await
+        .expect("out-of-range home resume page");
+
+    assert!(past_end.is_empty());
+    assert_eq!(total, 2);
+    assert_eq!(database.query_count(), 2);
+}
+
+#[tokio::test]
+async fn home_resume_settings_are_read_with_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let admin = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let user_id = admin.id.to_string();
+    database
+        .set_user_played_percent(&user_id, 85)
+        .await
+        .expect("played percent");
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('resume_min_ticks', '300000000')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await
+    .expect("minimum resume ticks");
+
+    database.reset_query_count();
+    let settings = database
+        .home_resume_settings(&user_id)
+        .await
+        .expect("home resume settings");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(settings, (85, 300_000_000));
+}
+
+#[tokio::test]
 async fn thumbnail_scraper_retries_are_persisted_and_claimed_at_due_times() {
     const SIX_HOURS: i64 = 6 * 60 * 60;
     const ONE_DAY: i64 = 24 * 60 * 60;
