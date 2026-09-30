@@ -799,12 +799,12 @@ impl Database {
     }
 
     #[cfg(test)]
-    fn reset_query_count(&self) {
+    pub(crate) fn reset_query_count(&self) {
         self.query_count.store(0, AtomicOrdering::Relaxed);
     }
 
     #[cfg(test)]
-    fn query_count(&self) -> usize {
+    pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
     }
 

@@ -1942,6 +1942,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fill_missing_plan_skips_attempt_history_reads_without_provider_identity()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        assert!(current.provider_ids_json.is_none());
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+
+        database.reset_query_count();
+        let plan = selection
+            .fill_missing_request_plan_for_current(&item_id, &current)
+            .await?;
+
+        assert!(plan.requestable.needs_metadata);
+        assert_eq!(
+            database.query_count(),
+            6,
+            "media strategy, local image inventory and writeback-path reads remain, but attempt history is skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fill_missing_skips_complete_local_items_before_resolving_scrapers()
     -> Result<(), Box<dyn Error>> {
         let (temp_dir, config, database, item_id) = role_test_fixture().await?;

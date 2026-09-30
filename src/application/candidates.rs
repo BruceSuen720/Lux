@@ -1680,24 +1680,14 @@ fn insert_provider_id_if_missing(
     provider_ids.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
 }
 
-fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
-    let provider_ids = current_provider_ids(current);
-    let Some(source) = current
-        .metadata_scraper_id
-        .as_deref()
-        .or(current.scraper_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Vec::new();
-    };
-    let Some(provider_id) = provider_id_for_key(&provider_ids, source)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Vec::new();
-    };
-    vec![(provider_key_from_plugin_id(source), provider_id.to_owned())]
+fn image_attempt_identities(
+    capability_identity: Option<&(String, String)>,
+) -> Vec<(String, String)> {
+    capability_identity
+        .map(|(source, provider_id)| {
+            vec![(provider_key_from_plugin_id(source), provider_id.clone())]
+        })
+        .unwrap_or_default()
 }
 
 fn selected_capability_identity(current: &StoredMediaMetadata) -> Option<(String, String)> {
@@ -2239,14 +2229,18 @@ impl MetadataSelectionService {
             return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full(), 0));
         }
         let image_policy = self.image_selection_policy(item_id).await?;
-        let (capability_states, image_attempts) =
-            self.database.list_metadata_attempts(item_id).await?;
+        let capability_identity = selected_capability_identity(current);
+        let (capability_states, image_attempts) = if capability_identity.is_some() {
+            self.database.list_metadata_attempts(item_id).await?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let unavailable_image_attempts = image_attempts
             .into_iter()
             .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
             .map(|attempt| (attempt.image_type, attempt.candidate_key))
             .collect::<BTreeSet<_>>();
-        let image_attempt_identities = image_attempt_identities(current);
+        let image_attempt_identities = image_attempt_identities(capability_identity.as_ref());
         let image_types = image_policy.enabled_types().collect::<Vec<_>>();
         let local_image_types = if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
             self.images
@@ -2320,7 +2314,6 @@ impl MetadataSelectionService {
         );
         requestable_plan.image_policy = Some(image_policy);
         requestable_plan.missing_image_mask = requestable_missing_image_mask;
-        let capability_identity = selected_capability_identity(current);
         requestable_plan.needs_credits = requestable_plan.needs_credits
             && capability_needs_request(
                 &capability_states,
@@ -3924,9 +3917,10 @@ mod tests {
         MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
         SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
         credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
-        generic_candidate_images, local_metadata_completeness_plan, merge_actor_values,
-        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
-        metadata_request_plan, parse_image_selection_policy, selected_scraper_provider_id,
+        generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
+        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
+        selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -4314,6 +4308,14 @@ mod tests {
             Some(&identity),
             "TRAILERS"
         ));
+        assert!(
+            capability_needs_request(&unavailable_attempts, None, "CREDITS"),
+            "attempt history cannot apply until a provider identity is selected"
+        );
+        assert!(
+            image_attempt_identities(None).is_empty(),
+            "image attempt history cannot apply until a provider identity is selected"
+        );
 
         let first_fingerprint = completeness.input_fingerprint;
         current.overview = Some("Updated local overview".to_owned());
