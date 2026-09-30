@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.7",
+    date: "2026-09-30",
+    sections: [
+      { kind: "changed", items: [
+        "元数据候选、能力尝试和图片状态等写入改为有界批处理；Provider 响应缓存按过期时间维护索引，减少逐条数据库操作和过期项全表清理。",
+        "PostgreSQL 首页每库最新资源查询改为一次预聚合剧集最近添加时间；目标服务器单次 SQL 选取测量由 3.556 秒降至 0.566 秒，该结果不代表完整首页 API p95。",
+      ] },
+      { kind: "fixed", items: [
+        "插件 JSON 响应现在在读取时限制为 4 MiB；超过限制会拒绝响应并终止对应插件进程。",
+        "修复首页数据请求失败后，被扫描变更事件反复触发重试并长期停留在骨架屏的问题；无数据时暂停自动轮询，用户可显式重试，已有缓存仍继续显示。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.6",
     date: "2026-09-30",
     sections: [
