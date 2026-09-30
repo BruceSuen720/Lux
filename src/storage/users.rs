@@ -1230,6 +1230,33 @@ impl Database {
         })
     }
 
+    pub(crate) async fn home_resume_settings(
+        &self,
+        user_id: &str,
+    ) -> Result<(i64, i64), StorageError> {
+        let (played_percent, minimum_ticks): (Option<i64>, Option<String>) = self
+            .query_as(
+                "SELECT
+                     (SELECT played_percent FROM user_playback_settings WHERE user_id = ?),
+                     (SELECT value FROM server_settings WHERE key = 'resume_min_ticks')",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let played_percent = played_percent
+            .unwrap_or(DEFAULT_PLAYED_PERCENT)
+            .clamp(1, 100);
+        let minimum_ticks = minimum_ticks
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_200_000_000)
+            .max(0);
+        Ok((played_percent, minimum_ticks))
+    }
+
     pub(crate) async fn force_admin_library_order(&self) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT value FROM server_settings

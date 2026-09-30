@@ -1611,6 +1611,130 @@ impl Database {
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
 
+    pub(crate) async fn list_resume_items_with_total(
+        &self,
+        query: &ResumeItemsQuery<'_>,
+        latest_episode_per_series: bool,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        if query.library_ids.is_empty() || query.item_types.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let item_type_placeholders = std::iter::repeat_n("?", query.item_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
+        let statement_sql = format!(
+            "WITH candidates AS (
+                 SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
+                        mi.episode_number, mi.sort_title, us.position_ticks, us.last_played_at,
+                        {runtime_ticks} AS resume_runtime_ticks
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                   AND us.is_played = 0 AND us.position_ticks >= ?
+                   AND mi.library_id IN ({library_placeholders})
+             ),
+             eligible AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at
+                 FROM candidates
+                 WHERE resume_runtime_ticks > 0
+                   AND position_ticks * 100 < resume_runtime_ticks * ?
+             ),
+             ranked AS (
+                 SELECT id, sort_title, last_played_at,
+                        {resume_rank} AS resume_rank
+                 FROM eligible
+             ),
+             qualified AS (
+                 SELECT id, sort_title, last_played_at,
+                        COUNT(*) OVER () AS resume_total
+                 FROM ranked
+                 WHERE resume_rank = 1
+             ),
+             limited AS (
+                 SELECT id, sort_title, last_played_at, resume_total
+                 FROM qualified
+                 ORDER BY last_played_at DESC NULLS LAST, sort_title, id
+                 LIMIT ? OFFSET ?
+             )
+             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    series.title AS series_name,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                     ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced,
+                    ranked.resume_total AS resume_total
+             FROM limited ranked
+             JOIN media_items mi ON mi.id = ranked.id
+             LEFT JOIN media_items series ON series.id = mi.series_id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             ORDER BY ranked.last_played_at DESC NULLS LAST,
+                      ranked.sort_title, ranked.id,
+                      ms.id, mt.stream_index"
+        );
+        let mut binds = Vec::with_capacity(query.item_types.len() + query.library_ids.len() + 5);
+        binds.push(CatalogBind::Text(query.user_id));
+        binds.extend(query.item_types.iter().copied().map(CatalogBind::Text));
+        binds.push(CatalogBind::Integer(query.minimum_ticks));
+        binds.extend(
+            query
+                .library_ids
+                .iter()
+                .map(|value| CatalogBind::Text(value)),
+        );
+        binds.push(CatalogBind::Integer(query.played_percent));
+        binds.push(CatalogBind::Integer(query.limit));
+        binds.push(CatalogBind::Integer(query.offset));
+        let (rows, total) = self
+            .fetch_catalog_rows_with_total(&statement_sql, &binds)
+            .await?;
+        if rows.is_empty() && (query.offset > 0 || query.limit <= 0) {
+            let total = self
+                .count_resume_items(
+                    query.user_id,
+                    query.library_ids,
+                    query.item_types,
+                    query.played_percent,
+                    query.minimum_ticks,
+                    latest_episode_per_series,
+                )
+                .await?;
+            return Ok((rows, total));
+        }
+        Ok((rows, total))
+    }
+
     pub(crate) async fn count_resume_items(
         &self,
         user_id: &str,
@@ -1674,108 +1798,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
-    }
-
-    pub(crate) async fn list_resume_items(
-        &self,
-        query: &ResumeItemsQuery<'_>,
-        latest_episode_per_series: bool,
-    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        if query.library_ids.is_empty() || query.item_types.is_empty() {
-            return Ok(Vec::new());
-        }
-        let item_type_placeholders = std::iter::repeat_n("?", query.item_types.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let runtime_ticks = resume_runtime_ticks_sql();
-        let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
-        let statement_sql = format!(
-            "WITH candidates AS (
-                 SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
-                        mi.episode_number, mi.sort_title, us.position_ticks, us.last_played_at,
-                        {runtime_ticks} AS resume_runtime_ticks
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
-                 WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.position_ticks >= ?
-                   AND mi.library_id IN ({library_placeholders})
-             ),
-             eligible AS (
-                 SELECT id, item_type, series_id, season_number, episode_number,
-                        sort_title, last_played_at
-                 FROM candidates
-                 WHERE resume_runtime_ticks > 0
-                   AND position_ticks * 100 < resume_runtime_ticks * ?
-             ),
-             ranked AS (
-                 SELECT id, sort_title, last_played_at,
-                        {resume_rank} AS resume_rank
-                 FROM eligible
-             ),
-             limited AS (
-                 SELECT id, sort_title, last_played_at
-                 FROM ranked
-                 WHERE resume_rank = 1
-                 ORDER BY last_played_at DESC NULLS LAST, sort_title, id
-                 LIMIT ? OFFSET ?
-             )
-             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
-                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
-                    series.title AS series_name,
-                    mi.title, mi.sort_title, mi.original_title, mi.overview,
-                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
-                    mi.added_at, mi.updated_at,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
-                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
-                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
-                     ORDER BY image_index LIMIT 1) AS thumb_image_tag,
-                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
-                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
-                    (SELECT fe.relative_path FROM filesystem_entries fe
-                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
-                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
-                    ms.edition_name, ms.quality_label,
-                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
-                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                    mt.codec, mt.language, mt.title AS stream_title,
-                    mt.details_json AS stream_details_json,
-                    mt.is_external AS stream_is_external,
-                    mt.is_default AS stream_is_default,
-                    mt.is_forced AS stream_is_forced
-             FROM limited ranked
-             JOIN media_items mi ON mi.id = ranked.id
-             LEFT JOIN media_items series ON series.id = mi.series_id
-             LEFT JOIN media_sources ms
-               ON ms.item_id = mi.id
-              AND EXISTS (
-                  SELECT 1 FROM filesystem_entries fe
-                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
-              )
-             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY ranked.last_played_at DESC NULLS LAST,
-                      ranked.sort_title, ranked.id,
-                      ms.id, mt.stream_index"
-        );
-        let mut binds = Vec::with_capacity(query.item_types.len() + query.library_ids.len() + 5);
-        binds.push(CatalogBind::Text(query.user_id));
-        binds.extend(query.item_types.iter().copied().map(CatalogBind::Text));
-        binds.push(CatalogBind::Integer(query.minimum_ticks));
-        binds.extend(
-            query
-                .library_ids
-                .iter()
-                .map(|value| CatalogBind::Text(value)),
-        );
-        binds.push(CatalogBind::Integer(query.played_percent));
-        binds.push(CatalogBind::Integer(query.limit));
-        binds.push(CatalogBind::Integer(query.offset));
-        self.fetch_catalog_rows(&statement_sql, &binds).await
     }
 
     fn resume_rank_expression(latest_episode_per_series: bool) -> &'static str {
@@ -2360,6 +2382,25 @@ impl Database {
         query: &str,
         binds: &[CatalogBind<'_>],
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        self.fetch_catalog_rows_internal(query, binds, false)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    async fn fetch_catalog_rows_with_total(
+        &self,
+        query: &str,
+        binds: &[CatalogBind<'_>],
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        self.fetch_catalog_rows_internal(query, binds, true).await
+    }
+
+    async fn fetch_catalog_rows_internal(
+        &self,
+        query: &str,
+        binds: &[CatalogBind<'_>],
+        read_resume_total: bool,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
         for bind in binds {
             statement = match bind {
@@ -2372,7 +2413,15 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map(|rows| {
-                rows.into_iter()
+                let total = if read_resume_total {
+                    rows.first()
+                        .and_then(|row| row.try_get("resume_total").ok())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let rows = rows
+                    .into_iter()
                     .map(|row| StoredCatalogRow {
                         item_id: row.get("item_id"),
                         library_id: row.get("library_id"),
@@ -2427,7 +2476,8 @@ impl Database {
                             .get::<Option<i64>, _>("stream_is_forced")
                             .map(|value| value != 0),
                     })
-                    .collect()
+                    .collect();
+                (rows, total)
             })
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),

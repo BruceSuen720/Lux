@@ -895,22 +895,10 @@ impl CatalogService {
         latest_episode_per_series: bool,
         item_types: &[&str],
     ) -> Result<CatalogPage, CatalogError> {
-        let played_percent = self.database.user_played_percent(user_id).await?;
-        let (_, minimum_ticks) = self.database.resume_settings().await?;
-        let total = self
+        let (played_percent, minimum_ticks) = self.database.home_resume_settings(user_id).await?;
+        let (rows, total) = self
             .database
-            .count_resume_items(
-                user_id,
-                library_ids,
-                item_types,
-                played_percent,
-                minimum_ticks,
-                latest_episode_per_series,
-            )
-            .await?;
-        let rows = self
-            .database
-            .list_resume_items(
+            .list_resume_items_with_total(
                 &ResumeItemsQuery {
                     user_id,
                     library_ids,
