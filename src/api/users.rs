@@ -96,6 +96,50 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
     Json(json!({ "source": source, "images": images })).into_response()
 }
 
+pub(super) async fn login_background_custom_image(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let asset = match plugins.selected_custom_login_background_asset().await {
+        Ok(Some(asset)) => asset,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(
+            crate::application::plugins::PluginServiceError::InvalidConfig
+            | crate::application::plugins::PluginServiceError::UnknownPlugin(_)
+            | crate::application::plugins::PluginServiceError::Unavailable(_),
+        ) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let not_modified = headers
+        .get("If-None-Match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == asset.etag
+            })
+        });
+    let (status, body) = if not_modified {
+        (StatusCode::NOT_MODIFIED, Body::empty())
+    } else {
+        (StatusCode::OK, Body::from(asset.bytes))
+    };
+    match Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, asset.content_type)
+        .header(CACHE_CONTROL, "no-cache, must-revalidate")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("ETag", &asset.etag)
+        .body(body)
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let Some(database) = state.database else {
         return (
@@ -1894,6 +1938,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/login-background",
             get(users::login_background),
+        )
+        .route(
+            "/api/v1/auth/login-background/custom-image",
+            get(users::login_background_custom_image),
         )
         .route("/api/v1/setup/status", get(users::setup_status))
         .route("/api/v1/setup/database", get(users::setup_database_status))

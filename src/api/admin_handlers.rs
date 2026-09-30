@@ -8326,6 +8326,52 @@ pub(crate) async fn admin_update_plugin_config(
     }
 }
 
+pub(crate) async fn admin_upload_plugin_config_image(
+    headers: HeaderMap,
+    Path((plugin_id, field_key)): Path<(String, String)>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match plugins
+        .upload_login_background_image(&plugin_id, &field_key, &body)
+        .await
+    {
+        Ok(asset) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PLUGIN_CONFIG_UPDATED",
+                Some("plugin"),
+                Some(&plugin_id),
+                "{\"kind\":\"image_upload\"}",
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "assetId": asset.asset_id,
+                    "contentType": asset.content_type,
+                    "configured": true
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => plugin_error(&headers, error),
+    }
+}
+
 pub(crate) async fn validate_scraper_selection(
     headers: &HeaderMap,
     state: &AppState,
@@ -9248,6 +9294,36 @@ pub(crate) fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Re
             "插件配置无效",
         )
         .into_response(),
+        PluginServiceError::ImageAsset(error) => match error {
+            crate::application::login_background_assets::LoginBackgroundAssetError::TooLarge => {
+                api_error(
+                    headers,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "图片超过 5 MiB 大小限制",
+                )
+                .into_response()
+            }
+            crate::application::login_background_assets::LoginBackgroundAssetError::InvalidContent
+            | crate::application::login_background_assets::LoginBackgroundAssetError::DimensionsTooLarge
+            | crate::application::login_background_assets::LoginBackgroundAssetError::InvalidAssetId => {
+                api_error(
+                    headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "图片格式或尺寸无效",
+                )
+                .into_response()
+            }
+            crate::application::login_background_assets::LoginBackgroundAssetError::InvalidPath
+            | crate::application::login_background_assets::LoginBackgroundAssetError::Io(_) => api_error(
+                headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                lux::ApiErrorCode::Internal,
+                "图片保存失败",
+            )
+            .into_response(),
+        },
         PluginServiceError::NoUpdate => api_error(
             headers,
             StatusCode::CONFLICT,

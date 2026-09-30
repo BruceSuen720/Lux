@@ -1,3 +1,4 @@
+use image::{DynamicImage, ImageFormat, Rgba};
 use luxd::{
     api::{AppState, app_with_state},
     application::settings::{is_valid_login_background_source, login_background_plugin_id},
@@ -14,6 +15,7 @@ use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
+    io::Cursor,
     os::unix::fs::PermissionsExt,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -459,6 +461,353 @@ for request_line in sys.stdin:
     assert_eq!(
         unrelated_body["loginBackgroundSourceStatus"],
         "PLUGIN_DISABLED"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn unified_plugin_custom_image_upload_is_admin_only_and_served_only_when_selected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let plugin_id = "org.lux.login-background";
+    let plugin_root = config.config_dir.join("plugins").join(plugin_id);
+    let entrypoint = plugin_root.join("binaries/plugin");
+    tokio::fs::create_dir_all(
+        entrypoint
+            .parent()
+            .ok_or("missing plugin binary directory")?,
+    )
+    .await?;
+    tokio::fs::write(
+        &entrypoint,
+        r##"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+config_path = os.environ["LUX_PLUGIN_CONFIG_PATH"]
+for request_line in sys.stdin:
+    request = json.loads(request_line)
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    source = config.get("source", "BING_DAILY")
+    image_url = (
+        "/api/v1/auth/login-background/custom-image"
+        if source == "CUSTOM_IMAGE" and config.get("customImage")
+        else "https://images.example.com/today.jpg"
+    )
+    print(json.dumps({
+        "id": request["id"],
+        "result": {
+            "contentKind": "HERO_IMAGE",
+            "sourceName": "Custom image fixture",
+            "items": [{"imageUrl": image_url}]
+        }
+    }), flush=True)
+"##,
+    )
+    .await?;
+    let mut permissions = tokio::fs::metadata(&entrypoint).await?.permissions();
+    permissions.set_mode(0o755);
+    tokio::fs::set_permissions(&entrypoint, permissions).await?;
+    tokio::fs::write(
+        plugin_root.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "id": plugin_id,
+            "name": "Unified login background",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "login_background",
+            "category": "UTILITY",
+            "capabilities": ["login_background.get"],
+            "configFields": [
+                {
+                    "key": "source",
+                    "label": "Source",
+                    "type": "select",
+                    "required": true,
+                    "defaultValue": "CUSTOM_IMAGE",
+                    "options": [
+                        {"value": "BING_DAILY", "label": "Bing"},
+                        {"value": "TMDB_TRENDING", "label": "TMDb"},
+                        {"value": "CUSTOM_IMAGE", "label": "Custom image"}
+                    ]
+                },
+                {"key": "customImage", "label": "Custom image", "type": "image"}
+            ],
+            "permissions": {"imageHosts": ["images.example.com"]},
+            "files": []
+        }))?,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    sqlx::query("INSERT INTO installed_plugins (plugin_id, is_enabled) VALUES (?, 1)")
+        .bind(plugin_id)
+        .execute(database.pool())
+        .await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let upload_url =
+        format!("{base_url}/api/v1/admin/plugins/{plugin_id}/config/image/customImage");
+    let image_bytes = |pixel| {
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 2, Rgba(pixel)))
+            .write_to(&mut output, ImageFormat::Png)
+            .expect("PNG fixture should encode");
+        output.into_inner()
+    };
+
+    let unauthenticated = client
+        .put(&upload_url)
+        .header("Content-Type", "image/png")
+        .body(image_bytes([1, 2, 3, 255]))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let cookies = format!(
+        "lux_session={}; lux_csrf={csrf}",
+        cookie_value(login.headers(), "lux_session"),
+    );
+
+    let missing_csrf = client
+        .put(&upload_url)
+        .header(COOKIE, &cookies)
+        .header("Content-Type", "image/png")
+        .body(image_bytes([1, 2, 3, 255]))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let first_bytes = image_bytes([1, 2, 3, 255]);
+    let first_upload = client
+        .put(&upload_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Content-Type", "image/png")
+        .body(first_bytes.clone())
+        .send()
+        .await?;
+    assert_eq!(first_upload.status(), reqwest::StatusCode::OK);
+    let first_body: Value = first_upload.json().await?;
+    let first_asset_id = first_body["assetId"]
+        .as_str()
+        .ok_or("upload response omitted assetId")?;
+    assert!(first_asset_id.starts_with("sha256:"));
+    assert_eq!(first_body["contentType"], "image/png");
+    let plugin_config: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            config
+                .config_dir
+                .join("plugin-config")
+                .join(format!("{plugin_id}.json")),
+        )
+        .await?,
+    )?;
+    assert_eq!(plugin_config["customImage"], first_asset_id);
+    assert!(!plugin_config.to_string().contains("/config/"));
+    assert!(!plugin_config.to_string().contains("data:image"));
+
+    let custom_image_url = format!("{base_url}/api/v1/auth/login-background/custom-image");
+    let hidden_before_source_selection = client.get(&custom_image_url).send().await?;
+    assert_eq!(
+        hidden_before_source_selection.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let select_plugin = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "loginBackgroundSource": "PLUGIN:org.lux.login-background" }))
+        .send()
+        .await?;
+    assert_eq!(select_plugin.status(), reqwest::StatusCode::OK);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client.get(&custom_image_url).send().await;
+            if response
+                .as_ref()
+                .is_ok_and(|response| response.status() == reqwest::StatusCode::OK)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+
+    let first_response = client.get(&custom_image_url).send().await?;
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(first_response.headers()["content-type"], "image/png");
+    assert_eq!(
+        first_response.headers()["x-content-type-options"],
+        "nosniff"
+    );
+    assert_eq!(
+        first_response.headers()["cache-control"],
+        "no-cache, must-revalidate"
+    );
+    let first_etag = first_response.headers()["etag"].to_str()?.to_owned();
+    assert_eq!(first_response.bytes().await?.as_ref(), first_bytes);
+
+    let direct_asset_config = client
+        .put(format!(
+            "{base_url}/api/v1/admin/plugins/{plugin_id}/config"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "customImage": first_asset_id }))
+        .send()
+        .await?;
+    assert_eq!(
+        direct_asset_config.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let not_modified = client
+        .get(&custom_image_url)
+        .header("If-None-Match", &first_etag)
+        .send()
+        .await?;
+    assert_eq!(not_modified.status(), reqwest::StatusCode::NOT_MODIFIED);
+
+    let head = client.head(&custom_image_url).send().await?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(head.headers()["etag"], first_etag);
+    assert!(head.bytes().await?.is_empty());
+
+    let select_bing_mode = client
+        .put(format!(
+            "{base_url}/api/v1/admin/plugins/{plugin_id}/config"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "source": "BING_DAILY" }))
+        .send()
+        .await?;
+    assert_eq!(select_bing_mode.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        client.get(&custom_image_url).send().await?.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let restore_custom_mode = client
+        .put(format!(
+            "{base_url}/api/v1/admin/plugins/{plugin_id}/config"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "source": "CUSTOM_IMAGE" }))
+        .send()
+        .await?;
+    assert_eq!(restore_custom_mode.status(), reqwest::StatusCode::OK);
+    let restored_asset = client.get(&custom_image_url).send().await?;
+    assert_eq!(restored_asset.status(), reqwest::StatusCode::OK);
+    assert_eq!(restored_asset.bytes().await?.as_ref(), first_bytes);
+
+    let bad_upload = client
+        .put(&upload_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Content-Type", "image/svg+xml")
+        .body(b"<svg></svg>".to_vec())
+        .send()
+        .await?;
+    assert_eq!(bad_upload.status(), reqwest::StatusCode::BAD_REQUEST);
+    let after_bad_upload = client.get(&custom_image_url).send().await?;
+    assert_eq!(after_bad_upload.status(), reqwest::StatusCode::OK);
+    assert_eq!(after_bad_upload.bytes().await?.as_ref(), first_bytes);
+
+    let oversized_upload = client
+        .put(&upload_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Content-Type", "image/png")
+        .body(vec![0; 5 * 1024 * 1024 + 1])
+        .send()
+        .await?;
+    assert_eq!(
+        oversized_upload.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let wrong_field = client
+        .put(format!(
+            "{base_url}/api/v1/admin/plugins/{plugin_id}/config/image/other"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Content-Type", "image/png")
+        .body(image_bytes([4, 5, 6, 255]))
+        .send()
+        .await?;
+    assert_eq!(wrong_field.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let second_bytes = image_bytes([9, 8, 7, 255]);
+    let second_upload = client
+        .put(&upload_url)
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .header("Content-Type", "image/png")
+        .body(second_bytes.clone())
+        .send()
+        .await?;
+    assert_eq!(second_upload.status(), reqwest::StatusCode::OK);
+    let second_body: Value = second_upload.json().await?;
+    assert_ne!(second_body["assetId"], first_asset_id);
+    let after_replace = client.get(&custom_image_url).send().await?;
+    assert_eq!(after_replace.status(), reqwest::StatusCode::OK);
+    assert_ne!(after_replace.headers()["etag"], first_etag);
+    assert_eq!(after_replace.bytes().await?.as_ref(), second_bytes);
+
+    let assets_directory = config.config_dir.join("login-background-assets");
+    let assets = tokio::fs::read_dir(&assets_directory).await?;
+    let mut asset_count = 0;
+    let mut assets = assets;
+    while assets.next_entry().await?.is_some() {
+        asset_count += 1;
+    }
+    assert_eq!(
+        asset_count, 1,
+        "replaced upload should not retain the old asset"
+    );
+    sqlx::query("UPDATE installed_plugins SET is_enabled = 0 WHERE plugin_id = ?")
+        .bind(plugin_id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        client.get(&custom_image_url).send().await?.status(),
+        reqwest::StatusCode::NOT_FOUND
     );
 
     server.abort();

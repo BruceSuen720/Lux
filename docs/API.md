@@ -25,6 +25,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 - `POST /api/v1/auth/login`：校验用户名和密码，成功后设置 `lux_session` 与 `lux_csrf` cookie。
 - `GET /api/v1/auth/login-background`：公开读取登录页背景，不要求 session。固定海报墙返回 `source: "STATIC"`；媒体库来源最多返回 40 个电影/剧集海报 URL。插件来源只有在其已安装、启用且可用并且缓存未超过 48 小时时，才返回 `PLUGIN:<pluginId>`、经校验的 `contentKind`、署名和图片 URL；接口只读持久化缓存，不启动插件或访问上游。插件不可用、缓存缺失/过期或读取失败时回退 `STATIC`。
+- `GET/HEAD /api/v1/auth/login-background/custom-image`：公开读取当前自定义登录背景图片，不要求 session。只有 `org.lux.login-background` 已安装、启用、可用，且其是当前服务器背景来源并配置 `source: "CUSTOM_IMAGE"`、存在通过校验的上传图片时才返回图像；其他状态返回 404。只返回 Lux 专用配置目录中的单张文件，不接受路径参数、不做代理。返回 magic bytes 检测出的 JPEG/PNG/WebP Content-Type、`X-Content-Type-Options: nosniff`、内容 SHA-256 ETag 和 `Cache-Control: no-cache, must-revalidate`；支持 `If-None-Match` 304 和无 body 的 HEAD。
 - 远程请求只需通过用户认证和媒体库 ACL；Lux 不再依据来源 IP 或 `can_remote_access` 阻止反代后的请求。
 - 登录失败按来源和用户名限流；失败响应不区分用户不存在、密码错误或暂时封锁。
 - `GET /api/v1/auth/me`：读取当前 Web session，返回用户和权限。
@@ -118,6 +119,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
   的上游字段由插件自己解释，Lux API 不再定义 TMDb 专用请求结构或读取 TMDb 配置文件；敏感字段仍不在响应中
   返回。`org.lux.strm-media-info` 仍接受其 manifest 声明的媒体信息和缩略图配置，其中
   `thumbnailPositionPercent` 范围为 1-99。
+- `PUT /api/v1/admin/plugins/{pluginId}/config/image/{fieldKey}`：管理员以原始图片 body 上传/替换 manifest 声明的托管 image 配置字段；需要管理员权限与 CSRF，body 最多 5 MiB。该配置目前只允许 `org.lux.login-background` 声明一个可选 `type: "image"` 字段；仅接受 JPEG/PNG/WebP 文件签名与不超过 20 MP 的图像头。成功返回 `assetId: "sha256:<64 位小写十六进制>"`、检测出的 `contentType` 和 `configured: true`。新内容按原字节保存并原子切换；无效上传不改动旧图。接口不接收 filename/path/URL，插件配置只存不透明 SHA-256 资源 ID，不暴露服务端路径或图像字节。
 - `POST /api/v1/admin/plugins/org.lux.strm-media-info/run`：按已保存的 strm-media-info 插件配置创建 STRM 探测任务，返回 202；不接受媒体库、并发等宿主覆盖参数。
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
 - 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。
