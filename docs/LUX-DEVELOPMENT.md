@@ -2142,6 +2142,11 @@ services:
 | LUX-261 | web/src/features/auth/LoginPage.tsx、web/src/features/admin/AdminSettingsPage.tsx、web/src/app/、web/src/lib/api/、web/tests/、docs/；插件来源选择、瀑布流/大图布局和来源鸣谢 |
 | LUX-262 | Lux-plugins/src/bin/lux-plugin-bing-daily-background.rs、manifests/org.lux.bing-daily-background.json、tests/、docs/；独立 Bing 每日图片插件 |
 | LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
+| LUX-317 | docs/LUX-317-PLAN.md、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/login_background_assets.rs、src/api/、web/src/features/admin/、Lux-plugins/；统一登录背景插件与单张自定义上传图 |
+| LUX-318 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；TMDb 丰富电影字段缺失检测与补抓 |
+| LUX-319 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；电影 NFO 演员上限扩展到 100 并保持顺序 |
+| LUX-320 | src/application/nfo.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
+| LUX-321 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后原子更新 NFO 技术信息 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
@@ -7683,6 +7688,111 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 其余未特别指定的普通媒体服务行为以 Emby 的用户体验为参考，但只有本文档明确列出的能力才属于首版承诺。
 
 ---
+
+#### LUX-317：统一登录背景插件与自定义上传图片（提案，待项目所有者确认）
+
+本任务是 2026-09-30 的后续产品规格更新，不修改 LUX-259 至 LUX-263 已完成任务的历史验收记录。它将取代未来正式目录中“Bing 与 TMDb 必须分包”的旧方向：Bing、TMDb 和自定义图片改由一个新插件配置选择；不合并或复用 `org.lux.tmdb` 元数据插件。详细接口草案、分步计划和待确认假设见 `docs/LUX-317-PLAN.md`。在项目所有者确认计划前，不修改公共协议、配置 API、数据库或运行代码。
+
+范围：新建 `org.lux.login-background` 登录背景插件，以 `source` 配置选择 `BING_DAILY`、`TMDB_TRENDING` 或 `CUSTOM_IMAGE`。Bing 个人用途确认与 TMDb 非商业许可确认保留为两个互相独立的显式配置门槛，只在选择对应来源时生效；自定义上传另需确认管理员有权在未登录页面公开展示该图片。Bing 与 TMDb 仍按 LUX-262/263 已记录的请求、图片 URL、版权提示、缓存和静态回退规则执行。
+
+自定义图片先只支持单张：管理员在该插件的配置界面上传 JPEG、PNG 或 WebP，最多 5 MiB；服务端校验真实格式与有界像素数，原样存储，不为媒体库图片生成衍生文件，也不压缩或重编码。上传新图以原子替换方式覆盖唯一现存的自定义背景文件。文件存放在 Lux 管理的数据目录，不交给插件进程读取，不接受客户端路径或任意图片 URL。管理员上传端点要求现有管理员鉴权与 CSRF；登录页使用固定同源资源路由读取该单张文件，该路由仅在统一插件已选为登录背景且其模式为 `CUSTOM_IMAGE` 时公开，提供受校验 MIME、`nosniff` 和可重新验证的缓存头。背景 URL 验证只允许该统一插件返回规定的固定资源路径，其他插件继续只能返回 manifest 主机 allowlist 内的 HTTPS URL；不增加通用 URL 代理。
+
+验收：
+
+- [ ] 正式目录只有一个统一登录背景插件 ID `org.lux.login-background`；它仍为独立的 `login_background` 包，不与 `org.lux.tmdb` 合并。
+- [ ] 插件配置能选择 `BING_DAILY`、`TMDB_TRENDING`、`CUSTOM_IMAGE`；仅执行选中的来源。Bing 与 TMDb 的独立许可确认默认均为未确认，缺少相应确认时不请求对应上游；自定义图片须单独确认公开展示权。
+- [ ] Bing 与 TMDb 行为保持原合同：Bing 仅请求既定每日大图接口；TMDb 仅取日榜混合电影/剧集中的首个有效 `backdrop_path`，不回退海报；二者继续输出 `HERO_IMAGE` 并由 Lux 左侧大图样式呈现。
+- [ ] `image` 配置字段仅允许登录背景插件声明，UI 只提供单张上传/替换；服务器强制 5 MiB 上限、JPEG/PNG/WebP allowlist、文件签名与有界尺寸检查，拒绝伪造 MIME、SVG、动画 GIF、畸形或超大尺寸内容；替换保持原字节并原子提交，不留下历史上传文件。
+- [ ] 上传只能由管理员经受 CSRF 保护的配置 API 完成；自定义图仅存于 Lux 配置数据目录，不写入媒体库、不通过插件文件权限暴露；插件 RPC 和配置响应均不返回服务端路径。
+- [ ] 自定义 RPC 结果只能引用固定同源登录背景资源路由；Lux 仅在已选择统一插件且模式为自定义图片时公开资源。响应使用真实检测出的 `Content-Type`、`X-Content-Type-Options: nosniff` 与可重新验证缓存；未知路径、缺图、模式切换和读取失败安全回退到静态海报墙。
+- [ ] 登录页 API 不把本地绝对路径、上传文件名或图片字节放入 JSON；不增加通用远程 URL 代理，不因公开图片 GET 触发插件、TMDb 或 Bing 请求。
+- [ ] 正式目录自动发布新统一插件、双架构包及哈希后，从活动目录移除 `org.lux.bing-daily-background` 和 `org.lux.tmdb-trending-background`；随后按项目所有者授权删除二者现有 GitHub Release 及 release tag（Bing 0.1.0、TMDb 0.1.0/0.1.1）。不改写仓库 Git 历史，也不远程卸载任何现有 Lux 服务器中的插件文件。
+- [ ] 发布说明给出手动迁移步骤：安装统一插件、选择旧来源对应的模式、重新确认对应许可、切换服务器背景来源，再由管理员自行卸载旧插件。不得把旧许可确认自动复制为新插件的确认。
+- [ ] 覆盖恶意/超限上传、原子替换、未授权/CSRF、关闭/未选中时的公开资源访问、条件缓存、Bing/TMDb 来源选择与许可门槛、RPC URL allowlist、空图与故障回退；插件 mock 测试不访问真实上游。
+
+验证：
+
+- Lux：新增图片配置/RPC 合同和资源服务定向测试；`cargo fmt --all -- --check`、相关 `cargo test --locked --test ...`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+- Web：配置页/上传 API/LoginPage 定向 Vitest 与 `pnpm --dir web build`；Playwright 检查管理员上传、三种模式切换、资源替换/缓存、窄屏及未授权状态。
+- Lux-plugins：统一插件单测、mock HTTP、插件目录与包合同测试，`cargo fmt --all -- --check`、Clippy；正式 workflow 必须同时通过 x86_64 与 aarch64 构建和 ZIP/manifest/hash 校验。
+- 外部 cutover 后读取 `main/index.json` 确认只有新 ID，不再存在两个旧 ID；检查旧 release/tag 删除完成及统一插件双架构 Release 可下载。部署到既有 Lux 实例后的 UI/真实图片请求另行记录，不以 CI 代替部署验证。
+
+建议增量与阶段门见 `docs/LUX-317-PLAN.md`。每个实现增量保持独立、先写失败测试再实现并原子提交；先完成宿主合同与本地图片托管，再接入 UI 和统一插件，最后发布切换并删除旧发布包。进入下一阶段前按项目阶段门运行检查并停下供项目所有者确认。
+
+依赖：LUX-259 至 LUX-263、LUX-260、LUX-261、LUX-110。当前状态：提案，待项目所有者确认范围、接口和实施计划。
+
+明确不做：自动卸载远端服务器已安装的旧插件；自动继承旧插件的许可确认；上传多图/轮播；读取媒体库路径；插件进程直接访问图片文件；图片 CDN/代理/转码服务；改动 TMDb 元数据插件或其配置。
+
+#### LUX-318：TMDb 丰富电影字段缺失检测与补抓
+
+范围：修复 `FILL_MISSING` 将已有标题、简介、年份、评分、上映日期和语言误当成电影 NFO 已完整的情况。电影 NFO 缺少 TMDb 支持的标语、官网、认证、国家、类型、制片公司、合集、演员/crew、外部 ID 或预告片时，候选缓存复用与自动补缺都必须请求尚未完成的详情能力；候选选择后将 provider 实际返回的字段写入 NFO。IMDb ID 可用时同时写入通用 `<id>`；官网可用时同时写入 `uniqueid type="official website"`。已存在或锁定的本地字段继续优先。
+
+丰富元数据能力以一次成功的 provider 详情读取为边界；provider 明确不支持或无数据时记录该能力结果，避免每次扫描重复请求。搜索摘要不得标记为完整详情。TMDb 插件已经返回的字段继续由宿主统一合并与写回；不增加逐演员外部请求、数据库 schema 或公共 API。
+
+验收：
+
+- [ ] 基础 catalog 字段齐全但 rich NFO 字段缺失时，电影补缺计划仍会请求详情；搜索摘要缓存不能跳过这次请求。
+- [ ] 旧候选只有 `metadataFetched=true` 而没有当前 rich-details 版本标记时，不得阻止一次详情回填；成功详情有版本标记并记录能力结果。
+- [ ] TMDb 有返回值的 rating、上映日期、MPAA、国家、类型、制片公司、合集、标语、官网、外部 ID、导演/编剧、演员和预告片能通过正常候选选择写入 NFO。
+- [ ] IMDb ID 存在时写入 `<id>`，官网存在时写入相应 official-website uniqueid；值与原始 provider 值一致。
+- [ ] 已有/锁定 NFO 字段不被覆盖；provider 对某能力返回空后记录结果，不在后续扫描中无限重试；详情失败仍可重试。
+- [ ] 回归覆盖“核心字段已完整、NFO rich 字段为空”的自动补缺场景。
+
+明确不做：以 TMDb 伪造 `dateadded`、`fileinfo`、`streamdetails`、Douban ID 或非 TMDb 人物身份；这些字段仅由实际本地来源提供。
+
+验证：`cargo test --locked --test metadata_selection`、`cargo fmt --all -- --check`；任务完成时运行全 Rust 门禁。
+
+依赖：LUX-168、LUX-195、LUX-196、LUX-300 至 LUX-303。
+
+#### LUX-319：电影 NFO 演员上限扩展到 100
+
+范围：将 TMDb 电影候选与 Lux NFO 解析/写回的演员上限统一提高到 100，保留 provider 返回顺序、角色和排序。只写 provider 或已有关系明确提供的人物 ID；缺少 IMDb、TVDb 或 Douban ID 时不猜测，不为每个演员额外发起网络请求。
+
+验收：
+
+- [ ] 100 位以内的演员按 TMDb 顺序完整进入 movie NFO，name、role、type、order 和可用 ID 保留。
+- [ ] 超过上限时稳定截断至 100，解析器与写入器使用同一上限。
+- [ ] 已有本地演员关系与 NFO 的 Fill Missing 合并语义不变，未知 XML 字段继续保留。
+
+明确不做：为取得 IMDb/TVDb/Douban 人物 ID 对演员逐条请求第三方 API；为缺失身份生成占位 ID。
+
+验证：`cargo test --locked --test metadata_selection`、`cargo test --locked --test nfo_writer`、格式检查。
+
+依赖：LUX-168、LUX-170、LUX-178、LUX-318。
+
+#### LUX-320：NFO 本地媒体流信息序列化
+
+范围：为电影 NFO 增加 `fileinfo/streamdetails` 序列化，将 Lux 有界本地探测结果映射为 Emby/Kodi 常用 video、audio、subtitle 字段，包括已观测到的 codec、bitrate、宽高、aspect、frame rate、language、channels、sampling rate、duration、default 和 forced。只写探测结果中存在且通过范围验证的值。
+
+验收：
+
+- [ ] video/audio/subtitle 轨分别写成对应节点；未知或无效值省略，布尔字段使用兼容的 `True`/`False`。
+- [ ] duration ticks 转为 NFO 秒与分钟时使用明确单位，不能把 tick 当作秒。
+- [ ] 更新 streamdetails 时保留 NFO 其他字段与未知 XML；没有可用探测结果时不制造空流信息。
+- [ ] 解析与写入受既有 NFO 字节数、XML 事件数和字段长度上限保护。
+
+明确不做：从 TMDb 推测媒体编码/分辨率/音轨；读取容器章节；改变播放媒体轨数据库模型。
+
+验证：`cargo test --locked --test nfo_writer`、格式检查。
+
+依赖：LUX-054、LUX-168、LUX-172。
+
+#### LUX-321：本地探测完成后更新 NFO 技术信息
+
+范围：本地媒体探测成功并提交 media streams 后，用同一份探测结果原子更新该媒体条目的 NFO `fileinfo/streamdetails`，并刷新 NFO 指纹和已启用的 `/config/metadata/library` 镜像。该更新独立于在线刮削，不读取 `.strm` 目标，不将外部远程媒体信息写入本地 NFO。
+
+验收：
+
+- [ ] 新探测结果写入实际媒体旁车 NFO；再次探测替换旧 streamdetails，不产生重复轨道。
+- [ ] TMDb rich 字段、用户已有未知 XML 和其他媒体信息在技术字段更新时保持不变。
+- [ ] NFO 写回失败不得丢失已提交的媒体探测结果；错误通过现有任务/日志路径可诊断，且不记录完整媒体路径。
+- [ ] 已启用的配置卷 NFO 镜像与媒体目录 NFO 一致。
+
+明确不做：为 `.strm` 创建虚构的本地 streamdetails；修改 Emby API 的媒体轨输出；增加新的探测器或 Cargo 依赖。
+
+验证：`cargo test --locked --test probe`、`cargo test --locked --test nfo_writer`、格式检查；任务完成时运行全 Rust 门禁。
+
+依赖：LUX-168、LUX-198、LUX-320。
 
 ## 28. 参考资料
 
