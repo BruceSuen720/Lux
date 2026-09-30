@@ -120,7 +120,8 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resources.metadata` 暴露。计数器只使用固定低基数标签：
 `search`、`bundle`、`get`、`images`、`credits`、`external_ids`、`trailers`，以及
-`queue_wait`、`item_total`、`image_download`、`image_write`、`cache_persist`、`nfo_write` 阶段；不会包含用户 ID、完整 URL、token 或原始错误文本。
+`queue_wait`、`queue_claim`、`item_total`、`image_download_queue`、`image_download`、
+`image_write_queue`、`image_write`、`cache_persist`、`nfo_write` 阶段；不会包含用户 ID、完整 URL、token 或原始错误文本。
 `stageP95Ms` 使用有界的最近样本窗口。缓存和 singleflight 分别记录 `cache.hit.count` 与 `cache.miss.count`，刮削器重试记录对应 capability 的 `retry.*.count`，图片累计字节记录在 `image.bytes`。
 缓存落盘另记录 `cache.persist.success.count`、`cache.persist.error.count` 和 `stageP95Ms.cache_persist`，用于区分缓存命中收益与落盘背压。
 
@@ -136,6 +137,7 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 | 2026-08-27 | `1c1c52e9`（`uname -m=arm64`） | `./scripts/run-metadata-performance.sh`（release，单次最终复测） | 32/32 条目成功；`elapsed=875ms`、吞吐 36.6 条/秒；32 次 search、32 次 bundle；图片 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms={bundle:4,image_download:0,image_write:30,item_total:114,nfo_write:34,queue_wait:7,search:4}`；`imageBytes=1876` | 最终并发/压力降档实现复测；结果与前一组连续 5 次基准同量级；adapter stub 不触发持久化 provider cache；仅代表本机 ARM64，不外推 NAS/x86_64 |
 | 2026-08-29 | `7b76f3bd`（`uname -m=arm64`） | `./scripts/run-metadata-performance.sh`（release，连续 3 次） | `FILL_MISSING` 候选无 credits 时跳过重复 `people.json`/人物关系索引写回；32/32 条目成功；耗时 525–598ms，吞吐 53.4–60.8 条/秒；每次 32 次 search、32 次 bundle；图片 28 条可用、4 条明确不可用、1 次临时重试；代表性 `stageP95Ms={bundle:3,image_download:0,image_write:29,item_total:78,nfo_write:28,queue_wait:4,search:3}`；`imageBytes=1876` | 相比此前 849–895ms 基线，提升受本机 I/O/调度噪声影响；仅代表本机 ARM64，不外推 NAS/x86_64；adapter stub 不触发持久化 provider cache |
 | 2026-08-27 | `00b7a472`（`uname -m=arm64`） | `cargo test --locked --test postgres_database -- --ignored --nocapture`（临时 `postgres:16-alpine`） | PostgreSQL 空库迁移、核心状态、元数据优先级/锁定字段/图片/人物关系、重扫布尔投影和 STRM 配置共 4/4 通过 | 临时本地容器，测试完成后已删除；不代表生产 NAS 连接池或远程磁盘延迟 |
+| 2026-09-30 | `edb28dbb`（`uname -m=arm64`） | `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/run-metadata-performance.sh`（release，连续 3 次） | 32/32 条目均成功；耗时 599–662ms，中位数 608ms；吞吐 48.3–53.4 条/秒；每次 32 次 search/bundle，图片 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms` 范围 `{bundle:3–4,image_download:0,image_download_queue:0,image_write:26–33,image_write_queue:0,item_total:92–129,nfo_write:30–37,queue_claim:5–8,queue_wait:5–8,search:3}`；`imageBytes=1876` | 仅本机 ARM64/SQLite、32 条固定夹具和 adapter stub；没有匹配改动前的同机 A/B，不据此声称吞吐提升；不代表 NAS/x86_64 或独立 PostgreSQL 的 CPU/延迟 |
 
 本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
 

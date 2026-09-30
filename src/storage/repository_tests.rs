@@ -7394,6 +7394,158 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
 }
 
 #[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_metadata_claim_uses_materialized_priorities_and_preserves_group_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection.clone()
+    };
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database =
+        Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
+            .await?;
+    let result = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("PostgreSQL metadata claim", LibraryKind::Movie, false)
+            .await?;
+        let item_ids = [
+            "metadata-claim-movie",
+            "metadata-claim-series",
+            "metadata-claim-season",
+            "metadata-claim-episode",
+        ];
+        for (item_id, item_type) in [
+            (item_ids[0], "MOVIE"),
+            (item_ids[1], "SERIES"),
+            (item_ids[2], "SEASON"),
+            (item_ids[3], "EPISODE"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ($1, $2, $3, $1, $1, 'PENDING')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_type)
+            .execute(database.pool())
+            .await?;
+        }
+        database
+            .create_metadata_reidentify_job(
+                "metadata-claim-job",
+                &item_ids.map(str::to_owned),
+                "REIDENTIFY",
+            )
+            .await?;
+        let priorities: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT item_id, priority FROM metadata_reidentify_job_items
+             WHERE job_id = $1 ORDER BY priority, item_id",
+        )
+        .bind("metadata-claim-job")
+        .fetch_all(database.pool())
+        .await?;
+        let claim_index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND indexname = 'idx_metadata_reidentify_items_claim_priority')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+
+        let first_claim = database
+            .claim_next_metadata_reidentify_items("metadata-claim-job", 2)
+            .await?;
+        let blocked_claim = database
+            .claim_next_metadata_reidentify_items("metadata-claim-job", 2)
+            .await?;
+        sqlx::query(
+            "UPDATE metadata_reidentify_job_items SET status = 'COMPLETED'
+             WHERE job_id = $1 AND priority = 0",
+        )
+        .bind("metadata-claim-job")
+        .execute(database.pool())
+        .await?;
+        let next_claim = database
+            .claim_next_metadata_reidentify_items("metadata-claim-job", 2)
+            .await?;
+
+        Ok::<_, Box<dyn std::error::Error>>((
+            priorities,
+            claim_index_exists,
+            first_claim,
+            blocked_claim,
+            next_claim,
+        ))
+    }
+    .await;
+    database.close().await;
+
+    let cleanup_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&cleanup_pool)
+    .await?;
+    cleanup_pool.close().await;
+
+    let (priorities, claim_index_exists, first_claim, blocked_claim, next_claim) = result?;
+    assert!(claim_index_exists);
+    assert_eq!(
+        priorities,
+        [
+            ("metadata-claim-movie".to_owned(), 0),
+            ("metadata-claim-series".to_owned(), 0),
+            ("metadata-claim-season".to_owned(), 1),
+            ("metadata-claim-episode".to_owned(), 2),
+        ]
+    );
+    assert_eq!(
+        first_claim,
+        ["metadata-claim-movie", "metadata-claim-series"]
+    );
+    assert!(blocked_claim.is_empty());
+    assert_eq!(next_claim, ["metadata-claim-season"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()

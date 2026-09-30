@@ -654,7 +654,6 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
             entry.file_name().to_str(),
             Some(
                 "0131_scan_manifest_resume_state.sql"
-                    | "0132_streamed_manifest_indexing.sql"
                     | "0133_skip_redundant_source_availability_update.sql"
                     | "0134_drop_redundant_manifest_entry_index.sql"
                     | "0135_manifest_discovery_format_and_seen_paths.sql"
