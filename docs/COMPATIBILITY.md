@@ -35,6 +35,9 @@ Lux 自有 API 的媒体、搜索、首页、图片、播放和用户状态接�
 `X-Lux-Token`，也可兼容发送同一令牌的 `X-Emby-Token`、`X-MediaBrowser-Token` 或
 `Authorization: Bearer`。`GET /api/v1/home` 返回继续观看、推荐、可见媒体库和每库最新资源，并继续执行
 当前用户的媒体库 ACL；Web Cookie 和 LUX-182 共享管理员 API Key 的边界保持不变。
+Lux Web 首页已改为独立读取轮播、继续观看、媒体库和每库最新资源；`/api/v1/home` 仍保留原完整响应。新
+`/api/v1/home/carousel`、`/api/v1/continue-watching` 和 `/api/v1/libraries/{libraryId}/latest` 接口复用
+相同用户认证与媒体库 ACL。sessionStorage 仅缓存轮播推荐，home SSE 失效事件会刷新轮播和可见区块，包含刮削后的新图片标签。
 
 自动化覆盖已加入 `tests/lux_api_auth.rs`，覆盖无凭证 401、`X-Lux-Token`、`X-Emby-Token` 和 Bearer
 调用 `/api/v1/home`/媒体库接口；本轮 `cargo test --locked --all-targets` 为 443 passed、4 ignored、0

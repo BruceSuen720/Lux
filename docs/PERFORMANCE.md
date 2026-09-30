@@ -102,7 +102,17 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 ### 2026-09-30 首页请求路径优化
 
-`2c0a02de` 将继续观看设置合并为一次读取；普通首页分页将继续观看条目与准确总数合并为一次 SQL（越界分页仍保留总数回退查询）。测试断言设置读取为 1 条 SQL、常规条目页和总数为 1 条 SQL。`HomeService` 仍按用户、权限和可见媒体库范围缓存静态首页区块，并通过每个 cache entry 的计算锁合并同键快照重建；继续观看在每次 `/api/v1/home` 请求中重新查询，播放进度不会因缓存变旧。
+`2c0a02de` 将继续观看设置合并为一次读取；普通首页分页将继续观看条目与准确总数合并为一次 SQL（越界分页仍保留总数回退查询）。测试断言设置读取为 1 条 SQL、常规条目页和总数为 1 条 SQL。该版本的 `HomeService` 按用户、权限和可见媒体库范围缓存静态首页区块，并通过每个 cache entry 的计算锁合并同键快照重建；继续观看在每次 `/api/v1/home` 请求中重新查询。
+
+### 2026-10-01 首页区块拆分
+
+`cf734932` 更新 LUX-082：Lux Web 不再请求聚合 `/api/v1/home`。`/api/v1/home/carousel` 单独读取推荐轮播；HomeService 现在只缓存推荐列表，继续观看、媒体库、兼容首页响应都实时读取。继续观看由 `/api/v1/continue-watching` 提供，每库最新资源由 `/api/v1/libraries/{libraryId}/latest` 提供，后者沿用剧集按最新可用分集加入时间排序的查询。
+
+首页每个区块有独立 TanStack Query 状态和 15 秒客户端超时，任一超时只显示该区块的重试状态。sessionStorage 只保存 `recommended`，home SSE 同时使服务端轮播缓存、浏览器轮播缓存及活动首页区块失效；最新资源 SSE 刷新覆盖刮削完成后新的图片标签。`/api/v1/home` 仍供已有 Lux 客户端兼容，继续遵守原 2 秒 worker 排队上限和 `Retry-After: 2`。
+
+验证：`cargo test --locked --all-targets` 全部通过；需要 PostgreSQL 或人工性能基准的测试按套件标记为 ignored。`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；Web 75 个测试文件、536 项通过，`pnpm --dir web build` 成功。
+
+这些是行为和构建验证，不是性能基准。测试环境为 `arm64`；目标平台首页 p95、扫描并发延迟和生产浏览器仍未重新测量，不能据此宣称 400 ms 或 NAS 性能目标已达成。
 
 `3409ec60` 将首页放入独立的有界 worker 池，容量保持与原 Catalog 池相同，避免其他目录流量占满首页执行名额；两类队列等待仍最多 2 秒，超限返回 `CATALOG_BUSY` 和 `Retry-After: 2`。Web 首页请求传递可取消信号，最长等待 15 秒；首次加载超时后立即显示错误和手动重试，有缓存时继续呈现缓存内容。
 
