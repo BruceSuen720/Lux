@@ -75,4 +75,9 @@ let is_custom_asset = manifest.id == UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID
 
 ## 当前增量计划
 
-宿主阶段 A 增量 1 精确文件：`src/application/plugin_protocol.rs`、`src/application/plugins.rs`、`tests/plugin_protocol.rs`、`docs/PLUGIN-SDK.md`。用 manifest/RPC/config ID 失败测试先行。后续每个 service/route slice 另列实际文件，不超过 5 个实现文件/增量。Lux 主路径有并行用户改动，LUX-317 在独立 worktree 中进行，只暂存其精确文件。
+宿主阶段 A 已完成增量：
+
+- A1：SDK image config、SHA-256 ID 与固定 RPC URL。`plugin_protocol` 33 项及 image config unit test 通过；fmt 通过。
+- A2：`login_background_assets` 单图文件服务。8 项单测覆盖原字节/三格式、5 MiB/20 MP、有界 hash、幂等、prune 和符号链接拒绝；`cargo clippy --locked --lib --all-features -- -D warnings` 通过。
+
+A3 当前实施目标：`PluginService` 的 image field/opaque ID 更新与管理员上传协调；之后 A4 为 `src/api/admin.rs`、`src/api/admin_handlers.rs`、`src/api/users.rs`、`tests/login_background.rs`、`docs/API.md` 的上传和 GET/HEAD routes。每个 slice 重新列预计文件，控制在 5 个实现文件内。Lux 主路径存在其它用户任务的未提交修改，LUX-317 使用独立 managed worktree，只精确暂存本任务文件。
