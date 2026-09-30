@@ -26,7 +26,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     initialDataUpdatedAt: cachedHome?.savedAt,
     staleTime: 0,
     retry: false,
-    refetchInterval: queryRefreshIntervals.mediaSurface,
+    refetchInterval: (query) => homeRefetchInterval(query.state.data),
     refetchIntervalInBackground: false,
   });
 
@@ -72,6 +72,10 @@ export function HomePage({ user }: { user: LuxUser }) {
       </div>
     </div>
   );
+}
+
+export function homeRefetchInterval(data: unknown): number | false {
+  return data === undefined ? false : queryRefreshIntervals.mediaSurface;
 }
 
 function homeCacheKey(userId: string) {

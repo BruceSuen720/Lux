@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { HomePage } from "../src/features/home/HomePage";
+import { HomePage, homeRefetchInterval } from "../src/features/home/HomePage";
 import { HERO_CAROUSEL_INTERVAL_MS } from "../src/features/home/carousel";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
@@ -79,10 +79,9 @@ describe("HomePage shelves", () => {
       .toMatchObject({ href: `${window.location.origin}/libraries/library-1` });
     expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
       .toEqual(["我的媒体库", "继续观看", "最新华语电影"]);
-    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.options.refetchInterval)
-      .toBe(queryRefreshIntervals.mediaSurface);
-    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.options.refetchIntervalInBackground)
-      .toBe(false);
+    const loadedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.home });
+    expect(homeRefetchInterval(loadedHomeQuery?.state.data)).toBe(queryRefreshIntervals.mediaSurface);
+    expect(loadedHomeQuery?.options.refetchIntervalInBackground).toBe(false);
     expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
@@ -113,6 +112,8 @@ describe("HomePage shelves", () => {
     expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
     const retry = container.querySelector<HTMLButtonElement>(".lux-page-state button");
     expect(retry?.textContent).toContain("重试");
+    const failedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.home });
+    expect(homeRefetchInterval(failedHomeQuery?.state.data)).toBe(false);
 
     await act(async () => {
       retry?.click();
@@ -121,6 +122,8 @@ describe("HomePage shelves", () => {
 
     expect(homeRequest).toHaveBeenCalledTimes(2);
     expect(container.querySelector(".lux-page-state")).toBeNull();
+    const loadedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.home });
+    expect(homeRefetchInterval(loadedHomeQuery?.state.data)).toBe(queryRefreshIntervals.mediaSurface);
   });
 
   it("renders homepage library shelves in the current account's saved order", async () => {

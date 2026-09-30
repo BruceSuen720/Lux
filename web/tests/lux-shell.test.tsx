@@ -7,7 +7,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LuxShell, useAvatar } from "../src/components/layout/LuxShell";
+import { HomePage } from "../src/features/home/HomePage";
 import { api } from "../src/lib/api/client";
+import { queryKeys } from "../src/lib/api/query-keys";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -365,10 +367,111 @@ describe("LuxShell user control", () => {
     act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
 
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
-      { queryKey: ["home"] },
+      { queryKey: ["home"], refetchType: "none" },
       { queryKey: ["libraries"] },
       { queryKey: ["library"] },
     ]);
+  });
+
+  it("does not cancel a cached-home refresh when scan events arrive", async () => {
+    FakeEventSource.instances = [];
+    sessionStorage.clear();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const response = { libraries: [], recommended: [], continueWatching: [] };
+    let resolveFirstRequest: ((value: typeof response) => void) | undefined;
+    let firstSignal: AbortSignal | undefined;
+    let callCount = 0;
+    const homeRequest = vi.spyOn(api, "home").mockImplementation((signal) => {
+      callCount += 1;
+      if (callCount > 1) return Promise.resolve(response);
+      firstSignal = signal;
+      return new Promise((resolve) => { resolveFirstRequest = resolve; });
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = { id: "user-1", usernameNormalized: "test" };
+    queryClient.setQueryData(queryKeys.home, {
+      libraries: [],
+      recommended: [],
+      continueWatching: [],
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <Routes>
+              <Route element={<LuxShell user={user} />}>
+                <Route index element={<HomePage user={user} />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    expect(homeRequest).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" }));
+      await Promise.resolve();
+    });
+
+    expect(homeRequest).toHaveBeenCalledTimes(1);
+    expect(firstSignal?.aborted).toBe(false);
+    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.state.fetchStatus).toBe("fetching");
+
+    await act(async () => {
+      resolveFirstRequest?.(response);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(homeRequest).toHaveBeenCalledTimes(2);
+    expect(firstSignal?.aborted).toBe(false);
+  });
+
+  it("does not restart a failed first home load for each scan event", async () => {
+    FakeEventSource.instances = [];
+    sessionStorage.clear();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const homeRequest = vi.spyOn(api, "home").mockRejectedValue(new Error("首页请求超时，请重试"));
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = { id: "user-1", usernameNormalized: "test" };
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <Routes>
+              <Route element={<LuxShell user={user} />}>
+                <Route index element={<HomePage user={user} />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(homeRequest).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".lux-skeleton-page")).toBeNull();
+    expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
+
+    await act(async () => {
+      FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(homeRequest).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".lux-skeleton-page")).toBeNull();
+    expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
   });
 
   it("shows active scan progress for admins without leaking paths or query strings", async () => {
