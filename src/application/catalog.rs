@@ -53,6 +53,7 @@ pub enum CatalogSort {
     SortName,
     DateCreated,
     PremiereDate,
+    ProductionYear,
     Rating,
 }
 
@@ -566,6 +567,7 @@ impl CatalogService {
                 CatalogSort::SortName => StorageCatalogSort::SortName,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
                 CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
+                CatalogSort::ProductionYear => StorageCatalogSort::ProductionYear,
                 CatalogSort::Rating => StorageCatalogSort::Rating,
             },
             descending: filter.descending,
@@ -613,6 +615,7 @@ impl CatalogService {
                 CatalogSort::SortName => StorageCatalogSort::SortName,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
                 CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
+                CatalogSort::ProductionYear => StorageCatalogSort::ProductionYear,
                 CatalogSort::Rating => StorageCatalogSort::Rating,
             },
             descending: filter.descending,
@@ -678,6 +681,7 @@ impl CatalogService {
                 CatalogSort::SortName => StorageCatalogSort::SortName,
                 CatalogSort::DateCreated => StorageCatalogSort::DateCreated,
                 CatalogSort::PremiereDate => StorageCatalogSort::PremiereDate,
+                CatalogSort::ProductionYear => StorageCatalogSort::ProductionYear,
                 CatalogSort::Rating => StorageCatalogSort::Rating,
             };
             (sort_by, descending)
