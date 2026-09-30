@@ -338,6 +338,49 @@ fn movie_nfo_parser_keeps_actor_without_provider_id() {
 }
 
 #[test]
+fn movie_nfo_actor_parser_and_writer_support_up_to_100_cast_members()
+-> Result<(), Box<dyn std::error::Error>> {
+    let actor_nodes = (0..105)
+        .map(|order| {
+            format!(
+                "<actor><name>Actor {order}</name><role>Character {order}</role><order>{order}</order></actor>"
+            )
+        })
+        .collect::<String>();
+    let original = format!("<movie>{actor_nodes}</movie>");
+    let parsed = parse_movie_nfo_actors(original.as_bytes())?;
+    assert_eq!(parsed.len(), 100);
+    assert_eq!(parsed[0].name, "Actor 0");
+    assert_eq!(parsed[99].name, "Actor 99");
+    assert_eq!(parsed[99].order, Some(99));
+
+    let actors = (0..105)
+        .map(|order| ActorCredit {
+            id: order.to_string(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: format!("Actor {order}"),
+            character: Some(format!("Character {order}")),
+            order: Some(order),
+            profile_url: None,
+            person: None,
+        })
+        .collect();
+    let rewritten = rewrite_movie_nfo(
+        b"<movie/>",
+        &MovieNfoMetadata {
+            actors,
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert_eq!(text.matches("<actor>").count(), 100);
+    assert!(text.contains("<name>Actor 99</name>"));
+    assert!(!text.contains("<name>Actor 100</name>"));
+    Ok(())
+}
+
+#[test]
 fn movie_nfo_uses_actor_provider_specific_identity_tags() -> Result<(), Box<dyn std::error::Error>>
 {
     let rewritten = rewrite_movie_nfo(

@@ -33,7 +33,7 @@ use crate::{
     },
 };
 
-const MAX_MOVIE_NFO_ACTORS: usize = 30;
+const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 const IMAGE_ITEM_CONCURRENCY: usize = 4;
 const SCRAPER_IMAGE_TYPES: [&str; 8] = [
@@ -3890,15 +3890,17 @@ mod tests {
         MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
         SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
         credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
-        generic_candidate_images, local_metadata_completeness_plan, merge_actor_values,
-        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
-        metadata_request_plan, parse_image_selection_policy, selected_scraper_provider_id,
+        generic_candidate_actors, generic_candidate_images, local_metadata_completeness_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
+        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
+        selected_scraper_provider_id,
     };
     use crate::application::scraper::{
-        ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
-        ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest, ScraperImagesResponse,
-        ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
-        ScraperSearchRequest, ScraperSearchResponse, ScraperTrailersResponse,
+        ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
+        ScraperExternalIdsResponse, ScraperFuture, ScraperGetRequest, ScraperImage,
+        ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
+        ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest, ScraperSearchResponse,
+        ScraperTrailersResponse,
     };
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
@@ -4409,6 +4411,43 @@ mod tests {
             Some("https://images.example/profile.jpg")
         );
         assert_eq!(actors[1].id, "person-10");
+    }
+
+    #[test]
+    fn movie_candidate_cast_is_bounded_to_100_and_keeps_provider_order() {
+        let credits = (0..105)
+            .map(|order| ScraperActorCredit {
+                provider_id: order.to_string(),
+                name: Some(format!("Actor {order}")),
+                character: Some(format!("Character {order}")),
+                order: Some(order),
+                profile_url: None,
+            })
+            .collect::<Vec<_>>();
+
+        let actors = generic_candidate_actors(&credits);
+
+        assert_eq!(actors.len(), 100);
+        assert_eq!(actors[0].name, "Actor 0");
+        assert_eq!(actors[99].name, "Actor 99");
+        assert_eq!(actors[99].order, Some(99));
+
+        let candidate_values = (0..105)
+            .map(|order| {
+                json!({
+                    "id": format!("person-{order}"),
+                    "provider": "tmdb",
+                    "name": format!("Actor {order}"),
+                    "character": format!("Character {order}"),
+                    "order": order
+                })
+            })
+            .collect::<Vec<_>>();
+        let parsed = candidate_actors(&json!({ "actors": candidate_values }))
+            .expect("bounded candidate cast should parse");
+        assert_eq!(parsed.len(), 100);
+        assert_eq!(parsed[99].name, "Actor 99");
+        assert_eq!(parsed[99].order, Some(99));
     }
 
     #[test]

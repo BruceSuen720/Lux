@@ -107,7 +107,7 @@ pub struct MovieNfoMetadata {
 
 const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
-const MAX_MOVIE_NFO_ACTORS: usize = 30;
+const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MOVIE_NFO_DETAILS_ITEMS: usize = 64;
 const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
@@ -1269,7 +1269,7 @@ fn append_movie_nfo_fields(
     writer: &mut Writer<Vec<u8>>,
     patch: &MovieNfoMetadata,
 ) -> Result<(), NfoWriteError> {
-    for actor in &patch.actors {
+    for actor in patch.actors.iter().take(MAX_MOVIE_NFO_ACTORS) {
         start_element(writer, "actor", None)?;
         write_simple_element(writer, "name", actor.name.trim())?;
         if let Some(character) = non_empty(actor.character.as_deref()) {
@@ -1385,7 +1385,7 @@ fn append_movie_nfo_fields(
 }
 
 fn validate_movie_nfo_actors(patch: &MovieNfoMetadata) -> Result<(), NfoWriteError> {
-    for actor in &patch.actors {
+    for actor in patch.actors.iter().take(MAX_MOVIE_NFO_ACTORS) {
         if actor.name.trim().is_empty() {
             return Err(NfoWriteError::InvalidMetadata(
                 "movie actor requires a name".to_owned(),
