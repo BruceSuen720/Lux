@@ -1529,7 +1529,7 @@ async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn automatic_candidate_search_expands_only_the_best_result()
+async fn automatic_full_metadata_search_fetches_details_for_every_selectable_candidate()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     let non_best_details_requests = Arc::new(AtomicUsize::new(0));
@@ -1573,6 +1573,15 @@ async fn automatic_candidate_search_expands_only_the_best_result()
                 }
                 if path == "/3/movie/2" {
                     non_best_details_requests.fetch_add(1, Ordering::SeqCst);
+                    return Json(json!({
+                        "id": 2,
+                        "title": "Unrelated Movie",
+                        "original_title": "Unrelated Movie",
+                        "overview": "Selectable alternative details",
+                        "release_date": "2020-01-01",
+                        "original_language": "en"
+                    }))
+                    .into_response();
                 }
                 StatusCode::NOT_FOUND.into_response()
             },
@@ -1608,17 +1617,59 @@ async fn automatic_candidate_search_expands_only_the_best_result()
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].provider_id, "1");
     assert_eq!(page.items[1].provider_id, "2");
-    assert_eq!(non_best_details_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        page.items[1].candidate["overview"],
+        "Selectable alternative details"
+    );
+    let stored_candidate_json: String =
+        sqlx::query_scalar("SELECT candidate_json FROM metadata_candidates WHERE id = ?")
+            .bind(&page.items[1].id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let stored_candidate: Value = serde_json::from_str(&stored_candidate_json)?;
+    assert_eq!(stored_candidate["metadataDetailsVersion"], 2);
+    assert_eq!(non_best_details_requests.load(Ordering::SeqCst), 1);
 
+    let mut legacy_candidate = stored_candidate;
+    legacy_candidate
+        .as_object_mut()
+        .expect("candidate is an object")
+        .remove("metadataDetailsVersion");
+    sqlx::query("UPDATE metadata_candidates SET candidate_json = ? WHERE id = ?")
+        .bind(legacy_candidate.to_string())
+        .bind(&page.items[1].id)
+        .execute(fixture.database.pool())
+        .await?;
+    non_best_details_requests.store(0, Ordering::SeqCst);
+    let fresh_tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
     let repeated_page = candidates
         .search_and_store_for_automatic_match(
             &fixture.item_id,
             "Example Movie",
             Some(2020),
-            &scraper,
+            &ScraperProvider::from_adapter(fresh_tmdb),
         )
         .await?;
     assert_eq!(repeated_page.items.len(), 2);
+    let refreshed_candidate_json: String =
+        sqlx::query_scalar("SELECT candidate_json FROM metadata_candidates WHERE id = ?")
+            .bind(&repeated_page.items[1].id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let refreshed_candidate: Value = serde_json::from_str(&refreshed_candidate_json)?;
+    assert_eq!(refreshed_candidate["metadataDetailsVersion"], 2);
+    assert_eq!(non_best_details_requests.load(Ordering::SeqCst), 1);
     let stored_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ? AND status = 'PENDING'",
     )
@@ -1646,12 +1697,22 @@ async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search
         }),
     )
     .await?;
-    let requests = Arc::new(AtomicUsize::new(0));
-    let handler_requests = Arc::clone(&requests);
-    let tmdb_app = Router::new().fallback(any(move |_request: Request<Body>| {
-        let requests = Arc::clone(&handler_requests);
+    let detail_requests = Arc::new(AtomicUsize::new(0));
+    let handler_detail_requests = Arc::clone(&detail_requests);
+    let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let detail_requests = Arc::clone(&handler_detail_requests);
         async move {
-            requests.fetch_add(1, Ordering::SeqCst);
+            if request.uri().path() == "/3/movie/603" {
+                detail_requests.fetch_add(1, Ordering::SeqCst);
+                return Json(json!({
+                    "id": 603,
+                    "title": "Pending Movie",
+                    "overview": "Hydrated pending overview",
+                    "release_date": "2020-01-01",
+                    "original_language": "en"
+                }))
+                .into_response();
+            }
             StatusCode::NOT_FOUND.into_response()
         }
     }));
@@ -1682,7 +1743,18 @@ async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search
 
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].provider_id, "603");
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        page.items[0].candidate["overview"],
+        "Hydrated pending overview"
+    );
+    let refreshed_candidate_json: String =
+        sqlx::query_scalar("SELECT candidate_json FROM metadata_candidates WHERE id = ?")
+            .bind(&page.items[0].id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let refreshed_candidate: Value = serde_json::from_str(&refreshed_candidate_json)?;
+    assert_eq!(refreshed_candidate["metadataDetailsVersion"], 2);
+    assert_eq!(detail_requests.load(Ordering::SeqCst), 1);
     tmdb_server.abort();
     Ok(())
 }
@@ -1749,6 +1821,13 @@ async fn automatic_matching_expands_only_the_best_pending_candidate_once()
         first_page.items[0].candidate["overview"],
         "Hydrated overview"
     );
+    let stored_candidate_json: String =
+        sqlx::query_scalar("SELECT candidate_json FROM metadata_candidates WHERE id = ?")
+            .bind(&first_page.items[0].id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let stored_candidate: Value = serde_json::from_str(&stored_candidate_json)?;
+    assert_eq!(stored_candidate["metadataDetailsVersion"], 2);
 
     let second_scraper = ScraperProvider::from_adapter(TestScraper::new(config)?);
     let second_page = candidates
@@ -1860,6 +1939,62 @@ async fn expired_pending_candidates_are_not_reused_by_automatic_matching()
 
     assert!(searches.load(Ordering::SeqCst) >= 1);
     assert!(page.items.iter().any(|item| item.provider_id == "604"));
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn requested_movie_details_failure_does_not_store_a_sparse_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let tmdb_app = Router::new().fallback(any(|request: Request<Body>| async move {
+        if request.uri().path() == "/3/search/movie" {
+            Json(json!({
+                "page": 1,
+                "total_pages": 1,
+                "total_results": 1,
+                "results": [{
+                    "id": 1,
+                    "title": "Example Movie",
+                    "original_title": "Example Movie",
+                    "overview": "Search summary only",
+                    "release_date": "2020-01-01",
+                    "vote_average": 8.0
+                }]
+            }))
+            .into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let service = MetadataCandidateService::new(fixture.database.clone());
+
+    let result = service
+        .search_and_store(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &ScraperProvider::from_adapter(tmdb),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(service.list_pending(0, 50).await?.total, 0);
+
     tmdb_server.abort();
     Ok(())
 }

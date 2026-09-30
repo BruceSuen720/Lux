@@ -33,7 +33,7 @@ use crate::{
     },
 };
 
-const MAX_MOVIE_NFO_ACTORS: usize = 30;
+const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 const IMAGE_ITEM_CONCURRENCY: usize = 4;
 const SCRAPER_IMAGE_TYPES: [&str; 8] = [
@@ -49,6 +49,7 @@ const SCRAPER_IMAGE_TYPES: [&str; 8] = [
 const CAPABILITY_CREDITS: &str = "CREDITS";
 const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
+const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataRequestPlan {
@@ -608,6 +609,8 @@ impl MetadataCandidateService {
                 mode,
                 CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
             ) && result_index > 0
+                && !plan.needs_metadata
+                && plan != MetadataRequestPlan::full()
             {
                 let score =
                     precomputed_score.unwrap_or_else(|| search_result_score(current, &result));
@@ -680,14 +683,16 @@ impl MetadataCandidateService {
             } else if let Some(bundle) = bundle.as_ref() {
                 Some(bundle.metadata.clone())
             } else if plan.needs_metadata {
-                scraper
-                    .get_generic(crate::application::scraper::ScraperGetRequest::new(
-                        item_type,
-                        provider_id.clone(),
-                        "zh-CN",
-                    ))
-                    .await
-                    .ok()
+                Some(
+                    scraper
+                        .get_generic(crate::application::scraper::ScraperGetRequest::new(
+                            item_type,
+                            provider_id.clone(),
+                            "zh-CN",
+                        ))
+                        .await
+                        .map_err(MetadataCandidateError::Scraper)?,
+                )
             } else {
                 None
             };
@@ -1004,33 +1009,40 @@ impl MetadataCandidateService {
             .await?;
         rows.retain(|row| provider_key_from_plugin_id(&row.provider) == provider_key);
         rows.truncate(2);
-        let Some(best) = rows.first_mut() else {
+        if rows.is_empty() {
             return Ok(None);
-        };
-        if plan.needs_metadata && !Self::candidate_metadata_was_fetched(&best.candidate_json)? {
+        }
+        if plan.needs_metadata {
             let item_type = match current.item_type.as_str() {
                 "MOVIE" => ScraperItemType::Movie,
                 "SERIES" => ScraperItemType::Series,
                 _ => return Ok(None),
             };
-            let details = scraper
-                .get_generic(ScraperGetRequest::new(
-                    item_type,
-                    best.provider_id.clone(),
-                    "zh-CN",
-                ))
-                .await
-                .map_err(MetadataCandidateError::Scraper)?;
-            let candidate_json =
-                Self::merge_scraper_metadata_into_candidate(&best.candidate_json, &details)?;
-            if !self
-                .database
-                .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
-                .await?
-            {
-                return Ok(None);
+            for candidate in &mut rows {
+                if Self::candidate_metadata_was_fetched(&candidate.candidate_json)? {
+                    continue;
+                }
+                let details = scraper
+                    .get_generic(ScraperGetRequest::new(
+                        item_type,
+                        candidate.provider_id.clone(),
+                        "zh-CN",
+                    ))
+                    .await
+                    .map_err(MetadataCandidateError::Scraper)?;
+                let candidate_json = Self::merge_scraper_metadata_into_candidate(
+                    &candidate.candidate_json,
+                    &details,
+                )?;
+                if !self
+                    .database
+                    .update_pending_metadata_candidate_json(item_id, &candidate.id, &candidate_json)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                candidate.candidate_json = candidate_json;
             }
-            best.candidate_json = candidate_json;
         }
         let items = rows
             .into_iter()
@@ -1053,7 +1065,11 @@ impl MetadataCandidateService {
         Ok(value
             .get("metadataFetched")
             .and_then(Value::as_bool)
-            .unwrap_or(false))
+            .unwrap_or(false)
+            && value
+                .get("metadataDetailsVersion")
+                .and_then(Value::as_u64)
+                .is_some_and(|version| version >= CANDIDATE_METADATA_DETAILS_VERSION))
     }
 
     fn merge_scraper_metadata_into_candidate(
@@ -1105,6 +1121,10 @@ impl MetadataCandidateService {
         }
         object.insert("providerIds".to_owned(), json!(provider_ids));
         object.insert("metadataFetched".to_owned(), Value::Bool(true));
+        object.insert(
+            "metadataDetailsVersion".to_owned(),
+            Value::from(CANDIDATE_METADATA_DETAILS_VERSION),
+        );
         serde_json::to_string(&value)
             .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))
     }
@@ -1406,6 +1426,9 @@ impl MetadataCandidateService {
                     "images": candidate.images,
                     "actors": candidate.actors,
                     "metadataFetched": candidate.metadata_fetched,
+                    "metadataDetailsVersion": candidate
+                        .metadata_fetched
+                        .then_some(CANDIDATE_METADATA_DETAILS_VERSION),
                 })
                 .to_string();
                 PreparedMetadataCandidate {
@@ -3759,8 +3782,11 @@ fn candidate_view(
     row: StoredMetadataCandidate,
     current: Option<&StoredMediaMetadata>,
 ) -> Result<MetadataCandidateView, MetadataCandidateError> {
-    let candidate: Value = serde_json::from_str(&row.candidate_json)
+    let mut candidate: Value = serde_json::from_str(&row.candidate_json)
         .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+    if let Some(candidate) = candidate.as_object_mut() {
+        candidate.remove("metadataDetailsVersion");
+    }
     let field_diffs = current
         .map(|current| field_diffs(current, &candidate))
         .unwrap_or_default();
@@ -3861,18 +3887,20 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
-        MetadataRequestPlan, MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actors,
-        capability_needs_request, completeness_capabilities, credits_are_missing,
-        default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
-        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
-        parse_image_selection_policy, selected_scraper_provider_id,
+        MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
+        SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
+        credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
+        generic_candidate_actors, generic_candidate_images, local_metadata_completeness_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
+        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
+        selected_scraper_provider_id,
     };
     use crate::application::scraper::{
-        ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
-        ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest, ScraperImagesResponse,
-        ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
-        ScraperSearchRequest, ScraperSearchResponse, ScraperTrailersResponse,
+        ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
+        ScraperExternalIdsResponse, ScraperFuture, ScraperGetRequest, ScraperImage,
+        ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
+        ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest, ScraperSearchResponse,
+        ScraperTrailersResponse,
     };
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
@@ -4124,6 +4152,9 @@ mod tests {
         assert!(!plan.needs_credits);
         assert!(!plan.needs_external_ids);
         assert!(!plan.needs_trailers);
+        // Existing items are not re-scraped solely because their local NFO lacks
+        // optional rich fields. A user-triggered full refresh still uses the full plan.
+        assert!(MetadataRequestPlan::full().needs_metadata);
 
         let poster_index = SCRAPER_IMAGE_TYPES
             .iter()
@@ -4192,6 +4223,7 @@ mod tests {
             &current,
             actual_plan,
             MetadataRequestPlan {
+                needs_metadata: false,
                 needs_images: false,
                 missing_image_mask: 0,
                 ..actual_plan
@@ -4235,6 +4267,28 @@ mod tests {
             local_metadata_completeness_plan("movie-1", &current, actual_plan, requestable_plan,)
                 .is_none(),
             "unsupported video types do not create online completeness plans"
+        );
+    }
+
+    #[test]
+    fn old_candidate_metadata_cache_is_not_treated_as_complete_details() {
+        assert!(
+            !MetadataCandidateService::candidate_metadata_was_fetched(
+                r#"{"metadataFetched":true}"#
+            )
+            .expect("valid candidate JSON")
+        );
+        assert!(
+            !MetadataCandidateService::candidate_metadata_was_fetched(
+                r#"{"metadataFetched":false,"metadataDetailsVersion":2}"#
+            )
+            .expect("valid candidate JSON")
+        );
+        assert!(
+            MetadataCandidateService::candidate_metadata_was_fetched(
+                r#"{"metadataFetched":true,"metadataDetailsVersion":2}"#
+            )
+            .expect("valid candidate JSON")
         );
     }
 
@@ -4313,18 +4367,9 @@ mod tests {
             episode_number: None,
         };
         let details = crate::application::nfo::LocalNfoDetails {
-            directors: vec![crate::application::nfo::LocalNfoCredit {
-                provider_id: "director-1".to_owned(),
-                name: "Director".to_owned(),
-            }],
-            writers: vec![crate::application::nfo::LocalNfoCredit {
-                provider_id: "writer-1".to_owned(),
-                name: "Writer".to_owned(),
-            }],
             trailers: vec!["https://example.invalid/trailer".to_owned()],
             ..crate::application::nfo::LocalNfoDetails::default()
         };
-
         let plan = metadata_request_plan(&current, false, false, Some(&details));
         assert!(!plan.needs_metadata);
     }
@@ -4366,6 +4411,43 @@ mod tests {
             Some("https://images.example/profile.jpg")
         );
         assert_eq!(actors[1].id, "person-10");
+    }
+
+    #[test]
+    fn movie_candidate_cast_is_bounded_to_100_and_keeps_provider_order() {
+        let credits = (0..105)
+            .map(|order| ScraperActorCredit {
+                provider_id: order.to_string(),
+                name: Some(format!("Actor {order}")),
+                character: Some(format!("Character {order}")),
+                order: Some(order),
+                profile_url: None,
+            })
+            .collect::<Vec<_>>();
+
+        let actors = generic_candidate_actors(&credits);
+
+        assert_eq!(actors.len(), 100);
+        assert_eq!(actors[0].name, "Actor 0");
+        assert_eq!(actors[99].name, "Actor 99");
+        assert_eq!(actors[99].order, Some(99));
+
+        let candidate_values = (0..105)
+            .map(|order| {
+                json!({
+                    "id": format!("person-{order}"),
+                    "provider": "tmdb",
+                    "name": format!("Actor {order}"),
+                    "character": format!("Character {order}"),
+                    "order": order
+                })
+            })
+            .collect::<Vec<_>>();
+        let parsed = candidate_actors(&json!({ "actors": candidate_values }))
+            .expect("bounded candidate cast should parse");
+        assert_eq!(parsed.len(), 100);
+        assert_eq!(parsed[99].name, "Actor 99");
+        assert_eq!(parsed[99].order, Some(99));
     }
 
     #[test]

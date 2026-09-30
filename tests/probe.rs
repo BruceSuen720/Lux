@@ -3,6 +3,8 @@ use std::{path::Path, time::Duration};
 use luxd::{
     application::{
         libraries::LibraryService,
+        metadata_paths::library_item_directory,
+        nfo::NfoWriteService,
         probe::{
             FfprobeRunner, MediaProbeResult, MediaProbeService, MediaStreamResult, ProbeError,
             StreamType, parse_media_info_json, parse_nfo_streamdetails, parse_probe_json,
@@ -128,6 +130,19 @@ fn attached_picture_stream_is_not_exposed_as_video() {
     assert_eq!(result.streams.len(), 2);
     assert_eq!(result.streams[0].stream_index, 0);
     assert_eq!(result.streams[1].stream_index, 1);
+}
+
+#[test]
+fn ffprobe_field_order_is_preserved_for_nfo_scantype() {
+    let result = parse_probe_json(
+        br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","field_order":"progressive"}]}"#,
+    )
+    .expect("valid video probe output");
+
+    assert_eq!(
+        result.streams[0].details.get("ScanType"),
+        Some(&serde_json::json!("progressive"))
+    );
 }
 
 #[test]
@@ -323,6 +338,11 @@ async fn probe_service_persists_success_skips_ready_and_reprobes_changed_file()
     tokio::fs::create_dir_all(&movie_dir).await?;
     let movie_path = movie_dir.join("Probe.Movie.2024.mkv");
     tokio::fs::write(&movie_path, b"fixture").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        "<movie><title>Probe Movie</title><plot>Existing plot</plot><custom><keep>Existing metadata</keep></custom></movie>",
+    )
+    .await?;
 
     let database = Database::connect(&config).await?;
     let libraries = LibraryService::new(database.clone());
@@ -334,23 +354,49 @@ async fn probe_service_persists_success_skips_ready_and_reprobes_changed_file()
         .await?;
     let scanner = LibraryScanner::new(database.clone());
     scanner.scan_movie_library(library.id).await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(serde_json::json!({ "images": { "writeToMetadata": true } }).to_string())
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
 
     let script = executable_script(
         temp_dir.path(),
         r#"#!/bin/sh
-printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"500000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}}]}'
+printf '%s' '{"format":{"format_name":"matroska","duration":"6374","bit_rate":"15975933"},"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","width":1920,"height":798,"display_aspect_ratio":"320:133","r_frame_rate":"24000/1001","bit_rate":"15000000","field_order":"progressive","tags":{"language":"eng"},"disposition":{"default":1,"forced":0}},{"index":1,"codec_type":"audio","codec_name":"dts","channels":6,"sample_rate":"48000","tags":{"language":"eng"},"disposition":{"default":1,"forced":0}},{"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle","tags":{"language":"chi"},"disposition":{"default":0,"forced":0}}]}'
 "#,
     )?;
     let service = MediaProbeService::new(
         database.clone(),
         FfprobeRunner::new(script, Duration::from_secs(5)),
-    );
+    )
+    .with_nfo_writer(NfoWriteService::new_with_config_dir(
+        database.clone(),
+        config.config_dir.clone(),
+    ));
 
     let first = service.probe_movie_library(library.id).await?;
     assert_eq!(first.attempted, 1);
     assert_eq!(first.ready, 1);
     assert_eq!(first.failed, 0);
     assert_eq!(first.timed_out, 0);
+
+    let nfo = tokio::fs::read_to_string(movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<plot>Existing plot</plot>"));
+    assert!(nfo.contains("<custom><keep>Existing metadata</keep></custom>"));
+    assert!(nfo.contains("<codec>hevc</codec><micodec>hevc</micodec>"));
+    assert!(nfo.contains("<width>1920</width><height>798</height>"));
+    assert!(nfo.contains("<aspect>320:133</aspect><aspectratio>320:133</aspectratio>"));
+    assert!(nfo.contains("<scantype>progressive</scantype>"));
+    assert!(nfo.contains("<duration>106</duration><durationinseconds>6374</durationinseconds>"));
+    assert!(nfo.contains("<channels>6</channels><samplingrate>48000</samplingrate>"));
+    assert!(nfo.contains("<codec>PGSSUB</codec><micodec>PGSSUB</micodec>"));
+    let metadata_nfo = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
+    assert_eq!(tokio::fs::read_to_string(metadata_nfo).await?, nfo);
 
     let source: (String, i64, i64, i64, Option<String>) = sqlx::query_as(
         "SELECT container, duration_ticks, bitrate, 
@@ -360,7 +406,10 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(source, ("mkv".to_owned(), 125_000_000, 500_000, 2, None));
+    assert_eq!(
+        source,
+        ("mkv".to_owned(), 63_740_000_000, 15_975_933, 3, None)
+    );
 
     let second = service.probe_movie_library(library.id).await?;
     assert_eq!(second.attempted, 0);
@@ -374,6 +423,16 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     let third = service.probe_movie_library(library.id).await?;
     assert_eq!(third.attempted, 1);
     assert_eq!(third.ready, 1);
+    let refreshed_nfo = tokio::fs::read_to_string(movie_dir.join("movie.nfo")).await?;
+    assert_eq!(refreshed_nfo.matches("<video>").count(), 1);
+    assert_eq!(refreshed_nfo.matches("<audio>").count(), 1);
+    assert_eq!(refreshed_nfo.matches("<subtitle>").count(), 1);
+    let refreshed_metadata_nfo =
+        library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
+    assert_eq!(
+        tokio::fs::read_to_string(refreshed_metadata_nfo).await?,
+        refreshed_nfo
+    );
     Ok(())
 }
 
@@ -484,6 +543,10 @@ async fn strm_probe_uses_media_info_sidecar_without_running_ffprobe()
         database.clone(),
         FfprobeRunner::new(failing_probe, Duration::from_secs(5)),
     )
+    .with_nfo_writer(NfoWriteService::new_with_config_dir(
+        database.clone(),
+        config.config_dir.clone(),
+    ))
     .probe_movie_library(library.id)
     .await?;
     assert_eq!(report.attempted, 1);
@@ -512,6 +575,7 @@ async fn strm_probe_uses_media_info_sidecar_without_running_ffprobe()
             .is_some_and(|details| details.contains("1920"))
     );
     assert_eq!(streams[2].1, "SUBTITLE");
+    assert!(!tokio::fs::try_exists(movie_dir.join("movie.nfo")).await?);
     Ok(())
 }
 

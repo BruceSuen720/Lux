@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::{
+    application::nfo::{NfoWriteError, NfoWriteService},
     config::{MAX_PROBE_CONCURRENCY, probe_concurrency_override_from_env},
     domain::{ids::LibraryId, time::duration_to_ticks},
     observability::resources::ResourceMetrics,
@@ -598,7 +599,7 @@ fn integer_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<i
 }
 
 fn ffprobe_stream_details(stream: &serde_json::Map<String, Value>) -> BTreeMap<String, Value> {
-    const FIELDS: [(&str, &str); 16] = [
+    const FIELDS: [(&str, &str); 17] = [
         ("width", "Width"),
         ("height", "Height"),
         ("display_aspect_ratio", "AspectRatio"),
@@ -615,6 +616,7 @@ fn ffprobe_stream_details(stream: &serde_json::Map<String, Value>) -> BTreeMap<S
         ("color_space", "ColorSpace"),
         ("color_transfer", "ColorTransfer"),
         ("color_primaries", "ColorPrimaries"),
+        ("field_order", "ScanType"),
     ];
     copy_detail_fields(stream, &FIELDS)
 }
@@ -868,6 +870,7 @@ async fn terminate_child(child: &mut Child) {
 pub struct MediaProbeService {
     database: Database,
     runner: FfprobeRunner,
+    nfo_writer: Option<NfoWriteService>,
     resources: ResourceMetrics,
     global_slots: Arc<Semaphore>,
     process_hard_cap: Result<usize, String>,
@@ -878,6 +881,20 @@ type ProbeTaskResult = (
     PathBuf,
     Result<Option<MediaProbeResult>, ProbeError>,
 );
+
+fn nfo_write_error_code(error: &NfoWriteError) -> &'static str {
+    match error {
+        NfoWriteError::Nfo(_) => "INVALID_NFO",
+        NfoWriteError::ItemNotFound => "ITEM_NOT_FOUND",
+        NfoWriteError::InvalidMetadata(_) => "INVALID_METADATA",
+        NfoWriteError::InvalidXml(_) => "INVALID_XML",
+        NfoWriteError::Io { .. } => "IO",
+        NfoWriteError::SymlinkTarget(_) => "SYMLINK_TARGET",
+        NfoWriteError::PathOutsideRoot(_) => "PATH_OUTSIDE_ROOT",
+        NfoWriteError::ConcurrentModification(_) => "CONCURRENT_MODIFICATION",
+        NfoWriteError::Storage(_) => "STORAGE",
+    }
+}
 
 #[derive(Default)]
 struct SubtitleDirectoryCache {
@@ -927,6 +944,7 @@ impl MediaProbeService {
         Self {
             database,
             runner,
+            nfo_writer: None,
             resources: ResourceMetrics::new(),
             global_slots: Arc::clone(
                 GLOBAL_PROBE_SLOTS.get_or_init(|| Arc::new(Semaphore::new(global_slot_count))),
@@ -937,6 +955,11 @@ impl MediaProbeService {
 
     pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
         self.resources = resources;
+        self
+    }
+
+    pub fn with_nfo_writer(mut self, nfo_writer: NfoWriteService) -> Self {
+        self.nfo_writer = Some(nfo_writer);
         self
     }
 
@@ -1183,6 +1206,17 @@ impl MediaProbeService {
                         streams: &streams,
                     })
                     .await?;
+                if let Some(nfo_writer) = &self.nfo_writer
+                    && let Err(error) = nfo_writer
+                        .write_item_probe_details(&source.item_id, &source.source_id, &result)
+                        .await
+                {
+                    tracing::warn!(
+                        item_id = %source.item_id,
+                        error_code = nfo_write_error_code(&error),
+                        "NFO stream details could not be updated after media probe"
+                    );
+                }
                 report.ready += 1;
                 Ok(ProbeTargetState::Done)
             }

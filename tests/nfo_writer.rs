@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use luxd::{
     application::{
         libraries::LibraryService,
@@ -7,15 +9,18 @@ use luxd::{
             LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService, MovieNfoCredit,
             MovieNfoMetadata, NfoWriteService, parse_local_nfo_actors, parse_local_nfo_details,
             parse_local_nfo_projection, parse_movie_nfo_actors, parse_movie_nfo_details,
-            rewrite_movie_nfo, rewrite_nfo, rewrite_series_nfo, write_nfo_atomically,
+            rewrite_movie_nfo, rewrite_nfo, rewrite_nfo_probe_details, rewrite_series_nfo,
+            write_nfo_atomically,
         },
         people::ActorCredit,
+        probe::{MediaProbeResult, MediaStreamResult, StreamType},
         scanner::{LibraryScanner, ScanJobService},
     },
     config::Config,
     library::LibraryKind,
     storage::Database,
 };
+use serde_json::Value;
 
 #[test]
 fn nfo_rewrite_updates_common_fields_and_preserves_unknown_xml()
@@ -58,7 +63,7 @@ fn nfo_rewrite_creates_a_movie_document_when_target_is_missing() {
 #[test]
 fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
 -> Result<(), Box<dyn std::error::Error>> {
-    let original = r#"<movie><title>旧标题</title><rating>1</rating><genre>旧类型</genre><actor><name>旧演员</name></actor><custom><keep>保留</keep></custom></movie>"#;
+    let original = r#"<movie><title>旧标题</title><rating>1</rating><genre>旧类型</genre><actor><name>旧演员</name></actor><id>tt-old</id><uniqueid type="official website">https://old.example/movie</uniqueid><uniqueid type="custom">custom-id</uniqueid><custom><keep>保留</keep></custom></movie>"#;
     let rewritten = rewrite_movie_nfo(
         original.as_bytes(),
         &MovieNfoMetadata {
@@ -125,6 +130,11 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
     assert!(text.contains("<status>Released</status>"));
     assert!(text.contains("<language>zh</language>"));
     assert!(text.contains("<website>https://example.com/movie</website>"));
+    assert!(text.contains("<id>tt38035835</id>"), "{text}");
+    assert!(
+        text.contains("<uniqueid type=\"official website\">https://example.com/movie</uniqueid>")
+    );
+    assert!(text.contains("<uniqueid type=\"custom\">custom-id</uniqueid>"));
     assert!(text.contains("<set>飞驰人生</set>"));
     assert!(text.contains("<setid>1281825</setid>"));
     assert!(text.contains(
@@ -149,6 +159,8 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
     assert!(text.contains("<trailer>https://www.youtube.com/watch?v=test</trailer>"));
     assert!(text.contains("<custom><keep>保留</keep></custom>"));
     assert!(!text.contains("<rating>1</rating>"));
+    assert!(!text.contains("<id>tt-old</id>"));
+    assert!(!text.contains("https://old.example/movie"));
     assert!(!text.contains("<genre>旧类型</genre>"));
     assert!(!text.contains("<name>旧演员</name>"));
     Ok(())
@@ -328,6 +340,122 @@ fn movie_nfo_parser_keeps_actor_without_provider_id() {
     assert!(actors[0].id.is_empty());
     assert_eq!(actors[0].name, "本地演员");
     assert_eq!(actors[0].character.as_deref(), Some("本地角色"));
+}
+
+#[test]
+fn movie_nfo_actor_parser_and_writer_support_up_to_100_cast_members()
+-> Result<(), Box<dyn std::error::Error>> {
+    let actor_nodes = (0..105)
+        .map(|order| {
+            format!(
+                "<actor><name>Actor {order}</name><role>Character {order}</role><order>{order}</order></actor>"
+            )
+        })
+        .collect::<String>();
+    let original = format!("<movie>{actor_nodes}</movie>");
+    let parsed = parse_movie_nfo_actors(original.as_bytes())?;
+    assert_eq!(parsed.len(), 100);
+    assert_eq!(parsed[0].name, "Actor 0");
+    assert_eq!(parsed[99].name, "Actor 99");
+    assert_eq!(parsed[99].order, Some(99));
+
+    let actors = (0..105)
+        .map(|order| ActorCredit {
+            id: order.to_string(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: format!("Actor {order}"),
+            character: Some(format!("Character {order}")),
+            order: Some(order),
+            profile_url: None,
+            person: None,
+        })
+        .collect();
+    let rewritten = rewrite_movie_nfo(
+        b"<movie/>",
+        &MovieNfoMetadata {
+            actors,
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert_eq!(text.matches("<actor>").count(), 100);
+    assert!(text.contains("<name>Actor 99</name>"));
+    assert!(!text.contains("<name>Actor 100</name>"));
+    Ok(())
+}
+
+#[test]
+fn movie_nfo_rewrite_serializes_probe_fileinfo_and_preserves_other_fileinfo_xml()
+-> Result<(), Box<dyn std::error::Error>> {
+    let video_details = BTreeMap::from([
+        ("Width".to_owned(), Value::from(1920)),
+        ("Height".to_owned(), Value::from(798)),
+        ("AspectRatio".to_owned(), Value::from("320:133")),
+        ("RealFrameRate".to_owned(), Value::from("24000/1001")),
+        ("BitRate".to_owned(), Value::from(15_000_000)),
+        ("ScanType".to_owned(), Value::from("progressive")),
+    ]);
+    let audio_details = BTreeMap::from([
+        ("Channels".to_owned(), Value::from(6)),
+        ("SampleRate".to_owned(), Value::from(48_000)),
+    ]);
+    let probe_details = MediaProbeResult {
+        container: Some("matroska".to_owned()),
+        source_size: Some(12_345),
+        duration_ticks: Some(63_740_000_000),
+        bitrate: Some(15_975_933),
+        streams: vec![
+            MediaStreamResult {
+                stream_index: 0,
+                stream_type: StreamType::Video,
+                codec: Some("hevc".to_owned()),
+                language: Some("eng".to_owned()),
+                title: None,
+                is_default: true,
+                is_forced: false,
+                details: video_details,
+            },
+            MediaStreamResult {
+                stream_index: 1,
+                stream_type: StreamType::Audio,
+                codec: Some("dts".to_owned()),
+                language: Some("eng".to_owned()),
+                title: None,
+                is_default: true,
+                is_forced: false,
+                details: audio_details,
+            },
+            MediaStreamResult {
+                stream_index: 2,
+                stream_type: StreamType::Subtitle,
+                codec: Some("hdmv_pgs_subtitle".to_owned()),
+                language: Some("chi".to_owned()),
+                title: None,
+                is_default: false,
+                is_forced: false,
+                details: BTreeMap::new(),
+            },
+        ],
+    };
+    let original = r#"<movie><title>Keep title</title><fileinfo><legacy>keep</legacy><streamdetails><video><codec>old</codec></video></streamdetails></fileinfo><custom>keep</custom></movie>"#;
+
+    let rewritten = rewrite_nfo_probe_details(original.as_bytes(), &probe_details)?;
+    let text = String::from_utf8(rewritten)?;
+
+    assert!(text.contains("<legacy>keep</legacy>"));
+    assert!(text.contains("<custom>keep</custom>"));
+    assert!(text.contains("<codec>hevc</codec><micodec>hevc</micodec>"));
+    assert!(text.contains("<bitrate>15000000</bitrate>"));
+    assert!(text.contains("<width>1920</width><height>798</height>"));
+    assert!(text.contains("<aspect>320:133</aspect><aspectratio>320:133</aspectratio>"));
+    assert!(text.contains("<framerate>23.976024</framerate>"));
+    assert!(text.contains("<scantype>progressive</scantype>"));
+    assert!(text.contains("<duration>106</duration><durationinseconds>6374</durationinseconds>"));
+    assert!(text.contains("<channels>6</channels><samplingrate>48000</samplingrate>"));
+    assert!(text.contains("<codec>PGSSUB</codec><micodec>PGSSUB</micodec>"));
+    assert!(!text.contains("<codec>old</codec>"));
+    Ok(())
 }
 
 #[test]
@@ -595,6 +723,118 @@ async fn nfo_service_can_write_an_additional_metadata_copy()
     let media_copy = tokio::fs::read(&report.path).await?;
     let metadata_copy = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
     assert_eq!(tokio::fs::read(metadata_copy).await?, media_copy);
+    Ok(())
+}
+
+#[tokio::test]
+async fn movie_nfo_write_adds_database_sort_title_and_date_without_overwriting_local_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET sort_title = ?, added_at = 0 WHERE id = ?")
+        .bind("007: quantum of solace")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(serde_json::json!({ "images": { "writeToMetadata": true } }).to_string())
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    let service = NfoWriteService::new_with_config_dir(database.clone(), config.config_dir.clone());
+    service
+        .write_item_movie_nfo(
+            &item_id,
+            &MovieNfoMetadata {
+                base: NfoMetadata {
+                    title: Some("Quantum of Solace".to_owned()),
+                    ..NfoMetadata::default()
+                },
+                ..MovieNfoMetadata::default()
+            },
+        )
+        .await?;
+    let nfo_path = movie_dir.join("movie.nfo");
+    let generated = tokio::fs::read_to_string(&nfo_path).await?;
+    assert!(generated.contains("<sorttitle>007: quantum of solace</sorttitle>"));
+    assert!(generated.contains("<dateadded>1970-01-01 00:00:00</dateadded>"));
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let probe = MediaProbeResult {
+        container: Some("mkv".to_owned()),
+        source_size: Some(100),
+        duration_ticks: Some(60 * 10_000_000),
+        bitrate: Some(500_000),
+        streams: vec![MediaStreamResult {
+            stream_index: 0,
+            stream_type: StreamType::Video,
+            codec: Some("h264".to_owned()),
+            language: None,
+            title: None,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::from([("Width".to_owned(), Value::from(1920))]),
+        }],
+    };
+    assert!(
+        service
+            .write_item_probe_details(&item_id, &source_id, &probe)
+            .await?
+    );
+    let with_probe = tokio::fs::read_to_string(&nfo_path).await?;
+    assert!(with_probe.contains("<width>1920</width>"));
+    assert!(with_probe.contains("<sorttitle>007: quantum of solace</sorttitle>"));
+    let metadata_copy = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
+    assert_eq!(tokio::fs::read_to_string(metadata_copy).await?, with_probe);
+
+    tokio::fs::write(
+        &nfo_path,
+        "<movie><sorttitle>Curated sort</sorttitle><dateadded>2001-02-03 04:05:06</dateadded><custom>keep</custom></movie>",
+    )
+    .await?;
+    service
+        .write_item_movie_nfo(
+            &item_id,
+            &MovieNfoMetadata {
+                base: NfoMetadata {
+                    title: Some("Quantum of Solace".to_owned()),
+                    ..NfoMetadata::default()
+                },
+                ..MovieNfoMetadata::default()
+            },
+        )
+        .await?;
+    let preserved = tokio::fs::read_to_string(nfo_path).await?;
+    assert!(preserved.contains("<sorttitle>Curated sort</sorttitle>"));
+    assert!(preserved.contains("<dateadded>2001-02-03 04:05:06</dateadded>"));
+    assert!(preserved.contains("<custom>keep</custom>"));
     Ok(())
 }
 
