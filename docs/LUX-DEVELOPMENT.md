@@ -7737,7 +7737,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] TMDb 有返回值的 rating、上映日期、MPAA、国家、类型、制片公司、合集、标语、官网、外部 ID、导演/编剧、演员和预告片能通过正常候选选择写入 NFO。
 - [ ] IMDb ID 存在时写入 `<id>`，官网存在时写入相应 official-website uniqueid；值与原始 provider 值一致。
 - [ ] 已有/锁定 NFO 字段不被覆盖；详情失败不能静默确认或写入搜索摘要候选，后续任务可重试。
-- [ ] 回归覆盖“核心字段已完整、NFO rich 字段为空”的自动补缺场景。
+- [ ] 回归覆盖“核心字段已完整、NFO rich 字段为空”时，单纯 `FILL_MISSING` 不补抓 metadata；完整刮削仍请求详情。
 
 明确不做：以 TMDb 伪造 `dateadded`、`fileinfo`、`streamdetails`、Douban ID 或非 TMDb 人物身份；这些字段仅由实际本地来源提供。
 
