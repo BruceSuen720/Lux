@@ -2985,6 +2985,7 @@ pub(crate) enum CatalogSort {
     SortName,
     DateCreated,
     PremiereDate,
+    ProductionYear,
     Rating,
 }
 

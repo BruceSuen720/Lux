@@ -194,6 +194,14 @@ fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> &'static str {
              COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') ASC,
              LOWER(mi.title) ASC, mi.id ASC"
         }
+        (CatalogSort::ProductionYear, true) => {
+            "CASE WHEN mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
+             mi.production_year DESC, LOWER(mi.title) ASC, mi.id ASC"
+        }
+        (CatalogSort::ProductionYear, false) => {
+            "CASE WHEN mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
+             mi.production_year ASC, LOWER(mi.title) ASC, mi.id ASC"
+        }
         (CatalogSort::Rating, true) => {
             "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
              mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC"

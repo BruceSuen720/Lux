@@ -608,6 +608,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .bind(&beta_item_id)
         .fetch_one(database.pool())
         .await?;
+    let alpha_production_year: Option<i64> =
+        sqlx::query_scalar("SELECT production_year FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let beta_production_year: Option<i64> =
+        sqlx::query_scalar("SELECT production_year FROM media_items WHERE id = ?")
+            .bind(&beta_item_id)
+            .fetch_one(database.pool())
+            .await?;
     let beta_parent_id: Option<String> =
         sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
             .bind(&beta_item_id)
@@ -623,12 +633,14 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .bind(&beta_item_id)
             .fetch_one(database.pool())
             .await?;
-    sqlx::query("UPDATE media_items SET added_at = 100, sort_title = 'zulu' WHERE id = ?")
+    sqlx::query(
+        "UPDATE media_items SET added_at = 100, sort_title = 'zulu', production_year = 2021 WHERE id = ?",
+    )
         .bind(&item_id)
         .execute(database.pool())
         .await?;
     sqlx::query(
-        "UPDATE media_items SET added_at = 200, sort_title = 'aardvark', parent_id = ? WHERE id = ?",
+        "UPDATE media_items SET added_at = 200, sort_title = 'aardvark', production_year = 2020, parent_id = ? WHERE id = ?",
     )
     .bind(&alpha_parent_id)
     .bind(&beta_item_id)
@@ -657,6 +669,17 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_sort_name_items.status(), reqwest::StatusCode::OK);
     let emby_sort_name_body: Value = emby_sort_name_items.json().await?;
 
+    let emby_production_year_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=2&SortBy=ProductionYear&SortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_production_year_items.status(), reqwest::StatusCode::OK);
+    let emby_production_year_body: Value = emby_production_year_items.json().await?;
+
     let emby_recent_folder_items = client
         .get(format!(
             "{base_url}/emby/Users/{}/Items?ParentId={emby_alpha_parent_id}&IncludeItemTypes=Movie&Limit=2&sortBy=DateCreated&sortOrder=Descending",
@@ -668,15 +691,21 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_recent_folder_items.status(), reqwest::StatusCode::OK);
     let emby_recent_folder_body: Value = emby_recent_folder_items.json().await?;
 
-    sqlx::query("UPDATE media_items SET added_at = ?, sort_title = ? WHERE id = ?")
-        .bind(alpha_added_at)
-        .bind(alpha_sort_title)
-        .bind(&item_id)
-        .execute(database.pool())
-        .await?;
-    sqlx::query("UPDATE media_items SET added_at = ?, sort_title = ?, parent_id = ? WHERE id = ?")
+    sqlx::query(
+        "UPDATE media_items SET added_at = ?, sort_title = ?, production_year = ? WHERE id = ?",
+    )
+    .bind(alpha_added_at)
+    .bind(alpha_sort_title)
+    .bind(alpha_production_year)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET added_at = ?, sort_title = ?, production_year = ?, parent_id = ? WHERE id = ?",
+    )
         .bind(beta_added_at)
         .bind(beta_sort_title)
+        .bind(beta_production_year)
         .bind(beta_parent_id)
         .bind(&beta_item_id)
         .execute(database.pool())
@@ -684,6 +713,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     assert_eq!(emby_recent_body["Items"][0]["Id"], emby_beta_item_id);
     assert_eq!(emby_sort_name_body["Items"][0]["Id"], emby_beta_item_id);
+    assert_eq!(emby_production_year_body["Items"][0]["Id"], emby_item_id);
     assert_eq!(emby_recent_folder_body["TotalRecordCount"], 2);
     assert_eq!(emby_recent_folder_body["Items"][0]["Id"], emby_beta_item_id);
 

@@ -292,6 +292,7 @@ fn catalog_sort_from_value(value: Option<&str>) -> CatalogSort {
         "sortname" => CatalogSort::SortName,
         "datecreated" => CatalogSort::DateCreated,
         "premieredate" => CatalogSort::PremiereDate,
+        "productionyear" => CatalogSort::ProductionYear,
         "communityrating" | "rating" => CatalogSort::Rating,
         _ => CatalogSort::Name,
     }
