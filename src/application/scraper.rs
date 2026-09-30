@@ -1346,8 +1346,10 @@ pub struct ScraperResolver {
     database: Database,
     plugins: PluginService,
     resources: Option<ResourceMetrics>,
-    client_cache: Arc<RwLock<HashMap<(u64, String), Arc<OnceCell<ScraperPluginClient>>>>>,
+    client_cache: ScraperClientCache,
 }
+
+type ScraperClientCache = Arc<RwLock<HashMap<(u64, String), Arc<OnceCell<ScraperPluginClient>>>>>;
 
 #[derive(Clone)]
 pub struct ResolvedScraper {
@@ -1392,7 +1394,7 @@ impl ScraperResolver {
             if self.plugins.scraper_client_revision() != revision {
                 continue;
             }
-            return result.map(Clone::clone).map_err(ScraperError::Plugin);
+            return result.cloned().map_err(ScraperError::Plugin);
         }
     }
 

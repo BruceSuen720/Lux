@@ -2344,7 +2344,7 @@ impl MetadataSelectionService {
                     .all(|(source, provider_id)| {
                         unavailable_image_attempts.contains(&(
                             (*image_type).to_owned(),
-                            image_no_candidate_key(source, *image_type, provider_id),
+                            image_no_candidate_key(source, image_type, provider_id),
                         ))
                     });
             if explicitly_unavailable {
