@@ -2885,7 +2885,7 @@ services:
 验收：
 
 - Lux Web 的推荐轮播通过 `/api/v1/home/carousel` 单独读取；服务端与 Web 会话缓存只保存轮播推荐条目。
-- Lux Web 的继续观看通过 `/api/v1/continue-watching` 读取，媒体库入口通过 `/api/v1/libraries` 读取，每库最新资源通过该库现有条目列表接口独立分页读取；各区块分别加载与刷新，单个请求失败不得阻塞其余区块。
+- Lux Web 的继续观看通过 `/api/v1/continue-watching` 读取，媒体库入口通过 `/api/v1/libraries` 读取，每库最新资源通过 `/api/v1/libraries/{id}/latest` 单独读取；该查询沿用有效入库时间，剧集按自身与最新可用分集加入时间的较大值排序。各区块分别加载与刷新，单个请求失败不得阻塞其余区块。
 - `home` SSE 事件会刷新轮播、继续观看、媒体库入口和已挂载的每库最新资源查询；封面刮削完成后，新的图像标签必须能随最新资源查询刷新。
 - `GET /api/v1/home` 保留原完整响应供兼容调用；Lux Web 不再依赖该聚合接口。该接口的继续观看、可见库和最新资源均实时读取，只有推荐轮播使用缓存。
 - Emby Latest/Resume/Views 分别正确。
