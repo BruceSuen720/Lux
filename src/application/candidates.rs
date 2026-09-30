@@ -27,8 +27,8 @@ use crate::{
     },
     observability::resources::ResourceMetrics,
     storage::{
-        Database, MetadataCapabilityResult, NewMetadataCandidate, SelectedMetadataUpdate,
-        StorageError, StoredMediaMetadata, StoredMetadataCandidate,
+        Database, MetadataCapabilityResult, MetadataImageUnavailable, NewMetadataCandidate,
+        SelectedMetadataUpdate, StorageError, StoredMediaMetadata, StoredMetadataCandidate,
         StoredMetadataCapabilityAttempt,
     },
 };
@@ -284,6 +284,46 @@ impl MetadataCandidateService {
         })
     }
 
+    async fn list_pending_for_current(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let limit = 50;
+        let (rows, total) = self
+            .database
+            .list_pending_metadata_candidates_for_item_with_count(item_id, 0, limit)
+            .await?;
+        let items = rows
+            .into_iter()
+            .map(|row| candidate_view(row, Some(current)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MetadataCandidatePage {
+            items,
+            total,
+            offset: 0,
+            limit,
+        })
+    }
+
+    async fn list_pending_after_search(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+        reuse_current_snapshot: bool,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        if reuse_current_snapshot {
+            return self.list_pending_for_current(item_id, current).await;
+        }
+        let refreshed_current = self
+            .database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        self.list_pending_for_current(item_id, &refreshed_current)
+            .await
+    }
+
     pub async fn search_and_store(
         &self,
         item_id: &str,
@@ -296,8 +336,11 @@ impl MetadataCandidateService {
             query,
             year,
             scraper,
-            CandidateSearchMode::Manual,
-            MetadataRequestPlan::full(),
+            CandidateSearchOptions {
+                mode: CandidateSearchMode::Manual,
+                plan: MetadataRequestPlan::full(),
+                current: None,
+            },
         )
         .await
     }
@@ -332,26 +375,56 @@ impl MetadataCandidateService {
             query,
             year,
             scraper,
-            CandidateSearchMode::AutomaticReuse,
-            plan,
+            CandidateSearchOptions {
+                mode: CandidateSearchMode::AutomaticReuse,
+                plan,
+                current: None,
+            },
         )
         .await
     }
 
-    pub(crate) async fn search_and_store_for_automatic_match_fresh(
+    pub(crate) async fn search_and_store_for_automatic_match_with_plan_for_current(
         &self,
         item_id: &str,
         query: &str,
         year: Option<i32>,
         scraper: &ScraperProvider,
+        plan: MetadataRequestPlan,
+        current: &StoredMediaMetadata,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         self.search_and_store_with_mode(
             item_id,
             query,
             year,
             scraper,
-            CandidateSearchMode::AutomaticFresh,
-            MetadataRequestPlan::full(),
+            CandidateSearchOptions {
+                mode: CandidateSearchMode::AutomaticReuse,
+                plan,
+                current: Some(current),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn search_and_store_for_automatic_match_fresh_for_current(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scraper: &ScraperProvider,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchOptions {
+                mode: CandidateSearchMode::AutomaticFresh,
+                plan: MetadataRequestPlan::full(),
+                current: Some(current),
+            },
         )
         .await
     }
@@ -362,17 +435,30 @@ impl MetadataCandidateService {
         query: &str,
         year: Option<i32>,
         scraper: &ScraperProvider,
-        mode: CandidateSearchMode,
-        plan: MetadataRequestPlan,
+        options: CandidateSearchOptions<'_>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        let current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
+        let CandidateSearchOptions {
+            mode,
+            plan,
+            current,
+        } = options;
+        let reuse_current_snapshot = current.is_some();
+        let fetched_current = if current.is_none() {
+            Some(
+                self.database
+                    .find_media_item_metadata(item_id)
+                    .await?
+                    .ok_or(MetadataCandidateError::ItemNotFound)?,
+            )
+        } else {
+            None
+        };
+        let current = current
+            .or(fetched_current.as_ref())
             .ok_or(MetadataCandidateError::ItemNotFound)?;
         if matches!(mode, CandidateSearchMode::AutomaticReuse)
             && let Some(page) = self
-                .reuse_unexpired_automatic_candidates(item_id, &current, scraper, plan)
+                .reuse_unexpired_automatic_candidates(item_id, current, scraper, plan)
                 .await?
         {
             return Ok(page);
@@ -382,7 +468,17 @@ impl MetadataCandidateService {
             "SERIES" => MediaKind::Series,
             "SEASON" | "EPISODE" => {
                 return self
-                    .search_child_and_store(item_id, query, year, &current, scraper, plan)
+                    .search_child_and_store(
+                        item_id,
+                        query,
+                        year,
+                        scraper,
+                        CandidateSearchContext {
+                            current,
+                            plan,
+                            reuse_current_snapshot,
+                        },
+                    )
                     .await;
             }
             _ => return Err(MetadataCandidateError::InvalidSearch),
@@ -405,7 +501,7 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let direct_provider_id = selected_scraper_provider_id(&current, scraper).filter(|_| {
+        let direct_provider_id = selected_scraper_provider_id(current, scraper).filter(|_| {
             if plan != MetadataRequestPlan::full() {
                 return true;
             }
@@ -426,7 +522,7 @@ impl MetadataCandidateService {
             } else {
                 None
             };
-            let mut provider_ids = current_provider_ids(&current);
+            let mut provider_ids = current_provider_ids(current);
             if let Some(details) = details.as_ref() {
                 provider_ids.extend(details.provider_ids.clone());
             }
@@ -480,19 +576,29 @@ impl MetadataCandidateService {
             )
         };
         let expires_at = candidate_expiry();
-        let mut results = response.items.into_iter().take(20).collect::<Vec<_>>();
-        if matches!(
+        let automatic_search = matches!(
             mode,
             CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
-        ) {
-            results.sort_by(|left, right| {
-                search_result_score(&current, left)
-                    .total_cmp(&search_result_score(&current, right))
-                    .reverse()
+        );
+        let mut results = response
+            .items
+            .into_iter()
+            .take(20)
+            .map(|result| {
+                let score = automatic_search.then(|| search_result_score(current, &result));
+                (result, score)
+            })
+            .collect::<Vec<_>>();
+        if automatic_search {
+            results.sort_by(|(_, left_score), (_, right_score)| {
+                right_score
+                    .unwrap_or_default()
+                    .total_cmp(&left_score.unwrap_or_default())
             });
             results.truncate(2);
         }
-        for (result_index, result) in results.into_iter().enumerate() {
+        let mut pending_candidates = Vec::with_capacity(results.len());
+        for (result_index, (result, precomputed_score)) in results.into_iter().enumerate() {
             let Some((provider, provider_id)) = scraper.selected_provider_entry(&result) else {
                 continue;
             };
@@ -503,14 +609,13 @@ impl MetadataCandidateService {
                 CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
             ) && result_index > 0
             {
-                let score = search_result_score(&current, &result);
+                let score =
+                    precomputed_score.unwrap_or_else(|| search_result_score(current, &result));
                 let mut provider_ids = result.provider_ids.clone();
                 provider_ids
                     .entry(scraper.provider_key().to_owned())
                     .or_insert_with(|| provider_id.clone());
-                self.store_candidate(
-                    item_id,
-                    &current,
+                pending_candidates.push((
                     CandidateMetadata {
                         title: result
                             .title
@@ -549,8 +654,7 @@ impl MetadataCandidateService {
                         score: Some(score),
                     },
                     expires_at,
-                )
-                .await?;
+                ));
                 continue;
             }
             let bundle = if direct_details.is_none()
@@ -760,6 +864,17 @@ impl MetadataCandidateService {
                 )
             };
             let now = current_unix_timestamp();
+            let mut transient_capability_failures = Vec::new();
+            for (capability, error) in capability_failures {
+                if capability_error_is_permanent(&error) {
+                    capability_results.push(MetadataCapabilityResult {
+                        capability,
+                        has_data: false,
+                    });
+                } else {
+                    transient_capability_failures.push(capability);
+                }
+            }
             self.database
                 .record_metadata_capability_results(
                     item_id,
@@ -770,33 +885,17 @@ impl MetadataCandidateService {
                 )
                 .await
                 .map_err(MetadataCandidateError::Storage)?;
-            for (capability, error) in capability_failures {
-                if capability_error_is_permanent(&error) {
-                    self.database
-                        .record_metadata_capability_results(
-                            item_id,
-                            scraper.provider_key(),
-                            &provider_id,
-                            &[MetadataCapabilityResult {
-                                capability,
-                                has_data: false,
-                            }],
-                            now,
-                        )
-                        .await
-                        .map_err(MetadataCandidateError::Storage)?;
-                } else {
-                    self.database
-                        .record_metadata_capability_failure(
-                            item_id,
-                            scraper.provider_key(),
-                            &provider_id,
-                            capability,
-                            now,
-                        )
-                        .await
-                        .map_err(MetadataCandidateError::Storage)?;
-                }
+            if !transient_capability_failures.is_empty() {
+                self.database
+                    .record_metadata_capability_failures(
+                        item_id,
+                        scraper.provider_key(),
+                        &provider_id,
+                        &transient_capability_failures,
+                        now,
+                    )
+                    .await
+                    .map_err(MetadataCandidateError::Storage)?;
             }
             if plan.needs_images
                 && images_response
@@ -817,9 +916,7 @@ impl MetadataCandidateService {
             if let Some(external_ids) = external_ids {
                 provider_ids.extend(external_ids.provider_ids);
             }
-            self.store_candidate(
-                item_id,
-                &current,
+            pending_candidates.push((
                 CandidateMetadata {
                     title,
                     original_title: details
@@ -885,10 +982,12 @@ impl MetadataCandidateService {
                     score: direct_provider_id.as_ref().map(|_| 100.0),
                 },
                 expires_at,
-            )
-            .await?;
+            ));
         }
-        self.list_for_item(item_id, None, 0, 50).await
+        self.store_candidates(item_id, current, pending_candidates)
+            .await?;
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+            .await
     }
 
     async fn reuse_unexpired_automatic_candidates(
@@ -1015,10 +1114,14 @@ impl MetadataCandidateService {
         item_id: &str,
         query: &str,
         year: Option<i32>,
-        current: &StoredMediaMetadata,
         scraper: &ScraperProvider,
-        plan: MetadataRequestPlan,
+        context: CandidateSearchContext<'_>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let CandidateSearchContext {
+            current,
+            plan,
+            reuse_current_snapshot,
+        } = context;
         let item_type = match current.item_type.as_str() {
             "SEASON" => ScraperItemType::Season,
             "EPISODE" => ScraperItemType::Episode,
@@ -1072,7 +1175,7 @@ impl MetadataCandidateService {
             )));
         }
         let expires_at = candidate_expiry();
-        let mut stored = false;
+        let mut stored_candidates = Vec::with_capacity(parents.len());
         let mut last_error = None;
         for parent in parents {
             let request = match item_type {
@@ -1147,9 +1250,7 @@ impl MetadataCandidateService {
             provider_ids
                 .entry(parent.provider.clone())
                 .or_insert_with(|| parent.provider_id.clone());
-            self.store_candidate(
-                item_id,
-                current,
+            stored_candidates.push((
                 CandidateMetadata {
                     title,
                     original_title: metadata.original_title,
@@ -1184,16 +1285,17 @@ impl MetadataCandidateService {
                     score: Some(parent.score),
                 },
                 expires_at,
-            )
-            .await?;
-            stored = true;
+            ));
         }
-        if !stored {
+        if stored_candidates.is_empty() {
             return Err(MetadataCandidateError::Scraper(ScraperError::Provider(
                 last_error.unwrap_or_else(|| "scraper returned no child metadata".to_owned()),
             )));
         }
-        self.list_for_item(item_id, None, 0, 50).await
+        self.store_candidates(item_id, current, stored_candidates)
+            .await?;
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+            .await
     }
 
     async fn parent_providers(
@@ -1254,66 +1356,82 @@ impl MetadataCandidateService {
         Ok(best.into_iter().collect())
     }
 
-    async fn store_candidate(
+    async fn store_candidates(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
-        candidate: CandidateMetadata,
-        expires_at: Option<i64>,
+        candidates: Vec<(CandidateMetadata, Option<i64>)>,
     ) -> Result<(), MetadataCandidateError> {
-        let score = candidate.score.unwrap_or_else(|| {
-            metadata_match_score(
-                &current.title,
-                current.production_year,
-                Some(&candidate.title),
-                candidate.original_title.as_deref(),
-                candidate.production_year,
-            )
-        });
-        let candidate_json = json!({
-            "title": candidate.title,
-            "originalTitle": candidate.original_title,
-            "overview": candidate.overview,
-            "tagline": candidate.tagline,
-            "website": candidate.website,
-            "releaseDate": candidate.release_date,
-            "premiereDate": candidate.release_date,
-            "endDate": candidate.end_date,
-            "status": candidate.status,
-            "setName": candidate.set_name,
-            "setId": candidate.set_id,
-            "posterUrl": candidate.poster_url,
-            "backdropUrl": candidate.backdrop_url,
-            "productionYear": candidate.production_year,
-            "rating": candidate.rating,
-            "votes": candidate.votes,
-            "runtime": candidate.runtime,
-            "certification": candidate.certification,
-            "countries": candidate.countries,
-            "genres": candidate.genres,
-            "studios": candidate.studios,
-            "providerIds": candidate.provider_ids,
-            "directors": candidate.directors,
-            "writers": candidate.writers,
-            "trailers": candidate.trailers,
-            "originalLanguage": candidate.original_language,
-            "images": candidate.images,
-            "actors": candidate.actors,
-            "metadataFetched": candidate.metadata_fetched,
-        })
-        .to_string();
-        let id = uuid::Uuid::now_v7().to_string();
-        let provider_id = candidate.provider_id.as_str();
-        self.database
-            .insert_metadata_candidate(NewMetadataCandidate {
-                id: &id,
+        let prepared = candidates
+            .into_iter()
+            .map(|(candidate, expires_at)| {
+                let score = candidate.score.unwrap_or_else(|| {
+                    metadata_match_score(
+                        &current.title,
+                        current.production_year,
+                        Some(&candidate.title),
+                        candidate.original_title.as_deref(),
+                        candidate.production_year,
+                    )
+                });
+                let provider = candidate.provider.clone();
+                let provider_id = candidate.provider_id.clone();
+                let candidate_json = json!({
+                    "title": candidate.title,
+                    "originalTitle": candidate.original_title,
+                    "overview": candidate.overview,
+                    "tagline": candidate.tagline,
+                    "website": candidate.website,
+                    "releaseDate": candidate.release_date,
+                    "premiereDate": candidate.release_date,
+                    "endDate": candidate.end_date,
+                    "status": candidate.status,
+                    "setName": candidate.set_name,
+                    "setId": candidate.set_id,
+                    "posterUrl": candidate.poster_url,
+                    "backdropUrl": candidate.backdrop_url,
+                    "productionYear": candidate.production_year,
+                    "rating": candidate.rating,
+                    "votes": candidate.votes,
+                    "runtime": candidate.runtime,
+                    "certification": candidate.certification,
+                    "countries": candidate.countries,
+                    "genres": candidate.genres,
+                    "studios": candidate.studios,
+                    "providerIds": candidate.provider_ids,
+                    "directors": candidate.directors,
+                    "writers": candidate.writers,
+                    "trailers": candidate.trailers,
+                    "originalLanguage": candidate.original_language,
+                    "images": candidate.images,
+                    "actors": candidate.actors,
+                    "metadataFetched": candidate.metadata_fetched,
+                })
+                .to_string();
+                PreparedMetadataCandidate {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    provider,
+                    provider_id,
+                    candidate_json,
+                    score,
+                    expires_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        let inputs = prepared
+            .iter()
+            .map(|candidate| NewMetadataCandidate {
+                id: &candidate.id,
                 item_id,
                 provider: &candidate.provider,
-                provider_id,
-                candidate_json: &candidate_json,
-                score,
-                expires_at,
+                provider_id: &candidate.provider_id,
+                candidate_json: &candidate.candidate_json,
+                score: candidate.score,
+                expires_at: candidate.expires_at,
             })
+            .collect::<Vec<_>>();
+        self.database
+            .insert_metadata_candidates(&inputs)
             .await
             .map_err(MetadataCandidateError::Storage)
     }
@@ -1336,16 +1454,26 @@ impl MetadataCandidateService {
             .ok()
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or_default();
-        for source in sources {
+        let mut candidate_keys = Vec::with_capacity(sources.len() * SCRAPER_IMAGE_TYPES.len());
+        for source in &sources {
             for image_type in SCRAPER_IMAGE_TYPES {
-                let candidate_key = image_no_candidate_key(&source, image_type, provider_id);
-                self.database
-                    .mark_metadata_image_unavailable(item_id, image_type, &candidate_key, now)
-                    .await
-                    .map_err(MetadataCandidateError::Storage)?;
+                candidate_keys.push((
+                    image_type,
+                    image_no_candidate_key(source, image_type, provider_id),
+                ));
             }
         }
-        Ok(())
+        let unavailable = candidate_keys
+            .iter()
+            .map(|(image_type, candidate_key)| MetadataImageUnavailable {
+                image_type,
+                candidate_key,
+            })
+            .collect::<Vec<_>>();
+        self.database
+            .mark_metadata_images_unavailable(item_id, &unavailable, now)
+            .await
+            .map_err(MetadataCandidateError::Storage)
     }
 }
 
@@ -1383,11 +1511,32 @@ struct CandidateMetadata {
     score: Option<f64>,
 }
 
+struct PreparedMetadataCandidate {
+    id: String,
+    provider: String,
+    provider_id: String,
+    candidate_json: String,
+    score: f64,
+    expires_at: Option<i64>,
+}
+
 #[derive(Clone, Copy)]
 enum CandidateSearchMode {
     Manual,
     AutomaticReuse,
     AutomaticFresh,
+}
+
+struct CandidateSearchOptions<'a> {
+    mode: CandidateSearchMode,
+    plan: MetadataRequestPlan,
+    current: Option<&'a StoredMediaMetadata>,
+}
+
+struct CandidateSearchContext<'a> {
+    current: &'a StoredMediaMetadata,
+    plan: MetadataRequestPlan,
+    reuse_current_snapshot: bool,
 }
 
 struct ParentProvider {

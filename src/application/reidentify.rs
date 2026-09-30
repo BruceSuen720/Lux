@@ -1213,27 +1213,44 @@ impl MetadataReidentifyService {
             || options.supplemental
             || options.preserve_identity
         {
-            self.candidates
-                .search_and_store_for_automatic_match_with_plan(
-                    item_id,
-                    &item.title,
-                    item.production_year
-                        .and_then(|year| i32::try_from(year).ok()),
-                    provider,
-                    options
-                        .request_plan
-                        .unwrap_or_else(MetadataRequestPlan::full),
-                )
-                .await
-                .map_err(MetadataReidentifyError::Candidate)?
+            let plan = options
+                .request_plan
+                .unwrap_or_else(MetadataRequestPlan::full);
+            let result = if options.supplemental {
+                // Earlier provider writes may have filled fields since the job loaded `item`.
+                self.candidates
+                    .search_and_store_for_automatic_match_with_plan(
+                        item_id,
+                        &item.title,
+                        item.production_year
+                            .and_then(|year| i32::try_from(year).ok()),
+                        provider,
+                        plan,
+                    )
+                    .await
+            } else {
+                self.candidates
+                    .search_and_store_for_automatic_match_with_plan_for_current(
+                        item_id,
+                        &item.title,
+                        item.production_year
+                            .and_then(|year| i32::try_from(year).ok()),
+                        provider,
+                        plan,
+                        item,
+                    )
+                    .await
+            };
+            result.map_err(MetadataReidentifyError::Candidate)?
         } else {
             self.candidates
-                .search_and_store_for_automatic_match_fresh(
+                .search_and_store_for_automatic_match_fresh_for_current(
                     item_id,
                     &item.title,
                     item.production_year
                         .and_then(|year| i32::try_from(year).ok()),
                     provider,
+                    item,
                 )
                 .await
                 .map_err(MetadataReidentifyError::Candidate)?

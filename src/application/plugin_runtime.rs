@@ -13,7 +13,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, RwLock, Semaphore, oneshot},
     time::{Instant, timeout_at},
@@ -30,6 +30,7 @@ const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PLUGIN_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PLUGIN_FILES: usize = 512;
 const MAX_PLUGIN_INFLIGHT: usize = 16;
+const MAX_PLUGIN_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 enum PluginConfigAccess {
@@ -566,18 +567,22 @@ impl PluginProcess {
     }
 
     async fn read_responses(weak: Weak<Self>, mut stdout: BufReader<ChildStdout>) {
+        let mut response_line = Vec::with_capacity(4096);
         loop {
-            let mut response_line = String::new();
-            let read_result = stdout.read_line(&mut response_line).await;
+            let read_result =
+                read_bounded_line(&mut stdout, &mut response_line, MAX_PLUGIN_RESPONSE_BYTES).await;
             let Some(process) = weak.upgrade() else {
                 return;
             };
             let bytes = match read_result {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    process
-                        .fail_pending(format!("plugin stdout read failed: {error}"))
-                        .await;
+                    let message = if error.kind() == io::ErrorKind::InvalidData {
+                        "plugin response is too large".to_owned()
+                    } else {
+                        format!("plugin stdout read failed: {error}")
+                    };
+                    process.fail_pending(message).await;
                     process.kill_child().await;
                     return;
                 }
@@ -588,14 +593,7 @@ impl PluginProcess {
                     .await;
                 return;
             }
-            if response_line.len() > 4 * 1024 * 1024 {
-                process
-                    .fail_pending("plugin response is too large".to_owned())
-                    .await;
-                process.kill_child().await;
-                return;
-            }
-            let response: PluginResponse = match serde_json::from_str(&response_line) {
+            let response: PluginResponse = match serde_json::from_slice(&response_line) {
                 Ok(response) => response,
                 Err(error) => {
                     process
@@ -752,6 +750,39 @@ impl fmt::Display for PluginRuntimeError {
 }
 
 impl std::error::Error for PluginRuntimeError {}
+
+async fn read_bounded_line<R>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    line.clear();
+    loop {
+        let (chunk_len, found_newline) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(line.len());
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let chunk_len = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(chunk_len) > max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "plugin response is too large",
+                ));
+            }
+            line.extend_from_slice(&available[..chunk_len]);
+            (chunk_len, newline.is_some())
+        };
+        reader.consume(chunk_len);
+        if found_newline {
+            return Ok(line.len());
+        }
+    }
+}
 
 fn discover_directory(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryError> {
     let manifest = read_manifest(&path.join("manifest.json"))?;
@@ -935,6 +966,35 @@ fn sha256_file(path: &Path) -> Result<String, PluginDiscoveryError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn plugin_response_line_reader_accepts_split_lines_within_the_limit() {
+        let mut reader = BufReader::with_capacity(2, std::io::Cursor::new(b"{\"a\":1}\nnext\n"));
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 8).await.unwrap(),
+            8
+        );
+        assert_eq!(line, b"{\"a\":1}\n");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 5).await.unwrap(),
+            5
+        );
+        assert_eq!(line, b"next\n");
+    }
+
+    #[tokio::test]
+    async fn plugin_response_line_reader_stops_before_growing_past_the_limit() {
+        let mut reader = BufReader::with_capacity(2, std::io::Cursor::new(b"123456789\n"));
+        let mut line = Vec::new();
+
+        let error = read_bounded_line(&mut reader, &mut line, 5)
+            .await
+            .expect_err("oversized response should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(line.len() <= 5);
+    }
 
     #[test]
     fn login_background_plugins_receive_only_their_dedicated_config_file() {
