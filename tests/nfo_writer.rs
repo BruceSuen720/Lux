@@ -58,7 +58,7 @@ fn nfo_rewrite_creates_a_movie_document_when_target_is_missing() {
 #[test]
 fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
 -> Result<(), Box<dyn std::error::Error>> {
-    let original = r#"<movie><title>旧标题</title><rating>1</rating><genre>旧类型</genre><actor><name>旧演员</name></actor><custom><keep>保留</keep></custom></movie>"#;
+    let original = r#"<movie><title>旧标题</title><rating>1</rating><genre>旧类型</genre><actor><name>旧演员</name></actor><id>tt-old</id><uniqueid type="official website">https://old.example/movie</uniqueid><uniqueid type="custom">custom-id</uniqueid><custom><keep>保留</keep></custom></movie>"#;
     let rewritten = rewrite_movie_nfo(
         original.as_bytes(),
         &MovieNfoMetadata {
@@ -125,6 +125,11 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
     assert!(text.contains("<status>Released</status>"));
     assert!(text.contains("<language>zh</language>"));
     assert!(text.contains("<website>https://example.com/movie</website>"));
+    assert!(text.contains("<id>tt38035835</id>"), "{text}");
+    assert!(
+        text.contains("<uniqueid type=\"official website\">https://example.com/movie</uniqueid>")
+    );
+    assert!(text.contains("<uniqueid type=\"custom\">custom-id</uniqueid>"));
     assert!(text.contains("<set>飞驰人生</set>"));
     assert!(text.contains("<setid>1281825</setid>"));
     assert!(text.contains(
@@ -149,6 +154,8 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
     assert!(text.contains("<trailer>https://www.youtube.com/watch?v=test</trailer>"));
     assert!(text.contains("<custom><keep>保留</keep></custom>"));
     assert!(!text.contains("<rating>1</rating>"));
+    assert!(!text.contains("<id>tt-old</id>"));
+    assert!(!text.contains("https://old.example/movie"));
     assert!(!text.contains("<genre>旧类型</genre>"));
     assert!(!text.contains("<name>旧演员</name>"));
     Ok(())

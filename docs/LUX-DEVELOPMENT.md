@@ -2143,7 +2143,7 @@ services:
 | LUX-262 | Lux-plugins/src/bin/lux-plugin-bing-daily-background.rs、manifests/org.lux.bing-daily-background.json、tests/、docs/；独立 Bing 每日图片插件 |
 | LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
 | LUX-317 | docs/LUX-317-PLAN.md、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/login_background_assets.rs、src/api/、web/src/features/admin/、Lux-plugins/；统一登录背景插件与单张自定义上传图 |
-| LUX-318 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；TMDb 丰富电影字段缺失检测与补抓 |
+| LUX-318 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；TMDb 电影完整详情候选与 NFO 写回 |
 | LUX-319 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；电影 NFO 演员上限扩展到 100 并保持顺序 |
 | LUX-320 | src/application/nfo.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
 | LUX-321 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后原子更新 NFO 技术信息 |
@@ -7723,19 +7723,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 明确不做：自动卸载远端服务器已安装的旧插件；自动继承旧插件的许可确认；上传多图/轮播；读取媒体库路径；插件进程直接访问图片文件；图片 CDN/代理/转码服务；改动 TMDb 元数据插件或其配置。
 
-#### LUX-318：TMDb 丰富电影字段缺失检测与补抓
+#### LUX-318：TMDb 电影完整详情候选与 NFO 写回
 
-范围：修复 `FILL_MISSING` 将已有标题、简介、年份、评分、上映日期和语言误当成电影 NFO 已完整的情况。电影 NFO 缺少 TMDb 支持的标语、官网、认证、国家、类型、制片公司、合集、演员/crew、外部 ID 或预告片时，候选缓存复用与自动补缺都必须请求尚未完成的详情能力；候选选择后将 provider 实际返回的字段写入 NFO。IMDb ID 可用时同时写入通用 `<id>`；官网可用时同时写入 `uniqueid type="official website"`。已存在或锁定的本地字段继续优先。
+范围：确保用户/任务下一次真正执行电影元数据刮削时，会请求完整电影详情并把 provider 返回的丰富字段写进 NFO。不得仅因已有 NFO 缺少标语、官网、认证、国家、类型或制片公司而触发 `FILL_MISSING`，也不为既有媒体增加专门回填任务。完整刮削、手动候选查询或其他本来需要详情的刮削继续遵守本地字段优先级与字段锁定。IMDb ID 可用时同时写入通用 `<id>`；官网可用时同时写入 `uniqueid type="official website"`。
 
-丰富元数据能力以一次成功的 provider 详情读取为边界；provider 明确不支持或无数据时记录该能力结果，避免每次扫描重复请求。搜索摘要不得标记为完整详情。TMDb 插件已经返回的字段继续由宿主统一合并与写回；不增加逐演员外部请求、数据库 schema 或公共 API。
+搜索摘要不得标记为完整详情。需要完整详情的刮削请求必须获取 TMDb 详情及本次计划要求的 credits、外部 ID 和预告片；若详情请求失败，候选搜索应失败并允许重试，不能把搜索摘要作为完整结果写入 NFO。TMDb 插件已经返回的字段继续由宿主统一合并与写回；不增加逐演员外部请求、数据库 schema 或公共 API。
 
 验收：
 
-- [ ] 基础 catalog 字段齐全但 rich NFO 字段缺失时，电影补缺计划仍会请求详情；搜索摘要缓存不能跳过这次请求。
-- [ ] 旧候选只有 `metadataFetched=true` 而没有当前 rich-details 版本标记时，不得阻止一次详情回填；成功详情有版本标记并记录能力结果。
+- [ ] 电影条目的基础字段齐全但 rich NFO 字段缺失时，单纯 `FILL_MISSING` 计划不创建刮削请求；完整刮削和手动刮削仍请求电影详情。
+- [ ] 完整刮削产生的每个可选电影候选都包含详情；旧搜索摘要/旧版本候选不能冒充完整详情。
 - [ ] TMDb 有返回值的 rating、上映日期、MPAA、国家、类型、制片公司、合集、标语、官网、外部 ID、导演/编剧、演员和预告片能通过正常候选选择写入 NFO。
 - [ ] IMDb ID 存在时写入 `<id>`，官网存在时写入相应 official-website uniqueid；值与原始 provider 值一致。
-- [ ] 已有/锁定 NFO 字段不被覆盖；provider 对某能力返回空后记录结果，不在后续扫描中无限重试；详情失败仍可重试。
+- [ ] 已有/锁定 NFO 字段不被覆盖；详情失败不能静默确认或写入搜索摘要候选，后续任务可重试。
 - [ ] 回归覆盖“核心字段已完整、NFO rich 字段为空”的自动补缺场景。
 
 明确不做：以 TMDb 伪造 `dateadded`、`fileinfo`、`streamdetails`、Douban ID 或非 TMDb 人物身份；这些字段仅由实际本地来源提供。

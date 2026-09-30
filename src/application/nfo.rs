@@ -1055,7 +1055,7 @@ fn rewrite_rich_nfo(
                     saw_root = true;
                 }
                 depth += 1;
-                if depth == 2 && replace_rich_root_tag(event.name().as_ref(), patch) {
+                if depth == 2 && replace_rich_root_tag(&event, patch) {
                     skip_depth = Some(depth);
                     buffer.clear();
                     continue;
@@ -1083,7 +1083,7 @@ fn rewrite_rich_nfo(
                     writer
                         .write_event(Event::End(BytesEnd::new(root_tag)))
                         .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
-                } else if depth == 1 && replace_rich_root_tag(event.name().as_ref(), patch) {
+                } else if depth == 1 && replace_rich_root_tag(&event, patch) {
                     buffer.clear();
                     continue;
                 } else {
@@ -1151,6 +1151,7 @@ fn rich_root_tag(tag: &[u8]) -> bool {
             | b"website"
             | b"set"
             | b"setid"
+            | b"id"
             | b"thumb"
             | b"fanart"
             | b"uniqueid"
@@ -1161,7 +1162,27 @@ fn rich_root_tag(tag: &[u8]) -> bool {
     )
 }
 
-fn replace_rich_root_tag(tag: &[u8], patch: &MovieNfoMetadata) -> bool {
+fn replace_rich_root_tag(event: &BytesStart<'_>, patch: &MovieNfoMetadata) -> bool {
+    let tag = event.name();
+    if tag.as_ref() == b"uniqueid" {
+        let identity_type = event
+            .attributes()
+            .flatten()
+            .find(|attribute| attribute.key.as_ref() == b"type")
+            .map(|attribute| attribute.value.into_owned());
+        return match identity_type.as_deref() {
+            Some(b"official website") => patch
+                .website
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            Some(b"tmdb") => provider_id_is_present(b"tmdbid", patch),
+            Some(b"imdb") => provider_id_is_present(b"imdbid", patch),
+            Some(b"tvdb") => provider_id_is_present(b"tvdbid", patch),
+            Some(b"wikidata") => provider_id_is_present(b"wikidataid", patch),
+            _ => false,
+        };
+    }
+    let tag = tag.as_ref();
     if !rich_root_tag(tag) {
         return false;
     }
@@ -1208,6 +1229,7 @@ fn replace_rich_root_tag(tag: &[u8], patch: &MovieNfoMetadata) -> bool {
             .website
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
+        b"id" => provider_id_is_present(b"imdbid", patch),
         b"set" => patch
             .set_name
             .as_deref()
@@ -1224,9 +1246,7 @@ fn replace_rich_root_tag(tag: &[u8], patch: &MovieNfoMetadata) -> bool {
             .fanart_url
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
-        b"uniqueid" | b"tmdbid" | b"imdbid" | b"tvdbid" | b"wikidataid" => {
-            provider_id_is_present(tag, patch)
-        }
+        b"tmdbid" | b"imdbid" | b"tvdbid" | b"wikidataid" => provider_id_is_present(tag, patch),
         _ => false,
     }
 }
@@ -1237,15 +1257,6 @@ fn provider_id_is_present(tag: &[u8], patch: &MovieNfoMetadata) -> bool {
         b"imdbid" => "imdb",
         b"tvdbid" => "tvdb",
         b"wikidataid" => "wikidata",
-        b"uniqueid" => {
-            return patch.provider_ids.iter().any(|(name, value)| {
-                !value.trim().is_empty()
-                    && matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "tmdb" | "imdb" | "tvdb" | "wikidata"
-                    )
-            });
-        }
         _ => return false,
     };
     patch
@@ -1326,6 +1337,7 @@ fn append_movie_nfo_fields(
     }
     if let Some(website) = non_empty(patch.website.as_deref()) {
         write_simple_element(writer, "website", website)?;
+        write_uniqueid(writer, "official website", website, false)?;
     }
     if let Some(set_name) = non_empty(patch.set_name.as_deref()) {
         write_simple_element(writer, "set", set_name)?;
@@ -1418,19 +1430,31 @@ fn append_provider_ids(
         }) else {
             continue;
         };
-        let mut uniqueid = BytesStart::new("uniqueid");
-        uniqueid.push_attribute(("type", provider.as_str()));
-        if provider == "tmdb" {
-            uniqueid.push_attribute(("default", "true"));
-        }
-        writer
-            .write_event(Event::Start(uniqueid))
-            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
-        write_text(writer, id)?;
-        end_element(writer, "uniqueid")?;
+        write_uniqueid(writer, &provider, id, provider == "tmdb")?;
         write_simple_element(writer, tag, id)?;
+        if provider == "imdb" {
+            write_simple_element(writer, "id", id)?;
+        }
     }
     Ok(())
+}
+
+fn write_uniqueid(
+    writer: &mut Writer<Vec<u8>>,
+    provider: &str,
+    id: &str,
+    default: bool,
+) -> Result<(), NfoWriteError> {
+    let mut uniqueid = BytesStart::new("uniqueid");
+    uniqueid.push_attribute(("type", provider));
+    if default {
+        uniqueid.push_attribute(("default", "true"));
+    }
+    writer
+        .write_event(Event::Start(uniqueid))
+        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+    write_text(writer, id)?;
+    end_element(writer, "uniqueid")
 }
 
 fn start_element(

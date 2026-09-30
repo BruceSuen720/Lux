@@ -758,3 +758,9 @@ SenPlayer 6.0.6 的历史实测结果：服务器已添加，但客户端重复�
 6. logout 后再次访问 `System/Info`，应为 `401`
 
 密码通过 `LUX_PROBE_PASSWORD` 注入，token 只在进程内使用；输出只包含路径、状态码和响应字段摘要。该工具用于协议回归，不等同于 VidHub、SenPlayer 或 Infuse 的真实客户端兼容性结论。
+
+## TMDb 电影 NFO 字段（2026-09-30）
+
+电影手动识别或完整刮削时，Lux 将 TMDb 能提供的评分、发行信息、类型、国家、制片公司、合集、官网、外部 ID、crew、演员和预告片写入 Emby/Kodi 风格 NFO；有 IMDb ID 时写 `<id>`，有官网时写 `uniqueid type="official website"`。未知 XML 字段保留。仅因为已有 NFO 缺少这些丰富字段，不会额外创建 `FILL_MISSING` 刮削任务；下一次真实元数据刮削会请求完整详情。
+
+Rust 回归由 `tests/metadata_selection.rs`、`tests/nfo_writer.rs` 覆盖；它们证明代码序列化与合并合同，不代表某一台已部署 Lux 与 Emby 的现场文件对比。
