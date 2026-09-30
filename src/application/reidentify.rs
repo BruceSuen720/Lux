@@ -1971,6 +1971,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backup_fill_missing_plan_skips_capability_attempt_history()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                provider_ids_json = '{\"tmdb\":\"603\"}',
+                metadata_scraper_id = 'tmdb',
+                identification_status = 'ONLINE_CONFIRMED'
+             WHERE id = ?",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+
+        database.reset_query_count();
+        let plan = selection
+            .fallback_request_plan_for_current(&item_id, &current)
+            .await?;
+
+        assert!(plan.needs_metadata);
+        assert_eq!(
+            database.query_count(),
+            6,
+            "fallbacks need current completeness but not primary-provider retry history"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fill_missing_skips_complete_local_items_before_resolving_scrapers()
     -> Result<(), Box<dyn Error>> {
         let (temp_dir, config, database, item_id) = role_test_fixture().await?;
@@ -1978,8 +2016,8 @@ mod tests {
             "UPDATE media_items SET
                 item_type = 'EPISODE', overview = 'Existing overview',
                 premiere_date = '2020-01-01',
-                provider_ids_json = ?, identification_status = 'LOCAL_CONFIRMED',
-                metadata_scraper_id = NULL, metadata_provenance_json = ?
+                provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
+                metadata_scraper_id = 'tmdb', metadata_provenance_json = ?
              WHERE id = ?",
         )
         .bind(serde_json::json!({"tmdb": "603", "imdb": "tt0133093"}).to_string())
@@ -2013,12 +2051,18 @@ mod tests {
             .find_media_item_metadata(&item_id)
             .await?
             .ok_or("fixture episode is missing")?;
+        database.reset_query_count();
         let plan = selection
             .fill_missing_request_plan_for_current(&item_id, &current)
             .await?;
         assert!(
             super::metadata_request_plan_is_complete(plan.requestable),
             "unexpected fill-missing plan: {plan:?}"
+        );
+        assert_eq!(
+            database.query_count(),
+            6,
+            "a complete item skips capability and image attempt-history reads"
         );
         let service = super::MetadataReidentifyService::with_selection(
             database.clone(),
