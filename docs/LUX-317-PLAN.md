@@ -6,7 +6,7 @@
 
 新建唯一插件 `org.lux.login-background`，插件配置选 Bing 每日图、TMDb 日榜或单张自定义上传图片。保持与 `org.lux.tmdb` 元数据插件独立。Bing/TMDb 原 provider 合同、许可提示、榜单选择和宿主 HERO_IMAGE 布局不变；Bing 个人用途和 TMDb 非商业许可确认保留为不同、默认关闭的开关。自定义图需独立确认公开展示权。
 
-自定义图片规则：单张，JPEG/PNG/WebP，最多 5 MiB 和 20 MP；校验真实文件格式和尺寸、原字节保存，不压缩或重编码。上传成功后原子切换新图并清理旧资源；出错时仍保留旧资源。文件由 Lux 存放在配置目录的专用目录，插件进程无文件系统访问。manifest 配置字段 `type: image` 只允许 login_background 插件且配置值为 `sha256:<64 位小写十六进制>` opaque ID，不是路径或 URL。
+自定义图片规则：单张，JPEG/PNG/WebP，最多 5 MiB 和 20 MP；校验真实文件格式和尺寸、原字节保存，不压缩或重编码。上传成功后原子切换新图并清理旧资源；出错时仍保留旧资源。文件由 Lux 存放在配置目录的专用目录，插件进程无文件系统访问。manifest 配置字段 `type: image` 只允许 `org.lux.login-background` 声明一个，且配置值为 `sha256:<64 位小写十六进制>` opaque ID，不是路径或 URL。
 
 上传 API：`PUT /api/v1/admin/plugins/{plugin_id}/config/image/{field_key}`；管理员鉴权并验证 CSRF；服务端校验 body 大小和 manifest field。插件 RPC 的 image URL 固定为 `/api/v1/auth/login-background/custom-image`，仅当 manifest ID 精确等于 `org.lux.login-background` 且声明 image 字段时允许。该 GET/HEAD 同源路由只有插件已安装、启用、可用且服务器选择 `PLUGIN:org.lux.login-background`、plugin config `source=CUSTOM_IMAGE` 时服务文件，否则 404。返回 sniff 后 MIME、`nosniff`、强 ETag、`Cache-Control: no-cache, must-revalidate`；匹配 If-None-Match 时 304，HEAD 无 body。其它插件仍须使用 HTTPS 且命中 manifest `imageHosts`。
 
@@ -79,5 +79,11 @@ let is_custom_asset = manifest.id == UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID
 
 - A1：SDK image config、SHA-256 ID 与固定 RPC URL。`plugin_protocol` 33 项及 image config unit test 通过；fmt 通过。
 - A2：`login_background_assets` 单图文件服务。8 项单测覆盖原字节/三格式、5 MiB/20 MP、有界 hash、幂等、prune 和符号链接拒绝；`cargo clippy --locked --lib --all-features -- -D warnings` 通过。
+- A3：PluginService 串行化配置写入，只由 upload API 设置 opaque image ID；普通 JSON config 不可伪造资源 ID。
+- A4：管理员上传与公开 GET/HEAD 同源路由。集成覆盖管理员/CSRF、固定 path 与 source mode gate、ETag/304、HEAD、5 MiB、格式校验、替换清理和 disabled 404。
 
-A3 当前实施目标：`PluginService` 的 image field/opaque ID 更新与管理员上传协调；之后 A4 为 `src/api/admin.rs`、`src/api/admin_handlers.rs`、`src/api/users.rs`、`tests/login_background.rs`、`docs/API.md` 的上传和 GET/HEAD routes。每个 slice 重新列预计文件，控制在 5 个实现文件内。Lux 主路径存在其它用户任务的未提交修改，LUX-317 使用独立 managed worktree，只精确暂存本任务文件。
+定向验证：`cargo test --locked --test plugin_protocol --test plugins --test login_background`（45 tests）通过；`cargo test --locked --lib application::plugins::plugin_update_tests`（6 tests）和 `cargo test --locked --lib application::login_background_assets::tests`（8 tests）通过。`cargo build --locked`、全目标 Clippy（`-D warnings`）、fmt 与 `git diff --check` 通过。
+
+全局阶段门尚未通过：`cargo test --locked --all-targets -- --test-threads=1` 的 638 个 library tests 通过（10 ignored），但集成测试 `tests/shutdown.rs::unix::luxd_exits_cleanly_on_sigterm_after_startup` 两次在 10 秒内没有观测到 child listener。该失败也在干净的 `test` 分支 control worktree 复现；同一生成的 `target/debug/luxd` 直接以临时配置启动时，`/health/live` 返回 200。shutdown 源文件最终未修改。故阶段 A 功能验收目标通过，但项目全局门仍因可复现的基线 shutdown 测试失败而暂停；等待项目所有者决定先处理该基线测试还是批准带此既有失败进入阶段 B。
+
+Lux 主工作目录里有并行任务的未提交修改；LUX-317 在独立 managed worktree 实现，只精确暂存本任务文件。
