@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -608,16 +608,16 @@ impl ImageWriteService {
         Ok(())
     }
 
-    pub(crate) async fn image_source_url_exists(
+    pub(crate) async fn existing_image_source_urls(
         &self,
         item_id: &str,
         image_type: &str,
-        source_url: &str,
-    ) -> Result<bool, ImageWriteError> {
+        source_urls: &[String],
+    ) -> Result<HashSet<String>, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
         self.database
-            .item_image_source_url_exists(item_id, image_type, source_url)
+            .list_existing_item_image_source_urls(item_id, image_type, source_urls)
             .await
             .map_err(ImageWriteError::Storage)
     }

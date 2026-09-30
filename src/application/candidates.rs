@@ -2821,21 +2821,33 @@ impl MetadataSelectionService {
         image_type: &str,
         urls: Vec<String>,
     ) -> Result<Vec<String>, MetadataSelectionError> {
+        const IMAGE_SOURCE_URL_LOOKUP_BATCH_SIZE: usize = 100;
+
         let mut seen = HashSet::new();
-        let mut filtered = Vec::with_capacity(urls.len());
-        for url in urls {
-            let url = url.trim().to_owned();
-            if url.is_empty() || !seen.insert(url.clone()) {
+        let mut filtered = Vec::with_capacity(MAX_IMAGE_VARIANTS);
+        for chunk in urls.chunks(IMAGE_SOURCE_URL_LOOKUP_BATCH_SIZE) {
+            let candidates = chunk
+                .iter()
+                .map(|url| url.trim())
+                .filter(|url| !url.is_empty())
+                .filter(|url| seen.insert((*url).to_owned()))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
                 continue;
             }
-            if self
+            let existing = self
                 .images
-                .image_source_url_exists(item_id, image_type, &url)
-                .await?
-            {
-                continue;
+                .existing_image_source_urls(item_id, image_type, &candidates)
+                .await?;
+            for url in candidates {
+                if !existing.contains(&url) {
+                    filtered.push(url);
+                    if filtered.len() == MAX_IMAGE_VARIANTS {
+                        return Ok(filtered);
+                    }
+                }
             }
-            filtered.push(url);
         }
         Ok(filtered)
     }
