@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.8",
+    date: "2026-09-30",
+    sections: [
+      { kind: "changed", items: [
+        "Emby 媒体库支持按 ProductionYear 升序或降序排序；缺少年份的条目置后，文件夹子项也在分页前应用排序。",
+        "详情页音轨和字幕选择器采用更紧凑的响应式布局，限制长文本宽度并省略显示，避免窄屏或长轨道名造成控件重叠。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.7",
     date: "2026-09-30",
     sections: [
