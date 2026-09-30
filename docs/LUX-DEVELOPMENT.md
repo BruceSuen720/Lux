@@ -2146,7 +2146,8 @@ services:
 | LUX-318 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；TMDb 电影完整详情候选与 NFO 写回 |
 | LUX-319 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；电影 NFO 演员上限扩展到 100 并保持顺序 |
 | LUX-320 | src/application/nfo.rs、src/application/probe.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
-| LUX-321 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后原子更新 NFO 技术信息 |
+| LUX-321 | src/application/nfo.rs、src/storage/media.rs、tests/nfo_writer.rs、docs/COMPATIBILITY.md、docs/；为电影 NFO 写入数据库时间/排序值并提供原子 probe-info 写回服务 |
+| LUX-322 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后调用 NFO 技术信息写回 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
@@ -7725,7 +7726,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-318：TMDb 电影完整详情候选与 NFO 写回
 
-范围：确保用户/任务下一次真正执行电影元数据刮削时，会请求完整电影详情并把 provider 返回的丰富字段写进 NFO。不得仅因已有 NFO 缺少标语、官网、认证、国家、类型或制片公司而触发 `FILL_MISSING`，也不为既有媒体增加专门回填任务。完整刮削、手动候选查询或其他本来需要详情的刮削继续遵守本地字段优先级与字段锁定。IMDb ID 可用时同时写入通用 `<id>`；官网可用时同时写入 `uniqueid type="official website"`。
+范围：确保用户/任务下一次真正执行电影元数据刮削时，会请求完整电影详情并把 provider 返回的丰富字段写进 NFO。不得仅因已有 NFO 缺少标语、官网、认证、国家、类型或制片公司而触发 `FILL_MISSING`，也不为既有媒体增加专门回填任务。完整刮削、手动候选查询或其他本来需要详情的刮削继续遵守本地字段优先级与字段锁定。IMDb ID 可用时同时写入通用 `<id>`；官网可用时同时写入 `uniqueid type="official website"`。电影 NFO 的 `sorttitle` 和 `dateadded` 读取 Lux 数据库已有值，不由 TMDb 生成。
 
 搜索摘要不得标记为完整详情。需要完整详情的刮削请求必须获取 TMDb 详情及本次计划要求的 credits、外部 ID 和预告片；若详情请求失败，候选搜索应失败并允许重试，不能把搜索摘要作为完整结果写入 NFO。TMDb 插件已经返回的字段继续由宿主统一合并与写回；不增加逐演员外部请求、数据库 schema 或公共 API。
 
@@ -7777,22 +7778,39 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-054、LUX-168、LUX-172。
 
-#### LUX-321：本地探测完成后更新 NFO 技术信息
+#### LUX-321：电影 NFO 数据库字段与技术信息写回服务
 
-范围：本地媒体探测成功并提交 media streams 后，用同一份探测结果原子更新该媒体条目的 NFO `fileinfo/streamdetails`，并刷新 NFO 指纹和已启用的 `/config/metadata/library` 镜像。该更新独立于在线刮削，不读取 `.strm` 目标，不将外部远程媒体信息写入本地 NFO。
+范围：完整电影 NFO 写回时，将数据库中的真实 `sort_title` 和 `added_at` 写入缺失的 `<sorttitle>` 与 `<dateadded>`；已有本地值始终保留。提供 probe-info 写回服务：只接受当前默认本地电影 source，将本地探测结果原子合并为 `fileinfo/streamdetails`，刷新 NFO 指纹，并同步已启用的 `/config/metadata/library` 镜像。该服务本身不由扫描阶段自动调用，接线由 LUX-322 负责。
 
 验收：
 
-- [ ] 新探测结果写入实际媒体旁车 NFO；再次探测替换旧 streamdetails，不产生重复轨道。
-- [ ] TMDb rich 字段、用户已有未知 XML 和其他媒体信息在技术字段更新时保持不变。
-- [ ] NFO 写回失败不得丢失已提交的媒体探测结果；错误通过现有任务/日志路径可诊断，且不记录完整媒体路径。
-- [ ] 已启用的配置卷 NFO 镜像与媒体目录 NFO 一致。
+- [ ] 数据库 NFO 辅助字段只补空值；已有 `sorttitle`/`dateadded` 不被覆盖，新 NFO 使用 `media_items.sort_title` 与 `added_at`。
+- [ ] probe-info 写回只作用于当前默认的本地电影 source，`.strm` 与其他媒体类型返回未处理，不生成本地技术信息。
+- [ ] 替换旧 streamdetails 时保留 fileinfo 下其他 XML、TMDb rich 字段与其他未知 XML；写回原子且刷新 NFO 指纹/策略启用的镜像。
+- [ ] probe-info writer 的定向测试覆盖嵌入轨道、替换、空数据和镜像行为。
 
-明确不做：为 `.strm` 创建虚构的本地 streamdetails；修改 Emby API 的媒体轨输出；增加新的探测器或 Cargo 依赖。
+明确不做：为 `.strm` 创建虚构的本地 streamdetails；修改 Emby API 的媒体轨输出；增加新的探测器或 Cargo 依赖；单独为已有缺失的 NFO 新建回填任务。
 
-验证：`cargo test --locked --test probe`、`cargo test --locked --test nfo_writer`、格式检查；任务完成时运行全 Rust 门禁。
+验证：`cargo test --locked --test nfo_writer`、格式检查。
 
 依赖：LUX-168、LUX-198、LUX-320。
+
+#### LUX-322：本地探测完成后更新 NFO 技术信息
+
+范围：将 LUX-321 的 NFO probe-info 写回服务接入本地媒体探测成功路径。仅在 probe 结果成功并提交数据库后执行；NFO 写回失败通过脱敏错误码记录，不回滚已提交媒体探测数据，也不记录完整媒体路径。
+
+验收：
+
+- [ ] 本地电影 probe 成功后，同名/既有电影 NFO 和策略启用的配置卷镜像包含实际探测到的 streamdetails。
+- [ ] 重复探测替换已有 streamdetails，不产生重复轨道；媒体其他元数据保持不变。
+- [ ] `.strm` sidecar 的 probe 结果永不写入 `.strm` 相邻 NFO；非默认多版本 source 不污染默认版本 NFO。
+- [ ] probe 成功但 NFO 写回失败时，媒体探测状态和轨道数据仍保持成功，可从脱敏日志定位失败类别。
+
+明确不做：代理或读取 `.strm` URL 指向的远程媒体；为缺失的历史 NFO 执行后台回填；更改 Emby 媒体轨 API。
+
+验证：`cargo test --locked --test probe`、`cargo fmt --all -- --check`；任务完成时运行全 Rust 门禁。
+
+依赖：LUX-320、LUX-321。
 
 ## 28. 参考资料
 

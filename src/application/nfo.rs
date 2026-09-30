@@ -14,6 +14,7 @@ use quick_xml::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -1020,6 +1021,156 @@ pub fn rewrite_nfo_probe_details(
     let movie = rewrite_movie_nfo(original, &MovieNfoMetadata::default())?;
     let streamdetails = serialize_probe_streamdetails(probe)?;
     rewrite_nfo_fileinfo(&movie, streamdetails.as_deref())
+}
+
+fn rewrite_movie_nfo_auxiliary_fields(
+    original: &[u8],
+    sort_title: Option<&str>,
+    date_added: Option<&str>,
+) -> Result<Vec<u8>, NfoWriteError> {
+    parse_nfo(original).map_err(NfoWriteError::Nfo)?;
+    let sort_title = sort_title
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_MOVIE_NFO_DETAILS_TEXT_BYTES)
+        .filter(|value| value.chars().all(is_valid_xml_character));
+    let date_added = date_added
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_MOVIE_NFO_DETAILS_TEXT_BYTES)
+        .filter(|value| value.chars().all(is_valid_xml_character));
+    let add_sort_title = sort_title.is_some() && !nfo_root_field_has_value(original, b"sorttitle")?;
+    let add_date_added = date_added.is_some() && !nfo_root_field_has_value(original, b"dateadded")?;
+    if !add_sort_title && !add_date_added {
+        return Ok(original.to_vec());
+    }
+
+    let mut reader = Reader::from_reader(original);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut saw_root = false;
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => {
+                if depth != 0 || !saw_root {
+                    return Err(NfoWriteError::InvalidXml(
+                        "NFO document does not contain a complete root element".to_owned(),
+                    ));
+                }
+                break;
+            }
+            Ok(Event::Start(event)) => {
+                if depth == 0 {
+                    saw_root = true;
+                }
+                writer
+                    .write_event(Event::Start(event.to_owned()))
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                depth = depth.saturating_add(1);
+            }
+            Ok(Event::End(event)) => {
+                if depth == 1 {
+                    if add_sort_title && let Some(sort_title) = sort_title {
+                        write_simple_element(&mut writer, "sorttitle", sort_title)?;
+                    }
+                    if add_date_added && let Some(date_added) = date_added {
+                        write_simple_element(&mut writer, "dateadded", date_added)?;
+                    }
+                }
+                writer
+                    .write_event(Event::End(event.to_owned()))
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Empty(event)) => {
+                if depth == 0 {
+                    saw_root = true;
+                }
+                writer
+                    .write_event(Event::Empty(event.to_owned()))
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+            }
+            Ok(event) => {
+                writer
+                    .write_event(event.to_owned())
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+            }
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+    let rewritten = writer.into_inner();
+    if rewritten.len() > MAX_LOCAL_NFO_BYTES {
+        return Err(NfoWriteError::InvalidMetadata(
+            "NFO exceeds the output size limit".to_owned(),
+        ));
+    }
+    parse_nfo(&rewritten).map_err(NfoWriteError::Nfo)?;
+    Ok(rewritten)
+}
+
+fn nfo_root_field_has_value(original: &[u8], field: &[u8]) -> Result<bool, NfoWriteError> {
+    let mut reader = Reader::from_reader(original);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut field_depth = None;
+    let mut has_value = false;
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => return Ok(false),
+            Ok(Event::Start(event)) => {
+                if depth == 1 && event.name().as_ref().eq_ignore_ascii_case(field) {
+                    field_depth = Some(depth.saturating_add(1));
+                }
+                depth = depth.saturating_add(1);
+            }
+            Ok(Event::Empty(event)) => {
+                if depth == 1 && event.name().as_ref().eq_ignore_ascii_case(field) {
+                    has_value = false;
+                }
+            }
+            Ok(Event::Text(event)) if field_depth == Some(depth) => {
+                let decoded = event
+                    .decode()
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                let value = unescape(decoded.as_ref())
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                has_value |= !value.trim().is_empty();
+            }
+            Ok(Event::CData(event)) if field_depth == Some(depth) => {
+                let value = event
+                    .decode()
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                has_value |= !value.trim().is_empty();
+            }
+            Ok(Event::End(_)) => {
+                if field_depth == Some(depth) {
+                    if has_value {
+                        return Ok(true);
+                    }
+                    field_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+}
+
+fn nfo_date_added(unix_seconds: i64) -> Option<String> {
+    let date = OffsetDateTime::from_unix_timestamp(unix_seconds).ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day(),
+        date.hour(),
+        date.minute(),
+        date.second()
+    ))
 }
 
 pub fn rewrite_series_nfo(
@@ -2029,13 +2180,83 @@ impl NfoWriteService {
         patch: &MovieNfoMetadata,
     ) -> Result<NfoWriteReport, NfoWriteError> {
         let target = self.item_nfo_target(item_id).await?;
+        let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
         let write = write_nfo_atomically_with_rewriter(
             &target,
-            |original| rewrite_movie_nfo(original, patch),
+            |original| {
+                let rich = rewrite_movie_nfo(original, patch)?;
+                rewrite_movie_nfo_auxiliary_fields(
+                    &rich,
+                    sort_title.as_deref(),
+                    date_added.as_deref(),
+                )
+            },
             None,
         )
         .await?;
         self.finish_item_write(item_id, target, write).await
+    }
+
+    pub async fn write_item_probe_details(
+        &self,
+        item_id: &str,
+        source_id: &str,
+        probe: &MediaProbeResult,
+    ) -> Result<bool, NfoWriteError> {
+        let Some(kind) = self.database.find_media_item_kind(item_id).await? else {
+            return Ok(false);
+        };
+        if kind.item_type != "MOVIE" {
+            return Ok(false);
+        }
+        let Some(writeback_source) = self
+            .database
+            .find_metadata_writeback_source_path(item_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let is_strm = Path::new(&writeback_source.relative_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("strm"));
+        if writeback_source.source_id != source_id || is_strm {
+            return Ok(false);
+        }
+        let target = self.item_nfo_target(item_id).await?;
+        let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
+        let write = write_nfo_atomically_with_rewriter(
+            &target,
+            |original| {
+                let details = rewrite_nfo_probe_details(original, probe)?;
+                rewrite_movie_nfo_auxiliary_fields(
+                    &details,
+                    sort_title.as_deref(),
+                    date_added.as_deref(),
+                )
+            },
+            None,
+        )
+        .await?;
+        self.finish_item_write(item_id, target, write).await?;
+        Ok(true)
+    }
+
+    async fn movie_nfo_auxiliary_fields(
+        &self,
+        item_id: &str,
+    ) -> Result<(Option<String>, Option<String>), NfoWriteError> {
+        let Some((sort_title, added_at)) = self
+            .database
+            .find_movie_nfo_auxiliary_fields(item_id)
+            .await?
+        else {
+            return Ok((None, None));
+        };
+        Ok((
+            non_empty(Some(sort_title.as_str())).map(str::to_owned),
+            nfo_date_added(added_at),
+        ))
     }
 
     pub async fn write_item_series_nfo(
