@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     sync::{
         Arc,
@@ -17,7 +17,6 @@ use crate::application::{
 };
 
 const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
-const HOME_SHARED_CACHE_TTL: Duration = Duration::from_secs(60);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const HOME_INVALIDATION_DEBOUNCE: Duration = Duration::from_millis(100);
 const MAX_HOME_CACHE_ENTRIES: usize = 256;
@@ -81,21 +80,7 @@ struct CachedSnapshot {
 }
 
 struct CachedHomeSnapshot {
-    recently_added: CatalogPage,
     recommended: Vec<CatalogItem>,
-    latest_groups: Vec<(String, Vec<CatalogItem>)>,
-    views: Vec<LibraryView>,
-}
-
-struct HomeSharedSnapshot {
-    latest_groups: Vec<(String, Vec<CatalogItem>)>,
-    views: Vec<LibraryView>,
-}
-
-struct CachedSharedSnapshot {
-    generation: u64,
-    refreshed_at: Instant,
-    snapshot: Arc<HomeSharedSnapshot>,
 }
 
 #[derive(Default)]
@@ -110,8 +95,6 @@ struct HomeServiceInner {
     libraries: LibraryService,
     generation: AtomicU64,
     entries: Mutex<HashMap<HomeCacheKey, Arc<HomeCacheEntry>>>,
-    shared: Mutex<Option<CachedSharedSnapshot>>,
-    shared_compute_lock: Mutex<()>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
     scan_invalidation: Mutex<ScanInvalidationState>,
@@ -134,9 +117,7 @@ impl HomeService {
             catalog,
             libraries,
             generation: AtomicU64::new(0),
-            shared: Mutex::new(None),
             entries: Mutex::new(HashMap::new()),
-            shared_compute_lock: Mutex::new(()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
             scan_invalidation: Mutex::new(ScanInvalidationState::default()),
@@ -172,21 +153,64 @@ impl HomeService {
     ) -> Result<Arc<HomeSnapshot>, HomeError> {
         library_ids.sort_unstable();
         library_ids.dedup();
-        let cached = self.cached_snapshot(principal, &library_ids).await?;
+        let recommended = self.carousel(principal, library_ids.clone()).await?;
         let user_id = principal.user_id.to_string();
-        let continue_watching = self
+        let (continue_watching, recently_added, latest_groups, views) = tokio::try_join!(
+            async {
+                self.inner
+                    .catalog
+                    .list_home_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
+                    .await
+                    .map_err(HomeError::Catalog)
+            },
+            async {
+                self.inner
+                    .catalog
+                    .list_recently_added_for_library_ids(&library_ids, 0, 12)
+                    .await
+                    .map_err(HomeError::Catalog)
+            },
+            async {
+                self.inner
+                    .catalog
+                    .list_recently_added_by_library_ids(&library_ids, 12)
+                    .await
+                    .map_err(HomeError::Catalog)
+            },
+            async {
+                self.inner
+                    .libraries
+                    .list_libraries()
+                    .await
+                    .map_err(HomeError::Libraries)
+            },
+        )?;
+        let views = self
             .inner
-            .catalog
-            .list_home_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
-            .await
-            .map_err(HomeError::Catalog)?;
+            .libraries
+            .order_views_for_user(&user_id, principal.is_admin, &library_ids, views)
+            .await?;
         Ok(Arc::new(HomeSnapshot {
             continue_watching,
-            recently_added: cached.recently_added.clone(),
-            recommended: cached.recommended.clone(),
-            latest_groups: cached.latest_groups.clone(),
-            views: cached.views.clone(),
+            recently_added,
+            recommended,
+            latest_groups,
+            views,
         }))
+    }
+
+    pub(crate) async fn carousel(
+        &self,
+        principal: AccessPrincipal,
+        mut library_ids: Vec<String>,
+    ) -> Result<Vec<CatalogItem>, HomeError> {
+        library_ids.sort_unstable();
+        library_ids.dedup();
+        Ok(self
+            .cached_snapshot(principal, &library_ids)
+            .await?
+            .recommended
+            .clone())
     }
 
     async fn cached_snapshot(
@@ -229,10 +253,7 @@ impl HomeService {
                 }
             }
 
-            let snapshot = Arc::new(
-                self.build_cached_snapshot(principal, library_ids, true)
-                    .await?,
-            );
+            let snapshot = Arc::new(self.build_cached_snapshot(principal, library_ids).await?);
             if self.inner.generation.load(Ordering::Acquire) != generation
                 || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
             {
@@ -368,64 +389,9 @@ impl HomeService {
             .clone()
     }
 
-    async fn refresh_shared_snapshot(
-        &self,
-        force: bool,
-    ) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
-        let _compute_guard = self.inner.shared_compute_lock.lock().await;
-        let generation = self.inner.generation.load(Ordering::Acquire);
-        {
-            let cached = self.inner.shared.lock().await;
-            if !force
-                && let Some(cached) = cached.as_ref()
-                && cached.generation == generation
-                && cached.refreshed_at.elapsed() < HOME_SHARED_CACHE_TTL
-            {
-                return Ok(cached.snapshot.clone());
-            }
-        }
-
-        let views = self.inner.libraries.list_libraries().await?;
-        let enabled_library_ids = views
-            .iter()
-            .filter(|view| view.library.is_enabled)
-            .map(|view| view.library.id.to_string())
-            .collect::<Vec<_>>();
-        let latest_groups = self
-            .inner
-            .catalog
-            .list_recently_added_by_library_ids(&enabled_library_ids, 12)
-            .await?;
-        let snapshot = Arc::new(HomeSharedSnapshot {
-            latest_groups,
-            views: views
-                .into_iter()
-                .filter(|view| view.library.is_enabled)
-                .collect(),
-        });
-        let generation_changed = self.inner.generation.load(Ordering::Acquire) != generation;
-        *self.inner.shared.lock().await = Some(CachedSharedSnapshot {
-            generation,
-            refreshed_at: Instant::now(),
-            snapshot: snapshot.clone(),
-        });
-        if generation_changed {
-            self.schedule_refresh();
-        }
-        Ok(snapshot)
-    }
-
     async fn refresh_cached_entries(&self, force: bool) -> bool {
         let generation = self.inner.generation.load(Ordering::Acquire);
         let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
-        let mut refreshed_all = true;
-        if let Err(error) = self.refresh_shared_snapshot(force).await {
-            tracing::warn!(%error, "failed to refresh shared home snapshot");
-            if force {
-                return false;
-            }
-            refreshed_all = false;
-        }
         if force
             && (self.inner.generation.load(Ordering::Acquire) != generation
                 || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch)
@@ -440,6 +406,7 @@ impl HomeService {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut refreshed_all = true;
         for entry in entries {
             let compute_guard = if force {
                 Some(entry.compute_lock.lock().await)
@@ -473,7 +440,7 @@ impl HomeService {
             drop(cached);
             let notified = self.inner.invalidation_notify.notified();
             let result = tokio::select! {
-                result = self.build_cached_snapshot(entry.principal, &entry.library_ids, false) => Some(result),
+                result = self.build_cached_snapshot(entry.principal, &entry.library_ids) => Some(result),
                 _ = notified => None,
             };
             match result {
@@ -507,76 +474,14 @@ impl HomeService {
         &self,
         principal: AccessPrincipal,
         accessible_library_ids: &[String],
-        require_fresh_shared: bool,
     ) -> Result<CachedHomeSnapshot, HomeError> {
-        let shared = if require_fresh_shared {
-            self.refresh_shared_snapshot(false).await?
-        } else {
-            self.shared_snapshot().await?
-        };
         let user_id = principal.user_id.to_string();
-        let (recently_added, recommended, views) = tokio::try_join!(
-            async {
-                self.inner
-                    .catalog
-                    .list_recently_added_for_library_ids(accessible_library_ids, 0, 12)
-                    .await
-                    .map_err(HomeError::Catalog)
-            },
-            async {
-                self.inner
-                    .catalog
-                    .list_recommended_for_library_ids(accessible_library_ids, &user_id, 7)
-                    .await
-                    .map_err(HomeError::Catalog)
-            },
-            async {
-                self.inner
-                    .libraries
-                    .order_views_for_user(
-                        &user_id,
-                        principal.is_admin,
-                        accessible_library_ids,
-                        shared.views.clone(),
-                    )
-                    .await
-                    .map_err(HomeError::Libraries)
-            },
-        )?;
-        let accessible_library_ids = accessible_library_ids
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let latest_groups = shared
-            .latest_groups
-            .iter()
-            .filter(|(library_id, _)| accessible_library_ids.contains(library_id))
-            .cloned()
-            .collect();
-        Ok(CachedHomeSnapshot {
-            recently_added,
-            recommended,
-            latest_groups,
-            views,
-        })
-    }
-
-    async fn shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
-        let generation = self.inner.generation.load(Ordering::Acquire);
-        {
-            let cached = self.inner.shared.lock().await;
-            if let Some(cached) = cached.as_ref() {
-                if cached.generation == generation {
-                    if cached.refreshed_at.elapsed() >= HOME_SHARED_CACHE_TTL {
-                        self.schedule_refresh();
-                    }
-                    return Ok(cached.snapshot.clone());
-                }
-                self.schedule_refresh();
-                return Ok(cached.snapshot.clone());
-            }
-        }
-        self.refresh_shared_snapshot(false).await
+        let recommended = self
+            .inner
+            .catalog
+            .list_recommended_for_library_ids(accessible_library_ids, &user_id, 7)
+            .await?;
+        Ok(CachedHomeSnapshot { recommended })
     }
 }
 
@@ -600,32 +505,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn shared_home_snapshot_stays_available_during_refresh() {
-        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
-        let config = Config {
-            http_addr: "127.0.0.1:8097".parse().expect("test address"),
-            config_dir: temp_dir.path().join("config"),
-        };
-        let database = Database::connect(&config).await.expect("database");
-        let access = MediaAccessService::new(database.clone());
-        let home = HomeService::new(
-            CatalogService::new(database.clone(), access.clone()),
-            LibraryService::new(database),
-        );
-
-        let first = home.shared_snapshot().await.expect("first snapshot");
-        home.invalidate();
-        let stale = home.shared_snapshot().await.expect("stale snapshot");
-
-        assert!(std::ptr::eq(first.as_ref(), stale.as_ref()));
-
-        tokio::time::sleep(Duration::from_secs(2) + Duration::from_millis(100)).await;
-        let refreshed = home.shared_snapshot().await.expect("refreshed snapshot");
-        assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
-    }
-
-    #[tokio::test]
-    async fn user_home_snapshot_cache_is_reused_but_isolated_by_principal() {
+    async fn carousel_cache_is_reused_but_isolated_by_principal() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -658,7 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidation_rebuilds_user_home_snapshot_before_returning_it() {
+    async fn invalidation_rebuilds_carousel_snapshot_before_returning_it() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -803,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continue_watching_is_read_fresh_on_cached_home_snapshot() {
+    async fn continue_watching_is_read_fresh_when_carousel_is_cached() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),

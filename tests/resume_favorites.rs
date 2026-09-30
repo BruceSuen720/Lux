@@ -722,6 +722,30 @@ async fn homevideo_playback_progress_and_played_state_flow_into_continue_watchin
     assert_eq!(home_body["continueWatching"][0]["id"], video_id);
     assert_eq!(home_body["continueWatching"][0]["itemType"], "VIDEO");
 
+    let carousel = client
+        .get(format!("{base_url}/api/v1/home/carousel"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(carousel.status(), reqwest::StatusCode::OK);
+    let carousel_body = carousel.json::<Value>().await?;
+    assert!(carousel_body["recommended"].is_array());
+    assert!(carousel_body.get("continueWatching").is_none());
+    assert!(carousel_body.get("libraries").is_none());
+
+    let continue_watching = client
+        .get(format!(
+            "{base_url}/api/v1/continue-watching?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(continue_watching.status(), reqwest::StatusCode::OK);
+    let continue_watching_body = continue_watching.json::<Value>().await?;
+    assert_eq!(continue_watching_body["total"], 1);
+    assert_eq!(continue_watching_body["items"][0]["id"], video_id);
+    assert_eq!(continue_watching_body["items"][0]["itemType"], "VIDEO");
+
     let played = client
         .put(format!("{base_url}/api/v1/items/{video_id}/played"))
         .header(COOKIE, &cookie)
@@ -747,6 +771,26 @@ async fn homevideo_playback_progress_and_played_state_flow_into_continue_watchin
     assert_eq!(home_after_played_body["continueWatchingTotal"], 0);
     assert_eq!(
         home_after_played_body["continueWatching"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    let continue_watching_after_played = client
+        .get(format!(
+            "{base_url}/api/v1/continue-watching?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        continue_watching_after_played.status(),
+        reqwest::StatusCode::OK
+    );
+    let continue_watching_after_played_body =
+        continue_watching_after_played.json::<Value>().await?;
+    assert_eq!(continue_watching_after_played_body["total"], 0);
+    assert_eq!(
+        continue_watching_after_played_body["items"]
             .as_array()
             .map(Vec::len),
         Some(0)

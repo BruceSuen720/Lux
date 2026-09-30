@@ -184,6 +184,152 @@ pub(super) async fn lux_home(headers: HeaderMap, State(state): State<AppState>) 
     .into_response()
 }
 
+pub(super) async fn lux_home_carousel(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(home) = state.home.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let user_id = user.id.to_string();
+    let library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let recommended = match home.carousel(principal, library_ids).await {
+        Ok(items) => items,
+        Err(HomeError::Catalog(_) | HomeError::Libraries(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    match lux_catalog_items_json_for_user(database, &user_id, &recommended).await {
+        Ok(items) => Json(json!({ "recommended": items })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(super) async fn lux_list_continue_watching(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match page_params(
+        Some(query.page.unwrap_or(1)),
+        Some(query.page_size.unwrap_or(10)),
+    ) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match catalog
+        .list_continue_watching(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &user.id.to_string(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+    }
+}
+
+pub(super) async fn lux_list_library_latest(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if !accessible_library_ids.iter().any(|id| id == &library_id) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match catalog
+        .list_recently_added_by_library_ids(std::slice::from_ref(&library_id), 12)
+        .await
+    {
+        Ok(groups) => {
+            let items = groups
+                .into_iter()
+                .flat_map(|(_, items)| items)
+                .collect::<Vec<_>>();
+            match lux_catalog_items_json_for_user(database, &user.id.to_string(), &items).await {
+                Ok(items) => Json(json!({ "items": items })).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct EmbySearchQuery {
     #[serde(

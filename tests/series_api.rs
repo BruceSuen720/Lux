@@ -1010,6 +1010,15 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         web_home_body["libraries"][0]["latest"][0]["episodeCount"],
         3
     );
+    let library_latest = client
+        .get(format!("{base_url}/api/v1/libraries/{}/latest", library.id))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(library_latest.status(), reqwest::StatusCode::OK);
+    let library_latest_body = library_latest.json::<Value>().await?;
+    assert_eq!(library_latest_body["items"][0]["id"], series_id);
+    assert_eq!(library_latest_body["items"][0]["episodeCount"], 3);
 
     let csrf = request_cookie(&web_cookie, "lux_csrf");
     for item_id in [&episode_id, &final_episode_id] {

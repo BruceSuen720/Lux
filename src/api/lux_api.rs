@@ -10,9 +10,15 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/favorites", get(lux_list_favorites))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
+        .route("/api/v1/home/carousel", get(lux_home_carousel))
+        .route("/api/v1/continue-watching", get(lux_list_continue_watching))
         .route(
             "/api/v1/libraries/{library_id}/items",
             get(lux_list_library_items),
+        )
+        .route(
+            "/api/v1/libraries/{library_id}/latest",
+            get(lux_list_library_latest),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
         .route("/api/v1/people", get(lux_search_people))
