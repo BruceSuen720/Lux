@@ -291,7 +291,12 @@ impl PluginService {
             return Ok(None);
         }
         let values = self.plugin_config_values(plugin_id).await?;
-        if values.get("source").and_then(Value::as_str) != Some("CUSTOM_IMAGE") {
+        if values.get("source").and_then(Value::as_str) != Some("CUSTOM_IMAGE")
+            || values
+                .get("customImageRightsConfirmed")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
             return Ok(None);
         }
         let Some(asset_id) = values.get("customImage").and_then(Value::as_str) else {

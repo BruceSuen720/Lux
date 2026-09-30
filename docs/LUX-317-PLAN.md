@@ -8,7 +8,7 @@
 
 自定义图片规则：单张，JPEG/PNG/WebP，最多 5 MiB 和 20 MP；校验真实文件格式和尺寸、原字节保存，不压缩或重编码。上传成功后原子切换新图并清理旧资源；出错时仍保留旧资源。文件由 Lux 存放在配置目录的专用目录，插件进程无文件系统访问。manifest 配置字段 `type: image` 只允许 `org.lux.login-background` 声明一个，且配置值为 `sha256:<64 位小写十六进制>` opaque ID，不是路径或 URL。
 
-上传 API：`PUT /api/v1/admin/plugins/{plugin_id}/config/image/{field_key}`；管理员鉴权并验证 CSRF；服务端校验 body 大小和 manifest field。插件 RPC 的 image URL 固定为 `/api/v1/auth/login-background/custom-image`，仅当 manifest ID 精确等于 `org.lux.login-background` 且声明 image 字段时允许。该 GET/HEAD 同源路由只有插件已安装、启用、可用且服务器选择 `PLUGIN:org.lux.login-background`、plugin config `source=CUSTOM_IMAGE` 时服务文件，否则 404。返回 sniff 后 MIME、`nosniff`、强 ETag、`Cache-Control: no-cache, must-revalidate`；匹配 If-None-Match 时 304，HEAD 无 body。其它插件仍须使用 HTTPS 且命中 manifest `imageHosts`。
+上传 API：`PUT /api/v1/admin/plugins/{plugin_id}/config/image/{field_key}`；管理员鉴权并验证 CSRF；服务端校验 body 大小和 manifest field。插件 RPC 的 image URL 固定为 `/api/v1/auth/login-background/custom-image`，仅当 manifest ID 精确等于 `org.lux.login-background` 且声明 image 字段时允许。该 GET/HEAD 同源路由只有插件已安装、启用、可用且服务器选择 `PLUGIN:org.lux.login-background`、plugin config `source=CUSTOM_IMAGE`、`customImageRightsConfirmed=true` 时服务文件；rights gate 由 Lux 宿主独立检查，不依赖插件守约。其他情况 404。返回 sniff 后 MIME、`nosniff`、强 ETag、`Cache-Control: no-cache, must-revalidate`；匹配 If-None-Match 时 304，HEAD 无 body。其它插件仍须使用 HTTPS 且命中 manifest `imageHosts`。
 
 文件按 content SHA-256 保存于固定目录；路径只从经过格式验证的 digest 和已检测格式生成，不用上传文件名。新文件先写唯一临时文件，尺寸/格式校验完成后 rename，再更新 opaque config ID；更新失败删除新文件并保留旧 ID/文件。成功后只保留当前 hash 文件；过期中断留下的临时文件/旧 hash 在后续成功替换时清理。
 

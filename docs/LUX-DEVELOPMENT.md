@@ -7691,7 +7691,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 统一插件配置字段 `source` 取 `BING_DAILY`、`TMDB_TRENDING` 或 `CUSTOM_IMAGE`。Bing 个人用途确认与 TMDb 非商业许可确认各自独立且默认关闭，仅对应来源启用时校验，不从旧插件配置迁移。Bing/TMDb 请求、URL、榜单选择、品牌署名和宿主 HERO_IMAGE 布局保持 LUX-262/263 的已验收行为。
 
-自定义图片先只支持单张：JPEG/PNG/WebP，最多 5 MiB/20 MP，按原字节存储，不转码、压缩，不写入媒体库。配置值只保存 `sha256:<64 位小写十六进制>` 不透明资源 ID，不存路径/图像字节。仅管理员可上传/替换，且须确认拥有登录公开展示权。Lux 在配置目录安全保存、原子替换和提供固定同源资源路由；插件进程无文件系统权限。该路由仅当统一插件已安装/启用/可用、服务器背景选中它且 `source=CUSTOM_IMAGE` 时公开，其他场景 404 并由登录页安全回退。只为统一插件接受精确资源路径，其他插件仍限 manifest HTTPS host allowlist；禁止通用图片代理。
+自定义图片先只支持单张：JPEG/PNG/WebP，最多 5 MiB/20 MP，按原字节存储，不转码、压缩，不写入媒体库。配置值只保存 `sha256:<64 位小写十六进制>` 不透明资源 ID，不存路径/图像字节。仅管理员可上传/替换，且须确认拥有登录公开展示权。Lux 在配置目录安全保存、原子替换和提供固定同源资源路由；插件进程无文件系统权限。该路由仅当统一插件已安装/启用/可用、服务器背景选中它、`source=CUSTOM_IMAGE` 且宿主配置 `customImageRightsConfirmed=true` 时公开；由 Lux 自身检查该确认，不依赖插件 RPC，其他场景 404 并由登录页安全回退。只为统一插件接受精确资源路径，其他插件仍限 manifest HTTPS host allowlist；禁止通用图片代理。
 
 验收：
 
@@ -7700,7 +7700,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] Bing/TMDb 的既有行为和 HERO_IMAGE 左侧大图不变；TMDb 只返回混合日榜中首个电影/剧集的有效 backdrop，不回退 poster；自定义模式无外网调用。
 - [ ] manifest `image` 字段只用于 login_background，配置值只接受 SHA-256 opaque ID。上传限 5 MiB、JPEG/PNG/WebP、20 MP，并校验 magic bytes；拒绝伪 MIME、SVG、GIF、畸形/超大内容。替换成功后不保留旧自定义文件；失败回滚仍服务旧图。
 - [ ] 上传端点管理员鉴权+CSRF，服务端固定文件命名，不接受路径/文件名作目标；错误不会覆盖旧图。配置/API/RPC 不泄露文件路径/图片字节。
-- [ ] 精确固定同源图片路由以 MIME、nosniff、ETag 和 revalidation cache headers 提供；未选中、未启用、缺图、错误 hash 或无效状态时不可公开读取；登录公开 JSON 不包含路径或字节。
+- [ ] 精确固定同源图片路由以 MIME、nosniff、ETag 和 revalidation cache headers 提供；未选中、未启用、未确认 `customImageRightsConfirmed`、缺图、错误 hash 或无效状态时不可公开读取；该许可门由 Lux 宿主执行。登录公开 JSON 不包含路径或字节。
 - [ ] 新插件双架构包和目录校验成功后，从目录移除旧 Bing/TMDb ID 并删除两者现存 GitHub Releases 与 release tags（Bing 0.1.0、TMDb 0.1.0/0.1.1 全部资产）；不改 Git 历史、不自动卸载任何用户服务器中的已安装文件。
 - [ ] 提供手动迁移说明：安装新包、选择旧来源对应模式、重新单独确认许可、切换服务器背景来源、验证成功后管理员自行卸载旧包；不继承旧许可同意。
 - [ ] 覆盖来源选择、两项许可门、mock HTTP、恶意/超限上传、原子替换失败、CSRF/未授权、条件 GET/HEAD、未激活资源 404、fallback、双架构打包。

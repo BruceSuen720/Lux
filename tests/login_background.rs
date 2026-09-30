@@ -541,7 +541,13 @@ for request_line in sys.stdin:
                         {"value": "CUSTOM_IMAGE", "label": "Custom image"}
                     ]
                 },
-                {"key": "customImage", "label": "Custom image", "type": "image"}
+                {"key": "customImage", "label": "Custom image", "type": "image"},
+                {
+                    "key": "customImageRightsConfirmed",
+                    "label": "I may display this image publicly",
+                    "type": "toggle",
+                    "defaultValue": false
+                }
             ],
             "permissions": {"imageHosts": ["images.example.com"]},
             "files": []
@@ -653,6 +659,39 @@ for request_line in sys.stdin:
         .await?;
     assert_eq!(select_plugin.status(), reqwest::StatusCode::OK);
 
+    let login_background_url = format!("{base_url}/api/v1/auth/login-background");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(response) = client.get(&login_background_url).send().await
+                && let Ok(body) = response.json::<Value>().await
+                && body["items"][0]["imageUrl"] == "/api/v1/auth/login-background/custom-image"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        client.get(&custom_image_url).send().await?.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "uploading and selecting a custom image is not enough without the rights confirmation"
+    );
+
+    let confirm_custom_image_rights = client
+        .put(format!(
+            "{base_url}/api/v1/admin/plugins/{plugin_id}/config"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "customImageRightsConfirmed": true }))
+        .send()
+        .await?;
+    assert_eq!(
+        confirm_custom_image_rights.status(),
+        reqwest::StatusCode::OK
+    );
+
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let response = client.get(&custom_image_url).send().await;
@@ -732,6 +771,18 @@ for request_line in sys.stdin:
         .send()
         .await?;
     assert_eq!(restore_custom_mode.status(), reqwest::StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(response) = client.get(&login_background_url).send().await
+                && let Ok(body) = response.json::<Value>().await
+                && body["items"][0]["imageUrl"] == "/api/v1/auth/login-background/custom-image"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
     let restored_asset = client.get(&custom_image_url).send().await?;
     assert_eq!(restored_asset.status(), reqwest::StatusCode::OK);
     assert_eq!(restored_asset.bytes().await?.as_ref(), first_bytes);
