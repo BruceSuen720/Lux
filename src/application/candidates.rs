@@ -102,6 +102,12 @@ pub(crate) struct FillMissingRequestPlan {
     pub(crate) actual_missing_image_mask: u16,
 }
 
+#[derive(Clone, Copy)]
+enum MetadataAttemptMode {
+    RespectRetryState,
+    IgnoreRetryState,
+}
+
 fn metadata_request_plan(
     current: &StoredMediaMetadata,
     images_missing: bool,
@@ -312,17 +318,37 @@ impl MetadataCandidateService {
         item_id: &str,
         current: &StoredMediaMetadata,
         reuse_current_snapshot: bool,
+        automatic_match: bool,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        if reuse_current_snapshot {
-            return self.list_pending_for_current(item_id, current).await;
+        let refreshed_current;
+        let current = if reuse_current_snapshot {
+            current
+        } else {
+            refreshed_current = self
+                .database
+                .find_media_item_metadata(item_id)
+                .await?
+                .ok_or(MetadataCandidateError::ItemNotFound)?;
+            &refreshed_current
+        };
+        if automatic_match {
+            let limit = 50;
+            let (rows, total) = self
+                .database
+                .list_best_pending_metadata_candidates_for_item(item_id, limit, 2)
+                .await?;
+            let items = rows
+                .into_iter()
+                .map(|row| candidate_view(row, Some(current)))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(MetadataCandidatePage {
+                items,
+                total,
+                offset: 0,
+                limit,
+            });
         }
-        let refreshed_current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
-            .ok_or(MetadataCandidateError::ItemNotFound)?;
-        self.list_pending_for_current(item_id, &refreshed_current)
-            .await
+        self.list_pending_for_current(item_id, current).await
     }
 
     pub async fn search_and_store(
@@ -443,6 +469,10 @@ impl MetadataCandidateService {
             plan,
             current,
         } = options;
+        let automatic_match = matches!(
+            mode,
+            CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
+        );
         let reuse_current_snapshot = current.is_some();
         let fetched_current = if current.is_none() {
             Some(
@@ -478,6 +508,7 @@ impl MetadataCandidateService {
                             current,
                             plan,
                             reuse_current_snapshot,
+                            automatic_match,
                         },
                     )
                     .await;
@@ -991,7 +1022,7 @@ impl MetadataCandidateService {
         }
         self.store_candidates(item_id, current, pending_candidates)
             .await?;
-        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot, automatic_match)
             .await
     }
 
@@ -1009,44 +1040,57 @@ impl MetadataCandidateService {
             .await?;
         rows.retain(|row| provider_key_from_plugin_id(&row.provider) == provider_key);
         rows.truncate(2);
-        if rows.is_empty() {
+        let Some(best) = rows.first_mut() else {
             return Ok(None);
-        }
-        if plan.needs_metadata {
-            let item_type = match current.item_type.as_str() {
-                "MOVIE" => ScraperItemType::Movie,
-                "SERIES" => ScraperItemType::Series,
-                _ => return Ok(None),
-            };
-            for candidate in &mut rows {
-                if Self::candidate_metadata_was_fetched(&candidate.candidate_json)? {
-                    continue;
-                }
+        };
+        let mut best_candidate_value = if plan.needs_metadata {
+            let mut value = serde_json::from_str::<Value>(&best.candidate_json)
+                .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+            if !Self::candidate_metadata_was_fetched(&value) {
+                let item_type = match current.item_type.as_str() {
+                    "MOVIE" => ScraperItemType::Movie,
+                    "SERIES" => ScraperItemType::Series,
+                    _ => return Ok(None),
+                };
                 let details = scraper
                     .get_generic(ScraperGetRequest::new(
                         item_type,
-                        candidate.provider_id.clone(),
+                        best.provider_id.clone(),
                         "zh-CN",
                     ))
                     .await
                     .map_err(MetadataCandidateError::Scraper)?;
-                let candidate_json = Self::merge_scraper_metadata_into_candidate(
-                    &candidate.candidate_json,
-                    &details,
-                )?;
+                value = Self::merge_scraper_metadata_into_candidate(value, &details)?;
+                let candidate_json = serde_json::to_string(&value).map_err(|error| {
+                    MetadataCandidateError::InvalidCandidateJson(error.to_string())
+                })?;
                 if !self
                     .database
-                    .update_pending_metadata_candidate_json(item_id, &candidate.id, &candidate_json)
+                    .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
                     .await?
                 {
                     return Ok(None);
                 }
-                candidate.candidate_json = candidate_json;
+                best.candidate_json = candidate_json;
             }
-        }
+            Some(value)
+        } else {
+            None
+        };
         let items = rows
             .into_iter()
-            .map(|row| candidate_view(row, Some(current)))
+            .enumerate()
+            .map(|(index, row)| {
+                let candidate = if index == 0 {
+                    best_candidate_value.take()
+                } else {
+                    None
+                };
+                match candidate {
+                    Some(candidate) => Ok(candidate_view_with_value(row, Some(current), candidate)),
+                    None => candidate_view(row, Some(current)),
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
         Ok(Some(MetadataCandidatePage {
@@ -1057,27 +1101,21 @@ impl MetadataCandidateService {
         }))
     }
 
-    fn candidate_metadata_was_fetched(
-        candidate_json: &str,
-    ) -> Result<bool, MetadataCandidateError> {
-        let value = serde_json::from_str::<Value>(candidate_json)
-            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
-        Ok(value
+    fn candidate_metadata_was_fetched(candidate: &Value) -> bool {
+        candidate
             .get("metadataFetched")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            && value
+            && candidate
                 .get("metadataDetailsVersion")
                 .and_then(Value::as_u64)
-                .is_some_and(|version| version >= CANDIDATE_METADATA_DETAILS_VERSION))
+                .is_some_and(|version| version >= CANDIDATE_METADATA_DETAILS_VERSION)
     }
 
     fn merge_scraper_metadata_into_candidate(
-        candidate_json: &str,
+        mut value: Value,
         details: &ScraperMetadata,
-    ) -> Result<String, MetadataCandidateError> {
-        let mut value = serde_json::from_str::<Value>(candidate_json)
-            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+    ) -> Result<Value, MetadataCandidateError> {
         let mut provider_ids = candidate_provider_ids(&value)
             .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
         provider_ids.extend(details.provider_ids.clone());
@@ -1125,8 +1163,7 @@ impl MetadataCandidateService {
             "metadataDetailsVersion".to_owned(),
             Value::from(CANDIDATE_METADATA_DETAILS_VERSION),
         );
-        serde_json::to_string(&value)
-            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))
+        Ok(value)
     }
 
     async fn search_child_and_store(
@@ -1141,6 +1178,7 @@ impl MetadataCandidateService {
             current,
             plan,
             reuse_current_snapshot,
+            automatic_match,
         } = context;
         let item_type = match current.item_type.as_str() {
             "SEASON" => ScraperItemType::Season,
@@ -1314,7 +1352,7 @@ impl MetadataCandidateService {
         }
         self.store_candidates(item_id, current, stored_candidates)
             .await?;
-        self.list_pending_after_search(item_id, current, reuse_current_snapshot)
+        self.list_pending_after_search(item_id, current, reuse_current_snapshot, automatic_match)
             .await
     }
 
@@ -1560,6 +1598,7 @@ struct CandidateSearchContext<'a> {
     current: &'a StoredMediaMetadata,
     plan: MetadataRequestPlan,
     reuse_current_snapshot: bool,
+    automatic_match: bool,
 }
 
 struct ParentProvider {
@@ -1663,24 +1702,14 @@ fn insert_provider_id_if_missing(
     provider_ids.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
 }
 
-fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
-    let provider_ids = current_provider_ids(current);
-    let Some(source) = current
-        .metadata_scraper_id
-        .as_deref()
-        .or(current.scraper_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Vec::new();
-    };
-    let Some(provider_id) = provider_id_for_key(&provider_ids, source)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Vec::new();
-    };
-    vec![(provider_key_from_plugin_id(source), provider_id.to_owned())]
+fn image_attempt_identities(
+    capability_identity: Option<&(String, String)>,
+) -> Vec<(String, String)> {
+    capability_identity
+        .map(|(source, provider_id)| {
+            vec![(provider_key_from_plugin_id(source), provider_id.clone())]
+        })
+        .unwrap_or_default()
 }
 
 fn selected_capability_identity(current: &StoredMediaMetadata) -> Option<(String, String)> {
@@ -2140,7 +2169,11 @@ impl MetadataSelectionService {
         current: &StoredMediaMetadata,
     ) -> Result<FillMissingRequestPlan, MetadataSelectionError> {
         let (_, requestable, actual_missing_image_mask) = self
-            .fill_missing_request_plans_for_current(item_id, current)
+            .fill_missing_request_plans_for_current(
+                item_id,
+                current,
+                MetadataAttemptMode::RespectRetryState,
+            )
             .await?;
         Ok(FillMissingRequestPlan {
             requestable,
@@ -2154,7 +2187,11 @@ impl MetadataSelectionService {
         current: &StoredMediaMetadata,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
         let (actual_plan, _, _) = self
-            .fill_missing_request_plans_for_current(item_id, current)
+            .fill_missing_request_plans_for_current(
+                item_id,
+                current,
+                MetadataAttemptMode::IgnoreRetryState,
+            )
             .await?;
         Ok(actual_plan)
     }
@@ -2168,7 +2205,11 @@ impl MetadataSelectionService {
             return Ok(None);
         }
         let (actual_plan, requestable_plan, _) = self
-            .fill_missing_request_plans_for_current(item_id, current)
+            .fill_missing_request_plans_for_current(
+                item_id,
+                current,
+                MetadataAttemptMode::RespectRetryState,
+            )
             .await?;
         Ok(local_metadata_completeness_plan(
             item_id,
@@ -2217,19 +2258,12 @@ impl MetadataSelectionService {
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
+        attempt_mode: MetadataAttemptMode,
     ) -> Result<(MetadataRequestPlan, MetadataRequestPlan, u16), MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full(), 0));
         }
         let image_policy = self.image_selection_policy(item_id).await?;
-        let (capability_states, image_attempts) =
-            self.database.list_metadata_attempts(item_id).await?;
-        let unavailable_image_attempts = image_attempts
-            .into_iter()
-            .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
-            .map(|attempt| (attempt.image_type, attempt.candidate_key))
-            .collect::<BTreeSet<_>>();
-        let image_attempt_identities = image_attempt_identities(current);
         let image_types = image_policy.enabled_types().collect::<Vec<_>>();
         let local_image_types = if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
             self.images
@@ -2239,31 +2273,17 @@ impl MetadataSelectionService {
             self.images.local_image_types(item_id, &image_types).await?
         };
         let mut actual_missing_image_mask = 0_u16;
-        let mut requestable_missing_image_mask = 0_u16;
-        for image_type in image_types {
-            if local_image_types.contains(image_type) {
+        for image_type in &image_types {
+            if local_image_types.contains(*image_type) {
                 continue;
             }
             let Some(index) = SCRAPER_IMAGE_TYPES
                 .iter()
-                .position(|candidate| *candidate == image_type)
+                .position(|candidate| *candidate == *image_type)
             else {
                 continue;
             };
-            let image_mask = 1_u16 << index;
-            actual_missing_image_mask |= image_mask;
-            let explicitly_unavailable = !image_attempt_identities.is_empty()
-                && image_attempt_identities
-                    .iter()
-                    .all(|(source, provider_id)| {
-                        unavailable_image_attempts.contains(&(
-                            image_type.to_owned(),
-                            image_no_candidate_key(source, image_type, provider_id),
-                        ))
-                    });
-            if !explicitly_unavailable {
-                requestable_missing_image_mask |= image_mask;
-            }
+            actual_missing_image_mask |= 1_u16 << index;
         }
         let details = current.nfo_metadata_json.as_deref().and_then(|value| {
             serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
@@ -2295,15 +2315,61 @@ impl MetadataSelectionService {
         );
         actual_plan.image_policy = Some(image_policy);
         actual_plan.missing_image_mask = actual_missing_image_mask;
-        let mut requestable_plan = metadata_request_plan(
-            current,
-            requestable_missing_image_mask != 0,
-            credits_missing,
-            details.as_ref(),
-        );
-        requestable_plan.image_policy = Some(image_policy);
+        if !has_selected_provider_id(current) {
+            actual_plan.needs_metadata = true;
+        }
+
+        let capability_identity = match attempt_mode {
+            MetadataAttemptMode::RespectRetryState => selected_capability_identity(current),
+            MetadataAttemptMode::IgnoreRetryState => None,
+        };
+        // Retry history only affects work that is actually missing and has a
+        // confirmed provider identity. Backups use actual missing data only.
+        let should_read_attempt_state =
+            capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
+        let (capability_states, image_attempts) = if should_read_attempt_state {
+            self.database.list_metadata_attempts(item_id).await?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let unavailable_image_attempts = image_attempts
+            .into_iter()
+            .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
+            .map(|attempt| (attempt.image_type, attempt.candidate_key))
+            .collect::<BTreeSet<_>>();
+        let image_attempt_identities = if should_read_attempt_state {
+            image_attempt_identities(capability_identity.as_ref())
+        } else {
+            Vec::new()
+        };
+        let mut requestable_missing_image_mask = actual_missing_image_mask;
+        for image_type in &image_types {
+            let Some(index) = SCRAPER_IMAGE_TYPES
+                .iter()
+                .position(|candidate| *candidate == *image_type)
+            else {
+                continue;
+            };
+            let image_mask = 1_u16 << index;
+            if actual_missing_image_mask & image_mask == 0 {
+                continue;
+            }
+            let explicitly_unavailable = !image_attempt_identities.is_empty()
+                && image_attempt_identities
+                    .iter()
+                    .all(|(source, provider_id)| {
+                        unavailable_image_attempts.contains(&(
+                            (*image_type).to_owned(),
+                            image_no_candidate_key(source, image_type, provider_id),
+                        ))
+                    });
+            if explicitly_unavailable {
+                requestable_missing_image_mask &= !image_mask;
+            }
+        }
+        let mut requestable_plan = actual_plan;
+        requestable_plan.needs_images = requestable_missing_image_mask != 0;
         requestable_plan.missing_image_mask = requestable_missing_image_mask;
-        let capability_identity = selected_capability_identity(current);
         requestable_plan.needs_credits = requestable_plan.needs_credits
             && capability_needs_request(
                 &capability_states,
@@ -2322,10 +2388,6 @@ impl MetadataSelectionService {
                 capability_identity.as_ref(),
                 CAPABILITY_TRAILERS,
             );
-        if !has_selected_provider_id(current) {
-            actual_plan.needs_metadata = true;
-            requestable_plan.needs_metadata = true;
-        }
         Ok((actual_plan, requestable_plan, actual_missing_image_mask))
     }
 
@@ -2844,21 +2906,33 @@ impl MetadataSelectionService {
         image_type: &str,
         urls: Vec<String>,
     ) -> Result<Vec<String>, MetadataSelectionError> {
+        const IMAGE_SOURCE_URL_LOOKUP_BATCH_SIZE: usize = 100;
+
         let mut seen = HashSet::new();
-        let mut filtered = Vec::with_capacity(urls.len());
-        for url in urls {
-            let url = url.trim().to_owned();
-            if url.is_empty() || !seen.insert(url.clone()) {
+        let mut filtered = Vec::with_capacity(MAX_IMAGE_VARIANTS);
+        for chunk in urls.chunks(IMAGE_SOURCE_URL_LOOKUP_BATCH_SIZE) {
+            let candidates = chunk
+                .iter()
+                .map(|url| url.trim())
+                .filter(|url| !url.is_empty())
+                .filter(|url| seen.insert((*url).to_owned()))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
                 continue;
             }
-            if self
+            let existing = self
                 .images
-                .image_source_url_exists(item_id, image_type, &url)
-                .await?
-            {
-                continue;
+                .existing_image_source_urls(item_id, image_type, &candidates)
+                .await?;
+            for url in candidates {
+                if !existing.contains(&url) {
+                    filtered.push(url);
+                    if filtered.len() == MAX_IMAGE_VARIANTS {
+                        return Ok(filtered);
+                    }
+                }
             }
-            filtered.push(url);
         }
         Ok(filtered)
     }
@@ -3782,15 +3856,23 @@ fn candidate_view(
     row: StoredMetadataCandidate,
     current: Option<&StoredMediaMetadata>,
 ) -> Result<MetadataCandidateView, MetadataCandidateError> {
-    let mut candidate: Value = serde_json::from_str(&row.candidate_json)
+    let candidate: Value = serde_json::from_str(&row.candidate_json)
         .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+    Ok(candidate_view_with_value(row, current, candidate))
+}
+
+fn candidate_view_with_value(
+    row: StoredMetadataCandidate,
+    current: Option<&StoredMediaMetadata>,
+    mut candidate: Value,
+) -> MetadataCandidateView {
     if let Some(candidate) = candidate.as_object_mut() {
         candidate.remove("metadataDetailsVersion");
     }
     let field_diffs = current
         .map(|current| field_diffs(current, &candidate))
         .unwrap_or_default();
-    Ok(MetadataCandidateView {
+    MetadataCandidateView {
         id: row.id,
         item_id: row.item_id,
         item_title: row.item_title,
@@ -3801,7 +3883,7 @@ fn candidate_view(
         status: row.status,
         expires_at: row.expires_at,
         field_diffs,
-    })
+    }
 }
 
 fn field_diffs(current: &StoredMediaMetadata, candidate: &Value) -> Vec<MetadataFieldDiff> {
@@ -3890,7 +3972,8 @@ mod tests {
         MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
         SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
         credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
-        generic_candidate_actors, generic_candidate_images, local_metadata_completeness_plan,
+        generic_candidate_actors, generic_candidate_images, image_attempt_identities,
+        local_metadata_completeness_plan,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
         metadata_match_score, metadata_request_plan, parse_image_selection_policy,
         selected_scraper_provider_id,
@@ -3905,6 +3988,7 @@ mod tests {
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -4015,6 +4099,37 @@ mod tests {
         assert!(actors.iter().all(|actor| actor.person.is_some()));
         assert!(maximum.load(Ordering::SeqCst) > 1);
         assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
+
+    #[test]
+    fn cached_candidate_value_is_merged_without_reparsing_its_json() {
+        let candidate = json!({
+            "title": "Example",
+            "providerIds": {"tmdb": "7"},
+            "unknownField": {"preserved": true},
+            "metadataFetched": false
+        });
+        assert!(!MetadataCandidateService::candidate_metadata_was_fetched(
+            &candidate
+        ));
+
+        let merged = MetadataCandidateService::merge_scraper_metadata_into_candidate(
+            candidate,
+            &ScraperMetadata {
+                overview: Some("Fetched summary".to_owned()),
+                provider_ids: BTreeMap::from([("imdb".to_owned(), "tt7".to_owned())]),
+                ..ScraperMetadata::default()
+            },
+        )
+        .expect("merge cached candidate value");
+
+        assert_eq!(merged["overview"], "Fetched summary");
+        assert_eq!(merged["providerIds"]["tmdb"], "7");
+        assert_eq!(merged["providerIds"]["imdb"], "tt7");
+        assert_eq!(merged["unknownField"]["preserved"], true);
+        assert!(MetadataCandidateService::candidate_metadata_was_fetched(
+            &merged
+        ));
     }
 
     #[test]
@@ -4254,6 +4369,14 @@ mod tests {
             Some(&identity),
             "TRAILERS"
         ));
+        assert!(
+            capability_needs_request(&unavailable_attempts, None, "CREDITS"),
+            "attempt history cannot apply until a provider identity is selected"
+        );
+        assert!(
+            image_attempt_identities(None).is_empty(),
+            "image attempt history cannot apply until a provider identity is selected"
+        );
 
         let first_fingerprint = completeness.input_fingerprint;
         current.overview = Some("Updated local overview".to_owned());
@@ -4272,23 +4395,26 @@ mod tests {
 
     #[test]
     fn old_candidate_metadata_cache_is_not_treated_as_complete_details() {
+        let missing_version = serde_json::from_str::<serde_json::Value>(
+            r#"{"metadataFetched":true}"#,
+        )
+        .expect("valid candidate JSON");
+        let not_fetched = serde_json::from_str::<serde_json::Value>(
+            r#"{"metadataFetched":false,"metadataDetailsVersion":2}"#,
+        )
+        .expect("valid candidate JSON");
+        let current_details = serde_json::from_str::<serde_json::Value>(
+            r#"{"metadataFetched":true,"metadataDetailsVersion":2}"#,
+        )
+        .expect("valid candidate JSON");
         assert!(
-            !MetadataCandidateService::candidate_metadata_was_fetched(
-                r#"{"metadataFetched":true}"#
-            )
-            .expect("valid candidate JSON")
+            !MetadataCandidateService::candidate_metadata_was_fetched(&missing_version)
         );
         assert!(
-            !MetadataCandidateService::candidate_metadata_was_fetched(
-                r#"{"metadataFetched":false,"metadataDetailsVersion":2}"#
-            )
-            .expect("valid candidate JSON")
+            !MetadataCandidateService::candidate_metadata_was_fetched(&not_fetched)
         );
         assert!(
-            MetadataCandidateService::candidate_metadata_was_fetched(
-                r#"{"metadataFetched":true,"metadataDetailsVersion":2}"#
-            )
-            .expect("valid candidate JSON")
+            MetadataCandidateService::candidate_metadata_was_fetched(&current_details)
         );
     }
 

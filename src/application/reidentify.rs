@@ -1256,9 +1256,9 @@ impl MetadataReidentifyService {
                 .map_err(MetadataReidentifyError::Candidate)?
         };
         if matches!(mode, MetadataRefreshMode::Reidentify) {
-            return Ok(RefreshItemOutcome::Confirmed(
-                i64::try_from(page.items.len()).unwrap_or(i64::MAX),
-            ));
+            return Ok(RefreshItemOutcome::Confirmed(candidate_count_for_page(
+                &page,
+            )));
         }
         let Some(selection) = self.selection.as_ref() else {
             return Err(MetadataReidentifyError::SelectionUnavailable);
@@ -1323,7 +1323,7 @@ impl MetadataReidentifyService {
                 "actor metadata enrichment queue is full"
             );
         }
-        let candidate_count = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
+        let candidate_count = candidate_count_for_page(&page);
         Ok(if needs_review {
             RefreshItemOutcome::NeedsReview(candidate_count)
         } else {
@@ -1548,6 +1548,10 @@ fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCan
     (candidate.score >= AUTO_MATCH_MIN_SCORE).then_some(candidate)
 }
 
+fn candidate_count_for_page(page: &MetadataCandidatePage) -> i64 {
+    page.total.max(0).min(page.limit.max(0))
+}
+
 fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
     let mut best = None;
     for candidate in page
@@ -1656,8 +1660,8 @@ mod tests {
     use super::{
         AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage,
         MetadataCandidateView, MetadataRequestPlan, best_automatic_candidate,
-        metadata_global_permits, metadata_request_plan_is_complete, metadata_worker_concurrency,
-        metadata_worker_default_concurrency,
+        candidate_count_for_page, metadata_global_permits, metadata_request_plan_is_complete,
+        metadata_worker_concurrency, metadata_worker_default_concurrency,
     };
     use crate::{
         application::{
@@ -1938,6 +1942,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fill_missing_plan_skips_attempt_history_reads_without_provider_identity()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        assert!(current.provider_ids_json.is_none());
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+
+        database.reset_query_count();
+        let plan = selection
+            .fill_missing_request_plan_for_current(&item_id, &current)
+            .await?;
+
+        assert!(plan.requestable.needs_metadata);
+        assert_eq!(
+            database.query_count(),
+            6,
+            "media strategy, local image inventory and writeback-path reads remain, but attempt history is skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_fill_missing_plan_skips_capability_attempt_history()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                provider_ids_json = '{\"tmdb\":\"603\"}',
+                metadata_scraper_id = 'tmdb',
+                identification_status = 'ONLINE_CONFIRMED'
+             WHERE id = ?",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+
+        database.reset_query_count();
+        let plan = selection
+            .fallback_request_plan_for_current(&item_id, &current)
+            .await?;
+
+        assert!(plan.needs_metadata);
+        assert_eq!(
+            database.query_count(),
+            6,
+            "fallbacks need current completeness but not primary-provider retry history"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fill_missing_skips_complete_local_items_before_resolving_scrapers()
     -> Result<(), Box<dyn Error>> {
         let (temp_dir, config, database, item_id) = role_test_fixture().await?;
@@ -1945,8 +2016,8 @@ mod tests {
             "UPDATE media_items SET
                 item_type = 'EPISODE', overview = 'Existing overview',
                 premiere_date = '2020-01-01',
-                provider_ids_json = ?, identification_status = 'LOCAL_CONFIRMED',
-                metadata_scraper_id = NULL, metadata_provenance_json = ?
+                provider_ids_json = ?, identification_status = 'ONLINE_CONFIRMED',
+                metadata_scraper_id = 'tmdb', metadata_provenance_json = ?
              WHERE id = ?",
         )
         .bind(serde_json::json!({"tmdb": "603", "imdb": "tt0133093"}).to_string())
@@ -1980,12 +2051,18 @@ mod tests {
             .find_media_item_metadata(&item_id)
             .await?
             .ok_or("fixture episode is missing")?;
+        database.reset_query_count();
         let plan = selection
             .fill_missing_request_plan_for_current(&item_id, &current)
             .await?;
         assert!(
             super::metadata_request_plan_is_complete(plan.requestable),
             "unexpected fill-missing plan: {plan:?}"
+        );
+        assert_eq!(
+            database.query_count(),
+            6,
+            "a complete item skips capability and image attempt-history reads"
         );
         let service = super::MetadataReidentifyService::with_selection(
             database.clone(),
@@ -2527,6 +2604,22 @@ mod tests {
         };
 
         assert!(best_automatic_candidate(&page).is_none());
+    }
+
+    #[test]
+    fn automatic_candidate_summary_preserves_page_bounded_candidate_counts() {
+        let page = MetadataCandidatePage {
+            items: vec![candidate("best", 95.0), candidate("second", 90.0)],
+            total: 60,
+            offset: 0,
+            limit: 50,
+        };
+
+        assert_eq!(candidate_count_for_page(&page), 50);
+        assert_eq!(
+            candidate_count_for_page(&MetadataCandidatePage { total: 1, ..page }),
+            1
+        );
     }
 
     #[test]

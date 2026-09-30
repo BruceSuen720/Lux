@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
+    io::{self, Write},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -9,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified},
@@ -20,7 +21,7 @@ use crate::observability::resources::ResourceMetrics;
 
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4096;
-const CACHE_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+const CACHE_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(crate) struct ProviderResponseCache {
@@ -86,13 +87,31 @@ impl CacheState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CacheEntry {
-    value: Value,
+    #[serde(
+        serialize_with = "serialize_shared_value",
+        deserialize_with = "deserialize_shared_value"
+    )]
+    value: Arc<Value>,
     expires_at: i64,
     negative: bool,
 }
 
+fn serialize_shared_value<S>(value: &Arc<Value>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.as_ref().serialize(serializer)
+}
+
+fn deserialize_shared_value<'de, D>(deserializer: D) -> Result<Arc<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Arc::new)
+}
+
 pub(crate) enum CacheLookup {
-    Hit(Value),
+    Hit(Arc<Value>),
     Negative,
     Wait(Pin<Box<OwnedNotified>>),
     Owner(CacheOwner),
@@ -173,7 +192,7 @@ impl ProviderResponseCache {
                 return if entry.negative {
                     CacheLookup::Negative
                 } else {
-                    CacheLookup::Hit(entry.value.clone())
+                    CacheLookup::Hit(Arc::clone(&entry.value))
                 };
             }
         }
@@ -192,8 +211,8 @@ impl ProviderResponseCache {
         })
     }
 
-    pub(crate) async fn store(&self, key: &str, value: &Value, ttl_seconds: i64) {
-        if ttl_seconds <= 0 || serialized_size(value) > MAX_ENTRY_BYTES {
+    pub(crate) async fn store_shared(&self, key: &str, value: Arc<Value>, ttl_seconds: i64) {
+        if ttl_seconds <= 0 || !serialized_value_fits_limit(value.as_ref(), MAX_ENTRY_BYTES) {
             return;
         }
         let Some(expires_at) = unix_now().checked_add(ttl_seconds) else {
@@ -209,7 +228,7 @@ impl ProviderResponseCache {
             state.insert(
                 key.to_owned(),
                 CacheEntry {
-                    value: value.clone(),
+                    value,
                     expires_at,
                     negative: false,
                 },
@@ -232,7 +251,7 @@ impl ProviderResponseCache {
             state.insert(
                 key.to_owned(),
                 CacheEntry {
-                    value: Value::Null,
+                    value: Arc::new(Value::Null),
                     expires_at,
                     negative: true,
                 },
@@ -392,10 +411,40 @@ pub(crate) fn ttl_for_method(method: &str) -> i64 {
     }
 }
 
-fn serialized_size(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+fn serialized_value_fits_limit(value: &Value, max_bytes: usize) -> bool {
+    struct SizeLimitWriter {
+        written: usize,
+        max_bytes: usize,
+    }
+
+    impl Write for SizeLimitWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let Some(next_size) = self.written.checked_add(bytes.len()) else {
+                return Err(io::Error::other("serialized value size overflow"));
+            };
+            if next_size > self.max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "serialized value exceeds the cache entry limit",
+                ));
+            }
+            self.written = next_size;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    serde_json::to_writer(
+        &mut SizeLimitWriter {
+            written: 0,
+            max_bytes,
+        },
+        value,
+    )
+    .is_ok()
 }
 
 fn unix_now() -> i64 {
@@ -420,7 +469,7 @@ mod tests {
         state.insert(
             "stale".to_owned(),
             CacheEntry {
-                value: json!({"id": 1}),
+                value: Arc::new(json!({"id": 1})),
                 expires_at: 100,
                 negative: false,
             },
@@ -428,7 +477,7 @@ mod tests {
         state.insert(
             "expired".to_owned(),
             CacheEntry {
-                value: json!({"id": 2}),
+                value: Arc::new(json!({"id": 2})),
                 expires_at: 120,
                 negative: false,
             },
@@ -436,7 +485,7 @@ mod tests {
         state.insert(
             "live".to_owned(),
             CacheEntry {
-                value: json!({"id": 3}),
+                value: Arc::new(json!({"id": 3})),
                 expires_at: 300,
                 negative: false,
             },
@@ -445,7 +494,7 @@ mod tests {
         state.insert(
             "stale".to_owned(),
             CacheEntry {
-                value: json!({"id": 4}),
+                value: Arc::new(json!({"id": 4})),
                 expires_at: 250,
                 negative: false,
             },
@@ -468,7 +517,7 @@ mod tests {
         state.insert(
             "soon".to_owned(),
             CacheEntry {
-                value: json!({"nested": [1, 2, 3]}),
+                value: Arc::new(json!({"nested": [1, 2, 3]})),
                 expires_at: 10,
                 negative: false,
             },
@@ -476,7 +525,7 @@ mod tests {
         state.insert(
             "later".to_owned(),
             CacheEntry {
-                value: json!({"nested": [4, 5, 6]}),
+                value: Arc::new(json!({"nested": [4, 5, 6]})),
                 expires_at: 20,
                 negative: false,
             },
@@ -491,15 +540,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_value_limit_counts_escaped_json_bytes_without_building_a_byte_vector() {
+        assert!(super::serialized_value_fits_limit(&json!("\0"), 8));
+        assert!(!super::serialized_value_fits_limit(&json!("\0"), 7));
+        assert!(!super::serialized_value_fits_limit(
+            &json!("\0".repeat(100)),
+            32,
+        ));
+    }
+
     #[tokio::test]
     async fn cache_reuses_values_and_negative_results() {
         let cache = ProviderResponseCache::new(None);
         let CacheLookup::Owner(owner) = cache.begin("value").await else {
             panic!("first request should own value lookup");
         };
-        cache.store("value", &json!({"id": 7}), 60).await;
+        cache
+            .store_shared("value", Arc::new(json!({"id": 7})), 60)
+            .await;
         owner.finish();
-        assert!(matches!(cache.begin("value").await, CacheLookup::Hit(value) if value["id"] == 7));
+        let CacheLookup::Hit(first) = cache.begin("value").await else {
+            panic!("stored value should be available");
+        };
+        let CacheLookup::Hit(second) = cache.begin("value").await else {
+            panic!("repeated lookup should remain a cache hit");
+        };
+        assert_eq!(first["id"], 7);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hits should share the immutable value"
+        );
 
         let CacheLookup::Owner(owner) = cache.begin("missing").await else {
             panic!("first request should own missing lookup");
@@ -529,7 +600,9 @@ mod tests {
             }
         });
         tokio::task::yield_now().await;
-        cache.store("same", &json!({"ok": true}), 60).await;
+        cache
+            .store_shared("same", Arc::new(json!({"ok": true})), 60)
+            .await;
         owner.finish();
         let result = timeout(Duration::from_secs(1), waiting)
             .await
@@ -587,7 +660,9 @@ mod tests {
         let CacheLookup::Owner(owner) = cache.begin("persisted").await else {
             panic!("first request should own persisted lookup");
         };
-        cache.store("persisted", &json!({"id": 9}), 60).await;
+        cache
+            .store_shared("persisted", Arc::new(json!({"id": 9})), 60)
+            .await;
         owner.finish();
         cache.flush().await;
 
@@ -608,7 +683,9 @@ mod tests {
         let CacheLookup::Owner(owner) = cache.begin("persisted").await else {
             panic!("first cache lookup must own the key");
         };
-        cache.store("persisted", &json!({"id": 9}), 60).await;
+        cache
+            .store_shared("persisted", Arc::new(json!({"id": 9})), 60)
+            .await;
         owner.finish();
         cache.flush().await;
 

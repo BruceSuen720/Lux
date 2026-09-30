@@ -6058,27 +6058,44 @@ impl Database {
         })
     }
 
-    pub(crate) async fn item_image_source_url_exists(
+    pub(crate) async fn list_existing_item_image_source_urls(
         &self,
         item_id: &str,
         image_type: &str,
-        source_url: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar::<i64>(
-            "SELECT 1 FROM item_images
-             WHERE item_id = ? AND image_type = ? AND source_url = ?
-             LIMIT 1",
-        )
-        .bind(item_id)
-        .bind(image_type)
-        .bind(source_url)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|value| value.is_some())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        source_urls: &[String],
+    ) -> Result<std::collections::HashSet<String>, StorageError> {
+        const MAX_SOURCE_URLS_PER_QUERY: usize = 100;
+
+        let mut existing = std::collections::HashSet::new();
+        for chunk in source_urls.chunks(MAX_SOURCE_URLS_PER_QUERY) {
+            let unique_urls = chunk
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            if unique_urls.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", unique_urls.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT source_url FROM item_images
+                 WHERE item_id = ? AND image_type = ?
+                   AND source_url IN ({placeholders})"
+            );
+            let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+            statement = statement.bind(item_id).bind(image_type);
+            for source_url in unique_urls {
+                statement = statement.bind(source_url);
+            }
+            existing.extend(statement.fetch_all(&self.pool).await.map_err(|source| {
+                StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?);
+        }
+        Ok(existing)
     }
 
     pub(crate) async fn list_item_images(
