@@ -480,8 +480,11 @@ mod tests {
 
     use super::{
         PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
-        metadata_capability_for_method, provider_id_for_key, provider_key_from_plugin_id,
-        retryable_scraper_error, scraper_id_matches_provider,
+        decode_bundle_response_ref, decode_credits_response, decode_credits_response_ref,
+        decode_images_response, decode_images_response_ref, decode_metadata_response,
+        decode_metadata_response_ref, decode_search_response, decode_search_response_ref,
+        deserialize_value_ref, metadata_capability_for_method, provider_id_for_key,
+        provider_key_from_plugin_id, retryable_scraper_error, scraper_id_matches_provider,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
@@ -573,6 +576,80 @@ mod tests {
         assert_eq!(bundle.images.images.len(), 1);
         assert_eq!(bundle.credits.cast[0].provider_id, "9");
         assert_eq!(bundle.external_ids.provider_ids["Imdb"], "tt7");
+    }
+
+    #[test]
+    fn borrowed_scraper_decoders_match_owned_decoders_without_consuming_cached_values() {
+        let search_value = json!({
+            "items": [{
+                "Type": "Movie",
+                "Name": "Example",
+                "ProviderIds": {"Tmdb": "7"}
+            }]
+        });
+        assert_eq!(
+            decode_search_response_ref(&search_value).expect("borrowed search response"),
+            decode_search_response(search_value.clone()).expect("owned search response")
+        );
+        assert_eq!(search_value["items"][0]["Name"], "Example");
+
+        let metadata_value = json!({"metadata": {"Name": "Example", "ProviderIds": {"Tmdb": "7"}}});
+        assert_eq!(
+            decode_metadata_response_ref(&metadata_value).expect("borrowed metadata response"),
+            decode_metadata_response(metadata_value.clone()).expect("owned metadata response")
+        );
+        assert_eq!(metadata_value["metadata"]["Name"], "Example");
+
+        let images_value = json!({
+            "images": [{"Type": "Primary", "Url": "https://image.example/poster.jpg"}],
+            "originalLanguageMode": true
+        });
+        assert_eq!(
+            decode_images_response_ref(&images_value).expect("borrowed image response"),
+            decode_images_response(images_value.clone()).expect("owned image response")
+        );
+        assert_eq!(
+            images_value["images"][0]["Url"],
+            "https://image.example/poster.jpg"
+        );
+
+        let credits_value = json!({"cast": [{"Id": "person-7", "Name": "Actor"}], "crew": []});
+        assert_eq!(
+            decode_credits_response_ref(&credits_value).expect("borrowed credits response"),
+            decode_credits_response(credits_value.clone()).expect("owned credits response")
+        );
+        assert_eq!(credits_value["cast"][0]["Id"], "person-7");
+
+        let external_ids_value = json!({"ProviderIds": {"Imdb": "tt7"}});
+        assert_eq!(
+            deserialize_value_ref::<super::ScraperExternalIdsResponse>(&external_ids_value)
+                .expect("borrowed external IDs response"),
+            serde_json::from_value(external_ids_value.clone())
+                .expect("owned external IDs response")
+        );
+        assert_eq!(external_ids_value["ProviderIds"]["Imdb"], "tt7");
+
+        let trailers_value =
+            json!({"trailers": [{"Name": "Trailer", "Url": "https://video.example/trailer"}]});
+        assert_eq!(
+            deserialize_value_ref::<super::ScraperTrailersResponse>(&trailers_value)
+                .expect("borrowed trailers response"),
+            serde_json::from_value(trailers_value.clone()).expect("owned trailers response")
+        );
+        assert_eq!(trailers_value["trailers"][0]["Name"], "Trailer");
+
+        let bundle_value = json!({
+            "metadata": {"Name": "Example", "ProviderIds": {"Tmdb": "7"}},
+            "images": {"images": []},
+            "credits": {"cast": [], "crew": []},
+            "externalIds": {"ProviderIds": {"Imdb": "tt7"}},
+            "trailers": {"trailers": []}
+        });
+        assert_eq!(
+            decode_bundle_response_ref(&bundle_value).expect("borrowed bundle response"),
+            decode_bundle_response(bundle_value.clone()).expect("owned bundle response")
+        );
+        assert_eq!(bundle_value["metadata"]["Name"], "Example");
     }
 
     #[test]
@@ -1023,12 +1100,12 @@ impl ScraperPluginClient {
         request: ScraperSearchRequest,
     ) -> Result<ScraperSearchResponse, ScraperError> {
         let value = self.call("metadata.search", request).await?;
-        decode_search_response(value)
+        decode_search_response_ref(&value)
     }
 
     pub async fn get(&self, request: ScraperGetRequest) -> Result<ScraperMetadata, ScraperError> {
         let value = self.call("metadata.get", request).await?;
-        decode_metadata_response(value)
+        decode_metadata_response_ref(&value)
     }
 
     pub async fn bundle(
@@ -1036,7 +1113,7 @@ impl ScraperPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperMetadataBundle, ScraperError> {
         let value = self.call("metadata.bundle", request).await?;
-        decode_bundle_response(value)
+        decode_bundle_response_ref(&value)
     }
 
     pub async fn images(
@@ -1044,7 +1121,7 @@ impl ScraperPluginClient {
         request: ScraperImageRequest,
     ) -> Result<ScraperImagesResponse, ScraperError> {
         let value = self.call("metadata.images", request).await?;
-        decode_images_response(value)
+        decode_images_response_ref(&value)
     }
 
     pub async fn credits(
@@ -1052,7 +1129,7 @@ impl ScraperPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperCreditsResponse, ScraperError> {
         let value = self.call("metadata.credits", request).await?;
-        decode_credits_response(value)
+        decode_credits_response_ref(&value)
     }
 
     pub async fn external_ids(
@@ -1060,8 +1137,7 @@ impl ScraperPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperExternalIdsResponse, ScraperError> {
         let value = self.call("metadata.externalIds", request).await?;
-        serde_json::from_value(value)
-            .map_err(|error| ScraperError::InvalidResponse(error.to_string()))
+        deserialize_value_ref(&value)
     }
 
     pub async fn trailers(
@@ -1069,11 +1145,14 @@ impl ScraperPluginClient {
         request: ScraperGetRequest,
     ) -> Result<ScraperTrailersResponse, ScraperError> {
         let value = self.call("metadata.trailers", request).await?;
-        serde_json::from_value(value)
-            .map_err(|error| ScraperError::InvalidResponse(error.to_string()))
+        deserialize_value_ref(&value)
     }
 
-    async fn call<T: Serialize>(&self, method: &str, params: T) -> Result<Value, ScraperError> {
+    async fn call<T: Serialize>(
+        &self,
+        method: &str,
+        params: T,
+    ) -> Result<Arc<Value>, ScraperError> {
         let params = serde_json::to_value(params)
             .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
         self.call_value(method, params).await
@@ -1083,7 +1162,7 @@ impl ScraperPluginClient {
         &self,
         method: &str,
         params: Value,
-    ) -> Result<Value, ScraperError> {
+    ) -> Result<Arc<Value>, ScraperError> {
         if let Some(capability) = metadata_capability_for_method(method) {
             let capabilities = self
                 .capability_cache
@@ -1101,7 +1180,7 @@ impl ScraperPluginClient {
         let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
             let result = self.call_scraper_with_retry(method, params).await;
             self.record_metadata_call(method, false, started);
-            return result;
+            return result.map(Arc::new);
         };
         let cache_owner = loop {
             match self.response_cache.begin(&cache_key).await {
@@ -1121,17 +1200,25 @@ impl ScraperPluginClient {
         };
         let result = self.call_scraper_with_retry(method, params).await;
         self.record_metadata_call(method, false, started);
-        if let Ok(value) = &result {
-            self.response_cache
-                .store(&cache_key, value, ttl_for_method(method))
-                .await;
-        } else if result.as_ref().err().is_some_and(is_negative_scraper_error) {
-            self.response_cache
-                .store_negative(&cache_key, 10 * 60)
-                .await;
+        match result {
+            Ok(value) => {
+                let value = Arc::new(value);
+                self.response_cache
+                    .store_shared(&cache_key, Arc::clone(&value), ttl_for_method(method))
+                    .await;
+                cache_owner.finish();
+                Ok(value)
+            }
+            Err(error) => {
+                if is_negative_scraper_error(&error) {
+                    self.response_cache
+                        .store_negative(&cache_key, 10 * 60)
+                        .await;
+                }
+                cache_owner.finish();
+                Err(error)
+            }
         }
-        cache_owner.finish();
-        result
     }
 
     async fn call_scraper_with_retry(
@@ -1338,6 +1425,53 @@ pub fn decode_credits_response(value: Value) -> Result<ScraperCreditsResponse, S
 
 pub fn decode_bundle_response(value: Value) -> Result<ScraperMetadataBundle, ScraperError> {
     serde_json::from_value(value).map_err(|error| ScraperError::InvalidResponse(error.to_string()))
+}
+
+fn decode_search_response_ref(value: &Value) -> Result<ScraperSearchResponse, ScraperError> {
+    let items = value
+        .get("items")
+        .ok_or_else(|| ScraperError::InvalidResponse("scraper response lacks items".to_owned()))?;
+    let items = deserialize_value_ref(items)?;
+    Ok(ScraperSearchResponse { items })
+}
+
+fn decode_metadata_response_ref(value: &Value) -> Result<ScraperMetadata, ScraperError> {
+    decode_wrapped_ref(value, "metadata")
+}
+
+fn decode_images_response_ref(value: &Value) -> Result<ScraperImagesResponse, ScraperError> {
+    let images_value = value
+        .get("images")
+        .ok_or_else(|| ScraperError::InvalidResponse("scraper response lacks images".to_owned()))?;
+    Ok(ScraperImagesResponse {
+        images: deserialize_value_ref(images_value)?,
+        original_language_mode: value
+            .get("originalLanguageMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn decode_credits_response_ref(value: &Value) -> Result<ScraperCreditsResponse, ScraperError> {
+    deserialize_value_ref(value)
+}
+
+fn decode_bundle_response_ref(value: &Value) -> Result<ScraperMetadataBundle, ScraperError> {
+    deserialize_value_ref(value)
+}
+
+fn decode_wrapped_ref<T: serde::de::DeserializeOwned>(
+    value: &Value,
+    key: &str,
+) -> Result<T, ScraperError> {
+    let payload = value
+        .get(key)
+        .ok_or_else(|| ScraperError::InvalidResponse(format!("scraper response lacks {key}")))?;
+    deserialize_value_ref(payload)
+}
+
+fn deserialize_value_ref<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ScraperError> {
+    T::deserialize(value).map_err(|error| ScraperError::InvalidResponse(error.to_string()))
 }
 
 fn decode_wrapped<T: serde::de::DeserializeOwned>(
