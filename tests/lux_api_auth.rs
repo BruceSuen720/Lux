@@ -51,6 +51,14 @@ async fn lux_client_tokens_authenticate_lux_api_without_web_cookies()
         .send()
         .await?;
     assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let unauthenticated_carousel = client
+        .get(format!("http://{address}/api/v1/home/carousel"))
+        .send()
+        .await?;
+    assert_eq!(
+        unauthenticated_carousel.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -74,6 +82,22 @@ async fn lux_client_tokens_authenticate_lux_api_without_web_cookies()
         .await?;
     assert_eq!(home.status(), reqwest::StatusCode::OK);
     assert!(home.json::<Value>().await?["libraries"].is_array());
+
+    let carousel = client
+        .get(format!("http://{address}/api/v1/home/carousel"))
+        .header("X-Lux-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(carousel.status(), reqwest::StatusCode::OK);
+    assert!(carousel.json::<Value>().await?["recommended"].is_array());
+
+    let continue_watching = client
+        .get(format!("http://{address}/api/v1/continue-watching"))
+        .header("X-Lux-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(continue_watching.status(), reqwest::StatusCode::OK);
+    assert_eq!(continue_watching.json::<Value>().await?["total"], 0);
 
     let settings = client
         .patch(format!("http://{address}/api/v1/auth/settings"))

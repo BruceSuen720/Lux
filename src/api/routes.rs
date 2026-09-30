@@ -86,7 +86,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
             move |request: Request<Body>, next: Next| {
                 let resources = resources.clone();
                 async move {
-                    let is_home = request.uri().path() == "/api/v1/home";
+                    let is_home = is_home_request_path(request.uri().path());
                     let started = Instant::now();
                     let response = next.run(request).await;
                     if is_home {
@@ -141,11 +141,15 @@ fn select_catalog_worker_pool(
     catalog_workers: Arc<tokio::sync::Semaphore>,
     home_workers: Arc<tokio::sync::Semaphore>,
 ) -> Arc<tokio::sync::Semaphore> {
-    if path == "/api/v1/home" {
+    if is_home_request_path(path) {
         home_workers
     } else {
         catalog_workers
     }
+}
+
+fn is_home_request_path(path: &str) -> bool {
+    matches!(path, "/api/v1/home" | "/api/v1/home/carousel")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,7 +189,7 @@ fn catalog_busy_response(path: &str, headers: &HeaderMap) -> Response {
 }
 
 fn catalog_route_class(path: &str) -> &'static str {
-    if path == "/api/v1/home" {
+    if is_home_request_path(path) {
         "home"
     } else if path == "/Items" || path.starts_with("/emby/Items") {
         "emby_items"
@@ -197,6 +201,22 @@ fn catalog_route_class(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn homepage_carousel_uses_the_isolated_home_worker_pool() {
+        let catalog_workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let home_workers = Arc::new(tokio::sync::Semaphore::new(1));
+
+        assert!(Arc::ptr_eq(
+            &select_catalog_worker_pool(
+                "/api/v1/home/carousel",
+                catalog_workers.clone(),
+                home_workers.clone(),
+            ),
+            &home_workers,
+        ));
+        assert_eq!(catalog_route_class("/api/v1/home/carousel"), "home");
+    }
 
     #[tokio::test]
     async fn catalog_worker_queue_wait_has_a_deadline() {

@@ -630,8 +630,13 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
 
     matches!(
         segments.as_slice(),
-        ["api", "v1", "favorites" | "search" | "home"]
+        [
+            "api",
+            "v1",
+            "favorites" | "search" | "home" | "continue-watching"
+        ] | ["api", "v1", "home", "carousel"]
             | ["api", "v1", "libraries", _, "items"]
+            | ["api", "v1", "libraries", _, "latest"]
             | ["api", "v1", "items", _, "children"]
             | ["api", "v1", "collections", _]
             | ["Users", _, "Items"]
@@ -1608,7 +1613,10 @@ mod tests {
     fn catalog_concurrency_guard_excludes_streaming_paths() {
         for path in [
             "/api/v1/home",
+            "/api/v1/home/carousel",
+            "/api/v1/continue-watching",
             "/api/v1/libraries/library-1/items",
+            "/api/v1/libraries/library-1/latest",
             "/api/v1/collections/collection-1",
             "/Users/user-1/Items/Resume",
             "/emby/Shows/show-1/Episodes",
