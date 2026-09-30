@@ -131,6 +131,19 @@ fn attached_picture_stream_is_not_exposed_as_video() {
 }
 
 #[test]
+fn ffprobe_field_order_is_preserved_for_nfo_scantype() {
+    let result = parse_probe_json(
+        br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","field_order":"progressive"}]}"#,
+    )
+    .expect("valid video probe output");
+
+    assert_eq!(
+        result.streams[0].details.get("ScanType"),
+        Some(&serde_json::json!("progressive"))
+    );
+}
+
+#[test]
 fn unavailable_optional_probe_values_do_not_discard_streams() {
     let result = parse_probe_json(
         br#"{"format":{"format_name":"mpeg4","duration":"N/A","bit_rate":"N/A"},"streams":[]}"#,

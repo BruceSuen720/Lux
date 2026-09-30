@@ -598,7 +598,7 @@ fn integer_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<i
 }
 
 fn ffprobe_stream_details(stream: &serde_json::Map<String, Value>) -> BTreeMap<String, Value> {
-    const FIELDS: [(&str, &str); 16] = [
+    const FIELDS: [(&str, &str); 17] = [
         ("width", "Width"),
         ("height", "Height"),
         ("display_aspect_ratio", "AspectRatio"),
@@ -615,6 +615,7 @@ fn ffprobe_stream_details(stream: &serde_json::Map<String, Value>) -> BTreeMap<S
         ("color_space", "ColorSpace"),
         ("color_transfer", "ColorTransfer"),
         ("color_primaries", "ColorPrimaries"),
+        ("field_order", "ScanType"),
     ];
     copy_detail_fields(stream, &FIELDS)
 }

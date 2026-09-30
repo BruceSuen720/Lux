@@ -27,6 +27,7 @@ use crate::application::metadata::{
 use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
+use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
 use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,6 +109,7 @@ pub struct MovieNfoMetadata {
 const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
+const MAX_MOVIE_NFO_STREAMS: usize = 128;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
 const MAX_MOVIE_NFO_DETAILS_ITEMS: usize = 64;
 const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
@@ -1011,6 +1013,15 @@ pub fn rewrite_movie_nfo(
     rewrite_rich_nfo(original, patch, "movie", false)
 }
 
+pub fn rewrite_nfo_probe_details(
+    original: &[u8],
+    probe: &MediaProbeResult,
+) -> Result<Vec<u8>, NfoWriteError> {
+    let movie = rewrite_movie_nfo(original, &MovieNfoMetadata::default())?;
+    let streamdetails = serialize_probe_streamdetails(probe)?;
+    rewrite_nfo_fileinfo(&movie, streamdetails.as_deref())
+}
+
 pub fn rewrite_series_nfo(
     original: &[u8],
     patch: &MovieNfoMetadata,
@@ -1382,6 +1393,454 @@ fn append_movie_nfo_fields(
     }
     append_provider_ids(writer, &patch.provider_ids)?;
     Ok(())
+}
+
+fn probe_has_serializable_streams(probe: &MediaProbeResult) -> bool {
+    probe
+        .streams
+        .iter()
+        .take(MAX_MOVIE_NFO_STREAMS)
+        .next()
+        .is_some()
+}
+
+fn serialize_probe_streamdetails(
+    probe: &MediaProbeResult,
+) -> Result<Option<Vec<u8>>, NfoWriteError> {
+    if !probe_has_serializable_streams(probe) {
+        return Ok(None);
+    }
+    let mut writer = Writer::new(Vec::new());
+    start_element(&mut writer, "streamdetails", None)?;
+    let duration_seconds = probe
+        .duration_ticks
+        .filter(|ticks| *ticks > 0)
+        .map(|ticks| ticks as f64 / 10_000_000.0)
+        .filter(|seconds| *seconds <= 315_576_000.0);
+    for stream in probe.streams.iter().take(MAX_MOVIE_NFO_STREAMS) {
+        match stream.stream_type {
+            StreamType::Video => write_video_stream(&mut writer, stream, probe, duration_seconds)?,
+            StreamType::Audio => write_audio_stream(&mut writer, stream)?,
+            StreamType::Subtitle => write_subtitle_stream(&mut writer, stream)?,
+        }
+    }
+    end_element(&mut writer, "streamdetails")?;
+    Ok(Some(writer.into_inner()))
+}
+
+fn rewrite_nfo_fileinfo(
+    original: &[u8],
+    streamdetails: Option<&[u8]>,
+) -> Result<Vec<u8>, NfoWriteError> {
+    parse_nfo(original).map_err(NfoWriteError::Nfo)?;
+    let mut reader = Reader::from_reader(original);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut saw_root = false;
+    let mut fileinfo_depth = None;
+    let mut skipped_streamdetails_depth = None;
+    let mut saw_fileinfo = false;
+    let mut wrote_streamdetails = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Eof) => {
+                if depth != 0 || !saw_root {
+                    return Err(NfoWriteError::InvalidXml(
+                        "NFO document does not contain a complete root element".to_owned(),
+                    ));
+                }
+                break;
+            }
+            Ok(Event::Start(event)) => {
+                if skipped_streamdetails_depth.is_some() {
+                    depth = depth.saturating_add(1);
+                    buffer.clear();
+                    continue;
+                }
+                if depth == 0 {
+                    saw_root = true;
+                }
+                if fileinfo_depth == Some(depth)
+                    && event.name().as_ref().eq_ignore_ascii_case(b"streamdetails")
+                {
+                    depth = depth.saturating_add(1);
+                    skipped_streamdetails_depth = Some(depth);
+                    buffer.clear();
+                    continue;
+                }
+                let starts_fileinfo =
+                    depth == 1 && event.name().as_ref().eq_ignore_ascii_case(b"fileinfo");
+                writer
+                    .write_event(Event::Start(event.to_owned()))
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                depth = depth.saturating_add(1);
+                if starts_fileinfo {
+                    fileinfo_depth = Some(depth);
+                    saw_fileinfo = true;
+                }
+            }
+            Ok(Event::Empty(event)) => {
+                if skipped_streamdetails_depth.is_some() {
+                    buffer.clear();
+                    continue;
+                }
+                if fileinfo_depth == Some(depth)
+                    && event.name().as_ref().eq_ignore_ascii_case(b"streamdetails")
+                {
+                    write_optional_xml_fragment(
+                        &mut writer,
+                        streamdetails,
+                        &mut wrote_streamdetails,
+                    );
+                    buffer.clear();
+                    continue;
+                }
+                if depth == 1 && event.name().as_ref().eq_ignore_ascii_case(b"fileinfo") {
+                    saw_fileinfo = true;
+                    if !wrote_streamdetails && let Some(streamdetails) = streamdetails {
+                        let fileinfo_name = std::str::from_utf8(event.name().as_ref())
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?
+                            .to_owned();
+                        writer
+                            .write_event(Event::Start(event.to_owned()))
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                        writer.get_mut().extend_from_slice(streamdetails);
+                        writer
+                            .write_event(Event::End(BytesEnd::new(fileinfo_name)))
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                        wrote_streamdetails = true;
+                    } else {
+                        writer
+                            .write_event(Event::Empty(event.to_owned()))
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    }
+                    buffer.clear();
+                    continue;
+                }
+                if depth == 0 {
+                    saw_root = true;
+                    let name = std::str::from_utf8(event.name().as_ref())
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?
+                        .to_owned();
+                    writer
+                        .write_event(Event::Start(event.to_owned()))
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    writer
+                        .write_event(Event::End(BytesEnd::new(name)))
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                } else {
+                    writer
+                        .write_event(Event::Empty(event.to_owned()))
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                }
+            }
+            Ok(Event::End(event)) => {
+                if skipped_streamdetails_depth == Some(depth) {
+                    skipped_streamdetails_depth = None;
+                    write_optional_xml_fragment(
+                        &mut writer,
+                        streamdetails,
+                        &mut wrote_streamdetails,
+                    );
+                    depth = depth.saturating_sub(1);
+                    buffer.clear();
+                    continue;
+                }
+                if skipped_streamdetails_depth.is_some() {
+                    depth = depth.saturating_sub(1);
+                    buffer.clear();
+                    continue;
+                }
+                if fileinfo_depth == Some(depth)
+                    && event.name().as_ref().eq_ignore_ascii_case(b"fileinfo")
+                {
+                    write_optional_xml_fragment(
+                        &mut writer,
+                        streamdetails,
+                        &mut wrote_streamdetails,
+                    );
+                    fileinfo_depth = None;
+                } else if depth == 1
+                    && !saw_fileinfo
+                    && let Some(streamdetails) = streamdetails
+                {
+                    writer
+                        .write_event(Event::Start(BytesStart::new("fileinfo")))
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    writer.get_mut().extend_from_slice(streamdetails);
+                    writer
+                        .write_event(Event::End(BytesEnd::new("fileinfo")))
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    saw_fileinfo = true;
+                    wrote_streamdetails = true;
+                }
+                writer
+                    .write_event(Event::End(event.to_owned()))
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                depth = depth.saturating_sub(1);
+            }
+            Ok(event) => {
+                writer
+                    .write_event(event.to_owned())
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+            }
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+
+    let result = writer.into_inner();
+    if result.len() > MAX_LOCAL_NFO_BYTES {
+        return Err(NfoWriteError::InvalidMetadata(
+            "NFO exceeds the output size limit".to_owned(),
+        ));
+    }
+    parse_nfo(&result).map_err(NfoWriteError::Nfo)?;
+    Ok(result)
+}
+
+fn write_optional_xml_fragment(
+    writer: &mut Writer<Vec<u8>>,
+    fragment: Option<&[u8]>,
+    already_written: &mut bool,
+) {
+    if *already_written {
+        return;
+    }
+    if let Some(fragment) = fragment {
+        writer.get_mut().extend_from_slice(fragment);
+    }
+    *already_written = true;
+}
+
+fn write_video_stream(
+    writer: &mut Writer<Vec<u8>>,
+    stream: &MediaStreamResult,
+    probe: &MediaProbeResult,
+    duration_seconds: Option<f64>,
+) -> Result<(), NfoWriteError> {
+    start_element(writer, "video", None)?;
+    if let Some(codec) = normalized_probe_codec(stream.codec.as_deref()) {
+        write_simple_element(writer, "codec", codec)?;
+        write_simple_element(writer, "micodec", codec)?;
+    }
+    let has_single_video = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.stream_type == StreamType::Video)
+        .take(2)
+        .count()
+        == 1;
+    if let Some(value) = probe_detail_integer(stream, "BitRate").or_else(|| {
+        has_single_video
+            .then_some(probe.bitrate)
+            .flatten()
+            .filter(|bitrate| *bitrate > 0 && *bitrate <= 100_000_000_000)
+    }) {
+        write_simple_element(writer, "bitrate", &value.to_string())?;
+    }
+    for (detail, tag) in [("Width", "width"), ("Height", "height")] {
+        if let Some(value) =
+            probe_detail_integer(stream, detail).filter(|value| (1..=100_000).contains(value))
+        {
+            write_simple_element(writer, tag, &value.to_string())?;
+        }
+    }
+    if let Some(aspect) =
+        probe_detail_text(stream, "AspectRatio").filter(|value| valid_aspect_ratio(value))
+    {
+        write_simple_element(writer, "aspect", aspect)?;
+        write_simple_element(writer, "aspectratio", aspect)?;
+    }
+    if let Some(frame_rate) = probe_detail_frame_rate(stream, "RealFrameRate") {
+        write_simple_element(writer, "framerate", &frame_rate)?;
+    }
+    write_optional_stream_text(writer, "language", stream.language.as_deref())?;
+    if let Some(scan_type) = probe_detail_text(stream, "ScanType").and_then(normalize_scan_type) {
+        write_simple_element(writer, "scantype", scan_type)?;
+    }
+    write_bool_element(writer, "default", stream.is_default)?;
+    write_bool_element(writer, "forced", stream.is_forced)?;
+    if let Some(seconds) = duration_seconds {
+        let rounded_minutes = (seconds / 60.0).round();
+        if rounded_minutes.is_finite() && rounded_minutes <= i64::MAX as f64 {
+            write_simple_element(writer, "duration", &(rounded_minutes as i64).to_string())?;
+        }
+        write_simple_element(writer, "durationinseconds", &format_probe_seconds(seconds))?;
+    }
+    end_element(writer, "video")
+}
+
+fn write_audio_stream(
+    writer: &mut Writer<Vec<u8>>,
+    stream: &MediaStreamResult,
+) -> Result<(), NfoWriteError> {
+    start_element(writer, "audio", None)?;
+    if let Some(codec) = normalized_probe_codec(stream.codec.as_deref()) {
+        write_simple_element(writer, "codec", codec)?;
+        write_simple_element(writer, "micodec", codec)?;
+    }
+    write_optional_stream_text(writer, "language", stream.language.as_deref())?;
+    if let Some(channels) =
+        probe_detail_integer(stream, "Channels").filter(|value| (1..=64).contains(value))
+    {
+        write_simple_element(writer, "channels", &channels.to_string())?;
+    }
+    if let Some(sample_rate) =
+        probe_detail_integer(stream, "SampleRate").filter(|value| (1..=768_000).contains(value))
+    {
+        write_simple_element(writer, "samplingrate", &sample_rate.to_string())?;
+    }
+    write_bool_element(writer, "default", stream.is_default)?;
+    write_bool_element(writer, "forced", stream.is_forced)?;
+    end_element(writer, "audio")
+}
+
+fn write_subtitle_stream(
+    writer: &mut Writer<Vec<u8>>,
+    stream: &MediaStreamResult,
+) -> Result<(), NfoWriteError> {
+    start_element(writer, "subtitle", None)?;
+    if let Some(codec) = normalized_probe_codec(stream.codec.as_deref()) {
+        write_simple_element(writer, "codec", codec)?;
+        write_simple_element(writer, "micodec", codec)?;
+    }
+    write_optional_stream_text(writer, "language", stream.language.as_deref())?;
+    write_bool_element(writer, "default", stream.is_default)?;
+    write_bool_element(writer, "forced", stream.is_forced)?;
+    end_element(writer, "subtitle")
+}
+
+fn normalized_probe_codec(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return None;
+    }
+    Some(match value {
+        "hdmv_pgs_subtitle" => "PGSSUB",
+        "dvd_subtitle" => "VOBSUB",
+        _ => value,
+    })
+}
+
+fn probe_detail_text<'a>(stream: &'a MediaStreamResult, key: &str) -> Option<&'a str> {
+    stream
+        .details
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 256 && value.chars().all(is_valid_xml_character)
+        })
+}
+
+fn probe_detail_integer(stream: &MediaStreamResult, key: &str) -> Option<i64> {
+    let value = stream.details.get(key)?;
+    let value = value.as_i64().or_else(|| {
+        let value = value.as_str()?;
+        if value.len() > 20 {
+            return None;
+        }
+        value.parse::<i64>().ok()
+    })?;
+    (value > 0).then_some(value)
+}
+
+fn probe_detail_frame_rate(stream: &MediaStreamResult, key: &str) -> Option<String> {
+    let raw = probe_detail_text(stream, key)?;
+    if raw.len() > 64 {
+        return None;
+    }
+    let rate = if let Some((numerator, denominator)) = raw.split_once('/') {
+        let denominator = denominator.parse::<f64>().ok()?;
+        if denominator <= 0.0 {
+            return None;
+        }
+        numerator.parse::<f64>().ok()? / denominator
+    } else {
+        raw.parse::<f64>().ok()?
+    };
+    if rate.is_finite() && (0.0..=1000.0).contains(&rate) && rate > 0.0 {
+        Some(
+            format!("{rate:.6}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+fn format_probe_seconds(seconds: f64) -> String {
+    if seconds.fract().abs() < f64::EPSILON {
+        return format!("{seconds:.0}");
+    }
+    format!("{seconds:.3}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+fn valid_aspect_ratio(value: &str) -> bool {
+    let Some((width, height)) = value.split_once(':') else {
+        return false;
+    };
+    width
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|width| (1..=100_000).contains(&width))
+        && height
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|height| (1..=100_000).contains(&height))
+}
+
+fn normalize_scan_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "progressive" => Some("progressive"),
+        "interlaced" | "tt" | "bb" | "tb" | "bt" => Some("interlaced"),
+        _ => None,
+    }
+}
+
+fn is_valid_xml_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{9}'..='\u{D}'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}'
+    )
+}
+
+fn write_optional_stream_text(
+    writer: &mut Writer<Vec<u8>>,
+    tag: &str,
+    value: Option<&str>,
+) -> Result<(), NfoWriteError> {
+    if let Some(value) = non_empty(value)
+        .filter(|value| value.len() <= 64 && value.chars().all(is_valid_xml_character))
+    {
+        write_simple_element(writer, tag, value)?;
+    }
+    Ok(())
+}
+
+fn write_bool_element(
+    writer: &mut Writer<Vec<u8>>,
+    tag: &str,
+    value: bool,
+) -> Result<(), NfoWriteError> {
+    write_simple_element(writer, tag, if value { "True" } else { "False" })
 }
 
 fn validate_movie_nfo_actors(patch: &MovieNfoMetadata) -> Result<(), NfoWriteError> {

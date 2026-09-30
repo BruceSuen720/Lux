@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use luxd::{
     application::{
         libraries::LibraryService,
@@ -7,15 +9,18 @@ use luxd::{
             LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService, MovieNfoCredit,
             MovieNfoMetadata, NfoWriteService, parse_local_nfo_actors, parse_local_nfo_details,
             parse_local_nfo_projection, parse_movie_nfo_actors, parse_movie_nfo_details,
-            rewrite_movie_nfo, rewrite_nfo, rewrite_series_nfo, write_nfo_atomically,
+            rewrite_movie_nfo, rewrite_nfo, rewrite_nfo_probe_details, rewrite_series_nfo,
+            write_nfo_atomically,
         },
         people::ActorCredit,
+        probe::{MediaProbeResult, MediaStreamResult, StreamType},
         scanner::{LibraryScanner, ScanJobService},
     },
     config::Config,
     library::LibraryKind,
     storage::Database,
 };
+use serde_json::Value;
 
 #[test]
 fn nfo_rewrite_updates_common_fields_and_preserves_unknown_xml()
@@ -377,6 +382,79 @@ fn movie_nfo_actor_parser_and_writer_support_up_to_100_cast_members()
     assert_eq!(text.matches("<actor>").count(), 100);
     assert!(text.contains("<name>Actor 99</name>"));
     assert!(!text.contains("<name>Actor 100</name>"));
+    Ok(())
+}
+
+#[test]
+fn movie_nfo_rewrite_serializes_probe_fileinfo_and_preserves_other_fileinfo_xml()
+-> Result<(), Box<dyn std::error::Error>> {
+    let video_details = BTreeMap::from([
+        ("Width".to_owned(), Value::from(1920)),
+        ("Height".to_owned(), Value::from(798)),
+        ("AspectRatio".to_owned(), Value::from("320:133")),
+        ("RealFrameRate".to_owned(), Value::from("24000/1001")),
+        ("BitRate".to_owned(), Value::from(15_000_000)),
+        ("ScanType".to_owned(), Value::from("progressive")),
+    ]);
+    let audio_details = BTreeMap::from([
+        ("Channels".to_owned(), Value::from(6)),
+        ("SampleRate".to_owned(), Value::from(48_000)),
+    ]);
+    let probe_details = MediaProbeResult {
+        container: Some("matroska".to_owned()),
+        source_size: Some(12_345),
+        duration_ticks: Some(63_740_000_000),
+        bitrate: Some(15_975_933),
+        streams: vec![
+            MediaStreamResult {
+                stream_index: 0,
+                stream_type: StreamType::Video,
+                codec: Some("hevc".to_owned()),
+                language: Some("eng".to_owned()),
+                title: None,
+                is_default: true,
+                is_forced: false,
+                details: video_details,
+            },
+            MediaStreamResult {
+                stream_index: 1,
+                stream_type: StreamType::Audio,
+                codec: Some("dts".to_owned()),
+                language: Some("eng".to_owned()),
+                title: None,
+                is_default: true,
+                is_forced: false,
+                details: audio_details,
+            },
+            MediaStreamResult {
+                stream_index: 2,
+                stream_type: StreamType::Subtitle,
+                codec: Some("hdmv_pgs_subtitle".to_owned()),
+                language: Some("chi".to_owned()),
+                title: None,
+                is_default: false,
+                is_forced: false,
+                details: BTreeMap::new(),
+            },
+        ],
+    };
+    let original = r#"<movie><title>Keep title</title><fileinfo><legacy>keep</legacy><streamdetails><video><codec>old</codec></video></streamdetails></fileinfo><custom>keep</custom></movie>"#;
+
+    let rewritten = rewrite_nfo_probe_details(original.as_bytes(), &probe_details)?;
+    let text = String::from_utf8(rewritten)?;
+
+    assert!(text.contains("<legacy>keep</legacy>"));
+    assert!(text.contains("<custom>keep</custom>"));
+    assert!(text.contains("<codec>hevc</codec><micodec>hevc</micodec>"));
+    assert!(text.contains("<bitrate>15000000</bitrate>"));
+    assert!(text.contains("<width>1920</width><height>798</height>"));
+    assert!(text.contains("<aspect>320:133</aspect><aspectratio>320:133</aspectratio>"));
+    assert!(text.contains("<framerate>23.976024</framerate>"));
+    assert!(text.contains("<scantype>progressive</scantype>"));
+    assert!(text.contains("<duration>106</duration><durationinseconds>6374</durationinseconds>"));
+    assert!(text.contains("<channels>6</channels><samplingrate>48000</samplingrate>"));
+    assert!(text.contains("<codec>PGSSUB</codec><micodec>PGSSUB</micodec>"));
+    assert!(!text.contains("<codec>old</codec>"));
     Ok(())
 }
 

@@ -2145,7 +2145,7 @@ services:
 | LUX-317 | docs/LUX-317-PLAN.md、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/login_background_assets.rs、src/api/、web/src/features/admin/、Lux-plugins/；统一登录背景插件与单张自定义上传图 |
 | LUX-318 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；TMDb 电影完整详情候选与 NFO 写回 |
 | LUX-319 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；电影 NFO 演员上限扩展到 100 并保持顺序 |
-| LUX-320 | src/application/nfo.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
+| LUX-320 | src/application/nfo.rs、src/application/probe.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
 | LUX-321 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后原子更新 NFO 技术信息 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
