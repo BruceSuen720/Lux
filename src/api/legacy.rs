@@ -79,7 +79,7 @@ use crate::{
         network_diagnostics::{NetworkDiagnostics, NetworkProbeResult, test_network},
         nfo::{
             LocalNfoDetails, LocalNfoMetadataStore, MetadataWriteRequest, MetadataWriteService,
-            NfoWriteError,
+            NfoWriteError, NfoWriteService,
         },
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
         plugins::{PluginPage, PluginService, PluginServiceError},
@@ -323,7 +323,11 @@ impl AppState {
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
         let probe = Some(
             MediaProbeService::new(database.clone(), FfprobeRunner::default())
-                .with_resource_metrics(resources.clone()),
+                .with_resource_metrics(resources.clone())
+                .with_nfo_writer(NfoWriteService::new_with_config_dir(
+                    database.clone(),
+                    config_dir.clone(),
+                )),
         );
         let embedded_subtitle = Some(EmbeddedSubtitleService::new());
         let thumbnails = Some(ThumbnailService::new(database.clone()));

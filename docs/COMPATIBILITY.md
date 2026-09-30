@@ -764,3 +764,9 @@ SenPlayer 6.0.6 的历史实测结果：服务器已添加，但客户端重复�
 电影手动识别或完整刮削时，Lux 将 TMDb 能提供的评分、发行信息、类型、国家、制片公司、合集、官网、外部 ID、crew、演员和预告片写入 Emby/Kodi 风格 NFO；演员按 provider 顺序最多写入 100 人，不生成缺失的 IMDb/TVDb/Douban 人物 ID。有 IMDb ID 时写 `<id>`，有官网时写 `uniqueid type="official website"`。`sorttitle` 和 `dateadded` 从 Lux 数据库的 `sort_title` 与 UTC `added_at` 补入，但既有 NFO 值优先。未知 XML 字段保留。仅因为已有 NFO 缺少这些丰富字段，不会额外创建 `FILL_MISSING` 刮削任务；下一次真实元数据刮削会请求完整详情。
 
 Rust 回归由 `tests/metadata_selection.rs`、`tests/nfo_writer.rs` 覆盖；它们证明代码序列化与合并合同，不代表某一台已部署 Lux 与 Emby 的现场文件对比。
+
+## 本地探测 NFO `fileinfo/streamdetails`（2026-09-30）
+
+成功的本地电影探测会把实际探测到的视频、音频和字幕轨写入主媒体 source 对应的 NFO，并按媒体库策略同步配置卷镜像。重复探测会替换旧 streamdetails，同时保留 NFO 其他字段。宽高、codec、帧率、aspect、语言、声道、采样率、默认/强制标志和时长都来自 Lux 探测结果；`.strm` 仅使用旁车数据供播放信息读取，不据此生成本地 NFO 技术信息。
+
+回归由 `tests/probe.rs` 与 `tests/nfo_writer.rs` 覆盖，包含真实媒体 source 的 NFO 回写、重探测去重、镜像同步和 `.strm` 不写回；尚未部署到实际媒体库与 Emby 对照验证。
