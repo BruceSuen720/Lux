@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -34,9 +34,54 @@ pub(crate) struct ProviderResponseCache {
     path: Option<PathBuf>,
 }
 
+#[derive(Default)]
 struct CacheState {
     entries: HashMap<String, CacheEntry>,
+    expiry_order: BTreeSet<(i64, String)>,
     inflight: HashMap<String, Arc<Notify>>,
+}
+
+impl CacheState {
+    fn insert(&mut self, key: String, entry: CacheEntry) {
+        self.remove(&key);
+        self.expiry_order.insert((entry.expires_at, key.clone()));
+        self.entries.insert(key, entry);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<CacheEntry> {
+        let entry = self.entries.remove(key)?;
+        self.expiry_order
+            .remove(&(entry.expires_at, key.to_owned()));
+        Some(entry)
+    }
+
+    fn remove_expired(&mut self, now: i64) -> usize {
+        let mut removed = 0;
+        while self
+            .expiry_order
+            .first()
+            .is_some_and(|(expires_at, _)| *expires_at <= now)
+        {
+            let Some((expires_at, key)) = self.expiry_order.pop_first() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.expires_at == expires_at)
+            {
+                self.entries.remove(&key);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn evict_oldest(&mut self) -> Option<String> {
+        let (_, key) = self.expiry_order.pop_first()?;
+        self.entries.remove(&key);
+        Some(key)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,6 +144,7 @@ impl ProviderResponseCache {
         Self {
             state: Arc::new(Mutex::new(CacheState {
                 entries: HashMap::new(),
+                expiry_order: BTreeSet::new(),
                 inflight: HashMap::new(),
             })),
             load_once: Arc::new(OnceCell::new()),
@@ -121,6 +167,7 @@ impl ProviderResponseCache {
         self.ensure_loaded().await;
         let now = unix_now();
         let mut state = lock_state(&self.state);
+        state.remove_expired(now);
         if let Some(entry) = state.entries.get(key) {
             if entry.expires_at > now {
                 return if entry.negative {
@@ -130,7 +177,6 @@ impl ProviderResponseCache {
                 };
             }
         }
-        state.entries.retain(|_, entry| entry.expires_at > now);
         if let Some(notify) = state.inflight.get(key) {
             let mut waiter = Box::pin(notify.clone().notified_owned());
             waiter.as_mut().enable();
@@ -155,10 +201,12 @@ impl ProviderResponseCache {
         };
         {
             let mut state = lock_state(&self.state);
+            state.remove_expired(unix_now());
+            state.remove(key);
             if state.entries.len() >= MAX_CACHE_ENTRIES {
-                evict_oldest(&mut state.entries);
+                state.evict_oldest();
             }
-            state.entries.insert(
+            state.insert(
                 key.to_owned(),
                 CacheEntry {
                     value: value.clone(),
@@ -176,10 +224,12 @@ impl ProviderResponseCache {
         };
         {
             let mut state = lock_state(&self.state);
+            state.remove_expired(unix_now());
+            state.remove(key);
             if state.entries.len() >= MAX_CACHE_ENTRIES {
-                evict_oldest(&mut state.entries);
+                state.evict_oldest();
             }
-            state.entries.insert(
+            state.insert(
                 key.to_owned(),
                 CacheEntry {
                     value: Value::Null,
@@ -193,7 +243,11 @@ impl ProviderResponseCache {
 
     pub(crate) async fn clear(&self) {
         self.ensure_loaded().await;
-        lock_state(&self.state).entries.clear();
+        {
+            let mut state = lock_state(&self.state);
+            state.entries.clear();
+            state.expiry_order.clear();
+        }
         self.schedule_persist().await;
     }
 
@@ -231,6 +285,11 @@ impl ProviderResponseCache {
                     .into_iter()
                     .filter(|(_, entry)| entry.expires_at > now)
                     .take(MAX_CACHE_ENTRIES)
+                    .collect();
+                state.expiry_order = state
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (entry.expires_at, key.clone()))
                     .collect();
             })
             .await;
@@ -281,11 +340,13 @@ impl ProviderResponseCache {
 
     async fn persist_now_to_path(&self, path: &Path) -> bool {
         let _guard = self.persist_lock.lock().await;
-        let entries = {
-            let state = lock_state(&self.state);
-            state.entries.clone()
-        };
-        let Ok(bytes) = serde_json::to_vec(&entries) else {
+        let state = Arc::clone(&self.state);
+        let bytes = tokio::task::spawn_blocking(move || {
+            let entries = lock_state(&state).entries.clone();
+            serde_json::to_vec(&entries)
+        })
+        .await;
+        let Ok(Ok(bytes)) = bytes else {
             return false;
         };
         let Some(parent) = path.parent() else {
@@ -331,16 +392,6 @@ pub(crate) fn ttl_for_method(method: &str) -> i64 {
     }
 }
 
-fn evict_oldest(entries: &mut HashMap<String, CacheEntry>) {
-    if let Some((key, _)) = entries
-        .iter()
-        .min_by_key(|(_, entry)| entry.expires_at)
-        .map(|(key, entry)| (key.clone(), entry.clone()))
-    {
-        entries.remove(&key);
-    }
-}
-
 fn serialized_size(value: &Value) -> usize {
     serde_json::to_vec(value)
         .map(|bytes| bytes.len())
@@ -357,10 +408,88 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheLookup, ProviderResponseCache};
+    use super::{CacheEntry, CacheLookup, CacheState, ProviderResponseCache};
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn cache_expiry_index_tracks_replacement_and_removes_expired_entries_in_order() {
+        let mut state = CacheState::default();
+        state.insert(
+            "stale".to_owned(),
+            CacheEntry {
+                value: json!({"id": 1}),
+                expires_at: 100,
+                negative: false,
+            },
+        );
+        state.insert(
+            "expired".to_owned(),
+            CacheEntry {
+                value: json!({"id": 2}),
+                expires_at: 120,
+                negative: false,
+            },
+        );
+        state.insert(
+            "live".to_owned(),
+            CacheEntry {
+                value: json!({"id": 3}),
+                expires_at: 300,
+                negative: false,
+            },
+        );
+
+        state.insert(
+            "stale".to_owned(),
+            CacheEntry {
+                value: json!({"id": 4}),
+                expires_at: 250,
+                negative: false,
+            },
+        );
+        assert_eq!(state.expiry_order.len(), 3);
+        assert!(!state.expiry_order.contains(&(100, "stale".to_owned())));
+        assert_eq!(state.remove_expired(200), 1);
+        assert!(state.entries.contains_key("stale"));
+        assert!(!state.entries.contains_key("expired"));
+        assert!(state.entries.contains_key("live"));
+        assert_eq!(
+            state.expiry_order,
+            BTreeSet::from([(250, "stale".to_owned()), (300, "live".to_owned()),])
+        );
+    }
+
+    #[test]
+    fn cache_evicts_the_earliest_expiry_without_cloning_the_cached_value() {
+        let mut state = CacheState::default();
+        state.insert(
+            "soon".to_owned(),
+            CacheEntry {
+                value: json!({"nested": [1, 2, 3]}),
+                expires_at: 10,
+                negative: false,
+            },
+        );
+        state.insert(
+            "later".to_owned(),
+            CacheEntry {
+                value: json!({"nested": [4, 5, 6]}),
+                expires_at: 20,
+                negative: false,
+            },
+        );
+
+        assert_eq!(state.evict_oldest().as_deref(), Some("soon"));
+        assert!(!state.entries.contains_key("soon"));
+        assert!(state.entries.contains_key("later"));
+        assert_eq!(
+            state.expiry_order,
+            BTreeSet::from([(20, "later".to_owned())])
+        );
+    }
 
     #[tokio::test]
     async fn cache_reuses_values_and_negative_results() {
