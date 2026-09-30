@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
-import { AdminDatabaseDiagnosticsPanel } from "./AdminDatabaseDiagnosticsPanel";
 import type {
   AdminNetworkProxySettings,
   LoginBackgroundSource,
@@ -119,8 +118,6 @@ export function AdminSettingsPage() {
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="admin-api-key-heading">
         <AdminApiKeyPanel />
       </section>
-
-      <AdminDatabaseDiagnosticsPanel />
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="playback-settings-heading">
         <div className="lux-admin-panel-heading">
