@@ -1032,34 +1032,54 @@ impl MetadataCandidateService {
         let Some(best) = rows.first_mut() else {
             return Ok(None);
         };
-        if plan.needs_metadata && !Self::candidate_metadata_was_fetched(&best.candidate_json)? {
-            let item_type = match current.item_type.as_str() {
-                "MOVIE" => ScraperItemType::Movie,
-                "SERIES" => ScraperItemType::Series,
-                _ => return Ok(None),
-            };
-            let details = scraper
-                .get_generic(ScraperGetRequest::new(
-                    item_type,
-                    best.provider_id.clone(),
-                    "zh-CN",
-                ))
-                .await
-                .map_err(MetadataCandidateError::Scraper)?;
-            let candidate_json =
-                Self::merge_scraper_metadata_into_candidate(&best.candidate_json, &details)?;
-            if !self
-                .database
-                .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
-                .await?
-            {
-                return Ok(None);
+        let mut best_candidate_value = if plan.needs_metadata {
+            let mut value = serde_json::from_str::<Value>(&best.candidate_json)
+                .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+            if !Self::candidate_metadata_was_fetched(&value) {
+                let item_type = match current.item_type.as_str() {
+                    "MOVIE" => ScraperItemType::Movie,
+                    "SERIES" => ScraperItemType::Series,
+                    _ => return Ok(None),
+                };
+                let details = scraper
+                    .get_generic(ScraperGetRequest::new(
+                        item_type,
+                        best.provider_id.clone(),
+                        "zh-CN",
+                    ))
+                    .await
+                    .map_err(MetadataCandidateError::Scraper)?;
+                value = Self::merge_scraper_metadata_into_candidate(value, &details)?;
+                let candidate_json = serde_json::to_string(&value).map_err(|error| {
+                    MetadataCandidateError::InvalidCandidateJson(error.to_string())
+                })?;
+                if !self
+                    .database
+                    .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                best.candidate_json = candidate_json;
             }
-            best.candidate_json = candidate_json;
-        }
+            Some(value)
+        } else {
+            None
+        };
         let items = rows
             .into_iter()
-            .map(|row| candidate_view(row, Some(current)))
+            .enumerate()
+            .map(|(index, row)| {
+                let candidate = if index == 0 {
+                    best_candidate_value.take()
+                } else {
+                    None
+                };
+                match candidate {
+                    Some(candidate) => Ok(candidate_view_with_value(row, Some(current), candidate)),
+                    None => candidate_view(row, Some(current)),
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
         Ok(Some(MetadataCandidatePage {
@@ -1070,23 +1090,17 @@ impl MetadataCandidateService {
         }))
     }
 
-    fn candidate_metadata_was_fetched(
-        candidate_json: &str,
-    ) -> Result<bool, MetadataCandidateError> {
-        let value = serde_json::from_str::<Value>(candidate_json)
-            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
-        Ok(value
+    fn candidate_metadata_was_fetched(candidate: &Value) -> bool {
+        candidate
             .get("metadataFetched")
             .and_then(Value::as_bool)
-            .unwrap_or(false))
+            .unwrap_or(false)
     }
 
     fn merge_scraper_metadata_into_candidate(
-        candidate_json: &str,
+        mut value: Value,
         details: &ScraperMetadata,
-    ) -> Result<String, MetadataCandidateError> {
-        let mut value = serde_json::from_str::<Value>(candidate_json)
-            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+    ) -> Result<Value, MetadataCandidateError> {
         let mut provider_ids = candidate_provider_ids(&value)
             .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
         provider_ids.extend(details.provider_ids.clone());
@@ -1130,8 +1144,7 @@ impl MetadataCandidateService {
         }
         object.insert("providerIds".to_owned(), json!(provider_ids));
         object.insert("metadataFetched".to_owned(), Value::Bool(true));
-        serde_json::to_string(&value)
-            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))
+        Ok(value)
     }
 
     async fn search_child_and_store(
@@ -3800,10 +3813,18 @@ fn candidate_view(
 ) -> Result<MetadataCandidateView, MetadataCandidateError> {
     let candidate: Value = serde_json::from_str(&row.candidate_json)
         .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+    Ok(candidate_view_with_value(row, current, candidate))
+}
+
+fn candidate_view_with_value(
+    row: StoredMetadataCandidate,
+    current: Option<&StoredMediaMetadata>,
+    candidate: Value,
+) -> MetadataCandidateView {
     let field_diffs = current
         .map(|current| field_diffs(current, &candidate))
         .unwrap_or_default();
-    Ok(MetadataCandidateView {
+    MetadataCandidateView {
         id: row.id,
         item_id: row.item_id,
         item_title: row.item_title,
@@ -3814,7 +3835,7 @@ fn candidate_view(
         status: row.status,
         expires_at: row.expires_at,
         field_diffs,
-    })
+    }
 }
 
 fn field_diffs(current: &StoredMediaMetadata, candidate: &Value) -> Vec<MetadataFieldDiff> {
@@ -3900,12 +3921,12 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
-        MetadataRequestPlan, MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actors,
-        capability_needs_request, completeness_capabilities, credits_are_missing,
-        default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
-        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
-        parse_image_selection_policy, selected_scraper_provider_id,
+        MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
+        SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
+        credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
+        generic_candidate_images, local_metadata_completeness_plan, merge_actor_values,
+        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
+        metadata_request_plan, parse_image_selection_policy, selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3916,6 +3937,7 @@ mod tests {
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -4026,6 +4048,37 @@ mod tests {
         assert!(actors.iter().all(|actor| actor.person.is_some()));
         assert!(maximum.load(Ordering::SeqCst) > 1);
         assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
+
+    #[test]
+    fn cached_candidate_value_is_merged_without_reparsing_its_json() {
+        let candidate = json!({
+            "title": "Example",
+            "providerIds": {"tmdb": "7"},
+            "unknownField": {"preserved": true},
+            "metadataFetched": false
+        });
+        assert!(!MetadataCandidateService::candidate_metadata_was_fetched(
+            &candidate
+        ));
+
+        let merged = MetadataCandidateService::merge_scraper_metadata_into_candidate(
+            candidate,
+            &ScraperMetadata {
+                overview: Some("Fetched summary".to_owned()),
+                provider_ids: BTreeMap::from([("imdb".to_owned(), "tt7".to_owned())]),
+                ..ScraperMetadata::default()
+            },
+        )
+        .expect("merge cached candidate value");
+
+        assert_eq!(merged["overview"], "Fetched summary");
+        assert_eq!(merged["providerIds"]["tmdb"], "7");
+        assert_eq!(merged["providerIds"]["imdb"], "tt7");
+        assert_eq!(merged["unknownField"]["preserved"], true);
+        assert!(MetadataCandidateService::candidate_metadata_was_fetched(
+            &merged
+        ));
     }
 
     #[test]
