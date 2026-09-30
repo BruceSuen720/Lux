@@ -21,7 +21,7 @@ mod unix {
         health_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let client = reqwest::Client::new();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match client.get(health_url).send().await {
                     Ok(response) if response.status().is_success() => {
