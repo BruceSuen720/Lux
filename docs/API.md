@@ -188,7 +188,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/favorites?page=1&pageSize=50`：返回当前用户跨可见媒体库的收藏条目，按最近添加倒序分页；服务端执行用户状态和媒体库 ACL。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，默认只返回电影和整剧，不返回季度或单集；结果执行媒体库 ACL。剧集季度/单集通过条目层级接口读取。
 - `GET /api/v1/home`：返回当前用户继续观看、推荐和可见媒体库入口；每个媒体库入口包含最多 12 条该库最新资源，按 `media_items.added_at` 倒序。该接口可由 Lux Web 或携带用户级客户端令牌的第三方客户端调用。所有内容均执行媒体库 ACL；响应中的 `recentlyAdded` 字段保留用于旧客户端兼容，Lux Web 首页按媒体库分别展示最新资源。
-- 共享 Catalog worker 繁忙、排队超过 2 秒时，Lux Catalog 聚合接口返回 503 和 `error.code=CATALOG_BUSY`，并附 `Retry-After: 2`；Emby 兼容路由保留原来的空 503 响应形状并附相同重试提示。
+- Catalog 聚合接口排队超过 2 秒时返回 503 和 `error.code=CATALOG_BUSY`，并附 `Retry-After: 2`。首页使用独立的有界 worker 池，避免搜索和目录请求占满首页 worker；两类 Lux 请求超过排队上限时返回相同错误。Emby 兼容路由保留原来的空 503 响应形状并附相同重试提示。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看、收藏状态，以及该条目的活动播放状态（`state`、`isPaused`、`lastEventAt`）。
 - `POST /api/v1/items/{itemId}/progress`：写入播放事件，需要当前 Web session 和 CSRF，或用户级客户端令牌。请求体为 `{ "positionTicks": 1200000000, "durationTicks": 7200000000, "state": "PLAYING" }`；`state` 可为 `PLAYING`、`PAUSED` 或 `STOPPED`，省略时兼容为 `PLAYING`。
 - `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF，或用户级客户端令牌。
