@@ -48,6 +48,8 @@ pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
 pub const NOTIFICATION_SEND_METHOD: &str = "notification.send";
 pub const DANMAKU_MATCH_METHOD: &str = "danmaku.match";
 pub const LOGIN_BACKGROUND_GET_METHOD: &str = "login_background.get";
+pub const UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID: &str = "org.lux.login-background";
+pub const LOGIN_BACKGROUND_CUSTOM_IMAGE_PATH: &str = "/api/v1/auth/login-background/custom-image";
 pub const MAX_LOGIN_BACKGROUND_RESULT_BYTES: usize = 256 * 1024;
 pub const MAX_LOGIN_BACKGROUND_ITEMS: usize = 40;
 pub const MAX_LOGIN_BACKGROUND_IMAGE_URL_BYTES: usize = 2048;
@@ -340,12 +342,23 @@ impl PluginManifest {
             validate_text("config field label", &field.label, 128)?;
             if !matches!(
                 field.input_type.as_str(),
-                "text" | "textarea" | "password" | "select" | "toggle" | "number"
+                "text" | "textarea" | "password" | "select" | "toggle" | "number" | "image"
             ) {
                 return Err(PluginManifestError::Invalid(format!(
                     "unsupported config field type: {}",
                     field.input_type
                 )));
+            }
+            if field.input_type == "image"
+                && (self.plugin_type != PLUGIN_TYPE_LOGIN_BACKGROUND
+                    || field.required
+                    || field.sensitive
+                    || field.default_value.is_some())
+            {
+                return Err(PluginManifestError::Invalid(
+                    "image config fields must be optional, non-sensitive login background fields"
+                        .to_owned(),
+                ));
             }
             if field.input_type == "select" {
                 if field.options.is_empty() == field.options_source.is_none()
@@ -937,6 +950,15 @@ fn validate_login_background_image_url(
     if image_url.len() > MAX_LOGIN_BACKGROUND_IMAGE_URL_BYTES {
         return Err(LoginBackgroundRpcValidationError::InvalidImageUrl);
     }
+    if image_url == LOGIN_BACKGROUND_CUSTOM_IMAGE_PATH
+        && manifest.id == UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID
+        && manifest
+            .config_fields
+            .iter()
+            .any(|field| field.input_type == "image")
+    {
+        return Ok(());
+    }
     let url =
         Url::parse(image_url).map_err(|_| LoginBackgroundRpcValidationError::InvalidImageUrl)?;
     if url.scheme() != "https"
@@ -964,6 +986,16 @@ fn validate_login_background_image_url(
         return Err(LoginBackgroundRpcValidationError::UndeclaredImageHost);
     }
     Ok(())
+}
+
+pub fn is_valid_login_background_asset_id(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

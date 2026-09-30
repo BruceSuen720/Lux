@@ -258,10 +258,11 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   宿主负责迁移任务、映射、导入、幂等、恢复和历史事件落库；插件不能访问 Lux 数据库、媒体目录或任务对象。
 - `plugin.shutdown`：请求插件优雅退出。
 
-配置字段支持 text、password、select、toggle 和 number；select 可通过 multiple: true 声明多选，选项使用
+配置字段支持 text、password、select、toggle、number 和 `login_background` 专用的 `image`；select 可通过 multiple: true 声明多选，选项使用
 `{ "value": "...", "label": "..." }`。`number` 可以声明 `minimum`、`maximum` 和
 `defaultValue`。select 可以声明 `optionsSource`，当前支持 `media-libraries`，由 Lux 根据当前
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
+`image` 字段必须可选、非敏感且无 defaultValue，仅允许 `login_background` 插件声明。它表示 Lux 宿主托管的单个图片资产，不是普通文件路径或图片 URL 输入框。其配置值只能是 `sha256:<64 位小写十六进制>` opaque asset ID；只通过管理员图片上传 API 创建/替换，插件不会收到本地路径或图片字节。
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。片头片尾插件不得用 `libraryIds` 配置媒体库归属；
 媒体库通过 Lux API 的 `chapterSourceId` 选择数据源。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
 
@@ -327,8 +328,11 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 ```
 
 `contentKind` 只允许 `POSTER_FEED`（0–40 项）、`HERO_IMAGE`（恰好 1 项）、`SINGLE_POSTER` 或 `SINGLE_IMAGE`（后两者恰好 1 项）。响应 JSON 最大
-256 KiB，每条图片 URL 最大 2048 字节。图片 URL 必须是无凭据、无片段的 HTTPS URL，且主机必须与
-`permissions.imageHosts` 中某一域名精确匹配；拒绝 localhost、本地域名和 IP 字面量。未知字段、
+256 KiB，每条图片 URL 最大 2048 字节。图片 URL 通常必须是无凭据、无片段的 HTTPS URL，且主机必须与
+`permissions.imageHosts` 中某一域名精确匹配；拒绝 localhost、本地域名和 IP 字面量。唯一例外是
+`org.lux.login-background` manifest 声明 `type: "image"` 配置字段时，可返回精确固定路径
+`/api/v1/auth/login-background/custom-image`。该能力不接受其他相对路径、查询参数或前缀匹配；Lux
+仅在该插件为当前启用来源且 `source` 为 `CUSTOM_IMAGE` 时公开服务校验后的资产。未知字段、
 超量条目、含控制字符或超长的署名文本会被拒绝。`sourceName` 为必填纯文本；版权字段及每项
 `title`/`copyrightNotice` 为可选纯文本。每项也可带 `attributionUrl` 和 `licenseUrl`：两者必须为
 HTTPS、无凭据/片段/端口的 URL，主机必须与 `permissions.network` 中某一域名精确匹配；宿主只按文本链接显示，永不将其作为服务端请求目标。

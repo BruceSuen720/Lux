@@ -42,6 +42,7 @@ use crate::{
             PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+            is_valid_login_background_asset_id,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
@@ -2724,6 +2725,14 @@ fn validate_config_values(
                     return Err(PluginServiceError::InvalidConfig);
                 }
             }
+            "image" => {
+                let Some(value) = value.as_str() else {
+                    return Err(PluginServiceError::InvalidConfig);
+                };
+                if !is_valid_login_background_asset_id(value) {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+            }
             _ => return Err(PluginServiceError::InvalidConfig),
         }
         normalized.insert(field.key.clone(), value.clone());
@@ -3242,7 +3251,10 @@ mod plugin_update_tests {
     use serde_json::{Map, json};
 
     use super::super::plugin_store::is_newer_version;
-    use super::{TMDB_PLUGIN_ID, normalize_plugin_config_for_fields};
+    use super::{
+        PluginServiceError, TMDB_PLUGIN_ID, normalize_plugin_config_for_fields,
+        validate_config_values,
+    };
     use crate::application::plugin_protocol::{PluginConfigField, PluginConfigOption};
 
     #[test]
@@ -3300,6 +3312,32 @@ mod plugin_update_tests {
 
         assert_eq!(normalized["preferredLanguage"], "en-US");
         assert_eq!(normalized["fallbackLanguages"], json!(["zh-CN", "zh-TW"]));
+    }
+
+    #[test]
+    fn image_config_values_accept_only_opaque_sha256_asset_ids() {
+        let fields = vec![PluginConfigField {
+            key: "customImage".to_owned(),
+            input_type: "image".to_owned(),
+            ..PluginConfigField::default()
+        }];
+        let asset_id = format!("sha256:{}", "a".repeat(64));
+        let accepted = Map::from_iter([("customImage".to_owned(), json!(asset_id))]);
+        assert!(validate_config_values(&fields, &accepted).is_ok());
+
+        for value in [
+            json!("../secret"),
+            json!("https://images.example.com/custom.jpg"),
+            json!(format!("sha256:{}", "A".repeat(64))),
+            json!(format!("sha256:{}", "a".repeat(63))),
+            json!(null),
+        ] {
+            let values = Map::from_iter([("customImage".to_owned(), value)]);
+            assert!(matches!(
+                validate_config_values(&fields, &values),
+                Err(PluginServiceError::InvalidConfig)
+            ));
+        }
     }
 }
 
