@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -136,6 +136,7 @@ pub struct PluginService {
     config_dir: PathBuf,
     catalog: Arc<RwLock<PluginCatalog>>,
     catalog_refresh_lock: Arc<Mutex<()>>,
+    scraper_client_revision: Arc<AtomicU64>,
     supervisor: PluginSupervisor,
     store: Option<PluginStore>,
     provider_cache: ProviderResponseCache,
@@ -166,6 +167,7 @@ impl PluginService {
             config_dir: config_dir.clone(),
             catalog,
             catalog_refresh_lock: Arc::new(Mutex::new(())),
+            scraper_client_revision: Arc::new(AtomicU64::new(0)),
             supervisor,
             store,
             provider_cache: ProviderResponseCache::new(Some(
@@ -181,6 +183,14 @@ impl PluginService {
 
     pub(crate) fn provider_cache(&self) -> ProviderResponseCache {
         self.provider_cache.clone()
+    }
+
+    pub(crate) fn scraper_client_revision(&self) -> u64 {
+        self.scraper_client_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate_scraper_client_cache(&self) {
+        self.scraper_client_revision.fetch_add(1, Ordering::AcqRel);
     }
 
     fn start_login_background_refresh_worker(&self) {
@@ -523,6 +533,7 @@ impl PluginService {
             self.install_remote_package(&entry, false).await?;
         }
         self.database.install_plugin(&plugin_id).await?;
+        self.invalidate_scraper_client_cache();
         let current_catalog = self.catalog_snapshot().await;
         if current_catalog
             .get(&plugin_id)
@@ -560,12 +571,14 @@ impl PluginService {
         remove_plugin_config(&self.config_dir, &plugin_id)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
+        self.invalidate_scraper_client_cache();
         let _catalog_refresh_guard = self.catalog_refresh_lock.lock().await;
         self.supervisor.stop(&plugin_id).await;
         remove_plugin_files(plugin)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
         self.database.uninstall_plugin(&plugin_id).await?;
+        self.invalidate_scraper_client_cache();
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.database.disable_strm_media_info_task().await?;
         } else if is_chapter_detector_plugin(plugin) {
@@ -574,6 +587,7 @@ impl PluginService {
         self.sync_manifest_scheduled_tasks().await?;
         let catalog = discover_plugin_catalog(self.config_dir.join("plugins"), None).await?;
         *self.catalog.write().await = catalog;
+        self.invalidate_scraper_client_cache();
         Ok(())
     }
 
@@ -683,6 +697,7 @@ impl PluginService {
         self.database
             .set_plugin_enabled(&plugin_id, enabled)
             .await?;
+        self.invalidate_scraper_client_cache();
         if !enabled {
             self.supervisor.stop(&plugin_id).await;
         } else if catalog
@@ -1802,7 +1817,9 @@ impl PluginService {
         drop(file);
         fs::rename(&temporary, &path)
             .await
-            .map_err(PluginServiceError::ConfigIo)
+            .map_err(PluginServiceError::ConfigIo)?;
+        self.invalidate_scraper_client_cache();
+        Ok(())
     }
 
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult, PluginServiceError> {
@@ -2134,6 +2151,7 @@ impl PluginService {
         }
         let _ = fs::remove_dir_all(&validation_dir).await;
         *self.catalog.write().await = catalog;
+        self.invalidate_scraper_client_cache();
         Ok(())
     }
 

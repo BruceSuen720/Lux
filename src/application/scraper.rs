@@ -1,9 +1,16 @@
-use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    sync::OnceCell,
+    sync::{OnceCell, RwLock},
     time::{Duration, sleep},
 };
 
@@ -477,17 +484,21 @@ pub struct ScraperSearchResult {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use super::{
-        PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
-        decode_bundle_response_ref, decode_credits_response, decode_credits_response_ref,
-        decode_images_response, decode_images_response_ref, decode_metadata_response,
-        decode_metadata_response_ref, decode_search_response, decode_search_response_ref,
-        deserialize_value_ref, metadata_capability_for_method, provider_id_for_key,
-        provider_key_from_plugin_id, retryable_scraper_error, scraper_id_matches_provider,
+        PluginServiceError, ScraperError, ScraperPluginClient, ScraperResolver,
+        ScraperSearchResult, decode_bundle_response, decode_bundle_response_ref,
+        decode_credits_response, decode_credits_response_ref, decode_images_response,
+        decode_images_response_ref, decode_metadata_response, decode_metadata_response_ref,
+        decode_search_response, decode_search_response_ref, deserialize_value_ref,
+        metadata_capability_for_method, provider_id_for_key, provider_key_from_plugin_id,
+        retryable_scraper_error, scraper_id_matches_provider,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
+    use crate::{application::plugins::PluginService, config::Config, storage::Database};
     use serde_json::json;
+    use tokio::sync::OnceCell;
 
     #[test]
     fn selects_the_id_for_the_configured_scraper() {
@@ -650,6 +661,49 @@ mod tests {
             decode_bundle_response(bundle_value.clone()).expect("owned bundle response")
         );
         assert_eq!(bundle_value["metadata"]["Name"], "Example");
+    }
+
+    #[tokio::test]
+    async fn scraper_client_cache_revalidates_after_config_revision_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let resolver = ScraperResolver::new(database, plugins.clone());
+        let revision = plugins.scraper_client_revision();
+        let cached_client = ScraperPluginClient::new_with_provider_key_and_capabilities(
+            plugins.clone(),
+            "missing-plugin",
+            "missing-provider",
+            Vec::new(),
+            Some(Vec::new()),
+            plugins.provider_cache(),
+        );
+        let client_cell = Arc::new(OnceCell::new());
+        assert!(client_cell.set(cached_client).is_ok());
+        resolver
+            .client_cache
+            .write()
+            .await
+            .insert((revision, "missing-plugin".to_owned()), client_cell);
+
+        let cached = resolver
+            .client_for_scraper("missing-plugin")
+            .await
+            .expect("same-revision client should be reused");
+        assert_eq!(cached.plugin_id(), "missing-plugin");
+
+        plugins.invalidate_scraper_client_cache();
+        assert_ne!(revision, plugins.scraper_client_revision());
+        assert!(matches!(
+            resolver.client_for_scraper("missing-plugin").await,
+            Err(ScraperError::Plugin(PluginServiceError::UnknownPlugin(_)))
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1292,6 +1346,7 @@ pub struct ScraperResolver {
     database: Database,
     plugins: PluginService,
     resources: Option<ResourceMetrics>,
+    client_cache: Arc<RwLock<HashMap<(u64, String), Arc<OnceCell<ScraperPluginClient>>>>>,
 }
 
 #[derive(Clone)]
@@ -1307,12 +1362,38 @@ impl ScraperResolver {
             database,
             plugins,
             resources: None,
+            client_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
         self.resources = Some(resources);
         self
+    }
+
+    async fn client_for_scraper(
+        &self,
+        scraper_id: &str,
+    ) -> Result<ScraperPluginClient, ScraperError> {
+        loop {
+            let revision = self.plugins.scraper_client_revision();
+            let cell = {
+                let mut cache = self.client_cache.write().await;
+                cache.retain(|(cached_revision, _), _| *cached_revision == revision);
+                Arc::clone(
+                    cache
+                        .entry((revision, scraper_id.to_owned()))
+                        .or_insert_with(|| Arc::new(OnceCell::new())),
+                )
+            };
+            let result = cell
+                .get_or_try_init(|| async { self.plugins.scraper_client(scraper_id).await })
+                .await;
+            if self.plugins.scraper_client_revision() != revision {
+                continue;
+            }
+            return result.map(Clone::clone).map_err(ScraperError::Plugin);
+        }
     }
 
     pub async fn for_item(
@@ -1340,7 +1421,7 @@ impl ScraperResolver {
                 .role
                 .parse::<LibraryScraperRole>()
                 .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
-            let client = match self.plugins.scraper_client(&scraper.scraper_id).await {
+            let client = match self.client_for_scraper(&scraper.scraper_id).await {
                 Ok(client) => {
                     if let Some(resources) = &self.resources {
                         client.with_resource_metrics(resources.clone())
@@ -1350,7 +1431,7 @@ impl ScraperResolver {
                 }
                 Err(error) => {
                     if first_error.is_none() {
-                        first_error = Some(ScraperError::Plugin(error));
+                        first_error = Some(error);
                     }
                     continue;
                 }
@@ -1366,7 +1447,7 @@ impl ScraperResolver {
         {
             let scraper_id = scraper_id.trim();
             if !scraper_id.is_empty()
-                && let Ok(client) = self.plugins.scraper_client(scraper_id).await
+                && let Ok(client) = self.client_for_scraper(scraper_id).await
             {
                 let client = if let Some(resources) = &self.resources {
                     client.with_resource_metrics(resources.clone())
