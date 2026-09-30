@@ -29,7 +29,6 @@ export const queryKeys = {
     ["web-playback-session", itemId, sourceId, audioStreamIndex ?? "default", attempt] as const,
   adminDashboard: ["admin", "dashboard"] as const,
   adminHealth: ["admin", "health"] as const,
-  adminDatabaseDiagnostics: ["admin", "database-diagnostics"] as const,
   adminLibraries: ["admin", "libraries"] as const,
   adminChapterSources: ["admin", "chapter-sources"] as const,
   adminPlugins: ["admin", "plugins"] as const,

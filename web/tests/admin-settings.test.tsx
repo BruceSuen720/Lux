@@ -127,6 +127,26 @@ describe("AdminSettingsPage network proxy", () => {
     expect(update).toHaveBeenCalledWith({ networkProxyUrl: "http://192.168.1.2:7890/" });
   });
 
+  it("keeps the temporary database diagnostics out of server settings", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent).not.toContain("临时数据库体检");
+    expect(container.textContent).not.toContain("立即开始体检");
+  });
+
   it("shows the pending metadata badge setting and preserves the media strategy when saving", async () => {
     const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

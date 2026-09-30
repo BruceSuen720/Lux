@@ -2,7 +2,6 @@ import type {
   AuthSession,
   AdminAuditEvent,
   AdminDashboard,
-  AdminDatabaseDiagnosticsStatus,
   AdminHealth,
   AdminImage,
   AdminJob,
@@ -628,19 +627,6 @@ export class LuxApiClient {
 
   adminHealth() {
     return this.request<AdminHealth>("/api/v1/admin/health");
-  }
-
-  adminDatabaseDiagnostics() {
-    return this.request<AdminDatabaseDiagnosticsStatus>(
-      "/api/v1/admin/database-diagnostics",
-    );
-  }
-
-  startAdminDatabaseDiagnostics() {
-    return this.request<AdminDatabaseDiagnosticsStatus>(
-      "/api/v1/admin/database-diagnostics/run",
-      { method: "POST" },
-    );
   }
 
   adminDashboard() {
