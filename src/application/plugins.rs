@@ -1233,6 +1233,7 @@ impl PluginService {
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
+        reject_direct_image_config_values(&fields, &values)?;
         let mut stored_values = self.read_plugin_config(&plugin_id).await?;
         stored_values.extend(values);
         let values = merge_default_config_values(&fields, stored_values);
@@ -2854,6 +2855,19 @@ fn validate_config_values(
     Ok(normalized)
 }
 
+fn reject_direct_image_config_values(
+    fields: &[PluginConfigField],
+    values: &Map<String, Value>,
+) -> Result<(), PluginServiceError> {
+    if fields
+        .iter()
+        .any(|field| field.input_type == "image" && values.contains_key(&field.key))
+    {
+        return Err(PluginServiceError::InvalidConfig);
+    }
+    Ok(())
+}
+
 fn login_background_asset_plugin_error(error: LoginBackgroundAssetError) -> PluginServiceError {
     PluginServiceError::ImageAsset(error)
 }
@@ -3385,7 +3399,7 @@ mod plugin_update_tests {
     use super::super::plugin_store::is_newer_version;
     use super::{
         PluginServiceError, TMDB_PLUGIN_ID, normalize_plugin_config_for_fields,
-        validate_config_values,
+        reject_direct_image_config_values, validate_config_values,
     };
     use crate::application::plugin_protocol::{PluginConfigField, PluginConfigOption};
 
@@ -3470,6 +3484,24 @@ mod plugin_update_tests {
                 Err(PluginServiceError::InvalidConfig)
             ));
         }
+    }
+
+    #[test]
+    fn generic_plugin_config_updates_cannot_set_host_managed_images() {
+        let fields = vec![PluginConfigField {
+            key: "customImage".to_owned(),
+            input_type: "image".to_owned(),
+            ..PluginConfigField::default()
+        }];
+        let values = Map::from_iter([(
+            "customImage".to_owned(),
+            json!(format!("sha256:{}", "a".repeat(64))),
+        )]);
+
+        assert!(matches!(
+            reject_direct_image_config_values(&fields, &values),
+            Err(PluginServiceError::InvalidConfig)
+        ));
     }
 }
 
