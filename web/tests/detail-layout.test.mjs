@@ -212,14 +212,34 @@ test("detail lower sections use the full content width", () => {
   assert.match(hierarchyRule, /max-width:\s*none/);
 });
 
-test("media detail track selectors fit two 320px columns only when the available width allows", () => {
+test("media detail track selectors fit without overlap and use compact controls", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const selectorsRule = stylesheet.match(/^\.lux-track-selectors\s*\{([^}]*)\}/m)?.[1] ?? "";
   const selectorRule = stylesheet.match(/^\.lux-track-selector\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const selectRule = stylesheet.match(/^\.lux-track-select\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const triggerRule = stylesheet.match(/^\.lux-track-select \.lux-select-trigger\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const valueRule = stylesheet.match(/^\.lux-track-select \.lux-select-value\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const baseValueRule = stylesheet.match(/^\.lux-select-value\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const headingRule = stylesheet.match(/^\.lux-track-selector \.lux-section-heading h2\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const countRule = stylesheet.match(/^\.lux-track-selector \.lux-section-heading span\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const menuOptionRule = stylesheet.match(/^\.lux-select-menu\.lux-track-select-menu \.lux-select-option\s*\{([^}]*)\}/m)?.[1] ?? "";
 
-  assert.match(selectorsRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*320px\),\s*1fr\)\)/);
-  assert.match(selectorsRule, /max-width:\s*657px/);
-  assert.match(selectorRule, /max-width:\s*320px/);
+  assert.match(selectorsRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*280px\),\s*1fr\)\)/);
+  assert.match(selectorsRule, /width:\s*min\(100%,\s*572px\)/);
+  assert.match(selectorRule, /min-width:\s*0/);
+  assert.match(selectorRule, /width:\s*100%/);
+  assert.match(selectorRule, /max-width:\s*280px/);
+  assert.match(selectRule, /min-width:\s*0/);
+  assert.match(triggerRule, /box-sizing:\s*border-box/);
+  assert.match(triggerRule, /min-height:\s*38px/);
+  assert.match(triggerRule, /font-size:\s*\.74rem/);
+  assert.match(valueRule, /flex:\s*1 1 0/);
+  assert.match(baseValueRule, /min-width:\s*0/);
+  assert.match(baseValueRule, /overflow:\s*hidden/);
+  assert.match(baseValueRule, /text-overflow:\s*ellipsis/);
+  assert.match(headingRule, /font-size:\s*\.76rem/);
+  assert.match(countRule, /font-size:\s*\.64rem/);
+  assert.match(menuOptionRule, /font-size:\s*\.72rem/);
 });
 
 test("mobile detail pages use a full-bleed portrait poster and logo-first identity", () => {

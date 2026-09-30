@@ -515,13 +515,17 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-source-option-content { display: grid; gap: 5px; min-width: 0; }
 .lux-source-option-label { overflow: hidden; font-size: .82rem; font-weight: 600; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
 .lux-source-option-detail { overflow: hidden; color: var(--lux-subtle); font-size: .7rem; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
-.lux-track-selectors { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 17px; max-width: 657px; margin-top: 20px; }
-.lux-track-selector { display: grid; gap: 10px; max-width: 320px; min-width: 0; }
-.lux-track-selector .lux-section-heading { gap: 12px; }
-.lux-track-selector .lux-section-heading h2 { margin: 0; color: var(--lux-text); font-size: .84rem; font-weight: 600; }
-.lux-track-selector .lux-section-heading span { color: var(--lux-subtle); font-size: .7rem; }
-.lux-track-select .lux-select-trigger { min-height: 44px; }
+.lux-track-selectors { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px; width: min(100%, 572px); box-sizing: border-box; margin-top: 16px; }
+.lux-track-selector { display: grid; gap: 7px; width: 100%; max-width: 280px; min-width: 0; }
+.lux-track-selector .lux-section-heading { gap: 8px; min-width: 0; }
+.lux-track-selector .lux-section-heading h2 { margin: 0; color: var(--lux-text); font-size: .76rem; font-weight: 600; }
+.lux-track-selector .lux-section-heading span { color: var(--lux-subtle); font-size: .64rem; white-space: nowrap; }
+.lux-track-select { width: 100%; min-width: 0; }
+.lux-track-select .lux-select-trigger { box-sizing: border-box; min-height: 38px; padding-inline: 10px; gap: 8px; font-size: .74rem; }
+.lux-track-select .lux-select-value { flex: 1 1 0; }
+.lux-track-select .lux-select-chevron { width: 14px; height: 14px; }
 .lux-track-select .lux-select-trigger:disabled { color: var(--lux-muted); opacity: .58; }
+.lux-select-menu.lux-track-select-menu .lux-select-option { min-height: 30px; font-size: .72rem; }
 .lux-media-info { max-width: none; margin-top: 72px; }
 .lux-media-info-extra { max-width: none; }
 .lux-media-info-heading h2 { margin: 0; color: #fff; font-size: 1rem; font-weight: 650; }

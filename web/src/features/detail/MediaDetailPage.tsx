@@ -644,6 +644,7 @@ function MediaTrackSelector({
           id={`media-${type.toLowerCase()}-select`}
           value={selectedStreamIndex ?? String(streams[0]?.index ?? "")}
           options={options}
+          menuClassName="lux-track-select-menu"
           disabled={streams.length <= 1}
           onChange={onSelect}
           aria-labelledby={headingId}

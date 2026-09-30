@@ -12,6 +12,7 @@ type LuxSelectCommonProps = {
   id?: string;
   options: readonly LuxSelectOption[];
   className?: string;
+  menuClassName?: string;
   placeholder?: string;
   disabled?: boolean;
   "aria-label"?: string;
@@ -36,6 +37,7 @@ export function LuxSelect(props: LuxSelectProps) {
     id,
     options,
     className,
+    menuClassName,
     placeholder = "请选择",
     disabled = false,
     "aria-label": ariaLabel,
@@ -166,7 +168,7 @@ export function LuxSelect(props: LuxSelectProps) {
   const menu = open ? (
     <div
       ref={menuRef}
-      className="lux-select-menu"
+      className={["lux-select-menu", menuClassName].filter(Boolean).join(" ")}
       id={listboxId}
       role="listbox"
       aria-multiselectable={multiple || undefined}
