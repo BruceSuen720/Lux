@@ -205,6 +205,27 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Content-Type")).toBe("image/png");
   });
 
+  it("uploads a plugin image field as a raw image body", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        assetId: `sha256:${"a".repeat(64)}`,
+        contentType: "image/webp",
+        configured: true,
+      }), { status: 200 }),
+    );
+    const file = new File(["image-bytes"], "background.webp", { type: "image/webp" });
+
+    await expect(
+      new LuxApiClient().uploadAdminPluginConfigImage("org.lux.login-background", "customImage", file),
+    ).resolves.toMatchObject({ contentType: "image/webp", configured: true });
+
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    expect(path).toBe("/api/v1/admin/plugins/org.lux.login-background/config/image/customImage");
+    expect(options?.method).toBe("PUT");
+    expect(options?.body).toBe(file);
+    expect((options?.headers as Headers).get("Content-Type")).toBe("image/webp");
+  });
+
   it("uses separate PATCH and DELETE contracts for admin user actions", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ user: {} }), { status: 200 }))

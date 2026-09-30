@@ -456,7 +456,7 @@ export type AdminWebhookDelivery = {
 export type AdminPluginConfigField = {
   key: string;
   label: string;
-  type: "password" | "text" | "textarea" | "select" | "toggle" | "number" | string;
+  type: "password" | "text" | "textarea" | "select" | "toggle" | "number" | "image" | string;
   required: boolean;
   sensitive: boolean;
   description?: string | null;
@@ -466,6 +466,12 @@ export type AdminPluginConfigField = {
   minimum?: number | null;
   maximum?: number | null;
   options?: Array<{ value: string; label: string }>;
+};
+
+export type AdminPluginConfigImageUpload = {
+  assetId: string;
+  contentType: string;
+  configured: boolean;
 };
 
 export type AdminUser = LuxUser & {
