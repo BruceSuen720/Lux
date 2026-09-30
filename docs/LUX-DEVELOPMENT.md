@@ -2142,6 +2142,7 @@ services:
 | LUX-261 | web/src/features/auth/LoginPage.tsx、web/src/features/admin/AdminSettingsPage.tsx、web/src/app/、web/src/lib/api/、web/tests/、docs/；插件来源选择、瀑布流/大图布局和来源鸣谢 |
 | LUX-262 | Lux-plugins/src/bin/lux-plugin-bing-daily-background.rs、manifests/org.lux.bing-daily-background.json、tests/、docs/；独立 Bing 每日图片插件 |
 | LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
+| LUX-317 | docs/LUX-317-PLAN.md、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/login_background_assets.rs、src/api/、web/src/features/admin/、Lux-plugins/；统一登录背景插件与单张自定义上传图 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
@@ -7683,6 +7684,32 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 其余未特别指定的普通媒体服务行为以 Emby 的用户体验为参考，但只有本文档明确列出的能力才属于首版承诺。
 
 ---
+
+#### LUX-317：统一登录背景插件与自定义上传图片（实施中）
+
+本任务于 2026-09-30 经项目所有者确认实施，不改写 LUX-259 至 LUX-263 已完成任务的历史验收记录。一个新插件 `org.lux.login-background` 通过插件配置选择 Bing 每日图片、TMDb 日榜或自定义上传图；不合并进或复用 `org.lux.tmdb` 元数据插件。接口草案、阶段计划和验收详见 `docs/LUX-317-PLAN.md`。
+
+统一插件配置字段 `source` 取 `BING_DAILY`、`TMDB_TRENDING` 或 `CUSTOM_IMAGE`。Bing 个人用途确认与 TMDb 非商业许可确认各自独立且默认关闭，仅对应来源启用时校验，不从旧插件配置迁移。Bing/TMDb 请求、URL、榜单选择、品牌署名和宿主 HERO_IMAGE 布局保持 LUX-262/263 的已验收行为。
+
+自定义图片先只支持单张：JPEG/PNG/WebP，最多 5 MiB/20 MP，按原字节存储，不转码、压缩，不写入媒体库。配置值只保存 `sha256:<64 位小写十六进制>` 不透明资源 ID，不存路径/图像字节。仅管理员可上传/替换，且须确认拥有登录公开展示权。Lux 在配置目录安全保存、原子替换和提供固定同源资源路由；插件进程无文件系统权限。该路由仅当统一插件已安装/启用/可用、服务器背景选中它且 `source=CUSTOM_IMAGE` 时公开，其他场景 404 并由登录页安全回退。只为统一插件接受精确资源路径，其他插件仍限 manifest HTTPS host allowlist；禁止通用图片代理。
+
+验收：
+
+- [ ] 官方目录只有一个新 ID `org.lux.login-background`；独立于 `org.lux.tmdb`。
+- [ ] 插件配置单选三种来源；按选择调用唯一 provider。Bing/TMDb 许可确认独立、默认 false；不确认时不访问相应上游。自定义图有单独公开展示许可确认。
+- [ ] Bing/TMDb 的既有行为和 HERO_IMAGE 左侧大图不变；TMDb 只返回混合日榜中首个电影/剧集的有效 backdrop，不回退 poster；自定义模式无外网调用。
+- [ ] manifest `image` 字段只用于 login_background，配置值只接受 SHA-256 opaque ID。上传限 5 MiB、JPEG/PNG/WebP、20 MP，并校验 magic bytes；拒绝伪 MIME、SVG、GIF、畸形/超大内容。替换成功后不保留旧自定义文件；失败回滚仍服务旧图。
+- [ ] 上传端点管理员鉴权+CSRF，服务端固定文件命名，不接受路径/文件名作目标；错误不会覆盖旧图。配置/API/RPC 不泄露文件路径/图片字节。
+- [ ] 精确固定同源图片路由以 MIME、nosniff、ETag 和 revalidation cache headers 提供；未选中、未启用、缺图、错误 hash 或无效状态时不可公开读取；登录公开 JSON 不包含路径或字节。
+- [ ] 新插件双架构包和目录校验成功后，从目录移除旧 Bing/TMDb ID 并删除两者现存 GitHub Releases 与 release tags（Bing 0.1.0、TMDb 0.1.0/0.1.1 全部资产）；不改 Git 历史、不自动卸载任何用户服务器中的已安装文件。
+- [ ] 提供手动迁移说明：安装新包、选择旧来源对应模式、重新单独确认许可、切换服务器背景来源、验证成功后管理员自行卸载旧包；不继承旧许可同意。
+- [ ] 覆盖来源选择、两项许可门、mock HTTP、恶意/超限上传、原子替换失败、CSRF/未授权、条件 GET/HEAD、未激活资源 404、fallback、双架构打包。
+
+验证：Lux 定向协议/插件/背景资源测试、fmt、Clippy、Web 定向 Vitest/build/Playwright；Lux-plugins mock HTTP/目录测试、fmt/Clippy 与 x86_64/aarch64 release workflow。主索引和旧 Release/tag 清理需在 cutover 后实时核验；部署验证与 CI 分开记录。
+
+阶段：A SDK/宿主安全托管完成后停止并等待项目所有者确认；B 设置 UI 与统一插件完成后停止并等待正式切换确认；C 发布新插件、更新目录，再按精确 ID 删除旧 Release/tag。增量与文件预算见 `docs/LUX-317-PLAN.md`。
+
+明确不做：多图/轮播、任意 URL/路径、插件读宿主文件、图片服务端代理/CDN/转码、媒体库写入、许可同意自动迁移、远程卸载已装插件或重写 Git 历史。
 
 ## 28. 参考资料
 
