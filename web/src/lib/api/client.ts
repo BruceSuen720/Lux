@@ -44,6 +44,7 @@ import type {
   ApiErrorBody,
   DatabaseSetupInput,
   LibraryKind,
+  HomeCarouselResponse,
   HomeResponse,
   UserLibraryOrder,
   Library,
@@ -86,6 +87,34 @@ export type LibraryItemsOptions = {
   pageSize?: number;
   parentId?: string;
 };
+
+function withHomeRequestTimeout<T>(
+  request: (signal: AbortSignal) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort(signal?.reason);
+  if (signal?.aborted) {
+    abortFromCaller();
+  } else {
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
+  }
+  const timeout = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, HOME_REQUEST_TIMEOUT_MS);
+
+  return request(controller.signal)
+    .catch((error: unknown) => {
+      if (timedOut) throw new Error("首页请求超时，请重试");
+      throw error;
+    })
+    .finally(() => {
+      globalThis.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortFromCaller);
+    });
+}
 
 export type AdminDirectoryEntry = {
   name: string;
@@ -331,28 +360,45 @@ export class LuxApiClient {
   }
 
   home(signal?: AbortSignal) {
-    const controller = new AbortController();
-    let timedOut = false;
-    const abortFromCaller = () => controller.abort(signal?.reason);
-    if (signal?.aborted) {
-      abortFromCaller();
-    } else {
-      signal?.addEventListener("abort", abortFromCaller, { once: true });
-    }
-    const timeout = globalThis.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, HOME_REQUEST_TIMEOUT_MS);
+    return withHomeRequestTimeout(
+      (requestSignal) => this.request<HomeResponse>("/api/v1/home", { signal: requestSignal }),
+      signal,
+    );
+  }
 
-    return this.request<HomeResponse>("/api/v1/home", { signal: controller.signal })
-      .catch((error: unknown) => {
-        if (timedOut) throw new Error("首页请求超时，请重试");
-        throw error;
-      })
-      .finally(() => {
-        globalThis.clearTimeout(timeout);
-        signal?.removeEventListener("abort", abortFromCaller);
-      });
+  homeCarousel(signal?: AbortSignal) {
+    return withHomeRequestTimeout(
+      (requestSignal) => this.request<HomeCarouselResponse>("/api/v1/home/carousel", { signal: requestSignal }),
+      signal,
+    );
+  }
+
+  homeLibraries(signal?: AbortSignal) {
+    return withHomeRequestTimeout(
+      (requestSignal) => this.request<LibrariesResponse>("/api/v1/libraries", { signal: requestSignal }),
+      signal,
+    );
+  }
+
+  homeContinueWatching(signal?: AbortSignal) {
+    const params = new URLSearchParams({ page: "1", pageSize: "10" });
+    return withHomeRequestTimeout(
+      (requestSignal) => this.request<PageResponse<MediaItem>>(
+        `/api/v1/continue-watching?${params}`,
+        { signal: requestSignal },
+      ),
+      signal,
+    );
+  }
+
+  homeLibraryLatest(libraryId: string, signal?: AbortSignal) {
+    return withHomeRequestTimeout(
+      (requestSignal) => this.request<PageResponse<MediaItem>>(
+        `/api/v1/libraries/${encodeURIComponent(libraryId)}/latest`,
+        { signal: requestSignal },
+      ),
+      signal,
+    );
   }
 
   favorites(page = 1) {

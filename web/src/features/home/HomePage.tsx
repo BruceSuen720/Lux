@@ -6,69 +6,102 @@ import { useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { HomeResponse, LuxUser, MediaItem } from "../../lib/api/types";
+import type { Library, LuxUser, MediaItem } from "../../lib/api/types";
 import { readAccountSettings } from "../account/account-settings";
-import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carousel";
+import {
+  HERO_CAROUSEL_INTERVAL_MS,
+  heroSlides,
+  heroTitleScale,
+  readHomeCarouselCache,
+  writeHomeCarouselCache,
+} from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
-
-const HOME_CACHE_VERSION = 1;
-const HOME_CACHE_TTL_MS = 5 * 60_000;
 
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
   const accountSettings = useMemo(() => readAccountSettings(user.id), [user.id]);
-  const cachedHome = useMemo(() => readHomeCache(user.id), [user.id]);
-  const home = useQuery({
-    queryKey: queryKeys.home,
-    queryFn: ({ signal }) => api.home(signal),
-    initialData: cachedHome?.data,
-    initialDataUpdatedAt: cachedHome?.savedAt,
+  const cachedCarousel = useMemo(() => readHomeCarouselCache(user.id), [user.id]);
+  const carousel = useQuery({
+    queryKey: queryKeys.homeCarousel,
+    queryFn: ({ signal }) => api.homeCarousel(signal),
+    initialData: cachedCarousel?.data,
+    initialDataUpdatedAt: cachedCarousel?.savedAt,
     staleTime: 0,
     retry: false,
     refetchInterval: (query) => homeRefetchInterval(query.state.data),
     refetchIntervalInBackground: false,
   });
+  const librariesQuery = useQuery({
+    queryKey: queryKeys.libraries,
+    queryFn: ({ signal }) => api.homeLibraries(signal),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchIntervalInBackground: false,
+  });
+  const continueWatchingQuery = useQuery({
+    queryKey: queryKeys.homeContinueWatching,
+    queryFn: ({ signal }) => api.homeContinueWatching(signal),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchIntervalInBackground: false,
+  });
+  const libraries = librariesQuery.data?.libraries ?? [];
 
   useEffect(() => {
-    if (home.data) {
-      queryClient.setQueryData(queryKeys.libraries, {
-        libraries: home.data.libraries ?? [],
-      });
-      writeHomeCache(user.id, home.data);
-    }
-  }, [home.data, queryClient, user.id]);
+    if (carousel.data) writeHomeCarouselCache(user.id, carousel.data);
+  }, [carousel.data, user.id]);
 
-  if (home.isPending && !home.data) return <HomeSkeleton />;
-  if (home.error && !home.data) return (
-    <section className="lux-page-state">
-      <h1>首页加载失败</h1>
-      <p>{home.error.message}</p>
-      <button className="lux-button lux-button-secondary" type="button" onClick={() => void home.refetch()}>
-        重试
-      </button>
-    </section>
-  );
-
-  const data = home.data ?? {};
-  const libraries = data.libraries ?? [];
-  const slides = heroSlides(data);
+  const continueWatching = continueWatchingQuery.data?.items ?? [];
+  const slides = heroSlides({
+    recommended: carousel.data?.recommended ?? [],
+    continueWatching,
+  });
   return (
     <div className="lux-home">
-      <HeroCarousel items={slides} continueWatching={data.continueWatching ?? []} />
+      <HeroCarousel items={slides} continueWatching={continueWatching} />
+      {carousel.error && !carousel.data ? (
+        <div className="lux-editor-error" role="status">
+          精选轮播加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void carousel.refetch()}>重试</button>
+        </div>
+      ) : null}
       <div className="lux-home-content">
         {accountSettings.showMediaLibraries ? (
           <section className="lux-section lux-library-section" aria-label="我的媒体库">
-            <div className="lux-section-heading"><h2>我的媒体库</h2><span>{libraries.length} 个库</span></div>
+            <div className="lux-section-heading"><h2>我的媒体库</h2><span>{librariesQuery.data ? `${libraries.length} 个库` : ""}</span></div>
             <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
               <div className="lux-library-rail">
-                {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />) : <EmptyLibraries />}
+                {librariesQuery.isPending && !librariesQuery.data ? <div className="lux-skeleton-row" /> : null}
+                {librariesQuery.error && !librariesQuery.data ? (
+                  <div className="lux-editor-error" role="alert">
+                    媒体库加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void librariesQuery.refetch()}>重试</button>
+                  </div>
+                ) : null}
+                {librariesQuery.data && libraries.length ? libraries.map((library) => (
+                  <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />
+                )) : null}
+                {librariesQuery.data && !libraries.length ? <EmptyLibraries /> : null}
               </div>
             </HorizontalScrollRail>
           </section>
         ) : null}
-        {accountSettings.showContinueWatching ? <ContinueWatchingRail items={data.continueWatching ?? []} total={data.continueWatchingTotal} /> : null}
-        {libraries.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} linkTo={`/libraries/${library.id}`} />)}
+        {accountSettings.showContinueWatching && continueWatchingQuery.isPending && !continueWatchingQuery.data ? (
+          <section className="lux-section" aria-label="继续观看">
+            <div className="lux-section-heading"><h2>继续观看</h2></div>
+            <div className="lux-skeleton-row" />
+          </section>
+        ) : null}
+        {accountSettings.showContinueWatching && continueWatching.length ? (
+          <ContinueWatchingRail items={continueWatching} total={continueWatchingQuery.data?.total} />
+        ) : null}
+        {accountSettings.showContinueWatching && continueWatchingQuery.error && !continueWatchingQuery.data ? (
+          <div className="lux-editor-error" role="alert">
+            继续观看加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void continueWatchingQuery.refetch()}>重试</button>
+          </div>
+        ) : null}
+        {libraries.map((library) => <HomeLatestRail key={library.id} library={library} />)}
       </div>
     </div>
   );
@@ -78,40 +111,36 @@ export function homeRefetchInterval(data: unknown): number | false {
   return data === undefined ? false : queryRefreshIntervals.mediaSurface;
 }
 
-function homeCacheKey(userId: string) {
-  return `lux.home.v${HOME_CACHE_VERSION}:${encodeURIComponent(userId)}`;
-}
+function HomeLatestRail({ library }: { library: Library }) {
+  const latest = useQuery({
+    queryKey: queryKeys.homeLatest(library.id),
+    queryFn: ({ signal }) => api.homeLibraryLatest(library.id, signal),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchIntervalInBackground: false,
+  });
+  const title = `最新${library.name}`;
 
-function readHomeCache(userId: string): { data: HomeResponse; savedAt: number } | undefined {
-  if (!userId || typeof window === "undefined") return undefined;
-  try {
-    const raw = window.sessionStorage.getItem(homeCacheKey(userId));
-    if (!raw) return undefined;
-    const parsed: unknown = JSON.parse(raw);
-    if (!isRecord(parsed) || parsed.version !== HOME_CACHE_VERSION || !isRecord(parsed.data)) return undefined;
-    if (typeof parsed.savedAt !== "number" || !Number.isFinite(parsed.savedAt)) return undefined;
-    if (Date.now() - parsed.savedAt > HOME_CACHE_TTL_MS) return undefined;
-    return { data: parsed.data as HomeResponse, savedAt: parsed.savedAt };
-  } catch {
-    return undefined;
+  if (latest.isPending && !latest.data) {
+    return (
+      <section className="lux-section" aria-label={title}>
+        <div className="lux-section-heading"><h2>{title}</h2></div>
+        <div className="lux-skeleton-row" />
+      </section>
+    );
   }
-}
-
-function writeHomeCache(userId: string, data: HomeResponse) {
-  if (!userId || typeof window === "undefined") return;
-  try {
-    window.sessionStorage.setItem(homeCacheKey(userId), JSON.stringify({
-      version: HOME_CACHE_VERSION,
-      savedAt: Date.now(),
-      data,
-    }));
-  } catch {
-    // Storage can be unavailable in private browsing or when the quota is exhausted.
+  if (latest.error && !latest.data) {
+    return (
+      <section className="lux-section" aria-label={title}>
+        <div className="lux-section-heading"><h2>{title}</h2></div>
+        <div className="lux-editor-error" role="alert">
+          最新资源加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void latest.refetch()}>重试</button>
+        </div>
+      </section>
+    );
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return <MediaRail title={title} items={latest.data?.items ?? []} linkTo={`/libraries/${library.id}`} />;
 }
 
 function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continueWatching: MediaItem[] }) {
@@ -185,8 +214,4 @@ function heroPlaybackItem(item: MediaItem, continueWatching: MediaItem[]) {
 
 function EmptyLibraries() {
   return <div className="lux-empty-card"><span>还没有可访问的媒体库</span><Link to="/libraries">查看设置</Link></div>;
-}
-
-function HomeSkeleton() {
-  return <div className="lux-home lux-skeleton-page"><div className="lux-hero lux-skeleton-block" /><div className="lux-home-content"><div className="lux-skeleton-line" /><div className="lux-skeleton-row" /><div className="lux-skeleton-row" /></div></div>;
 }

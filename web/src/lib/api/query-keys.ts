@@ -6,6 +6,9 @@ export const queryKeys = {
   userSettings: ["user-settings"] as const,
   libraryOrder: ["library-order"] as const,
   home: ["home"] as const,
+  homeCarousel: ["home", "carousel"] as const,
+  homeContinueWatching: ["home", "continue-watching"] as const,
+  homeLatest: (libraryId: string) => ["home", "latest", libraryId] as const,
   favorites: ["favorites"] as const,
   libraries: ["libraries"] as const,
   library: (

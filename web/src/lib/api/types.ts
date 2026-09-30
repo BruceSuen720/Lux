@@ -269,6 +269,10 @@ export type HomeResponse = {
   recentlyAddedTotal?: number;
 };
 
+export type HomeCarouselResponse = {
+  recommended?: MediaItem[];
+};
+
 export type PageResponse<T> = {
   items?: T[];
   page?: number;
