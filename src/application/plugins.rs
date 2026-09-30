@@ -24,6 +24,9 @@ use crate::{
     application::provider_cache::ProviderResponseCache,
     application::settings::login_background_plugin_id,
     application::{
+        login_background_assets::{
+            LoginBackgroundAssetError, LoginBackgroundAssetStore, StoredLoginBackgroundAsset,
+        },
         plugin_protocol::{
             CHAPTER_DETECT_CAPABILITY, CHAPTER_DETECT_METHOD,
             CHAPTER_FINGERPRINT_POINT_DURATION_TICKS, CHAPTER_FINGERPRINT_SAMPLE_RATE,
@@ -42,6 +45,7 @@ use crate::{
             PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+            is_valid_login_background_asset_id,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
@@ -137,12 +141,14 @@ pub struct PluginService {
     catalog: Arc<RwLock<PluginCatalog>>,
     catalog_refresh_lock: Arc<Mutex<()>>,
     scraper_client_revision: Arc<AtomicU64>,
+    dynamic_plugin_config_update_lock: Arc<Mutex<()>>,
     supervisor: PluginSupervisor,
     store: Option<PluginStore>,
     provider_cache: ProviderResponseCache,
     login_background_refresh_notify: Arc<Notify>,
     login_background_refresh_worker_started: Arc<AtomicBool>,
     login_background_refresh_failures: Arc<Mutex<HashMap<String, LoginBackgroundRefreshFailure>>>,
+    login_background_asset_upload_lock: Arc<Mutex<()>>,
 }
 
 impl PluginService {
@@ -168,6 +174,7 @@ impl PluginService {
             catalog,
             catalog_refresh_lock: Arc::new(Mutex::new(())),
             scraper_client_revision: Arc::new(AtomicU64::new(0)),
+            dynamic_plugin_config_update_lock: Arc::new(Mutex::new(())),
             supervisor,
             store,
             provider_cache: ProviderResponseCache::new(Some(
@@ -176,6 +183,7 @@ impl PluginService {
             login_background_refresh_notify: Arc::new(Notify::new()),
             login_background_refresh_worker_started: Arc::new(AtomicBool::new(false)),
             login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
+            login_background_asset_upload_lock: Arc::new(Mutex::new(())),
         };
         service.start_login_background_refresh_worker();
         service
@@ -268,6 +276,46 @@ impl PluginService {
             _ => return Ok(None),
         };
         Ok(Some(result))
+    }
+
+    pub async fn selected_custom_login_background_asset(
+        &self,
+    ) -> Result<
+        Option<crate::application::login_background_assets::LoadedLoginBackgroundAsset>,
+        PluginServiceError,
+    > {
+        let plugin_id = crate::application::plugin_protocol::UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID;
+        let source = format!("PLUGIN:{plugin_id}");
+        if self.database.login_background_source().await?.as_deref() != Some(source.as_str()) {
+            return Ok(None);
+        }
+        let Some(result) = self.cached_login_background_result(plugin_id).await? else {
+            return Ok(None);
+        };
+        if result.content_kind
+            != crate::application::plugin_protocol::LoginBackgroundContentKind::HeroImage
+            || result.items.len() != 1
+            || result.items[0].image_url
+                != crate::application::plugin_protocol::LOGIN_BACKGROUND_CUSTOM_IMAGE_PATH
+        {
+            return Ok(None);
+        }
+        let values = self.plugin_config_values(plugin_id).await?;
+        if values.get("source").and_then(Value::as_str) != Some("CUSTOM_IMAGE")
+            || values
+                .get("customImageRightsConfirmed")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Ok(None);
+        }
+        let Some(asset_id) = values.get("customImage").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        LoginBackgroundAssetStore::new(self.config_dir.clone())
+            .load(asset_id)
+            .await
+            .map_err(login_background_asset_plugin_error)
     }
 
     pub async fn login_background_source_status(&self, source: &str) -> String {
@@ -1197,6 +1245,7 @@ impl PluginService {
         plugin_id: &str,
         values: Map<String, Value>,
     ) -> Result<PluginView, PluginServiceError> {
+        let _config_guard = self.dynamic_plugin_config_update_lock.lock().await;
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
         self.ensure_known_plugin(&plugin_id, &catalog)?;
@@ -1204,6 +1253,7 @@ impl PluginService {
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
         let fields = self.config_fields_for_plugin(plugin).await?;
+        reject_direct_image_config_values(&fields, &values)?;
         let mut stored_values = self.read_plugin_config(&plugin_id).await?;
         stored_values.extend(values);
         let values = merge_default_config_values(&fields, stored_values);
@@ -1232,6 +1282,77 @@ impl PluginService {
         self.sync_manifest_scheduled_tasks().await?;
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
+    }
+
+    pub async fn upload_login_background_image(
+        &self,
+        plugin_id: &str,
+        field_key: &str,
+        bytes: &[u8],
+    ) -> Result<StoredLoginBackgroundAsset, PluginServiceError> {
+        let _upload_guard = self.login_background_asset_upload_lock.lock().await;
+        let _config_guard = self.dynamic_plugin_config_update_lock.lock().await;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        if plugin_id != crate::application::plugin_protocol::UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        self.ensure_known_plugin(&plugin_id, &catalog)?;
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_login_background_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let image_fields = fields
+            .iter()
+            .filter(|field| field.input_type == "image")
+            .collect::<Vec<_>>();
+        if image_fields.len() != 1 || image_fields[0].key != field_key {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        let (installed, _) = self.plugin_state(&plugin_id).await?;
+        if !installed {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+
+        let mut values =
+            merge_default_config_values(&fields, self.read_plugin_config(&plugin_id).await?);
+        values = normalize_plugin_config_for_fields(&plugin_id, &fields, values);
+        values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(&plugin_id, &values)?;
+
+        let assets = LoginBackgroundAssetStore::new(self.config_dir.clone());
+        let uploaded = assets
+            .store(bytes)
+            .await
+            .map_err(PluginServiceError::ImageAsset)?;
+        values.insert(
+            field_key.to_owned(),
+            Value::String(uploaded.asset_id.clone()),
+        );
+        let values = match validate_config_values(&fields, &values).and_then(|values| {
+            validate_dynamic_plugin_config(&plugin_id, &values)?;
+            Ok(values)
+        }) {
+            Ok(values) => values,
+            Err(error) => {
+                remove_unreferenced_login_background_asset(&assets, &uploaded).await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self.write_plugin_config(&plugin_id, &values).await {
+            remove_unreferenced_login_background_asset(&assets, &uploaded).await;
+            return Err(error);
+        }
+        self.supervisor.stop(&plugin_id).await;
+        self.request_login_background_refresh();
+        if let Err(error) = assets.prune_except(&uploaded.asset_id).await {
+            return Err(PluginServiceError::ImageAsset(error));
+        }
+        Ok(uploaded)
     }
 
     pub async fn plugin_config_values(
@@ -2742,11 +2863,47 @@ fn validate_config_values(
                     return Err(PluginServiceError::InvalidConfig);
                 }
             }
+            "image" => {
+                let Some(value) = value.as_str() else {
+                    return Err(PluginServiceError::InvalidConfig);
+                };
+                if !is_valid_login_background_asset_id(value) {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+            }
             _ => return Err(PluginServiceError::InvalidConfig),
         }
         normalized.insert(field.key.clone(), value.clone());
     }
     Ok(normalized)
+}
+
+fn reject_direct_image_config_values(
+    fields: &[PluginConfigField],
+    values: &Map<String, Value>,
+) -> Result<(), PluginServiceError> {
+    if fields
+        .iter()
+        .any(|field| field.input_type == "image" && values.contains_key(&field.key))
+    {
+        return Err(PluginServiceError::InvalidConfig);
+    }
+    Ok(())
+}
+
+fn login_background_asset_plugin_error(error: LoginBackgroundAssetError) -> PluginServiceError {
+    PluginServiceError::ImageAsset(error)
+}
+
+async fn remove_unreferenced_login_background_asset(
+    assets: &LoginBackgroundAssetStore,
+    uploaded: &StoredLoginBackgroundAsset,
+) {
+    if uploaded.created
+        && let Err(error) = assets.remove(&uploaded.asset_id).await
+    {
+        tracing::warn!(%error, "failed to remove unreferenced login background asset");
+    }
 }
 
 fn select_option_is_valid(field: &PluginConfigField, value: &Value) -> bool {
@@ -2821,6 +2978,7 @@ pub enum PluginServiceError {
     InvalidConfig,
     NoUpdate,
     InvalidResponse,
+    ImageAsset(LoginBackgroundAssetError),
     ConfigIo(io::Error),
     Runtime(PluginRuntimeError),
     Store(PluginStoreError),
@@ -2837,6 +2995,7 @@ impl fmt::Display for PluginServiceError {
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
             Self::NoUpdate => formatter.write_str("plugin is already up to date"),
             Self::InvalidResponse => formatter.write_str("plugin returned an invalid response"),
+            Self::ImageAsset(error) => error.fmt(formatter),
             Self::ConfigIo(error) => write!(formatter, "plugin configuration IO error: {error}"),
             Self::Runtime(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
@@ -2852,6 +3011,7 @@ impl std::error::Error for PluginServiceError {
             Self::Runtime(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Storage(error) => Some(error),
+            Self::ImageAsset(error) => Some(error),
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)
             | Self::InvalidConfig
@@ -3260,7 +3420,10 @@ mod plugin_update_tests {
     use serde_json::{Map, json};
 
     use super::super::plugin_store::is_newer_version;
-    use super::{TMDB_PLUGIN_ID, normalize_plugin_config_for_fields};
+    use super::{
+        PluginServiceError, TMDB_PLUGIN_ID, normalize_plugin_config_for_fields,
+        reject_direct_image_config_values, validate_config_values,
+    };
     use crate::application::plugin_protocol::{PluginConfigField, PluginConfigOption};
 
     #[test]
@@ -3318,6 +3481,50 @@ mod plugin_update_tests {
 
         assert_eq!(normalized["preferredLanguage"], "en-US");
         assert_eq!(normalized["fallbackLanguages"], json!(["zh-CN", "zh-TW"]));
+    }
+
+    #[test]
+    fn image_config_values_accept_only_opaque_sha256_asset_ids() {
+        let fields = vec![PluginConfigField {
+            key: "customImage".to_owned(),
+            input_type: "image".to_owned(),
+            ..PluginConfigField::default()
+        }];
+        let asset_id = format!("sha256:{}", "a".repeat(64));
+        let accepted = Map::from_iter([("customImage".to_owned(), json!(asset_id))]);
+        assert!(validate_config_values(&fields, &accepted).is_ok());
+
+        for value in [
+            json!("../secret"),
+            json!("https://images.example.com/custom.jpg"),
+            json!(format!("sha256:{}", "A".repeat(64))),
+            json!(format!("sha256:{}", "a".repeat(63))),
+            json!(null),
+        ] {
+            let values = Map::from_iter([("customImage".to_owned(), value)]);
+            assert!(matches!(
+                validate_config_values(&fields, &values),
+                Err(PluginServiceError::InvalidConfig)
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_plugin_config_updates_cannot_set_host_managed_images() {
+        let fields = vec![PluginConfigField {
+            key: "customImage".to_owned(),
+            input_type: "image".to_owned(),
+            ..PluginConfigField::default()
+        }];
+        let values = Map::from_iter([(
+            "customImage".to_owned(),
+            json!(format!("sha256:{}", "a".repeat(64))),
+        )]);
+
+        assert!(matches!(
+            reject_direct_image_config_values(&fields, &values),
+            Err(PluginServiceError::InvalidConfig)
+        ));
     }
 }
 

@@ -78,6 +78,12 @@ pub(super) fn api_routes() -> Router<AppState> {
             put(admin_update_plugin_config),
         )
         .route(
+            "/api/v1/admin/plugins/{plugin_id}/config/image/{field_key}",
+            put(admin_upload_plugin_config_image).layer(DefaultBodyLimit::max(
+                crate::application::login_background_assets::MAX_LOGIN_BACKGROUND_ASSET_BYTES,
+            )),
+        )
+        .route(
             "/api/v1/admin/plugins/{plugin_id}/run",
             post(admin_run_plugin),
         )

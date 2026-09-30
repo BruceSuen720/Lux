@@ -380,6 +380,41 @@
   line-height: 1.5;
 }
 
+.lux-admin-plugin-image-field {
+  gap: 9px !important;
+  padding: 14px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .035);
+}
+
+.lux-admin-plugin-image-field > strong {
+  color: var(--lux-text);
+  font-size: .8rem;
+}
+
+.lux-admin-plugin-image-field input[type="file"] {
+  min-height: 40px;
+  padding: 7px 9px;
+  font-size: .72rem;
+}
+
+.lux-admin-plugin-image-field input[type="file"]::file-selector-button {
+  margin-right: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--lux-line);
+  border-radius: 6px;
+  color: var(--lux-text);
+  background: rgba(255, 255, 255, .08);
+  cursor: pointer;
+}
+
+.lux-admin-plugin-image-status {
+  color: var(--lux-muted);
+  font-size: .72rem;
+  line-height: 1.45;
+}
+
 .lux-admin-plugin-dialog-form .lux-admin-plugin-toggle {
   display: flex;
   grid-template-columns: auto 1fr;

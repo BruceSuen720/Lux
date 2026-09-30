@@ -37,6 +37,7 @@ import type {
   AdminItemMergeResult,
   AdminMetadataReidentifyStart,
   AdminPlugin,
+  AdminPluginConfigImageUpload,
   AdminPluginStore,
   AdminWebhookDelivery,
   AdminWebhookDestination,
@@ -927,6 +928,17 @@ export class LuxApiClient {
     return this.request<{ plugin: AdminPlugin }>(
       `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/config`,
       { method: "PUT", body: JSON.stringify(body) },
+    );
+  }
+
+  uploadAdminPluginConfigImage(pluginId: string, fieldKey: string, file: File) {
+    return this.request<AdminPluginConfigImageUpload>(
+      `/api/v1/admin/plugins/${encodeURIComponent(pluginId)}/config/image/${encodeURIComponent(fieldKey)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      },
     );
   }
 

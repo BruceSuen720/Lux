@@ -1167,7 +1167,9 @@ fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
         PluginServiceError::InvalidConfig => "PLUGIN_NOT_CONFIGURED",
         PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",
         PluginServiceError::Runtime(_) => "PLUGIN_RUNTIME_ERROR",
-        PluginServiceError::ConfigIo(_) => "PLUGIN_CONFIG_ERROR",
+        PluginServiceError::ConfigIo(_) | PluginServiceError::ImageAsset(_) => {
+            "PLUGIN_CONFIG_ERROR"
+        }
         PluginServiceError::NoUpdate
         | PluginServiceError::Store(_)
         | PluginServiceError::Storage(_) => "PLUGIN_ERROR",

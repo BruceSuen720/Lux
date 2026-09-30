@@ -16,6 +16,8 @@ const CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY = new Set([
   "libraryIds",
   "preferredLanguage",
 ]);
+const LOGIN_BACKGROUND_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const MAX_PLUGIN_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024;
 
 export function AdminPluginsPage() {
   const queryClient = useQueryClient();
@@ -148,6 +150,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [apiKey, setApiKey] = useState("");
   const [apiKeyDirty, setApiKeyDirty] = useState(false);
   const [additionalSelectValues, setAdditionalSelectValues] = useState<Record<string, string | string[]>>({});
+  const [additionalToggleValues, setAdditionalToggleValues] = useState<Record<string, boolean>>({});
+  const [uploadedImageFields, setUploadedImageFields] = useState<Record<string, boolean>>({});
+  const [imageUploadErrors, setImageUploadErrors] = useState<Record<string, string>>({});
   const [danmakuProviderBaseUrl, setDanmakuProviderBaseUrl] = useState("");
   const [danmakuProviderBaseUrlDirty, setDanmakuProviderBaseUrlDirty] = useState(false);
   const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
@@ -207,11 +212,18 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const scheduleField = plugin.configFields.find((field) => field.key === "schedule");
   const additionalSelectFields = plugin.configFields.filter((field) =>
     field.type === "select" && !CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY.has(field.key));
+  const additionalToggleFields = plugin.configFields.filter((field) => field.type === "toggle");
+  const imageFields = plugin.configFields.filter((field) => field.type === "image");
   const additionalSelectConfig = additionalSelectFields.reduce<Record<string, string | string[]>>((config, field) => {
     const value = additionalSelectValues[field.key];
     if (Array.isArray(value) || (typeof value === "string" && value !== "")) {
       config[field.key] = value;
     }
+    return config;
+  }, {});
+  const additionalToggleConfig = additionalToggleFields.reduce<Record<string, boolean>>((config, field) => {
+    const value = additionalToggleValues[field.key];
+    if (typeof value === "boolean") config[field.key] = value;
     return config;
   }, {});
   const requiredSelectMissing = additionalSelectFields.some((field) => {
@@ -256,7 +268,10 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
             ...additionalSelectConfig,
             })
           : isLoginBackgroundProvider
-            ? api.updateAdminPluginConfig(plugin.id, additionalSelectConfig)
+            ? api.updateAdminPluginConfig(plugin.id, {
+              ...additionalSelectConfig,
+              ...additionalToggleConfig,
+            })
           : api.updateAdminPluginConfig(plugin.id, {
           ...(apiKeyDirty ? { apiKey } : {}),
           preferredLanguage,
@@ -292,6 +307,17 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
+    },
+  });
+  const uploadImage = useMutation({
+    mutationFn: ({ fieldKey, file }: { fieldKey: string; file: File }) =>
+      api.uploadAdminPluginConfigImage(plugin.id, fieldKey, file),
+    onSuccess: (_result, { fieldKey }) => {
+      setUploadedImageFields((current) => ({ ...current, [fieldKey]: true }));
+      setImageUploadErrors((current) => ({ ...current, [fieldKey]: "" }));
+    },
+    onError: (error, { fieldKey }) => {
+      setImageUploadErrors((current) => ({ ...current, [fieldKey]: error.message }));
     },
   });
   useEffect(() => {
@@ -391,6 +417,12 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           : typeof defaultValue === "string" ? defaultValue : "";
       return [field.key, value];
     })));
+    setAdditionalToggleValues(Object.fromEntries(additionalToggleFields.map((field) => {
+      const configuredValue = values[field.key];
+      return [field.key, typeof configuredValue === "boolean"
+        ? configuredValue
+        : field.defaultValue === true];
+    })));
     setApiKey("");
     setApiKeyDirty(false);
     setDanmakuProviderBaseUrl("");
@@ -472,15 +504,83 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                 {apiBaseUrlPresetField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlPresetField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} options={apiBaseUrlPresetField.options ?? []} disabled={!alternateApiEnabled} onChange={setApiBaseUrlChoice} aria-label={apiBaseUrlPresetField.label} /><small>{apiBaseUrlPresetField.description}</small></label> : null}
                 {customApiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>{customApiBaseUrlField.label}<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>{customApiBaseUrlField.description}</small></label> : null}
               </>}
+              {isLoginBackgroundProvider ? (
+                <>
+                  {additionalToggleFields.map((field) => (
+                    <label className="lux-admin-plugin-toggle" key={field.key}>
+                      <input
+                        type="checkbox"
+                        checked={additionalToggleValues[field.key] === true}
+                        onChange={(event) => setAdditionalToggleValues((current) => ({
+                          ...current,
+                          [field.key]: event.target.checked,
+                        }))}
+                      />
+                      <span>
+                        <strong>{field.label}</strong>
+                        {field.description ? <small>{field.description}</small> : null}
+                      </span>
+                    </label>
+                  ))}
+                  {imageFields.map((field) => {
+                    const savedAsset = plugin.configValues?.[field.key];
+                    const hasUploadedImage = uploadedImageFields[field.key] === true
+                      || (typeof savedAsset === "string" && /^sha256:[a-f0-9]{64}$/.test(savedAsset));
+                    const inputId = `plugin-config-${plugin.id}-${field.key}`;
+                    return (
+                      <label className="lux-admin-plugin-image-field" htmlFor={inputId} key={field.key}>
+                        <strong>{field.label}</strong>
+                        <input
+                          id={inputId}
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                          aria-label={`${field.label}（上传后立即替换旧图）`}
+                          disabled={uploadImage.isPending}
+                          onChange={(event) => {
+                            const input = event.currentTarget;
+                            const file = input.files?.[0];
+                            input.value = "";
+                            if (!file) return;
+                            if (file.size > MAX_PLUGIN_IMAGE_UPLOAD_BYTES) {
+                              setImageUploadErrors((current) => ({
+                                ...current,
+                                [field.key]: "图片不能超过 5 MiB；原有图片保持不变。",
+                              }));
+                              return;
+                            }
+                            if (file.type && !LOGIN_BACKGROUND_IMAGE_TYPES.has(file.type)) {
+                              setImageUploadErrors((current) => ({
+                                ...current,
+                                [field.key]: "仅支持 JPEG、PNG 或 WebP；原有图片保持不变。",
+                              }));
+                              return;
+                            }
+                            setImageUploadErrors((current) => ({ ...current, [field.key]: "" }));
+                            uploadImage.mutate({ fieldKey: field.key, file });
+                          }}
+                        />
+                        {field.description ? <small>{field.description}</small> : null}
+                        <small>上传成功会立即替换服务器托管图片；展示来源和许可确认仍需单独保存。</small>
+                        <span className="lux-admin-plugin-image-status" role="status" aria-live="polite">
+                          {uploadImage.isPending && uploadImage.variables?.fieldKey === field.key
+                            ? "正在上传…"
+                            : hasUploadedImage ? "已上传 1 张；选择新图可替换旧图。" : "尚未上传自定义图片。"}
+                        </span>
+                        {imageUploadErrors[field.key] ? <span className="lux-error-copy" role="alert">{imageUploadErrors[field.key]}</span> : null}
+                      </label>
+                    );
+                  })}
+                </>
+              ) : null}
               {additionalSelectFields.map((field) => {
                 const id = `plugin-config-${plugin.id}-${field.key}`;
                 const value = additionalSelectValues[field.key];
                 return <label key={field.key} htmlFor={id}>{field.label}{field.multiple ? <LuxSelect id={id} multiple value={Array.isArray(value) ? value : []} options={field.options ?? []} onChange={(selected) => setAdditionalSelectValues((current) => ({ ...current, [field.key]: selected }))} aria-label={field.label} /> : <LuxSelect id={id} value={typeof value === "string" ? value : ""} options={field.options ?? []} placeholder={field.required ? "请选择" : "可选"} onChange={(selected) => setAdditionalSelectValues((current) => ({ ...current, [field.key]: selected }))} aria-label={field.label} />}{field.description ? <small>{field.description}</small> : null}</label>;
               })}
-              <p>{danmakuProviderField?.description ?? configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
+              <p>{isLoginBackgroundProvider ? "展示来源与许可确认需要保存配置；自定义图片上传后会立即替换托管图片。" : `${danmakuProviderField?.description ?? configField?.description ?? "插件配置"} 当前：${availabilityLabel(plugin.configSource)}。`}</p>
               <div className="lux-admin-plugin-dialog-actions">
                 <button className="lux-button lux-button-secondary" type="button" onClick={closeDialog}>取消</button>
-                <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending || requiredSelectMissing}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>
+                <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending || uploadImage.isPending || requiredSelectMissing}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</button>
               </div>
               {save.error ? <span className="lux-error-copy" role="alert">{save.error.message}</span> : null}
             </form>}

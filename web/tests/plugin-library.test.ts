@@ -147,6 +147,11 @@ describe("AdminPluginsPage plugin cards", () => {
     vi.spyOn(api, "adminPluginStore").mockResolvedValue({ url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
     vi.spyOn(api, "updateAdminPluginStore").mockResolvedValue({ url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: configuredPlugin });
+    vi.spyOn(api, "uploadAdminPluginConfigImage").mockResolvedValue({
+      assetId: `sha256:${"a".repeat(64)}`,
+      contentType: "image/png",
+      configured: true,
+    });
     vi.spyOn(api, "updateAdminPluginEnabled").mockImplementation(async (_pluginId, enabled) => ({ plugin: { ...currentPlugin, enabled, available: enabled } }));
     vi.spyOn(api, "runAdminPlugin").mockResolvedValue({ operationId: "operation-1", jobs: [] });
     vi.spyOn(api, "installAdminPlugin").mockResolvedValue({ plugin: configuredPlugin });
@@ -597,6 +602,210 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.tmdb-trending-background", {
       licenseReviewed: "reviewed",
     });
+  });
+
+  it("renders independent login-background consents and the hosted single-image upload field", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.login-background",
+      name: "统一登录背景",
+      capabilities: ["login_background.get"],
+      configValues: { source: "BING_DAILY" },
+      configFields: [
+        {
+          key: "source",
+          label: "展示来源",
+          type: "select",
+          required: true,
+          sensitive: false,
+          defaultValue: "BING_DAILY",
+          options: [
+            { value: "BING_DAILY", label: "必应每日图片" },
+            { value: "TMDB_TRENDING", label: "TMDb 日榜" },
+            { value: "CUSTOM_IMAGE", label: "自定义图片" },
+          ],
+        },
+        ...[
+          ["bingPersonalUseConfirmed", "必应个人用途确认"],
+          ["tmdbLicenseConfirmed", "TMDb 非商业许可确认"],
+          ["customImageRightsConfirmed", "自定义图片公开展示权确认"],
+        ].map(([key, label]) => ({
+          key,
+          label,
+          type: "toggle" as const,
+          required: false,
+          sensitive: false,
+          defaultValue: false,
+          description: `${label}说明`,
+        })),
+        {
+          key: "customImage",
+          label: "自定义背景图片",
+          type: "image",
+          required: false,
+          sensitive: false,
+          description: "单张图片；上传新图会替换旧图。",
+        },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 统一登录背景"]')?.click();
+    });
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("必应个人用途确认");
+    expect(dialog?.textContent).toContain("TMDb 非商业许可确认");
+    expect(dialog?.textContent).toContain("自定义图片公开展示权确认");
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
+    expect(dialog?.querySelector('input[type="file"][accept*="image/webp"]')).toBeTruthy();
+    expect(dialog?.textContent).toContain("单张图片；上传新图会替换旧图。");
+    expect(dialog?.textContent).toContain("尚未上传自定义图片。");
+  });
+
+  it("saves separate login-background consents without sending the host-managed image ID", async () => {
+    const assetId = `sha256:${"b".repeat(64)}`;
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.login-background",
+      name: "统一登录背景",
+      capabilities: ["login_background.get"],
+      configValues: { source: "BING_DAILY", customImage: assetId },
+      configFields: [
+        {
+          key: "source",
+          label: "展示来源",
+          type: "select",
+          required: true,
+          sensitive: false,
+          defaultValue: "BING_DAILY",
+          options: [{ value: "BING_DAILY", label: "必应每日图片" }],
+        },
+        { key: "bingPersonalUseConfirmed", label: "必应个人用途确认", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "tmdbLicenseConfirmed", label: "TMDb 非商业许可确认", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "customImageRightsConfirmed", label: "自定义图片公开展示权确认", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "customImage", label: "自定义背景图片", type: "image", required: false, sensitive: false },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 统一登录背景"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const consents = dialog?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    expect(consents?.[0]?.checked).toBe(false);
+    expect(consents?.[1]?.checked).toBe(false);
+    expect(consents?.[2]?.checked).toBe(false);
+
+    await act(async () => {
+      consents?.[0]?.click();
+      consents?.[2]?.click();
+    });
+    await act(async () => dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.login-background", {
+      source: "BING_DAILY",
+      bingPersonalUseConfirmed: true,
+      tmdbLicenseConfirmed: false,
+      customImageRightsConfirmed: true,
+    });
+    expect(vi.mocked(api.updateAdminPluginConfig).mock.calls.at(-1)?.[1]).not.toHaveProperty("customImage");
+  });
+
+  it("uploads a replacement login background image immediately and shows its saved status", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.login-background",
+      name: "统一登录背景",
+      capabilities: ["login_background.get"],
+      configValues: { source: "CUSTOM_IMAGE" },
+      configFields: [
+        { key: "source", label: "展示来源", type: "select", required: true, sensitive: false, defaultValue: "CUSTOM_IMAGE", options: [{ value: "CUSTOM_IMAGE", label: "自定义图片" }] },
+        { key: "customImageRightsConfirmed", label: "自定义图片公开展示权确认", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "customImage", label: "自定义背景图片", type: "image", required: false, sensitive: false },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 统一登录背景"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const input = dialog?.querySelector<HTMLInputElement>('input[type="file"]');
+    const file = new File(["png-bytes"], "background.png", { type: "image/png" });
+    if (!input) throw new Error("image field should render a file picker");
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+    await act(async () => {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(api.uploadAdminPluginConfigImage).toHaveBeenCalledWith("org.lux.login-background", "customImage", file);
+    expect(dialog?.textContent).toContain("已上传 1 张；选择新图可替换旧图。");
+  });
+
+  it("keeps the previously uploaded image visible and announces replacement upload errors", async () => {
+    const oldAssetId = `sha256:${"c".repeat(64)}`;
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.login-background",
+      name: "统一登录背景",
+      capabilities: ["login_background.get"],
+      configValues: { source: "CUSTOM_IMAGE", customImage: oldAssetId },
+      configFields: [
+        { key: "source", label: "展示来源", type: "select", required: true, sensitive: false, defaultValue: "CUSTOM_IMAGE", options: [{ value: "CUSTOM_IMAGE", label: "自定义图片" }] },
+        { key: "customImageRightsConfirmed", label: "自定义图片公开展示权确认", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "customImage", label: "自定义背景图片", type: "image", required: false, sensitive: false },
+      ],
+    };
+    vi.mocked(api.uploadAdminPluginConfigImage).mockRejectedValueOnce(new Error("上传失败，原有图片未更改"));
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 统一登录背景"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const input = dialog?.querySelector<HTMLInputElement>('input[type="file"]');
+    const file = new File(["new-image"], "replacement.webp", { type: "image/webp" });
+    if (!input) throw new Error("image field should render a file picker");
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+    await act(async () => {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(dialog?.textContent).toContain("已上传 1 张；选择新图可替换旧图。");
+    expect(dialog?.textContent).toContain("上传失败，原有图片未更改");
+  });
+
+  it("rejects a clearly oversized image in the UI before submitting an upload", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.lux.login-background",
+      name: "统一登录背景",
+      capabilities: ["login_background.get"],
+      configValues: { source: "CUSTOM_IMAGE" },
+      configFields: [
+        { key: "source", label: "展示来源", type: "select", required: true, sensitive: false, defaultValue: "CUSTOM_IMAGE", options: [{ value: "CUSTOM_IMAGE", label: "自定义图片" }] },
+        { key: "customImage", label: "自定义背景图片", type: "image", required: false, sensitive: false },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 统一登录背景"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const input = dialog?.querySelector<HTMLInputElement>('input[type="file"]');
+    const oversized = new File([new Uint8Array(5 * 1024 * 1024 + 1)], "too-large.png", { type: "image/png" });
+    if (!input) throw new Error("image field should render a file picker");
+    Object.defineProperty(input, "files", { configurable: true, value: [oversized] });
+    await act(async () => input.dispatchEvent(new Event("change", { bubbles: true })));
+
+    expect(api.uploadAdminPluginConfigImage).not.toHaveBeenCalled();
+    expect(dialog?.textContent).toContain("图片不能超过 5 MiB；原有图片保持不变。");
   });
 
   it("keeps the install action in the top-right corner for store items", async () => {

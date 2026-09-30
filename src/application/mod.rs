@@ -22,6 +22,7 @@ pub mod ip_location;
 pub mod item_merge;
 pub mod libraries;
 pub mod library_covers;
+pub mod login_background_assets;
 pub mod media_matching;
 pub mod metadata;
 pub mod metadata_objects;

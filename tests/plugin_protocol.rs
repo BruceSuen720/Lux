@@ -182,6 +182,177 @@ fn accepts_a_login_background_manifest_with_declared_image_hosts() {
 }
 
 #[test]
+fn accepts_an_image_config_field_only_for_login_background_plugins() {
+    let login_background = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background",
+        "name": "Lux Login Background",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "configFields": [{
+            "key": "customImage",
+            "label": "自定义图片",
+            "type": "image"
+        }],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }))
+    .expect("login background plugin may declare a managed image field");
+    assert_eq!(login_background.config_fields[0].input_type, "image");
+
+    let separate_provider = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.other-login-background",
+        "name": "Separate background provider",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "configFields": [{
+            "key": "customImage",
+            "label": "Custom image",
+            "type": "image"
+        }],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }));
+    assert!(
+        separate_provider.is_err(),
+        "host image upload belongs to one first-party plugin"
+    );
+
+    let multiple_images = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background",
+        "name": "Lux Login Background",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "configFields": [
+            {"key": "customImage", "label": "Custom image", "type": "image"},
+            {"key": "alternateImage", "label": "Alternate image", "type": "image"}
+        ],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }));
+    assert!(
+        multiple_images.is_err(),
+        "the first-party plugin stores one image asset"
+    );
+
+    let metadata = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.metadata-image-upload",
+        "name": "Metadata image upload",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "configFields": [{
+            "key": "customImage",
+            "label": "Custom image",
+            "type": "image"
+        }],
+        "files": []
+    }));
+    assert!(
+        metadata.is_err(),
+        "image uploads are scoped to login backgrounds"
+    );
+}
+
+#[test]
+fn accepts_only_the_unified_plugin_fixed_custom_image_route() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background",
+        "name": "Lux Login Background",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "configFields": [{
+            "key": "customImage",
+            "label": "自定义图片",
+            "type": "image"
+        }],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }))
+    .expect("unified background manifest should validate");
+    let fixed_route = "/api/v1/auth/login-background/custom-image";
+
+    let result = LoginBackgroundRpcResult::validate(
+        json!({
+            "contentKind": "HERO_IMAGE",
+            "sourceName": "自定义登录背景",
+            "items": [{"imageUrl": fixed_route}]
+        }),
+        &manifest,
+    )
+    .expect("unified plugin may reference its fixed host-managed image route");
+    assert_eq!(result.items[0].image_url, fixed_route);
+
+    for invalid_url in [
+        "/api/v1/auth/login-background/custom-image/other",
+        "/api/v1/auth/login-background/custom-image?path=../../secret",
+        "http://localhost/api/v1/auth/login-background/custom-image",
+    ] {
+        let error = LoginBackgroundRpcResult::validate(
+            json!({
+                "contentKind": "HERO_IMAGE",
+                "sourceName": "自定义登录背景",
+                "items": [{"imageUrl": invalid_url}]
+            }),
+            &manifest,
+        )
+        .expect_err("only the exact custom image path is permitted");
+        assert!(matches!(
+            error,
+            LoginBackgroundRpcValidationError::InvalidImageUrl
+                | LoginBackgroundRpcValidationError::UndeclaredImageHost
+        ));
+    }
+
+    let other_provider = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.other-background",
+        "name": "Other Background",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }))
+    .expect("other background manifest should validate");
+    assert!(
+        LoginBackgroundRpcResult::validate(
+            json!({
+                "contentKind": "HERO_IMAGE",
+                "sourceName": "Other Background",
+                "items": [{"imageUrl": fixed_route}]
+            }),
+            &other_provider,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn rejects_login_background_capability_on_metadata_plugins() {
     let error = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,
