@@ -120,7 +120,7 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
-  it("aborts a stalled home request at its 15-second deadline", async () => {
+  it("aborts each homepage section request at its 15-second deadline", async () => {
     vi.useFakeTimers();
     let requestSignal: AbortSignal | undefined;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) =>
@@ -133,16 +133,26 @@ describe("LuxApiClient", () => {
     );
 
     try {
-      const request = new LuxApiClient().home();
-      const rejection = request.then(
-        () => undefined,
-        (error: unknown) => error,
-      );
-      await vi.advanceTimersByTimeAsync(15_000);
+      const client = new LuxApiClient();
+      const requests = [
+        ["/api/v1/home/carousel", () => client.homeCarousel()],
+        ["/api/v1/libraries", () => client.homeLibraries()],
+        ["/api/v1/continue-watching?page=1&pageSize=10", () => client.homeContinueWatching()],
+        ["/api/v1/libraries/library-1/latest", () => client.homeLibraryLatest("library-1")],
+      ] as const;
+      for (const [, run] of requests) {
+        requestSignal = undefined;
+        const request = run();
+        const rejection = request.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        await vi.advanceTimersByTimeAsync(15_000);
 
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(requestSignal?.aborted).toBe(true);
-      await expect(rejection).resolves.toMatchObject({ message: "首页请求超时，请重试" });
+        expect(requestSignal?.aborted).toBe(true);
+        await expect(rejection).resolves.toMatchObject({ message: "首页请求超时，请重试" });
+      }
+      expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(requests.map(([path]) => path));
     } finally {
       vi.useRealTimers();
     }

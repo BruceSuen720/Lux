@@ -344,6 +344,7 @@ describe("LuxShell user control", () => {
 
   it("invalidates home and library queries when user events announce new content", () => {
     vi.stubGlobal("EventSource", FakeEventSource);
+    sessionStorage.setItem("lux.home-carousel.v2:user-1", JSON.stringify({ version: 2, data: { recommended: [] } }));
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -366,6 +367,7 @@ describe("LuxShell user control", () => {
     expect(FakeEventSource.instances[0]?.url).toBe("/api/v1/events");
     act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
 
+    expect(sessionStorage.getItem("lux.home-carousel.v2:user-1")).toBeNull();
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
       { queryKey: ["home"], refetchType: "none" },
       { queryKey: ["libraries"] },
@@ -373,30 +375,76 @@ describe("LuxShell user control", () => {
     ]);
   });
 
+  it("refreshes the library poster tags after a scraper home event", async () => {
+    FakeEventSource.instances = [];
+    sessionStorage.clear();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    const latest = vi.spyOn(api, "homeLibraryLatest")
+      .mockResolvedValueOnce({
+        items: [{ id: "movie-1", title: "刮削电影", itemType: "MOVIE", imageTags: { poster: "poster-v1" } }],
+      })
+      .mockResolvedValueOnce({
+        items: [{ id: "movie-1", title: "刮削电影", itemType: "MOVIE", imageTags: { poster: "poster-v2" } }],
+      });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const user = { id: "user-1", usernameNormalized: "test" };
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <Routes>
+              <Route element={<LuxShell user={user} />}>
+                <Route index element={<HomePage user={user} />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(
+      '[aria-label="最新电影库"] .lux-media-card img',
+    )?.src).toContain("tag=poster-v1"));
+    act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
+    await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(
+      '[aria-label="最新电影库"] .lux-media-card img',
+    )?.src).toContain("tag=poster-v2"));
+  });
+
   it("does not cancel a cached-home refresh when scan events arrive", async () => {
     FakeEventSource.instances = [];
     sessionStorage.clear();
     vi.stubGlobal("EventSource", FakeEventSource);
-    const response = { libraries: [], recommended: [], continueWatching: [] };
+    const response = { recommended: [] };
     let resolveFirstRequest: ((value: typeof response) => void) | undefined;
     let firstSignal: AbortSignal | undefined;
     let callCount = 0;
-    const homeRequest = vi.spyOn(api, "home").mockImplementation((signal) => {
+    const homeRequest = vi.spyOn(api, "homeCarousel").mockImplementation((signal) => {
       callCount += 1;
       if (callCount > 1) return Promise.resolve(response);
       firstSignal = signal;
       return new Promise((resolve) => { resolveFirstRequest = resolve; });
     });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const user = { id: "user-1", usernameNormalized: "test" };
-    queryClient.setQueryData(queryKeys.home, {
-      libraries: [],
-      recommended: [],
-      continueWatching: [],
-    });
+    queryClient.setQueryData(queryKeys.homeCarousel, response);
 
     await act(async () => {
       root.render(
@@ -421,7 +469,7 @@ describe("LuxShell user control", () => {
 
     expect(homeRequest).toHaveBeenCalledTimes(1);
     expect(firstSignal?.aborted).toBe(false);
-    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.home })?.state.fetchStatus).toBe("fetching");
+    expect(queryClient.getQueryCache().find({ queryKey: queryKeys.homeCarousel })?.state.fetchStatus).toBe("fetching");
 
     await act(async () => {
       resolveFirstRequest?.(response);
@@ -436,7 +484,9 @@ describe("LuxShell user control", () => {
     FakeEventSource.instances = [];
     sessionStorage.clear();
     vi.stubGlobal("EventSource", FakeEventSource);
-    const homeRequest = vi.spyOn(api, "home").mockRejectedValue(new Error("首页请求超时，请重试"));
+    const homeRequest = vi.spyOn(api, "homeCarousel").mockRejectedValue(new Error("首页请求超时，请重试"));
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -462,7 +512,7 @@ describe("LuxShell user control", () => {
 
     expect(homeRequest).toHaveBeenCalledTimes(1);
     expect(container.querySelector(".lux-skeleton-page")).toBeNull();
-    expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("精选轮播加载失败");
 
     await act(async () => {
       FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" }));
@@ -471,7 +521,7 @@ describe("LuxShell user control", () => {
 
     expect(homeRequest).toHaveBeenCalledTimes(1);
     expect(container.querySelector(".lux-skeleton-page")).toBeNull();
-    expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("精选轮播加载失败");
   });
 
   it("shows active scan progress for admins without leaking paths or query strings", async () => {

@@ -8,10 +8,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomePage, homeRefetchInterval } from "../src/features/home/HomePage";
 import { HERO_CAROUSEL_INTERVAL_MS } from "../src/features/home/carousel";
 import { api } from "../src/lib/api/client";
+import type { HomeResponse } from "../src/lib/api/types";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+function mockHomeSections(response: HomeResponse) {
+  vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: response.recommended ?? [] });
+  vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: response.libraries ?? [] });
+  const continueWatching = response.continueWatching ?? [];
+  vi.spyOn(api, "homeContinueWatching").mockResolvedValue({
+    items: continueWatching,
+    total: response.continueWatchingTotal ?? continueWatching.length,
+  });
+  vi.spyOn(api, "homeLibraryLatest").mockImplementation(async (libraryId) => ({
+    items: response.libraries?.find((library) => library.id === libraryId)?.latest ?? [],
+  }));
+}
 
 describe("HomePage shelves", () => {
   let container: HTMLDivElement | undefined;
@@ -30,8 +44,53 @@ describe("HomePage shelves", () => {
     vi.restoreAllMocks();
   });
 
+  it("renders independent library shelves when the carousel request times out", async () => {
+    vi.spyOn(api, "homeCarousel").mockRejectedValue(new Error("轮播请求超时"));
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "homeLibraryLatest").mockResolvedValue({
+      items: [{
+        id: "scraped-movie",
+        title: "刚刮削完成",
+        itemType: "MOVIE",
+        imageTags: { poster: "poster-v2" },
+      }],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-skeleton-page")).toBeNull();
+    expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
+      .toContain("电影库");
+    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
+      .toContain("刚刮削完成"));
+    expect(container.querySelector<HTMLImageElement>(
+      '[aria-label="最新电影库"] .lux-media-card img',
+    )?.src).toContain("tag=poster-v2");
+
+    expect(sessionStorage.getItem("lux.home-carousel.v2:user-1")).toBeNull();
+  });
+
   it("shows accessible media libraries without a generic recently-added shelf", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [{
         id: "library-1",
         name: "华语电影",
@@ -72,24 +131,28 @@ describe("HomePage shelves", () => {
       .toContain("华语电影");
     expect(container.querySelector<HTMLImageElement>(".lux-library-cover")?.getAttribute("decoding")).toBe("async");
     expect(container.querySelector('[aria-label="我的媒体库"] .lux-horizontal-scroll-viewport')).not.toBeNull();
-    expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
-      .toContain("最新华语片");
+    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新华语电影"]')?.textContent)
+      .toContain("最新华语片"));
+    await vi.waitFor(() => expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影"));
     expect(container.querySelector('[aria-label="最新华语电影"] .lux-horizontal-scroll-viewport')).not.toBeNull();
     expect(container.querySelector<HTMLAnchorElement>('[aria-label="最新华语电影"] .lux-section-heading h2 a'))
       .toMatchObject({ href: `${window.location.origin}/libraries/library-1` });
     expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
       .toEqual(["我的媒体库", "继续观看", "最新华语电影"]);
-    const loadedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.home });
+    const loadedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.homeCarousel });
     expect(homeRefetchInterval(loadedHomeQuery?.state.data)).toBe(queryRefreshIntervals.mediaSurface);
     expect(loadedHomeQuery?.options.refetchIntervalInBackground).toBe(false);
     expect(container.querySelector('.lux-continue-card')?.textContent).toContain("继续中的电影");
     expect(container.querySelector('[aria-label="最近添加"]')).toBeNull();
   });
 
-  it("replaces a timed-out first-load skeleton with an explicit retry state", async () => {
-    const homeRequest = vi.spyOn(api, "home")
+  it("keeps other homepage sections visible when the carousel request times out", async () => {
+    const homeRequest = vi.spyOn(api, "homeCarousel")
       .mockRejectedValueOnce(new Error("首页请求超时，请重试"))
-      .mockResolvedValueOnce({ libraries: [], recommended: [], continueWatching: [] });
+      .mockResolvedValueOnce({ recommended: [] });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "homeLibraryLatest").mockResolvedValue({ items: [] });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -109,10 +172,11 @@ describe("HomePage shelves", () => {
     });
 
     expect(container.querySelector(".lux-skeleton-page")).toBeNull();
-    expect(container.querySelector(".lux-page-state")?.textContent).toContain("首页请求超时");
-    const retry = container.querySelector<HTMLButtonElement>(".lux-page-state button");
+    expect(container.querySelector(".lux-page-state")).toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("精选轮播加载失败");
+    const retry = container.querySelector<HTMLButtonElement>('[role="status"] button');
     expect(retry?.textContent).toContain("重试");
-    const failedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.home });
+    const failedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.homeCarousel });
     expect(homeRefetchInterval(failedHomeQuery?.state.data)).toBe(false);
 
     await act(async () => {
@@ -122,12 +186,12 @@ describe("HomePage shelves", () => {
 
     expect(homeRequest).toHaveBeenCalledTimes(2);
     expect(container.querySelector(".lux-page-state")).toBeNull();
-    const loadedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.home });
+    const loadedHomeQuery = queryClient.getQueryCache().find({ queryKey: queryKeys.homeCarousel });
     expect(homeRefetchInterval(loadedHomeQuery?.state.data)).toBe(queryRefreshIntervals.mediaSurface);
   });
 
   it("renders homepage library shelves in the current account's saved order", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [
         { id: "library-2", name: "剧集库", kind: "SERIES", latest: [{ id: "series-latest", title: "剧集最新", itemType: "SERIES" }] },
         { id: "library-1", name: "电影库", kind: "MOVIE", latest: [{ id: "movie-latest", title: "电影最新", itemType: "MOVIE" }] },
@@ -165,7 +229,7 @@ describe("HomePage shelves", () => {
       showMediaLibraries: false,
       showContinueWatching: false,
     }));
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [{
         id: "library-1",
         name: "电影库",
@@ -200,7 +264,7 @@ describe("HomePage shelves", () => {
   });
 
   it("renders every returned continue-watching item and shows the server total", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [],
       continueWatching: [
@@ -236,7 +300,7 @@ describe("HomePage shelves", () => {
   });
 
   it("keeps carousel controls in the same row as the playback actions", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [
         { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
@@ -264,6 +328,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    await vi.waitFor(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
     const actionRow = container.querySelector(".lux-hero-action-row");
     expect(actionRow).not.toBeNull();
     expect(actionRow?.querySelector(".lux-hero-actions")).not.toBeNull();
@@ -272,7 +337,7 @@ describe("HomePage shelves", () => {
   });
 
   it("uses clickable dots without arrows for quick selection", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [
         { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
@@ -300,6 +365,7 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    await vi.waitFor(() => expect(container.querySelector(".lux-hero-carousel-controls")).not.toBeNull());
     const controls = container.querySelector(".lux-hero-carousel-controls");
     expect(controls?.querySelectorAll(".lux-hero-carousel-arrow")).toHaveLength(0);
     expect(controls?.querySelectorAll(".lux-hero-dot")).toHaveLength(2);
@@ -317,7 +383,7 @@ describe("HomePage shelves", () => {
 
   it("advances to the next slide after the active dot's fill duration", async () => {
     try {
-      vi.spyOn(api, "home").mockResolvedValue({
+      mockHomeSections({
         libraries: [],
         recommended: [
           { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
@@ -344,8 +410,8 @@ describe("HomePage shelves", () => {
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
       });
-      expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
-        .toContain("第 1 条精选");
+      await vi.waitFor(() => expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
+        .toContain("第 1 条精选"));
 
       vi.useFakeTimers();
       await act(async () => {
@@ -365,7 +431,7 @@ describe("HomePage shelves", () => {
   });
 
   it("starts an unfinished episode when the carousel highlights its series", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [{ id: "series-1", title: "精选剧集", itemType: "SERIES" }],
       continueWatching: [{
@@ -396,13 +462,13 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
-      .toBe("/watch/episode-7");
+    await vi.waitFor(() => expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/episode-7"));
     expect(container.querySelector(".lux-hero-actions a.lux-button-primary")?.textContent).toContain("继续播放");
   });
 
   it("starts the highlighted movie from the carousel instead of opening its detail page", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [{ id: "movie-1", title: "精选电影", itemType: "MOVIE" }],
       continueWatching: [],
@@ -427,13 +493,13 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
-      .toBe("/watch/movie-1");
+    await vi.waitFor(() => expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/movie-1"));
   });
 
   it("applies the smallest title size while keeping the complete title text available", async () => {
     const title = "FC2-4916281 脸）强忍着因为嘘息而即将失禁，但在猛烈的冲击下不停地溢出";
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [{ id: "featured-long-title", title, itemType: "MOVIE" }],
       continueWatching: [],
@@ -458,13 +524,14 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    await vi.waitFor(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toBe(title));
     const heroTitle = container.querySelector(".lux-hero-title");
     expect(heroTitle?.classList.contains("lux-hero-title--small")).toBe(true);
     expect(heroTitle?.querySelector(".lux-hero-title-text")?.textContent).toBe(title);
   });
 
   it("uses an available media logo in the carousel title area", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [],
       recommended: [{ id: "featured-1", title: "精选电影", itemType: "MOVIE", imageTags: { logo: "logo-tag" } }],
       continueWatching: [],
@@ -493,21 +560,22 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("src"))
-      .toBe("/api/v1/items/featured-1/images/logo?tag=logo-tag");
+    await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("src"))
+      .toBe("/api/v1/items/featured-1/images/logo?tag=logo-tag"));
     expect(container.querySelector<HTMLImageElement>(".lux-hero-logo")?.getAttribute("decoding")).toBe("async");
     expect(container.querySelector(".lux-hero-title")?.textContent).toBe("");
     expect(container.querySelector(".lux-hero-title")?.querySelector("img")?.getAttribute("alt"))
       .toBe("精选电影");
   });
 
-  it("shows the previous homepage immediately while a hard-refresh request is pending", async () => {
-    const response = {
-      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE", latest: [] }],
-      recommended: [],
-      continueWatching: [],
-    };
-    const home = vi.spyOn(api, "home").mockResolvedValueOnce(response);
+  it("restores only cached carousel recommendations while sections reload", async () => {
+    const response = { recommended: [{ id: "featured-cached", title: "缓存轮播", itemType: "MOVIE" }] };
+    const home = vi.spyOn(api, "homeCarousel").mockResolvedValueOnce(response);
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "homeLibraryLatest").mockResolvedValue({ items: [] });
 
     container = document.createElement("div");
     document.body.append(container);
@@ -526,9 +594,9 @@ describe("HomePage shelves", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    const cachedLibraryCard = container.querySelector('[aria-label="我的媒体库"] .lux-library-card');
-    expect(cachedLibraryCard).not.toBeNull();
-    expect(cachedLibraryCard?.textContent).toContain("电影库");
+    await vi.waitFor(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toContain("缓存轮播"));
+    const cachedCarousel = JSON.parse(sessionStorage.getItem("lux.home-carousel.v2:user-1") ?? "{}");
+    expect(Object.keys(cachedCarousel.data ?? {})).toEqual(["recommended"]);
 
     act(() => root?.unmount());
     root = undefined;
@@ -547,9 +615,7 @@ describe("HomePage shelves", () => {
       );
     });
 
-    const refreshedLibraryCard = container.querySelector('[aria-label="我的媒体库"] .lux-library-card');
-    expect(refreshedLibraryCard).not.toBeNull();
-    expect(refreshedLibraryCard?.textContent).toContain("电影库");
+    await vi.waitFor(() => expect(container.querySelector(".lux-hero-title-text")?.textContent).toContain("缓存轮播"));
     expect(container.querySelector(".lux-skeleton-page")).toBeNull();
 
     await act(async () => {
@@ -558,7 +624,7 @@ describe("HomePage shelves", () => {
   });
 
   it("prefetches the first library page when a homepage library is focused", async () => {
-    vi.spyOn(api, "home").mockResolvedValue({
+    mockHomeSections({
       libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE", latest: [] }],
       recommended: [],
       continueWatching: [],
