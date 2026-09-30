@@ -4,6 +4,7 @@ use serde::Serialize;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ApiErrorCode {
     AuthenticationRequired,
+    CatalogBusy,
     CsrfFailed,
     DatabaseUnavailable,
     DatabaseConfigurationRequired,
@@ -33,6 +34,7 @@ impl ApiErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthenticationRequired => "AUTHENTICATION_REQUIRED",
+            Self::CatalogBusy => "CATALOG_BUSY",
             Self::CsrfFailed => "CSRF_FAILED",
             Self::DatabaseUnavailable => "DATABASE_UNAVAILABLE",
             Self::DatabaseConfigurationRequired => "DATABASE_CONFIGURATION_REQUIRED",
