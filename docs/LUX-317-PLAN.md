@@ -84,6 +84,6 @@ let is_custom_asset = manifest.id == UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID
 
 定向验证：`cargo test --locked --test plugin_protocol --test plugins --test login_background`（45 tests）通过；`cargo test --locked --lib application::plugins::plugin_update_tests`（6 tests）和 `cargo test --locked --lib application::login_background_assets::tests`（8 tests）通过。`cargo build --locked`、全目标 Clippy（`-D warnings`）、fmt 与 `git diff --check` 通过。
 
-全局阶段门尚未通过：`cargo test --locked --all-targets -- --test-threads=1` 的 638 个 library tests 通过（10 ignored），但集成测试 `tests/shutdown.rs::unix::luxd_exits_cleanly_on_sigterm_after_startup` 两次在 10 秒内没有观测到 child listener。该失败也在干净的 `test` 分支 control worktree 复现；同一生成的 `target/debug/luxd` 直接以临时配置启动时，`/health/live` 返回 200。shutdown 源文件最终未修改。故阶段 A 功能验收目标通过，但项目全局门仍因可复现的基线 shutdown 测试失败而暂停；等待项目所有者决定先处理该基线测试还是批准带此既有失败进入阶段 B。
+全局阶段门：最初 `tests/shutdown.rs::unix::luxd_exits_cleanly_on_sigterm_after_startup` 在 10 秒内未观测到 child listener；相同失败在干净的 `test` branch control worktree 可复现。临时打开 stdout 后，startup log 证明迁移、恢复任务清理及 HTTP bind 总共约 12 秒，早于 30 秒测试门限正常启动；同一二进制手动运行也能返回 health 200。根因是 shutdown 测试 10 秒启动门限小于本机冷启动耗时，将其只调整为 30 秒。没有更改服务启动行为。调整后 `cargo test --locked --test shutdown ... -- --exact` 连续通过两次；完整 `cargo test --locked --all-targets -- --test-threads=1` 完成且集成目标通过，638 个 library tests 通过、10 个环境/性能专项标记 ignored。结合 `cargo build --locked`、全目标 Clippy、fmt 和 diff 检查，阶段 A 全局门通过。项目所有者要求“修复然后继续”，因此进入阶段 B。
 
 Lux 主工作目录里有并行任务的未提交修改；LUX-317 在独立 managed worktree 实现，只精确暂存本任务文件。

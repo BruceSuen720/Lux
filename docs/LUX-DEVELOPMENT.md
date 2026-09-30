@@ -7707,7 +7707,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验证：Lux 定向协议/插件/背景资源测试、fmt、Clippy、Web 定向 Vitest/build/Playwright；Lux-plugins mock HTTP/目录测试、fmt/Clippy 与 x86_64/aarch64 release workflow。主索引和旧 Release/tag 清理需在 cutover 后实时核验；部署验证与 CI 分开记录。
 
-阶段：A SDK/宿主安全托管完成后停止并等待项目所有者确认；B 设置 UI 与统一插件完成后停止并等待正式切换确认；C 发布新插件、更新目录，再按精确 ID 删除旧 Release/tag。增量与文件预算见 `docs/LUX-317-PLAN.md`。
+阶段：A SDK/宿主安全托管及全目标质量门已于 2026-09-30 通过；原 shutdown 集成测试门限从 10 秒调整到 30 秒（本机冷启动实测约 12 秒），连续定向和完整 all-targets 验证通过。项目所有者已要求修复后继续，当前进入阶段 B（设置 UI 与统一插件）。阶段 B 完成后停止等待正式切换确认；阶段 C 发布新插件、更新目录，再按精确 ID 删除旧 Release/tag。增量与文件预算见 `docs/LUX-317-PLAN.md`。
 
 明确不做：多图/轮播、任意 URL/路径、插件读宿主文件、图片服务端代理/CDN/转码、媒体库写入、许可同意自动迁移、远程卸载已装插件或重写 Git 历史。
 
