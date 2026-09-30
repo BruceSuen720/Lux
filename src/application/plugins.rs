@@ -3323,9 +3323,11 @@ mod plugin_update_tests {
 
 #[cfg(test)]
 mod plugin_discovery_tests {
+    use serde_json::Map;
     use tempfile::tempdir;
 
-    use super::discover_plugin_catalog;
+    use super::{PluginService, discover_plugin_catalog};
+    use crate::{config::Config, storage::Database};
 
     #[tokio::test]
     async fn discovers_a_catalog_through_the_async_boundary() {
@@ -3337,5 +3339,25 @@ mod plugin_discovery_tests {
 
         assert!(catalog.plugins.is_empty());
         assert!(catalog.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn writing_plugin_config_advances_the_scraper_client_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: root.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new(database, config.config_dir.clone());
+        let revision = service.scraper_client_revision();
+
+        service
+            .write_plugin_config("org.example.scraper", &Map::new())
+            .await?;
+
+        assert_ne!(revision, service.scraper_client_revision());
+        Ok(())
     }
 }
