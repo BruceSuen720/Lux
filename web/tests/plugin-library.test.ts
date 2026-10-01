@@ -261,9 +261,17 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(grid).toBeTruthy();
     expect(grid?.querySelectorAll(":scope > .lux-admin-plugin-card")).toHaveLength(2);
     expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
-    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-card\s*\{[^}]*align-items:\s*start;/s);
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-card\s*\{[^}]*align-items:\s*center;/s);
     expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-heading-line\s*\{[^}]*align-items:\s*baseline;/s);
-    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-actions\s*\{[^}]*justify-content:\s*flex-start;/s);
+    expect(pluginLibraryCss).toMatch(/\.lux-admin-plugin-actions\s*\{[^}]*justify-content:\s*center;/s);
+  });
+
+  it("keeps plugin rows aligned when the responsive layout becomes one column", () => {
+    const tabletRules = pluginLibraryCss.match(/@media \(max-width: 1440px\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+    const mobileRules = pluginLibraryCss.match(/@media \(max-width: 640px\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+
+    expect(tabletRules).toMatch(/\.lux-admin-plugin-grid > \.lux-admin-plugin-card:nth-child\(even\)[\s\S]*?\{[^}]*padding-left:\s*12px;/s);
+    expect(mobileRules).toMatch(/\.lux-admin-plugin-grid > \.lux-admin-plugin-card:nth-child\(even\)[\s\S]*?\{[^}]*padding-left:\s*4px;/s);
   });
 
   it("opens configuration in a separate dialog card", async () => {
