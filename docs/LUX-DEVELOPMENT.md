@@ -7503,6 +7503,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：将约 1,800 行 Manifest 专用类型、目录发现/安全文件访问、观察验证、受限 STRM 读取和 delta 准备助手移至 `scanner/manifest.rs`；扫描流程仍留在 `scanner.rs`，仅添加内部可见性供父模块调用。`cargo fmt --all -- --check`、`cargo build --locked` 和 all-target Clippy 通过。扫描器单测 28 项、`scanner` 目标 17 项通过；`scanning_jobs` 首轮 80/81，其中一个带 750 ms 时限的等待用例超时，单项隔离复跑和随后完整目标重跑均通过（81/81）。没有改测试时限或扫描行为，不据模块拆分声称运行时性能提升。
 
+#### LUX-328：复用电影版本后缀推断结果
+
+范围：常规电影重扫的未变化检查会先推断同目录版本后缀，确认条目需要刷新身份；之后分组和实际扫描又会查询同一批候选兄弟文件。常规变更重扫与 reconciliation 也会在分组后再次推断，兼容性 reconciliation 会在预检查后再次推断。将已经得到的后缀随待扫描项传到文件扫描逻辑；这些连续调用链只推断一次，没有预计算结果的直接调用仍按原逻辑推断。保持候选文件判定、分组顺序、文件变化处理和电影身份语义不变。
+
+验收：
+
+- [x] 常规重扫的未变化检查、电影分组、reconciliation 分组和兼容性预检查向实际扫描传递已得到的后缀，不重复执行候选兄弟文件的 `symlink_metadata` 查询。
+- [x] 电影后缀推断的单测记录代表性多连字符文件所需的 metadata 探测数；已有全量扫描与变体重扫回归保持不变。
+- [x] `scanner` 目标、格式检查、build 与 all-target Clippy 通过；性能记录只报告文件系统查询次数，不把次数变化推断成耗时收益。
+
+依赖：LUX-323、LUX-327。预计文件：`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改数据库、扫描并发、Manifest 安全边界或目录读取策略。
+
+结果（2026-10-02）：未变化变体快检得到的后缀现在沿重扫路径复用；普通变更重扫、reconciliation 分组以及兼容性预检查也把分组/预检查时计算的结果交给实际扫描。新增探测计数测试验证 `ADN-725-Alternate-Cut.mp4` 的代表性候选算法执行 13 次 metadata 探测，变体重扫回归验证 `Alternate-Cut` 身份仍被恢复。Toshiba 上 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 全部通过，包含 Rust build、all-target 测试、fmt、all-target Clippy、Python 检查和 Web 冻结安装/测试/生产构建；本机架构 `arm64`。性能记录仅量化候选查询次数，不声称系统调用或实际耗时收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

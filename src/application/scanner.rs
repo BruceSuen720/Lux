@@ -448,6 +448,7 @@ impl LibraryScanner {
                 for path in files {
                     let classification =
                         classify_mixed_file(&root_path, &path, &mut classification_cache).await;
+                    let mut inferred_movie_variant_suffix = None;
                     let quick_report = match classification {
                         MixedClassification::Movie => {
                             let relative_path = path
@@ -459,13 +460,24 @@ impl LibraryScanner {
                                 .ok_or(ScannerError::NonUtf8Path)?;
                             match existing_entries.get(relative_path) {
                                 Some(existing_entry) => {
-                                    self.scan_movie_file_if_unchanged(
-                                        &root.id,
-                                        &root_path,
-                                        &path,
-                                        existing_entry,
-                                    )
-                                    .await?
+                                    let quick_result = self
+                                        .scan_movie_file_if_unchanged(
+                                            &root.id,
+                                            &root_path,
+                                            &path,
+                                            existing_entry,
+                                        )
+                                        .await?;
+                                    match quick_result {
+                                        MovieQuickScanResult::Unchanged { entry_id, report } => {
+                                            Some((entry_id, report))
+                                        }
+                                        MovieQuickScanResult::Rescan => None,
+                                        MovieQuickScanResult::RescanWithVariantSuffix(suffix) => {
+                                            inferred_movie_variant_suffix = Some(suffix);
+                                            None
+                                        }
+                                    }
                                 }
                                 None => None,
                             }
@@ -542,16 +554,29 @@ impl LibraryScanner {
                         }
                     }
                     let result = match classification {
-                        MixedClassification::Movie => {
-                            self.scan_movie_file(
-                                &library_id_text,
-                                &root,
-                                &root_path,
-                                &path,
-                                &generation,
-                            )
-                            .await?
-                        }
+                        MixedClassification::Movie => match inferred_movie_variant_suffix {
+                            Some(suffix) => {
+                                self.scan_movie_file_with_inferred_suffix(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                    &generation,
+                                    Some(&suffix),
+                                )
+                                .await?
+                            }
+                            None => {
+                                self.scan_movie_file(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                            }
+                        },
                         MixedClassification::Episode => {
                             self.scan_episode_file_with_provider_cache(
                                 &library_id_text,
@@ -1421,13 +1446,20 @@ impl LibraryScanner {
         let mut report = ScanReport::default();
         let mut seen_entry_ids = Vec::with_capacity(files.len());
         let mut new_paths = Vec::new();
-        let mut changed_paths = Vec::new();
+        let mut changed_paths = Vec::<(PathBuf, Option<String>)>::new();
         for (path, quick_result) in files.iter().zip(quick_results) {
-            if let Some((entry_id, quick_report)) = quick_result {
-                seen_entry_ids.push(entry_id);
-                report.merge(quick_report);
-                continue;
-            }
+            let inferred_variant_suffix = match quick_result {
+                MovieQuickScanResult::Unchanged {
+                    entry_id,
+                    report: quick_report,
+                } => {
+                    seen_entry_ids.push(entry_id);
+                    report.merge(quick_report);
+                    continue;
+                }
+                MovieQuickScanResult::Rescan => None,
+                MovieQuickScanResult::RescanWithVariantSuffix(suffix) => Some(suffix),
+            };
             let relative_path = path
                 .strip_prefix(root_path)
                 .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -1437,7 +1469,7 @@ impl LibraryScanner {
                 new_paths.push(path.clone());
                 continue;
             }
-            changed_paths.push(path.clone());
+            changed_paths.push((path.clone(), inferred_variant_suffix));
         }
         for changed_report in self
             .scan_movie_files_with_concurrency(
@@ -1491,7 +1523,7 @@ impl LibraryScanner {
         library_id_text: &str,
         root: &StoredLibraryRoot,
         root_path: &Path,
-        paths: &[PathBuf],
+        paths: &[(PathBuf, Option<String>)],
         generation: &str,
         configured_concurrency: usize,
     ) -> Result<Vec<ScanReport>, ScannerError> {
@@ -1504,10 +1536,13 @@ impl LibraryScanner {
         // therefore stay in input order; otherwise two source variants can
         // both observe the pre-repair rows and create duplicate logical items.
         // Different identities remain eligible for concurrent processing.
-        let mut grouped_paths = Vec::<Vec<(usize, PathBuf)>>::new();
+        let mut grouped_paths = Vec::<Vec<(usize, PathBuf, Option<String>)>>::new();
         let mut group_indexes = HashMap::<String, usize>::new();
-        for (index, path) in paths.iter().cloned().enumerate() {
-            let inferred_suffix = infer_sibling_movie_variant_suffix(&path).await;
+        for (index, (path, cached_suffix)) in paths.iter().cloned().enumerate() {
+            let inferred_suffix = match cached_suffix {
+                Some(suffix) => Some(suffix),
+                None => infer_sibling_movie_variant_suffix(&path).await,
+            };
             let group_key = reconciliation_regular_group_key(
                 &root.id,
                 &path,
@@ -1519,7 +1554,7 @@ impl LibraryScanner {
                 grouped_paths.push(Vec::new());
                 grouped_paths.len() - 1
             });
-            grouped_paths[group_index].push((index, path));
+            grouped_paths[group_index].push((index, path, inferred_suffix));
         }
         let mut tasks: JoinSet<ReconciliationRegularGroupTask> = JoinSet::new();
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
@@ -1534,9 +1569,16 @@ impl LibraryScanner {
             let generation = generation.to_owned();
             tasks.spawn(async move {
                 let mut reports = Vec::with_capacity(group.len());
-                for (index, path) in group {
+                for (index, path, inferred_suffix) in group {
                     let report = scanner
-                        .scan_movie_file(&library_id_text, &root, &root_path, &path, &generation)
+                        .scan_movie_file_with_inferred_suffix(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                            inferred_suffix.as_deref(),
+                        )
                         .await?;
                     reports.push((index, report));
                 }
@@ -1555,12 +1597,12 @@ impl LibraryScanner {
         root_path: &Path,
         path: &Path,
         existing_entry: &StoredFilesystemEntry,
-    ) -> Result<Option<(String, ScanReport)>, ScannerError> {
+    ) -> Result<MovieQuickScanResult, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         };
         if parse_movie_filename(file_name).is_none() || is_strm_file(path) {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         }
         let relative_path = path
             .strip_prefix(root_path)
@@ -1586,28 +1628,30 @@ impl LibraryScanner {
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         }
         let expected_parent_identity =
             movie_parent_folder_identity(library_root_id, &relative_path);
         if existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref() {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         }
         // CD-part and version-marker entries need the regular path to refresh their identity.
-        if has_multi_part_marker(file_name)
-            || has_source_variant_marker(file_name)
-            || infer_sibling_movie_variant_suffix(path).await.is_some()
-        {
-            return Ok(None);
+        if has_multi_part_marker(file_name) || has_source_variant_marker(file_name) {
+            return Ok(MovieQuickScanResult::Rescan);
         }
-        Ok(Some((
-            existing_entry.id.clone(),
-            ScanReport {
+        if let Some(inferred_variant_suffix) = infer_sibling_movie_variant_suffix(path).await {
+            return Ok(MovieQuickScanResult::RescanWithVariantSuffix(
+                inferred_variant_suffix,
+            ));
+        }
+        Ok(MovieQuickScanResult::Unchanged {
+            entry_id: existing_entry.id.clone(),
+            report: ScanReport {
                 discovered_files: 1,
                 skipped_files: 1,
                 ..ScanReport::default()
             },
-        )))
+        })
     }
 
     async fn scan_movie_files_if_unchanged(
@@ -1617,8 +1661,10 @@ impl LibraryScanner {
         paths: &[PathBuf],
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
         configured_concurrency: usize,
-    ) -> Result<Vec<Option<(String, ScanReport)>>, ScannerError> {
-        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+    ) -> Result<Vec<MovieQuickScanResult>, ScannerError> {
+        let mut results = (0..paths.len())
+            .map(|_| MovieQuickScanResult::Rescan)
+            .collect::<Vec<_>>();
         let mut tasks: JoinSet<MovieFingerprintTask> = JoinSet::new();
         let concurrency = configured_concurrency.clamp(1, FINGERPRINT_CHECK_CONCURRENCY);
         for (index, path) in paths.iter().enumerate() {
@@ -2571,12 +2617,31 @@ impl LibraryScanner {
         path: &Path,
         generation: &str,
     ) -> Result<ScanReport, ScannerError> {
+        let inferred_suffix = infer_sibling_movie_variant_suffix(path).await;
+        self.scan_movie_file_with_inferred_suffix(
+            library_id_text,
+            root,
+            root_path,
+            path,
+            generation,
+            inferred_suffix.as_deref(),
+        )
+        .await
+    }
+
+    async fn scan_movie_file_with_inferred_suffix(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+        inferred_suffix: Option<&str>,
+    ) -> Result<ScanReport, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(ScanReport::default());
         };
-        let inferred_suffix = infer_sibling_movie_variant_suffix(path).await;
         let parsed_name = inferred_suffix
-            .as_deref()
             .and_then(|suffix| parse_movie_filename_with_variant_suffix(file_name, suffix))
             .or_else(|| parse_movie_filename(file_name));
         let Some(parsed_name) = parsed_name else {
@@ -5383,12 +5448,20 @@ impl ScanJobService {
         let mut movie_identity_reassigned = false;
         for relative_path in relative_paths {
             let path = root_path.join(relative_path);
-            if infer_sibling_movie_variant_suffix(&path).await.is_none() {
+            let inferred_suffix = infer_sibling_movie_variant_suffix(&path).await;
+            if inferred_suffix.is_none() {
                 continue;
             }
             let report = self
                 .scanner
-                .scan_movie_file(&job.library_id, &root, root_path, &path, &job.generation)
+                .scan_movie_file_with_inferred_suffix(
+                    &job.library_id,
+                    &root,
+                    root_path,
+                    &path,
+                    &job.generation,
+                    inferred_suffix.as_deref(),
+                )
                 .await?;
             movie_identity_reassigned |= report.changed_files > 0;
         }
@@ -7998,7 +8071,8 @@ impl ScanJobService {
             ));
         }
 
-        let mut grouped_regular_works = Vec::<Vec<(usize, ReconciliationRegularWork)>>::new();
+        let mut grouped_regular_works =
+            Vec::<Vec<(usize, ReconciliationRegularWork, Option<String>)>>::new();
         let mut regular_group_indexes = HashMap::<String, usize>::new();
         for (regular_index, work) in regular_works.iter().cloned().enumerate() {
             let inferred_suffix = if matches!(work.classification, MixedClassification::Movie) {
@@ -8017,7 +8091,7 @@ impl ScanJobService {
                 grouped_regular_works.push(Vec::new());
                 grouped_regular_works.len() - 1
             });
-            grouped_regular_works[group_index].push((regular_index, work));
+            grouped_regular_works[group_index].push((regular_index, work, inferred_suffix));
         }
         let mut regular_tasks: JoinSet<ReconciliationRegularGroupTask> = JoinSet::new();
         let mut regular_results = (0..regular_works.len()).map(|_| None).collect::<Vec<_>>();
@@ -8047,18 +8121,19 @@ impl ScanJobService {
             let generation = job.generation.clone();
             regular_tasks.spawn(async move {
                 let mut reports = Vec::with_capacity(group.len());
-                for (regular_index, work) in group {
+                for (regular_index, work, inferred_suffix) in group {
                     let root = work.root;
                     let path = work.path;
                     let report = match work.classification {
                         MixedClassification::Movie => {
                             scanner
-                                .scan_movie_file(
+                                .scan_movie_file_with_inferred_suffix(
                                     &library_id,
                                     &root,
                                     Path::new(&root.canonical_path),
                                     &path,
                                     &generation,
+                                    inferred_suffix.as_deref(),
                                 )
                                 .await?
                         }
@@ -10405,12 +10480,21 @@ type MoviePreparationOutput = (
     Option<NewMovieFile>,
 );
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
-type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+type MovieFingerprintTask = Result<(usize, MovieQuickScanResult), ScannerError>;
 type EpisodeQuickResult = Option<(String, ScanReport, Option<(String, String)>)>;
 type EpisodeFingerprintTask = Result<(usize, EpisodeQuickResult), ScannerError>;
 type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 type ReconciliationRegularTask = Result<(usize, ScanReport), ScannerError>;
 type ReconciliationRegularGroupTask = Result<Vec<(usize, ScanReport)>, ScannerError>;
+
+enum MovieQuickScanResult {
+    Unchanged {
+        entry_id: String,
+        report: ScanReport,
+    },
+    Rescan,
+    RescanWithVariantSuffix(String),
+}
 
 fn reconciliation_regular_group_key(
     root_id: &str,
@@ -10454,7 +10538,7 @@ fn reconciliation_regular_group_key(
 
 async fn collect_movie_fingerprint_task(
     tasks: &mut JoinSet<MovieFingerprintTask>,
-    results: &mut [Option<(String, ScanReport)>],
+    results: &mut [MovieQuickScanResult],
 ) -> Result<(), ScannerError> {
     let (index, result) = match tasks.join_next().await {
         Some(Ok(result)) => result?,
@@ -11540,6 +11624,22 @@ fn trailing_hyphen_variant_candidates(filename: &str) -> Option<Vec<(&str, &str)
 }
 
 async fn infer_sibling_movie_variant_suffix(path: &Path) -> Option<String> {
+    infer_sibling_movie_variant_suffix_with_probe(path, |sibling| async move {
+        fs::symlink_metadata(sibling)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+    })
+    .await
+}
+
+async fn infer_sibling_movie_variant_suffix_with_probe<F, Fut>(
+    path: &Path,
+    mut is_regular_file: F,
+) -> Option<String>
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let filename = path.file_name()?.to_str()?;
     let candidates = trailing_hyphen_variant_candidates(filename)?;
     let directory = path.parent()?;
@@ -11556,10 +11656,7 @@ async fn infer_sibling_movie_variant_suffix(path: &Path) -> Option<String> {
     for (base, suffix) in candidates.iter().rev() {
         for extension in &extensions {
             let sibling = directory.join(format!("{base}.{extension}"));
-            if fs::symlink_metadata(sibling)
-                .await
-                .is_ok_and(|metadata| metadata.file_type().is_file())
-            {
+            if is_regular_file(sibling).await {
                 matched_suffixes.insert(*suffix);
                 break;
             }
@@ -11761,7 +11858,14 @@ fn configured_scan_concurrency(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::{
         LibraryScanner, MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
@@ -11771,11 +11875,11 @@ mod tests {
         NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
         PreparedManifestFilename, ScanJobService, ScannerError, classify_manifest_removal_outcomes,
         classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
-        is_lite_manifest_discovery, manifest_file_observation_matches,
-        manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
-        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
-        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
-        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
+        manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
+        merge_movie_provider_ids, normalize_incremental_path, parse_episode_filename,
+        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
+        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
@@ -12363,6 +12467,103 @@ mod tests {
             None,
             "more than one exact prefix match must not be guessed"
         );
+    }
+
+    #[tokio::test]
+    async fn inferred_variant_counts_candidate_metadata_probes() {
+        let variant_path = PathBuf::from("/virtual/ADN-725-Alternate-Cut.mp4");
+        let base_path = variant_path
+            .parent()
+            .expect("variant parent")
+            .join("ADN-725.mp4");
+        let expected_base_path = Arc::new(base_path);
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let inferred_suffix = infer_sibling_movie_variant_suffix_with_probe(&variant_path, {
+            let expected_base_path = Arc::clone(&expected_base_path);
+            let probe_count = Arc::clone(&probe_count);
+            move |candidate| {
+                let expected_base_path = Arc::clone(&expected_base_path);
+                let probe_count = Arc::clone(&probe_count);
+                async move {
+                    probe_count.fetch_add(1, Ordering::Relaxed);
+                    candidate == *expected_base_path
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(inferred_suffix.as_deref(), Some("Alternate-Cut"));
+        assert_eq!(probe_count.load(Ordering::Relaxed), 13);
+    }
+
+    #[tokio::test]
+    async fn movie_variant_rescan_reuses_the_suffix_found_by_the_quick_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        let movie_dir = media_root.join("ADN-725");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("ADN-725.mp4"), b"base").await?;
+        let variant_path = movie_dir.join("ADN-725-Alternate-Cut.mp4");
+        tokio::fs::write(&variant_path, b"variant").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF-8 media root")?,
+            )
+            .await?;
+        let scanner = LibraryScanner::new(database.clone());
+        scanner.scan_movie_library(library.id).await?;
+
+        sqlx::query(
+            "UPDATE media_sources SET edition_name = NULL
+             WHERE filesystem_entry_id = (
+                 SELECT id FROM filesystem_entries
+                 WHERE relative_path = 'ADN-725/ADN-725-Alternate-Cut.mp4'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        scanner.scan_movie_library(library.id).await?;
+        let edition: Option<String> = sqlx::query_scalar(
+            "SELECT source.edition_name
+             FROM media_sources source
+             JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+             WHERE entry.relative_path = 'ADN-725/ADN-725-Alternate-Cut.mp4'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(edition.as_deref(), Some("Alternate-Cut"));
+
+        tokio::fs::write(&variant_path, b"variant content changed").await?;
+        let report = scanner.scan_movie_library(library.id).await?;
+        assert_eq!(report.changed_files, 1);
+
+        let edition: Option<String> = sqlx::query_scalar(
+            "SELECT source.edition_name
+             FROM media_sources source
+             JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+             WHERE entry.relative_path = 'ADN-725/ADN-725-Alternate-Cut.mp4'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(edition.as_deref(), Some("Alternate-Cut"));
+        Ok(())
     }
 
     #[test]
