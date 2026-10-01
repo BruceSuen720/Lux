@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.12",
+    date: "2026-10-01",
+    sections: [
+      { kind: "changed", items: [
+        "扩展 Emby 目录查询兼容性：SortName 可用于人物姓名排序；EnableTotalRecordCount=true 且 Limit=0 时返回完整总数，未启用总数时 Limit=0 返回最多 1000 条的首个分页，兼容 AVdb 与 CineChill 的请求方式。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.11",
     date: "2026-10-01",
     sections: [
