@@ -61,7 +61,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`realtimeWatchEnabled` 省略时默认开启。`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
 - `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时文件监控、全量校验/元数据 cron 计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。`realtimeWatchEnabled` 与 `realtimeMetadataAutoMatchEnabled` 相互独立；关闭前者会停止该媒体库根目录的实时文件监控，但不影响手动扫描、计划调和或外部刷新接口。历史 `incrementalSchedule` 字段仍会被兼容接受但始终为 `null`。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，计划表达式必须是标准五段式 cron（分 时 日 月 周），最长 128 个字符；扫描并发范围为 1-1024，探测并发范围由探测器配置约束。设置 Docker 环境变量 `LUX_SCAN_CONCURRENCY` 后会全局覆盖媒体库的 `scanConcurrency`。例如 `{ "realtimeWatchEnabled": false, "scraperId": "tmdb", "scanConcurrency": 64, "reconciliationSchedule": "0 3 * * *", "metadataSchedule": "*/5 * * * *" }`。修改无需重启，下一次调度轮询读取最新配置；刮削器必须已安装且配置完成。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`；成功后自动创建异步扫描任务并返回 `scanJob`，扫描完成后若配置刮削器会继续自动匹配元数据。
-- `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
+- `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：将媒体库加入或移出普通用户的显式访问范围。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF；没有任何显式允许项时，用户默认可访问全部已启用媒体库，有显式允许项时仅能访问这些媒体库。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
 - `POST /api/v1/admin/libraries/{libraryId}/scan-path`：管理员按媒体库根目录下的相对路径创建局部 `INCREMENTAL_SCAN`。请求体为 `{ "rootId": "<libraryRootId>", "path": "Movies/NewMovie", "recursive": true }`；单根媒体库可省略 `rootId`，多根媒体库必须提供。`path` 必须是非空的库内相对路径，不接受 `.`, `..`、绝对路径、反斜杠穿越或 Windows 盘符；当前 `recursive` 必须为 `true`。接口只入队路径并返回 202，不在 HTTP 请求中扫描目录。
 - `POST /api/v1/admin/libraries/{libraryId}/reconcile`：按当前库配置创建并异步执行一次调和扫描；已停用或不存在的媒体库返回 404。
@@ -206,7 +206,7 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/items/{itemId}/children?itemType=SEASON|EPISODE&seasonId=...`：Web 同源读取剧集季度/单集或合集成员，结果执行当前用户 ACL。媒体条目响应同时返回 `parentId`、`seriesId`、`parentIndexNumber`（季号）和 `indexNumber`（集号），用于保持剧集层级导航。
 - `GET /api/v1/collections/{collectionId}`：返回可访问 BOX_SET 及按媒体库 ACL 过滤后的成员。
 - `GET|POST /api/v1/admin/users`、`PATCH|DELETE /api/v1/admin/users/{userId}`：管理员管理用户、权限和禁用状态；`PATCH` 携带 `isDisabled: true` 只禁用账户并保留数据，`DELETE` 永久删除账户及关联数据并返回 204；最后一个启用的服务器管理账户受保护。
-- `GET /api/v1/admin/users/{userId}/libraries`：读取该用户当前可访问的媒体库 ID，用于管理控制台展示 ACL；不返回服务器路径。
+- `GET /api/v1/admin/users/{userId}/libraries`：读取该用户显式选择的媒体库 ID，用于管理控制台展示 ACL；空列表表示未限定范围、可访问全部已启用媒体库；不返回服务器路径。
 - `GET /api/v1/admin/audit?page=1&pageSize=50`：管理员分页读取管理操作审计与近期登录/播放活动。新事件及详情存储于 `/config/logs/` JSONL 与压缩归档，敏感 metadata 会脱敏；LUX-316 启动迁移旧审计后，接口只读活动文件与保留归档。
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。
