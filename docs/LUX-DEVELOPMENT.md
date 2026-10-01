@@ -7489,6 +7489,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：新增独立只读 `Project quality` 工作流，监听 `main`/`test` 的 PR 与 push；使用 Rust stable、clippy/rustfmt、Node 22 和 pnpm 11.19.0，执行统一 `scripts/check-all.sh`。YAML 解析和 shell 语法检查通过；两个 Python 工具测试 3/3、2/2 通过；pnpm frozen install、Web 测试（Node 108 项、Vitest 546 项）与生产构建通过。Rust build、all-target 测试、fmt 和 Clippy 已在同一代码版本的 LUX-325 验证中通过。工作流尚未推送，GitHub 托管 runner 上的首次结果待后续 CI 触发确认；没有修改仓库分支保护规则。
 
+#### LUX-327：拆分扫描器 Manifest 辅助模块
+
+范围：`src/application/scanner.rs` 将 Manifest 专用数据类型、目录枚举、安全文件/目录 stat、观察校验、STRM 读取及 delta 准备辅助逻辑与顶层扫描编排放在同一文件。将这些 Manifest 辅助逻辑提取到 `src/application/scanner/manifest.rs`，扫描编排继续通过 scanner 内部接口调用。保持路径规范化、root 身份检查、`O_NOFOLLOW`/`O_NONBLOCK`、文件指纹 CAS、读取上界和错误行为不变；不借此修改扫描算法或扩大缓冲/并发。
+
+验收：
+
+- [x] Manifest 专用类型与文件访问/准备助手集中在独立子模块，`scanner.rs` 的 Manifest 流程保留编排和调用边界。
+- [x] Manifest 安全打开、root 替换、文件变化、STRM 上限与扫描取消/恢复合同保持不变。
+- [x] 扫描器单测、`scanner` 和 `scanning_jobs` 集成目标、格式检查与 all-target Clippy 通过；没有性能提升声明。
+
+依赖：LUX-266。预计文件：`src/application/scanner.rs`、`src/application/scanner/manifest.rs`、`docs/LUX-DEVELOPMENT.md`。这是纯模块拆分，不修改用户可见行为、存储模型或性能策略。
+
+结果（2026-10-02）：将约 1,800 行 Manifest 专用类型、目录发现/安全文件访问、观察验证、受限 STRM 读取和 delta 准备助手移至 `scanner/manifest.rs`；扫描流程仍留在 `scanner.rs`，仅添加内部可见性供父模块调用。`cargo fmt --all -- --check`、`cargo build --locked` 和 all-target Clippy 通过。扫描器单测 28 项、`scanner` 目标 17 项通过；`scanning_jobs` 首轮 80/81，其中一个带 750 ms 时限的等待用例超时，单项隔离复跑和随后完整目标重跑均通过（81/81）。没有改测试时限或扫描行为，不据模块拆分声称运行时性能提升。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
