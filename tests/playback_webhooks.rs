@@ -68,7 +68,10 @@ async fn playback_webhooks_and_home_events_follow_emby_progress()
         .create_library("Shows", LibraryKind::Series, false)
         .await?;
     let root = temp_dir.path().join("Shows");
-    for (season, episode) in [(1, "First Night S01E01.mkv"), (2, "Second Night S02E01.mkv")] {
+    for (season, episode) in [
+        (1, "First Night S01E01.mkv"),
+        (2, "Second Night S02E01.mkv"),
+    ] {
         let season_dir = root.join(format!("Playback Hook Show/Season {season:02}"));
         tokio::fs::create_dir_all(&season_dir).await?;
         tokio::fs::write(season_dir.join(episode), b"video").await?;

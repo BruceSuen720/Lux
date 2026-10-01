@@ -87,11 +87,15 @@ fn playback_display_title(data: &Map<String, Value>) -> String {
         _ => None,
     };
 
-    [Some(series), season, (!episode.is_empty()).then_some(episode)]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
+    [
+        Some(series),
+        season,
+        (!episode.is_empty()).then_some(episode),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn contextual_title(action: &str, data: &Map<String, Value>) -> String {
