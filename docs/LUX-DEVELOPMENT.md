@@ -7446,6 +7446,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：完整性结果先按最多 100 个 eligible item 分片，再依 item ID 分配已 claim 结果；不属于调度列表的结果落入首个事务，每条结果只提交一次。无新 claim 但有 READY/missing eligible item 时仍产生空结果提交批次；没有在线调度资格时仍提交 claim 结果。256 个 source、最多 512 个 capability 结果由最多 3 个事务各提交至多 100 个 eligible item；结果 UPDATE 尝试上界从 512×3=1,536 降至 512。SQLite/PostgreSQL 原子事务实现未修改。两个定向 scanner 测试、`cargo build --locked`、fmt 和 all-target Clippy 通过。`cargo test --locked --all-targets` 库测试 640 项通过、10 项忽略、2 项在并行全目标负载下遇到 2 秒子进程超时；隔离重跑 `application::embedded_subtitle::tests` 3 项通过。性能推导与限制见 `docs/PERFORMANCE.md`；没有据 SQL 次数变化推断墙钟耗时。
 
+#### LUX-324：剧集合并批量读取季度分集
+
+范围：手动合并剧集时，避免对每个源季度分别查询分集。每次合并源剧集与主剧集时，批量读取两侧所有有效季度的有效分集，再沿用现有季度号/集号、ID 的排序与匹配规则。只减少层级读取次数，不批量改写媒体源或用户状态，不改变合并顺序、事务边界、数据库模型或 schema。
+
+验收：
+
+- [x] 每次源剧集合并最多执行一次季度分集读取，与季度数无关；SQLite 与 PostgreSQL 使用兼容查询。
+- [x] 12 个未匹配季度的查询计数相对当前逐季读取减少至少 11 条；该计数只代表 SQL 调用，不推断墙钟耗时。
+- [x] 既有重复季度/分集合并、额外季度/分集迁移、媒体源和用户状态保留、后续扫描归并行为通过回归验证。
+- [x] 不改变不同源剧集依次合并时，新挂载季度可被后续源识别的语义。
+
+依赖：LUX-251。预计文件：`src/storage/media_merge.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。测试计划：新增存储级 SQL 计数用例，并运行 `item_merge` 与 `scanner` 相关集成目标、格式检查和 Clippy。
+
+结果（2026-10-02）：`merge_series_in_transaction` 保留目标/源季度查询和全部逐条写操作，将两侧有效季度的分集改为单条 CTE 查询，并按 parent season 分组复用；每个源剧集仍顺序处理，所以前一个源新增的季度仍会被后一个源查询并匹配。新增用例先在旧实现测得 32 条存储查询，再在新实现测得 21 条（减少 11 条，约 34.4%）；这是 12 个空源季度的 SQL 调用计数，不是时延基准。SQLite 存储测试 2 项、`item_merge` 1 项、扫描重扫回归 1 项通过；`cargo build --locked`、`cargo test --locked --all-targets`（644 项通过、10 项忽略）、fmt 和 all-target Clippy 通过。查询形状使用 SQLite/PostgreSQL 通用 CTE 与固定 4 个 bind 参数，没有 PostgreSQL 实例运行本任务行为测试。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
