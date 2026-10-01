@@ -7587,6 +7587,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：移除 4 个未使用导入；`PlayerPage` 的 HLS 引擎动态导入保持不变。TypeScript 未使用符号诊断从 7 处降至 3 处；剩余的是迁移报告组件的未使用 `jobId` 参数、HEVC 引擎未读取的 `streamTask` 字段和 API client 中未使用的 `Library` 类型导入，将分别审查，不纳入本任务。`pnpm --dir web install --frozen-lockfile`、完整 Web 测试（76 个文件 / 548 项）和生产构建通过；本任务没有性能收益声明。
 
+#### LUX-334 清理未使用的报告参数和 HEVC 任务字段
+
+范围：删除未被读取的迁移报告组件 `jobId` prop 及其唯一调用处的传参，删除 API client 未使用的 `Library` 类型导入，并删除 HEVC 播放引擎从未读取的 `streamTask` 字段。媒体流消费仍由 detached `consumeSource` 异步任务继续执行；取消仍由 AbortController 与 generation 检查处理。
+
+验收：
+
+- [x] 报告组件与唯一调用方移除未读取的 `jobId` prop，报告查询继续由 hook 的 job ID query key 隔离。
+- [x] HEVC `consumeSource` 错误处理与取消/销毁行为保持，移除无读取者的 Promise 保留字段。
+- [x] 未使用符号诊断不再报告这些声明；冻结依赖安装、完整 Web 测试与生产构建通过。
+
+预计文件：`web/src/features/admin/EmbyMigrationReports.tsx`、`web/src/features/admin/EmbyMigrationPluginConfig.tsx`、`web/src/lib/api/client.ts`、`web/src/features/player/hevc-playback-engine.ts`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：报告组件与唯一调用方删除未使用的 `jobId` prop；API client 删除未使用的 `Library` 类型；HEVC 播放引擎删除未被读取的 `streamTask` 字段，并以 `void` 明确保留后台 `consumeSource` 执行。取消、generation 隔离、错误上报及 MSE 结束逻辑保持不变。`pnpm --dir web exec tsc --noEmit --noUnusedLocals --noUnusedParameters`、冻结依赖安装、完整 Web 测试（76 个文件 / 548 项）和生产构建通过。构建输出中 HEVC chunk 为 197.74 kB / gzip 49.68 kB；不据微小 bundle 差异推断播放性能提升。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

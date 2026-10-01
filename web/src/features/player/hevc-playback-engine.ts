@@ -133,7 +133,6 @@ export class ClientHevcEngine implements PlaybackEngine {
   private durationSeconds: number | null = null;
   private transcodedMediaDurationMs = 0;
   private transcodedProcessingDurationMs = 0;
-  private streamTask: Promise<void> | null = null;
   private generation = 0;
 
   constructor(
@@ -210,7 +209,7 @@ export class ClientHevcEngine implements PlaybackEngine {
         resolveTracksReady();
       };
 
-      this.streamTask = this.consumeSource(response.body, file, segmentChains, tracksReady, initialization, mediaSource, generation, () => playbackReady, rejectPlaybackReady);
+      void this.consumeSource(response.body, file, segmentChains, tracksReady, initialization, mediaSource, generation, () => playbackReady, rejectPlaybackReady);
       await playbackReadyPromise;
     } catch (error) {
       this.destroy();
@@ -262,8 +261,6 @@ export class ClientHevcEngine implements PlaybackEngine {
       } else {
         this.element.dispatchEvent(new Event("error"));
       }
-    } finally {
-      if (generation === this.generation) this.streamTask = null;
     }
   }
 
@@ -378,7 +375,6 @@ export class ClientHevcEngine implements PlaybackEngine {
     this.generation += 1;
     this.abortController?.abort();
     this.abortController = null;
-    this.streamTask = null;
     this.worker?.destroy();
     this.worker = null;
     if (this.mediaSource?.readyState === "open") {

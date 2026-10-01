@@ -48,7 +48,6 @@ import type {
   HomeCarouselResponse,
   HomeResponse,
   UserLibraryOrder,
-  Library,
   LibrariesResponse,
   LuxUser,
   MediaActor,
