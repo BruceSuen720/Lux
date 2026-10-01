@@ -84,18 +84,6 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .await?;
     let admin_cookie = cookie_pair(admin_login.headers());
     let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
-    let grant_first = client
-        .patch(format!(
-            "{base_url}/api/v1/admin/users/{}/libraries/{}",
-            viewer.id, first.id
-        ))
-        .header(COOKIE, &admin_cookie)
-        .header("x-csrf-token", &admin_csrf)
-        .json(&json!({ "canView": true }))
-        .send()
-        .await?;
-    assert_eq!(grant_first.status(), reqwest::StatusCode::OK);
-
     let upload_cover = client
         .put(format!(
             "{base_url}/api/v1/admin/libraries/{}/cover",
@@ -115,6 +103,61 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .send()
         .await?;
     let viewer_cookie = cookie_pair(viewer_login.headers());
+    let default_visible_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    let default_visible_body: Value = default_visible_libraries.json().await?;
+    assert_eq!(
+        default_visible_body["libraries"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let unselected_access = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/libraries",
+            viewer.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(unselected_access.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        unselected_access.json::<Value>().await?["libraryIds"],
+        json!([])
+    );
+    let default_detail = client
+        .get(format!("{base_url}/api/v1/items/{second_item}"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(default_detail.status(), reqwest::StatusCode::OK);
+    let default_source: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&second_item)
+            .fetch_one(database.pool())
+            .await?;
+    let default_stream = client
+        .get(format!(
+            "{base_url}/api/v1/items/{second_item}/stream?sourceId={default_source}"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(default_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(default_stream.bytes().await?.as_ref(), b"movie");
+
+    let grant_first = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/users/{}/libraries/{}",
+            viewer.id, first.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "canView": true }))
+        .send()
+        .await?;
+    assert_eq!(grant_first.status(), reqwest::StatusCode::OK);
     let visible_libraries = client
         .get(format!("{base_url}/api/v1/libraries"))
         .header(COOKIE, &viewer_cookie)
@@ -335,6 +378,60 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .send()
         .await?;
     assert_eq!(now_allowed.status(), reqwest::StatusCode::OK);
+
+    for library_id in [first.id, second.id] {
+        let revoke = client
+            .patch(format!(
+                "{base_url}/api/v1/admin/users/{}/libraries/{library_id}",
+                viewer.id
+            ))
+            .header(COOKIE, &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .json(&json!({ "canView": false }))
+            .send()
+            .await?;
+        assert_eq!(revoke.status(), reqwest::StatusCode::OK);
+    }
+    let cleared_access = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/libraries",
+            viewer.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        cleared_access.json::<Value>().await?["libraryIds"],
+        json!([])
+    );
+    let restored_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        restored_libraries.json::<Value>().await?["libraries"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let restored_detail = client
+        .get(format!("{base_url}/api/v1/items/{second_item}"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(restored_detail.status(), reqwest::StatusCode::OK);
+    let restored_emby_views = client
+        .get(format!("{base_url}/Users/{}/Views", viewer.id))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(
+        restored_emby_views.json::<Value>().await?["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
 
     server.abort();
     assert_ne!(admin.id, viewer.id);

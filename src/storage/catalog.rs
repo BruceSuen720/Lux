@@ -4013,13 +4013,20 @@ impl Database {
         user_id: &str,
         is_admin: bool,
     ) -> Result<Option<StoredPlaybackSource>, StorageError> {
-        let access_join = if is_admin {
+        // The explicit allow-list limits access only when at least one library is selected.
+        let access_filter = if is_admin {
             ""
         } else {
-            "JOIN user_library_access ula
-               ON ula.user_id = ?
-              AND ula.library_id = mi.library_id
-              AND ula.can_view = 1"
+            "AND (
+                NOT EXISTS (
+                    SELECT 1 FROM user_library_access scope
+                    WHERE scope.user_id = ? AND scope.can_view = 1
+                )
+                OR EXISTS (
+                    SELECT 1 FROM user_library_access allowed
+                    WHERE allowed.user_id = ? AND allowed.library_id = mi.library_id AND allowed.can_view = 1
+                )
+             )"
         };
         let query = format!(
             "SELECT ms.id AS source_id, ms.source_kind, ms.container, ms.external_url,
@@ -4027,10 +4034,10 @@ impl Database {
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             {access_join}
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.id = ? AND mi.removed_at IS NULL
+               {access_filter}
                AND (? IS NULL OR ms.id = ?)
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
@@ -4038,10 +4045,11 @@ impl Database {
              LIMIT 1"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        statement = statement.bind(item_id);
         if !is_admin {
-            statement = statement.bind(user_id);
+            statement = statement.bind(user_id).bind(user_id);
         }
-        statement = statement.bind(item_id).bind(source_id).bind(source_id);
+        statement = statement.bind(source_id).bind(source_id);
         statement
             .fetch_optional(&self.pool)
             .await

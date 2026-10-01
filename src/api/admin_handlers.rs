@@ -4447,8 +4447,9 @@ pub(crate) async fn admin_list_user_library_access(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // The editor needs explicit selections; an empty list represents the all-libraries default.
     match database
-        .list_accessible_library_ids(&user_id.to_string())
+        .list_selected_library_ids(&user_id.to_string())
         .await
     {
         Ok(library_ids) => Json(json!({ "libraryIds": library_ids })).into_response(),

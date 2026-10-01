@@ -948,11 +948,15 @@ impl Database {
         library_id: &str,
     ) -> Result<bool, StorageError> {
         self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
+            "SELECT CASE WHEN NOT EXISTS(
+                SELECT 1 FROM user_library_access
+                WHERE user_id = ? AND can_view = 1
+            ) OR EXISTS(
                 SELECT 1 FROM user_library_access
                 WHERE user_id = ? AND library_id = ? AND can_view = 1
             ) THEN 1 ELSE 0 END",
         )
+        .bind(user_id)
         .bind(user_id)
         .bind(library_id)
         .fetch_one(&self.pool)
@@ -965,6 +969,37 @@ impl Database {
     }
 
     pub(crate) async fn list_accessible_library_ids(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        // No positive entries means no library restriction; enabled libraries are all visible.
+        self.query_scalar(
+            "SELECT l.id
+             FROM libraries l
+             WHERE l.is_enabled = 1
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM user_library_access
+                       WHERE user_id = ? AND can_view = 1
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM user_library_access ula
+                       WHERE ula.user_id = ? AND ula.library_id = l.id AND ula.can_view = 1
+                   )
+               )
+             ORDER BY l.name, l.id",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_selected_library_ids(
         &self,
         user_id: &str,
     ) -> Result<Vec<String>, StorageError> {
