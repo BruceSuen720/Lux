@@ -7475,6 +7475,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：统一 STRM 上限常量；普通扫描与 manifest 回退路径从无界 `read_to_string` 改为最多读取 1 MiB 加 1 字节，manifest 路径继续使用 root-relative 安全打开并执行同一上限检查。超限均返回 `InvalidData`。非 manifest 和 manifest 超限回归测试通过；既有首个非空行/BOM/目标分类合同不变。`cargo build --locked`、`cargo test --locked --all-targets`（645 项库测试通过、10 项忽略及全部集成目标通过）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。本任务确认了读取字节上界，没有新增 I/O 次数或耗时基准，也不推断端到端性能变化。
 
+#### LUX-326：在 CI 中运行完整项目质量门
+
+范围：当前 GitHub Actions 工作流构建 Docker 镜像，但未直接执行仓库的 `scripts/check-all.sh`。新增独立质量工作流，在面向 `main`/`test` 的 Pull Request 及推送上运行统一脚本；设置只读仓库权限，并安装项目要求的 Rust、Node 与 pnpm 工具链。不得在质量工作流中发布镜像、读取仓库 secrets 或修改部署流程。
+
+验收：
+
+- [x] PR 与 `main`/`test` 推送触发独立的质量检查工作流。
+- [x] CI 使用受控的 Rust stable（含 rustfmt/clippy）、Node 22 和固定 pnpm 版本，并运行 `scripts/check-all.sh`。
+- [x] 权限最小化为仓库只读；静态 YAML 校验和本地项目检查通过。
+
+依赖：无。预计文件：`.github/workflows/quality.yml`、`docs/LUX-DEVELOPMENT.md`。此任务增加现有质量脚本的自动触发，不修改应用代码、Docker 发布或分支保护设置。
+
+结果（2026-10-02）：新增独立只读 `Project quality` 工作流，监听 `main`/`test` 的 PR 与 push；使用 Rust stable、clippy/rustfmt、Node 22 和 pnpm 11.19.0，执行统一 `scripts/check-all.sh`。YAML 解析和 shell 语法检查通过；两个 Python 工具测试 3/3、2/2 通过；pnpm frozen install、Web 测试（Node 108 项、Vitest 546 项）与生产构建通过。Rust build、all-target 测试、fmt 和 Clippy 已在同一代码版本的 LUX-325 验证中通过。工作流尚未推送，GitHub 托管 runner 上的首次结果待后续 CI 触发确认；没有修改仓库分支保护规则。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
