@@ -36,6 +36,17 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
+    let unrelated_library = libraries
+        .create_library("Unrelated", LibraryKind::Series, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(unrelated_library.id.to_string())
+    .execute(database.pool())
+    .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     let media_path = root.join("Range.Movie.2024.mkv");
