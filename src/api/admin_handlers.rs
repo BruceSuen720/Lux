@@ -5562,10 +5562,23 @@ pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppS
         .list_activity_events(DASHBOARD_ACTIVITY_LIMIT)
         .await
     {
-        Ok(events) => events
-            .iter()
-            .map(|event| dashboard_activity_json(event, state.ip_location.as_ref()))
-            .collect::<Vec<_>>(),
+        Ok(events) => {
+            let series_by_event_id = match dashboard_activity_series_metadata(&state, &events).await
+            {
+                Ok(series) => series,
+                Err(status) => return status.into_response(),
+            };
+            events
+                .iter()
+                .map(|event| {
+                    dashboard_activity_json(
+                        event,
+                        state.ip_location.as_ref(),
+                        series_by_event_id.get(&event.id),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let now_playing = match dashboard_playback_json(&state, &sessions, &users).await {
@@ -5828,6 +5841,7 @@ pub(crate) fn dashboard_source_json(source: &CatalogSource) -> Value {
 pub(crate) fn dashboard_activity_json(
     event: &crate::storage::StoredActivityEvent,
     ip_location: Option<&IpLocationService>,
+    series: Option<&DashboardActivitySeriesMetadata>,
 ) -> Value {
     let metadata =
         serde_json::from_str::<Value>(&event.metadata_json).unwrap_or_else(|_| json!({}));
@@ -5843,6 +5857,9 @@ pub(crate) fn dashboard_activity_json(
         "targetType": event.target_type,
         "targetId": event.target_id,
         "targetTitle": event.target_title,
+        "targetSeriesTitle": series.map(|series| series.title.as_str()),
+        "targetSeasonNumber": series.and_then(|series| series.season_number),
+        "targetSeriesSeasonCount": series.and_then(|series| series.season_count),
         "metadata": metadata,
         "remoteIp": remote_ip,
         "remoteIpLocation": remote_ip_location
@@ -5850,6 +5867,73 @@ pub(crate) fn dashboard_activity_json(
             .map(dashboard_ip_location_json),
         "createdAt": event.created_at,
     })
+}
+
+pub(crate) struct DashboardActivitySeriesMetadata {
+    title: String,
+    season_number: Option<i64>,
+    season_count: Option<i64>,
+}
+
+async fn dashboard_activity_series_metadata(
+    state: &AppState,
+    events: &[crate::storage::StoredActivityEvent],
+) -> Result<HashMap<String, DashboardActivitySeriesMetadata>, StatusCode> {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let item_ids = events
+        .iter()
+        .filter(|event| event.target_type.as_deref() == Some("media_item"))
+        .filter_map(|event| event.target_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let principal = AccessPrincipal::new(crate::domain::ids::UserId::new(), true);
+    let items_by_id = catalog
+        .find_items(principal, &item_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let series_ids = items_by_id
+        .values()
+        .filter(|item| item.item_type == "EPISODE")
+        .filter_map(|item| item.series_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let series_by_id = catalog
+        .find_items(principal, &series_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(events
+        .iter()
+        .filter_map(|event| {
+            let item = event
+                .target_id
+                .as_deref()
+                .and_then(|item_id| items_by_id.get(item_id))?;
+            if item.item_type != "EPISODE" {
+                return None;
+            }
+            let series = item
+                .series_id
+                .as_deref()
+                .and_then(|series_id| series_by_id.get(series_id))?;
+            Some((
+                event.id.clone(),
+                DashboardActivitySeriesMetadata {
+                    title: series.title.clone(),
+                    season_number: item.season_number,
+                    season_count: series.season_count,
+                },
+            ))
+        })
+        .collect())
 }
 
 #[derive(Deserialize)]
