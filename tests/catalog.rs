@@ -571,15 +571,18 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     let zero_limit_without_count = client
         .get(format!(
-            "{base_url}/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Limit=0",
+            "{base_url}/emby/Items?Recursive=true&IncludeItemTypes=Movie&Limit=0&UserId={}",
             admin.id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
         .await?;
-    assert_eq!(
-        zero_limit_without_count.status(),
-        reqwest::StatusCode::BAD_REQUEST
+    assert_eq!(zero_limit_without_count.status(), reqwest::StatusCode::OK);
+    let zero_limit_without_count_body: Value = zero_limit_without_count.json().await?;
+    assert!(
+        zero_limit_without_count_body["Items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
     );
 
     let latest_with_empty_optional_favorite = client

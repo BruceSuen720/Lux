@@ -2107,7 +2107,7 @@ pub(super) async fn emby_catalog_page_from_query(
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> Result<CatalogPage, StatusCode> {
-    let (offset, limit) = match emby_page_params(query) {
+    let (offset, limit) = match emby_catalog_items_page_params(query) {
         Ok(params) => params,
         Err(status) => return Err(status),
     };
@@ -3013,6 +3013,17 @@ pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), Sta
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
+}
+
+fn emby_catalog_items_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    if offset < 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if query.limit == Some(0) && query.enable_total_record_count != Some(true) {
+        return Ok((offset, EMBY_MAX_PAGE_LIMIT));
+    }
+    emby_page_params(query)
 }
 
 pub(super) fn emby_show_episode_page_params(

@@ -1508,7 +1508,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - IncludeItemTypes、ExcludeItemTypes。
 - Recursive。
 - StartIndex、Limit。
-- Emby `GET /Items` 与 `GET /Users/{UserId}/Items` 在 `EnableTotalRecordCount=true` 时接受 `Limit=0` 作为只计数请求，返回空 `Items` 和完整 `TotalRecordCount`；未启用总数时，`Limit` 仍须为 1..=1000。
+- Emby `GET /Items` 与 `GET /Users/{UserId}/Items` 在 `EnableTotalRecordCount=true` 时接受 `Limit=0` 作为只计数请求，返回空 `Items` 和完整 `TotalRecordCount`；未启用总数（未传标志或为 `false`）时，`Limit=0` 返回最多 1000 条的首个分页，以兼容将零值用作未分页请求的 Emby 客户端。其他 `Limit` 仍须为 1..=1000。
 - SortBy、SortOrder。
 - Filters、IsPlayed、IsFavorite。
 - Years。
