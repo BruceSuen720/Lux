@@ -7545,6 +7545,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：启用库筛选、任务创建/恢复与最终列表查询合并为单条批量 upsert 加一次列表读取；4 个启用库的 SQL 调用计数为 6→2。SQLite UPDATE 触发器验证未变化同步写入 0 行，schema 变化更新 4 行；任务状态测试覆盖过期运行回收与活动运行的 token、游标、进度、取消标记保留。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 最终通过：build、all-target 测试（650 个库测试通过、10 个忽略，所有集成目标通过）、fmt、Clippy、shell/Python 检查及 Web 冻结安装、测试和生产构建均通过。首次脚本运行仅因新增测试的 Clippy `type_complexity` 报错退出；为测试 SQL 行定义命名类型别名后，独立 Clippy 与完整脚本复跑通过。本机架构 `arm64`。性能记录只报告 SQL 与 UPDATE 行计数，不推断耗时收益。
 
+#### LUX-331：批量读取人物清单恢复状态
+
+范围：人物清单恢复逐项读取 `person_manifest_index_state` 来跳过校验和未变化的清单。改为每最多 100 份有效清单批量预读索引状态；完整 person ID、checksum 和 schema version 都匹配时跳过单项 storage 调用，不匹配时继续走既有单人物校验与事务恢复。批量预读失败时回退到既有逐项路径，保持恢复错误隔离和并发语义。
+
+验收：
+
+- [x] 205 份有效且校验状态未变的清单，storage 查询调用由 205 条降为 3 条；状态比较包含 person ID、checksum 与 schema version。
+- [x] 查询批次最多 100 个 ID；修改过的清单仍恢复，provider 身份冲突仍按原逻辑跳过且不会部分写入。
+- [x] 人物清单恢复定向测试、build、fmt 和 all-target Clippy 通过；性能记录只报告查询调用数，不据此推断墙钟耗时。
+
+依赖：LUX-329、现有人物 Manifest 恢复合同。预计文件：`src/storage/people.rs`、`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改 schema、人物关系恢复策略、Manifest 格式或事务边界。
+
+结果（2026-10-02）：恢复流程每批最多 100 份有效清单，按 person ID、checksum、schema version 精确对照已存状态；未变化清单跳过单项查询，变化清单仍进入原有校验与原子恢复路径，批量状态读取失败会回退逐项检查。205 份未变化清单的 storage 查询调用由 205 降为 3。定向恢复测试和 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 通过：651 个库测试通过、10 个忽略，all-target 集成测试、fmt、Clippy、shell/Python 检查及 Web 测试和生产构建通过。本机架构 `arm64`；PostgreSQL 专用用例因本机无 PostgreSQL 实例而按配置忽略。生产构建仍报告 `hls.js` chunk 超过 500 kB（594.13 kB，gzip 185.60 kB）；播放器通过动态 import 延迟加载该 chunk，因此没有把它算作首页 bundle 回归，也未在缺少浏览器性能基线时改动打包策略。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

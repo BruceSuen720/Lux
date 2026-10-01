@@ -930,6 +930,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restoring_unchanged_person_manifests_batches_checksum_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MANIFEST_COUNT: usize = 205;
+
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+
+        for index in 0..MANIFEST_COUNT {
+            let person_id = format!("lux-{index:06}");
+            let display_name = format!("Person {index}");
+            let person_dir = lux_person_directory(&config.config_dir, &display_name, &person_id)?;
+            tokio::fs::create_dir_all(&person_dir).await?;
+            let mut manifest = PersonManifest {
+                schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+                lux_person_id: person_id.clone(),
+                display_name,
+                ..PersonManifest::default()
+            };
+            let unsigned_bytes = serde_json::to_vec(&manifest)?;
+            manifest.checksum = Sha256::digest(unsigned_bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            tokio::fs::write(
+                person_dir.join(PERSON_MANIFEST),
+                serde_json::to_vec(&manifest)?,
+            )
+            .await?;
+            sqlx::query(
+                "INSERT INTO people (
+                    id, display_name, directory_name, normalized_name,
+                    status, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 'ACTIVE', 1, 1)",
+            )
+            .bind(&person_id)
+            .bind(&manifest.display_name)
+            .bind(&manifest.display_name)
+            .bind(manifest.display_name.to_lowercase())
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO person_manifest_index_state (
+                    person_id, manifest_checksum, manifest_schema_version, updated_at
+                 ) VALUES (?, ?, ?, 1)",
+            )
+            .bind(person_id)
+            .bind(&manifest.checksum)
+            .bind(i64::from(PERSON_MANIFEST_SCHEMA_VERSION))
+            .execute(database.pool())
+            .await?;
+        }
+
+        database.reset_query_count();
+        let report = service.restore_person_manifests(&database).await?;
+
+        assert_eq!(report.restored, 0);
+        assert!(!report.failed);
+        assert_eq!(database.query_count(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nfo_actor_without_identity_keeps_the_existing_profile_after_restart()
     -> Result<(), Box<dyn std::error::Error>> {
         let config_dir = tempfile::tempdir()?;

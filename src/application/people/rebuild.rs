@@ -1,4 +1,12 @@
 use super::*;
+use std::collections::HashSet;
+
+const PERSON_MANIFEST_RESTORE_BATCH_SIZE: usize = 100;
+
+struct PersonManifestRestoreCandidate {
+    manifest_path: PathBuf,
+    manifest: PersonManifest,
+}
 
 impl PeopleService {
     pub(super) async fn find_person_manifest_path(
@@ -759,6 +767,7 @@ impl PeopleService {
             }
         };
         let mut report = PersonManifestRestoreReport::default();
+        let mut pending_manifests = Vec::with_capacity(PERSON_MANIFEST_RESTORE_BATCH_SIZE);
         while let Some(initial) = initials
             .next_entry()
             .await
@@ -814,34 +823,17 @@ impl PeopleService {
                         continue;
                     }
                 };
-                let identities = manifest
-                    .identities
-                    .iter()
-                    .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
-                    .collect::<Vec<_>>();
-                match database
-                    .restore_canonical_person_if_manifest_changed(
-                        &manifest.lux_person_id,
-                        &manifest.display_name,
-                        &identities,
-                        &manifest.checksum,
-                        manifest.schema_version as i64,
-                    )
-                    .await
-                {
-                    Ok(true) => report.restored += 1,
-                    Ok(false) => {}
-                    Err(error) => {
-                        report.failed = true;
-                        tracing::warn!(
-                            path = %manifest_path.display(),
-                            %error,
-                            "skipping conflicting person manifest"
-                        );
-                    }
+                pending_manifests.push(PersonManifestRestoreCandidate {
+                    manifest_path,
+                    manifest,
+                });
+                if pending_manifests.len() == PERSON_MANIFEST_RESTORE_BATCH_SIZE {
+                    restore_person_manifest_batch(database, &pending_manifests, &mut report).await;
+                    pending_manifests.clear();
                 }
             }
         }
+        restore_person_manifest_batch(database, &pending_manifests, &mut report).await;
         Ok(report)
     }
 
@@ -958,6 +950,77 @@ impl PeopleService {
             None => Ok(read_relation(&legacy_path)
                 .await?
                 .map(|relation| (legacy_path, relation))),
+        }
+    }
+}
+
+async fn restore_person_manifest_batch(
+    database: &Database,
+    candidates: &[PersonManifestRestoreCandidate],
+    report: &mut PersonManifestRestoreReport,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let person_ids = candidates
+        .iter()
+        .map(|candidate| candidate.manifest.lux_person_id.clone())
+        .collect::<Vec<_>>();
+    let indexed_states = match database
+        .list_person_manifest_index_states(&person_ids)
+        .await
+    {
+        Ok(states) => Some(states),
+        Err(error) => {
+            tracing::warn!(
+                manifest_count = candidates.len(),
+                %error,
+                "person manifest state batch read failed; checking manifests individually"
+            );
+            None
+        }
+    };
+    let mut checked_person_ids = HashSet::new();
+
+    for candidate in candidates {
+        let manifest = &candidate.manifest;
+        let schema_version = i64::from(manifest.schema_version);
+        let indexed_state_is_unchanged = indexed_states
+            .as_ref()
+            .and_then(|states| states.get(&manifest.lux_person_id))
+            .is_some_and(|(checksum, indexed_schema_version)| {
+                checksum == &manifest.checksum && *indexed_schema_version == schema_version
+            });
+        if !checked_person_ids.contains(&manifest.lux_person_id) && indexed_state_is_unchanged {
+            continue;
+        }
+        checked_person_ids.insert(manifest.lux_person_id.clone());
+
+        let identities = manifest
+            .identities
+            .iter()
+            .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
+            .collect::<Vec<_>>();
+        match database
+            .restore_canonical_person_if_manifest_changed(
+                &manifest.lux_person_id,
+                &manifest.display_name,
+                &identities,
+                &manifest.checksum,
+                schema_version,
+            )
+            .await
+        {
+            Ok(true) => report.restored += 1,
+            Ok(false) => {}
+            Err(error) => {
+                report.failed = true;
+                tracing::warn!(
+                    path = %candidate.manifest_path.display(),
+                    %error,
+                    "skipping conflicting person manifest"
+                );
+            }
         }
     }
 }

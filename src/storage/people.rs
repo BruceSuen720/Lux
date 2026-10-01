@@ -1,6 +1,7 @@
 use super::*;
 
 const PERSON_MANIFEST_IDENTITY_BATCH_SIZE: usize = 100;
+const PERSON_MANIFEST_STATE_QUERY_BATCH_SIZE: usize = 100;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PersonCreditKey {
@@ -1686,6 +1687,43 @@ impl Database {
                 source,
             })?;
         Ok(status.as_deref() != Some("COMPLETED"))
+    }
+
+    pub(crate) async fn list_person_manifest_index_states(
+        &self,
+        person_ids: &[String],
+    ) -> Result<HashMap<String, (String, i64)>, StorageError> {
+        let mut states = HashMap::new();
+        for chunk in person_ids.chunks(PERSON_MANIFEST_STATE_QUERY_BATCH_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT person_id, manifest_checksum, manifest_schema_version
+                 FROM person_manifest_index_state
+                 WHERE person_id IN ({placeholders})"
+            )));
+            for person_id in chunk {
+                query = query.bind(person_id);
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            states.extend(rows.into_iter().map(|row| {
+                (
+                    row.get::<String, _>("person_id"),
+                    (
+                        row.get::<String, _>("manifest_checksum"),
+                        row.get::<i64, _>("manifest_schema_version"),
+                    ),
+                )
+            }));
+        }
+        Ok(states)
     }
 
     pub(crate) async fn legacy_person_migration_needed(
