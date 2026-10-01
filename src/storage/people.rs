@@ -1,5 +1,7 @@
 use super::*;
 
+const PERSON_MANIFEST_IDENTITY_BATCH_SIZE: usize = 100;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PersonCreditKey {
     person_id: String,
@@ -1527,21 +1529,39 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for (provider, provider_id) in identities {
-            let owner = self
-                .query_scalar::<String>(
-                    "SELECT person_id FROM person_identities
-                     WHERE provider = ? AND provider_id = ?",
-                )
-                .bind(provider)
-                .bind(provider_id)
-                .fetch_optional(&mut *transaction)
+        let mut identity_owners = HashMap::<(String, String), String>::new();
+        for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
+            let conditions = std::iter::repeat_n("(provider = ? AND provider_id = ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT provider, provider_id, person_id
+                 FROM person_identities
+                 WHERE {conditions}"
+            )));
+            for (provider, provider_id) in chunk {
+                statement = statement.bind(provider).bind(provider_id);
+            }
+            let rows = statement
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            if let Some(owner) = owner
+            identity_owners.extend(rows.into_iter().map(|row| {
+                (
+                    (
+                        row.get::<String, _>("provider"),
+                        row.get::<String, _>("provider_id"),
+                    ),
+                    row.get::<String, _>("person_id"),
+                )
+            }));
+        }
+        for (provider, provider_id) in identities {
+            if let Some(owner) =
+                identity_owners.get(&((*provider).to_owned(), (*provider_id).to_owned()))
                 && owner != person_id
             {
                 return Err(StorageError::Conflict(format!(
@@ -1602,27 +1622,35 @@ impl Database {
                 })?;
             }
         }
-        for (provider, provider_id) in identities {
-            self.query(
+        for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
+            let placeholders =
+                std::iter::repeat_n("(?, ?, ?, 'RECOVERED_MANIFEST', ?, ?, ?, ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO person_identities (
                     person_id, provider, provider_id, match_method, confidence,
                     evidence_json, created_at, updated_at
-                 ) VALUES (?, ?, ?, 'RECOVERED_MANIFEST', ?, ?, ?, ?)
-                 ON CONFLICT(provider, provider_id) DO NOTHING",
-            )
-            .bind(person_id)
-            .bind(provider)
-            .bind(provider_id)
-            .bind(Some(1.0_f64))
-            .bind(r#"{"method":"person-manifest"}"#)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {placeholders}
+                 ON CONFLICT(provider, provider_id) DO NOTHING"
+            )));
+            for (provider, provider_id) in chunk {
+                statement = statement
+                    .bind(person_id)
+                    .bind(provider)
+                    .bind(provider_id)
+                    .bind(Some(1.0_f64))
+                    .bind(r#"{"method":"person-manifest"}"#)
+                    .bind(now)
+                    .bind(now);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         let row = self
             .query("SELECT id FROM people WHERE id = ?")

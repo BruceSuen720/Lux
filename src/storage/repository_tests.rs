@@ -6630,10 +6630,28 @@ async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_perso
         .expect("first canonical person");
 
     let error = database
-        .restore_canonical_person("lux-000002", "另一位演员", &[("tmdb", "57975")])
+        .restore_canonical_person(
+            "lux-000002",
+            "另一位演员",
+            &[("douban", "new-id"), ("tmdb", "57975")],
+        )
         .await
         .expect_err("conflicting manifest must be rejected");
     assert!(matches!(error, StorageError::Conflict(_)));
+    let new_identity_owner: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities
+         WHERE provider = 'douban' AND provider_id = 'new-id'",
+    )
+    .fetch_optional(database.pool())
+    .await
+    .expect("new identity lookup");
+    assert!(new_identity_owner.is_none());
+    let restored_person: Option<String> =
+        sqlx::query_scalar("SELECT id FROM people WHERE id = 'lux-000002'")
+            .fetch_optional(database.pool())
+            .await
+            .expect("restored person lookup");
+    assert!(restored_person.is_none());
     assert_eq!(
         database
             .find_canonical_person_by_identity("tmdb", "57975")
@@ -6643,6 +6661,67 @@ async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_perso
             .id,
         "lux-000001"
     );
+}
+
+#[tokio::test]
+async fn restoring_a_person_manifest_batches_identity_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let identities = [
+        ("tmdb", "57975"),
+        ("douban", "1313123"),
+        ("imdb", "nm0000001"),
+        ("anilist", "42"),
+    ];
+
+    database.reset_query_count();
+    database
+        .restore_canonical_person("lux-000001", "华晨宇", &identities)
+        .await
+        .expect("restore person");
+
+    assert_eq!(database.query_count(), 5);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_identities WHERE person_id = 'lux-000001'")
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+    assert_eq!(identity_count, identities.len() as i64);
+}
+
+#[tokio::test]
+async fn restoring_a_person_manifest_chunks_large_identity_sets() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let owned_identities = (0..205)
+        .map(|index| ("tmdb".to_owned(), format!("id-{index}")))
+        .collect::<Vec<_>>();
+    let identities = owned_identities
+        .iter()
+        .map(|(provider, provider_id)| (provider.as_str(), provider_id.as_str()))
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    database
+        .restore_canonical_person("lux-000001", "Person", &identities)
+        .await
+        .expect("restore person with many identities");
+
+    assert_eq!(database.query_count(), 9);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_identities WHERE person_id = 'lux-000001'")
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+    assert_eq!(identity_count, owned_identities.len() as i64);
 }
 
 #[tokio::test]

@@ -7517,6 +7517,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：未变化变体快检得到的后缀现在沿重扫路径复用；普通变更重扫、reconciliation 分组以及兼容性预检查也把分组/预检查时计算的结果交给实际扫描。新增探测计数测试验证 `ADN-725-Alternate-Cut.mp4` 的代表性候选算法执行 13 次 metadata 探测，变体重扫回归验证 `Alternate-Cut` 身份仍被恢复。Toshiba 上 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 全部通过，包含 Rust build、all-target 测试、fmt、all-target Clippy、Python 检查和 Web 冻结安装/测试/生产构建；本机架构 `arm64`。性能记录仅量化候选查询次数，不声称系统调用或实际耗时收益。
 
+#### LUX-329：批量恢复人物清单中的 provider 身份
+
+范围：人物清单恢复当前在每个身份上分别查询归属，并逐条执行身份 INSERT；清单恢复会串行处理多个人物，单个人物也可以有多个 provider 身份。将同一个人物的归属预检查与 INSERT 改为有界批次，减少与身份数量成比例的 SQL 往返。身份归属冲突仍在写入人物前报告，使用原输入顺序选择首个冲突；人物/序列/身份写入仍处于同一事务，`ON CONFLICT DO NOTHING` 和清单校验语义保持不变。
+
+验收：
+
+- [x] 对 4 个无冲突身份的恢复查询计数从逐身份读写的 11 条降至 5 条；测试同时验证四个身份都保存。
+- [x] 批次大小不超过 100 个身份；覆盖跨批次恢复和已有身份归属冲突，不部分写入其他身份或人物。
+- [x] `storage` 定向测试、build、fmt 和 all-target Clippy 通过；性能记录只报告 SQL 查询计数，不据此推断墙钟耗时。
+
+依赖：现有人物 Manifest 恢复合同。预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改 schema、恢复格式、人物关系恢复策略或并发语义。
+
+结果（2026-10-02）：人物身份归属预检查和 INSERT 都改为每批最多 100 个身份。storage 查询计数从 4 身份时 11→5、205 身份时 413→9；冲突回归确认冲突检查在人物写入前完成，既有冲突身份不被移动，新身份与人物均不落库。storage 定向测试 3 项通过；Rust build、all-target 测试（649 通过、10 忽略）、fmt、all-target Clippy、shell 语法、Python 检查（3/3 与 2/2）通过。本机架构 `arm64`。首次 `./scripts/check-all.sh` 在 Web 测试中有一个剧集加载期间播放导航用例失败；定向复跑、完整 Vitest 复跑（546/546）、随后 `pnpm --dir web test`（Node 108/108、Vitest 546/546）和 Web 生产构建均通过。失败未复现，未修改 Web 文件；完整脚本的首次退出码 1 如实保留。性能记录只报告 storage SQL 查询调用计数，不推断墙钟耗时。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
