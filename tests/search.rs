@@ -34,6 +34,21 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
+    let unrelated_library = libraries
+        .create_library("Unrelated", LibraryKind::Series, false)
+        .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(unrelated_library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(unrelated_library.id.to_string())
+    .execute(database.pool())
+    .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(root.join("银河护卫队.2024.mkv"), b"one").await?;

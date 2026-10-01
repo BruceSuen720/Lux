@@ -43,6 +43,9 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
     let second = libraries
         .create_library("Movies B", LibraryKind::Movie, false)
         .await?;
+    let disabled = libraries
+        .create_library("Disabled Library", LibraryKind::Movie, false)
+        .await?;
     let (first_item, _) = create_fixture(
         &database,
         &libraries,
@@ -96,6 +99,22 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .send()
         .await?;
     assert_eq!(upload_cover.status(), reqwest::StatusCode::OK);
+    let upload_disabled_cover = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{}/cover",
+            disabled.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .header("content-type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(upload_disabled_cover.status(), reqwest::StatusCode::OK);
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(disabled.id.to_string())
+        .execute(database.pool())
+        .await?;
 
     let viewer_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -113,6 +132,57 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         default_visible_body["libraries"].as_array().map(Vec::len),
         Some(2)
     );
+    let disabled_cover = client
+        .get(format!("{base_url}/api/v1/libraries/{}/cover", disabled.id))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(disabled_cover.status(), reqwest::StatusCode::NOT_FOUND);
+    let select_disabled_library = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/users/{}/libraries/{}",
+            viewer.id, disabled.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "canView": true }))
+        .send()
+        .await?;
+    assert_eq!(select_disabled_library.status(), reqwest::StatusCode::OK);
+    let selected_disabled_access = client
+        .get(format!(
+            "{base_url}/api/v1/admin/users/{}/libraries",
+            viewer.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        selected_disabled_access.json::<Value>().await?["libraryIds"],
+        json!([disabled.id.to_string()])
+    );
+    let disabled_only_libraries = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        disabled_only_libraries.json::<Value>().await?["libraries"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    let clear_disabled_library = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/users/{}/libraries/{}",
+            viewer.id, disabled.id
+        ))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({ "canView": false }))
+        .send()
+        .await?;
+    assert_eq!(clear_disabled_library.status(), reqwest::StatusCode::OK);
     let unselected_access = client
         .get(format!(
             "{base_url}/api/v1/admin/users/{}/libraries",

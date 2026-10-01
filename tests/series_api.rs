@@ -39,6 +39,21 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     let library = libraries
         .create_library("Shows", LibraryKind::Series, false)
         .await?;
+    let unrelated_library = libraries
+        .create_library("Unrelated", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(unrelated_library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(unrelated_library.id.to_string())
+    .execute(database.pool())
+    .await?;
     let root = temp_dir.path().join("Shows");
     let season_dir = root.join("Example Show/Season 01");
     tokio::fs::create_dir_all(&season_dir).await?;

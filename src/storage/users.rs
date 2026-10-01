@@ -948,14 +948,17 @@ impl Database {
         library_id: &str,
     ) -> Result<bool, StorageError> {
         self.query_scalar(
-            "SELECT CASE WHEN NOT EXISTS(
+            "SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM libraries WHERE id = ? AND is_enabled = 1
+            ) AND (NOT EXISTS(
                 SELECT 1 FROM user_library_access
                 WHERE user_id = ? AND can_view = 1
             ) OR EXISTS(
                 SELECT 1 FROM user_library_access
                 WHERE user_id = ? AND library_id = ? AND can_view = 1
-            ) THEN 1 ELSE 0 END",
+            )) THEN 1 ELSE 0 END",
         )
+        .bind(library_id)
         .bind(user_id)
         .bind(user_id)
         .bind(library_id)
@@ -1007,7 +1010,7 @@ impl Database {
             "SELECT ula.library_id
              FROM user_library_access ula
              JOIN libraries l ON l.id = ula.library_id
-             WHERE ula.user_id = ? AND ula.can_view = 1 AND l.is_enabled = 1
+             WHERE ula.user_id = ? AND ula.can_view = 1
              ORDER BY l.name, l.id",
         )
         .bind(user_id)
