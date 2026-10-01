@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.10",
+    date: "2026-10-01",
+    sections: [
+      { kind: "changed", items: [
+        "管理台插件页采用响应式布局：宽屏下双列展示，较窄屏幕切换为单列，并调整移动端卡片信息与操作排列。",
+        "元数据补全需要详情时，自动候选会补齐前两项候选的完整详情，便于比较，不再只补最佳候选。",
+      ] },
+      { kind: "fixed", items: [
+        "兼容插件在 BelongsToCollection.Id 返回整数或字符串，并统一规范为字符串，避免整数格式导致详情解码失败。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.9",
     date: "2026-10-01",
     sections: [
