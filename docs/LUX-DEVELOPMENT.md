@@ -7559,6 +7559,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：恢复流程每批最多 100 份有效清单，按 person ID、checksum、schema version 精确对照已存状态；未变化清单跳过单项查询，变化清单仍进入原有校验与原子恢复路径，批量状态读取失败会回退逐项检查。205 份未变化清单的 storage 查询调用由 205 降为 3。定向恢复测试和 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 通过：651 个库测试通过、10 个忽略，all-target 集成测试、fmt、Clippy、shell/Python 检查及 Web 测试和生产构建通过。本机架构 `arm64`；PostgreSQL 专用用例因本机无 PostgreSQL 实例而按配置忽略。生产构建仍报告 `hls.js` chunk 超过 500 kB（594.13 kB，gzip 185.60 kB）；播放器通过动态 import 延迟加载该 chunk，因此没有把它算作首页 bundle 回归，也未在缺少浏览器性能基线时改动打包策略。
 
+#### LUX-332 使用 HLS.js light build 缩小服务器 HLS chunk
+
+范围：Lux Web 的 `SERVER_HLS` 播放只加载 `hls.js/light`。本地服务器 HLS 使用 fMP4/CMAF，仅映射一个视频流和一个选中的音频流，不输出 HLS 字幕轨或备用音轨；保持原生 HLS 优先路径及现有 HLS.js manifest/error 生命周期。不修改 Emby HLS、播放计划、FFmpeg 输出或用户可见播放策略。
+
+验收：
+
+- [x] 原生 HLS 继续直接设置 video source；MSE 路径加载 light build、处理 manifest parsed/error 事件并在销毁时释放实例。
+- [x] 生产构建中的 HLS chunk 与 gzip 字节数均下降；入口 chunk 不变，HLS chunk 不再触发 500 kB 警告。
+- [x] `pnpm --dir web install --frozen-lockfile`、播放器定向测试、完整 Web 测试与生产构建通过。
+
+预计文件：`web/src/features/player/hls-playback-engine.ts`、`web/src/types/hls-js-light.d.ts`、`web/tests/hls-playback-engine.test.ts`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。没有真实浏览器播放启动时间样本；本任务只对构建产物大小作性能结论。
+
+结果（2026-10-02）：HLS.js light build 保留 Lux 自有服务端 fMP4 单视频/单音轨播放所需 API，并排除播放器未使用的 HLS 字幕、备用音轨及 DRM 等功能。播放器测试先验证非原生 HLS 分支，再改为 light build；原生 HLS 路径仍不加载 HLS.js。播放器定向测试 3 项通过，完整 Web 测试 76 个文件 / 548 项通过，冻结安装与生产构建通过。HLS chunk 从 594.13 kB / gzip 185.60 kB 降至 371.83 kB / gzip 117.93 kB；gzip 传输字节减少 67.67 kB（约 36.5%），入口 chunk 保持 113.77 kB / gzip 30.20 kB，构建不再产生大 chunk 警告。浏览器 LCP、MSE 实际首帧和播放启动时延未测量，不能据此声称这些时延已改善。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

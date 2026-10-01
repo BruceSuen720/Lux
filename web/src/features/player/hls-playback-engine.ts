@@ -20,7 +20,7 @@ export class HlsVideoEngine implements PlaybackEngine {
       this.element.load();
       return;
     }
-    const { default: Hls } = await import("hls.js");
+    const { default: Hls } = await import("hls.js/light");
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,

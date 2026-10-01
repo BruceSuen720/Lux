@@ -1089,3 +1089,16 @@ poster-worker A/B 使用每个 movie 一张有效 1×1 PNG。候选父目录快�
 ### LUX-331 人物清单恢复状态预读
 
 使用 205 份有效人物清单，并预先写入与其 person ID、checksum 和 schema version 完全匹配的索引状态。逐清单校验路径发出 205 条 storage 查询；每 100 个 ID 批量读取状态后发出 3 条查询，未变化清单不再执行单项查询。状态表查询最多绑定 100 个 ID。该计数是 SQL 调用次数，不是数据库往返采样或墙钟基准；变化清单仍走原有单人物校验/事务恢复路径。
+
+### LUX-332 Web 服务端 HLS chunk 大小
+
+在 2026-10-02 的 macOS ARM64 开发机上，用同一工作树分别执行改动前和改动后的 `pnpm --dir web build`。Vite 将 `hls.js` 独立为 HLS 播放时按需加载的 chunk：
+
+| 构建 | HLS chunk 原始大小 | gzip 大小 | 首页入口原始大小 | 首页入口 gzip |
+|---|---:|---:|---:|---:|
+| 完整 HLS.js | 594.13 kB | 185.60 kB | 113.77 kB | 30.20 kB |
+| HLS.js light | 371.83 kB | 117.93 kB | 113.77 kB | 30.20 kB |
+
+light build 的 HLS chunk 减少 222.30 kB（约 37.4%），gzip 减少 67.67 kB（约 36.5%）；首页入口大小未变，Vite 的 500 kB chunk 警告消失。Lux 自有 `SERVER_HLS` 输出为 fMP4/CMAF，FFmpeg 只映射一个视频和一个音频流，因此此路径不使用 light build 排除的 HLS 字幕、备用音轨和 DRM 功能。HLS.js 仍仅在浏览器没有原生 HLS 时动态加载。
+
+本次没有记录真实浏览器的 LCP、MSE 首帧或播放启动时延，构建字节下降不代表这些时延已实测改善；数据也不外推为端到端播放性能或设备间差异。
