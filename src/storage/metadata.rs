@@ -1344,8 +1344,15 @@ impl Database {
     pub(crate) async fn list_unexpired_pending_metadata_candidates_for_item(
         &self,
         item_id: &str,
+        provider_key: &str,
         limit: i64,
     ) -> Result<Vec<StoredMetadataCandidate>, StorageError> {
+        let escaped_provider_key = provider_key
+            .replace('!', "!!")
+            .replace('%', "!%")
+            .replace('_', "!_");
+        let suffix_patterns =
+            [".", ":", "/"].map(|separator| format!("%{separator}{escaped_provider_key}"));
         self.query(
             "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
                     mc.candidate_json, mc.score, mc.status, mc.expires_at,
@@ -1355,10 +1362,20 @@ impl Database {
              WHERE mc.item_id = ? AND mc.status = 'PENDING'
                AND mi.removed_at IS NULL
                AND (mc.expires_at IS NULL OR mc.expires_at > unixepoch())
+               AND (
+                   lower(mc.provider) = lower(?)
+                   OR lower(mc.provider) LIKE ? ESCAPE '!'
+                   OR lower(mc.provider) LIKE ? ESCAPE '!'
+                   OR lower(mc.provider) LIKE ? ESCAPE '!'
+               )
              ORDER BY mc.score DESC, mc.created_at, mc.id
              LIMIT ?",
         )
         .bind(item_id)
+        .bind(provider_key)
+        .bind(&suffix_patterns[0])
+        .bind(&suffix_patterns[1])
+        .bind(&suffix_patterns[2])
         .bind(limit)
         .fetch_all(&self.pool)
         .await

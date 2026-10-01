@@ -1046,6 +1046,50 @@ async fn local_nfo_cast_is_exposed_by_detail_api_without_selection()
 }
 
 #[tokio::test]
+async fn local_nfo_cast_exposes_all_one_hundred_actors_in_detail_api()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let mut nfo = String::from("<movie><title>百人演员电影</title>");
+    for order in 0..100 {
+        let number = order + 1;
+        nfo.push_str(&format!(
+            "<actor><name>演员{number}</name><role>角色{number}</role><type>Actor</type><order>{order}</order></actor>"
+        ));
+    }
+    nfo.push_str("</movie>");
+    tokio::fs::write(fixture.movie_dir.join("movie.nfo"), nfo).await?;
+
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    MetadataEnricher::new(fixture.database.clone())
+        .with_people(PeopleService::new(fixture.config.config_dir.clone()))
+        .enrich_movie_library(library_id.parse()?)
+        .await?;
+
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::new();
+    let (cookies, _) = login(&client, &base_url).await?;
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let body: Value = detail.json().await?;
+    let actors = body["actors"].as_array().ok_or("missing actors")?;
+    assert_eq!(actors.len(), 100);
+    assert_eq!(actors[0]["name"], "演员1");
+    assert_eq!(actors[0]["character"], "角色1");
+    assert_eq!(actors[99]["name"], "演员100");
+    assert_eq!(actors[99]["character"], "角色100");
+
+    lux_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_selection_writes_only_configured_candidate_image_types()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
@@ -1693,13 +1737,44 @@ async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search
             "title": "Pending Movie",
             "productionYear": 2020,
             "providerIds": {"Tmdb": "603"},
-            "metadataFetched": true
+            "metadataFetched": true,
+            "metadataDetailsVersion": 2,
+            "overview": "Cached overview"
         }),
     )
     .await?;
+    sqlx::query(
+        "UPDATE metadata_candidates SET provider = 'org.lux.tmdb', score = 0 WHERE item_id = ?",
+    )
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+    for index in 0..50 {
+        sqlx::query(
+            "INSERT INTO metadata_candidates
+             (id, item_id, provider, provider_id, candidate_json, score, status)
+             VALUES (?, ?, 'DOUBAN', ?, ?, 100, 'PENDING')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&fixture.item_id)
+        .bind(format!("douban-{index}"))
+        .bind(
+            json!({
+                "title": format!("Other Provider {index}"),
+                "metadataFetched": true,
+                "metadataDetailsVersion": 2
+            })
+            .to_string(),
+        )
+        .execute(fixture.database.pool())
+        .await?;
+    }
+    let search_requests = Arc::new(AtomicUsize::new(0));
+    let handler_search_requests = Arc::clone(&search_requests);
     let detail_requests = Arc::new(AtomicUsize::new(0));
     let handler_detail_requests = Arc::clone(&detail_requests);
     let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let search_requests = Arc::clone(&handler_search_requests);
         let detail_requests = Arc::clone(&handler_detail_requests);
         async move {
             if request.uri().path() == "/3/movie/603" {
@@ -1713,6 +1788,7 @@ async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search
                 }))
                 .into_response();
             }
+            search_requests.fetch_add(1, Ordering::SeqCst);
             StatusCode::NOT_FOUND.into_response()
         }
     }));
@@ -1743,18 +1819,9 @@ async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search
 
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].provider_id, "603");
-    assert_eq!(
-        page.items[0].candidate["overview"],
-        "Hydrated pending overview"
-    );
-    let refreshed_candidate_json: String =
-        sqlx::query_scalar("SELECT candidate_json FROM metadata_candidates WHERE id = ?")
-            .bind(&page.items[0].id)
-            .fetch_one(fixture.database.pool())
-            .await?;
-    let refreshed_candidate: Value = serde_json::from_str(&refreshed_candidate_json)?;
-    assert_eq!(refreshed_candidate["metadataDetailsVersion"], 2);
-    assert_eq!(detail_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(page.items[0].candidate["overview"], "Cached overview");
+    assert_eq!(search_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(detail_requests.load(Ordering::SeqCst), 0);
     tmdb_server.abort();
     Ok(())
 }

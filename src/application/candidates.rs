@@ -34,6 +34,8 @@ use crate::{
 };
 
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
+// Keep optional per-person RPCs bounded while retaining the full cast list.
+const MAX_ACTOR_DETAIL_FETCHES: usize = 12;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 const IMAGE_ITEM_CONCURRENCY: usize = 4;
 const SCRAPER_IMAGE_TYPES: [&str; 8] = [
@@ -739,9 +741,7 @@ impl MetadataCandidateService {
                 .as_ref()
                 .and_then(|value| value.original_language.clone())
                 .or_else(|| result.original_language.clone());
-            let (images, credits, external_ids, trailers, images_response) = if let Some(bundle) =
-                bundle
-            {
+            let (images_response, credits, external_ids, trailers) = if let Some(bundle) = bundle {
                 let bundle_images = bundle.images;
                 capability_results.extend([
                     MetadataCapabilityResult {
@@ -761,7 +761,7 @@ impl MetadataCandidateService {
                     },
                 ]);
                 (
-                    bundle_images.clone(),
+                    Some(bundle_images),
                     bundle.credits,
                     Some(bundle.external_ids),
                     bundle
@@ -770,7 +770,6 @@ impl MetadataCandidateService {
                         .into_iter()
                         .filter_map(|trailer| trailer.url)
                         .collect(),
-                    Some(bundle_images),
                 )
             } else {
                 let (images_response, credits_result, external_ids_result, trailers_result) = tokio::join!(
@@ -891,13 +890,7 @@ impl MetadataCandidateService {
                     }
                     None => Vec::new(),
                 };
-                (
-                    images_response.clone().unwrap_or_default(),
-                    credits,
-                    external_ids,
-                    trailers,
-                    images_response,
-                )
+                (images_response, credits, external_ids, trailers)
             };
             let now = current_unix_timestamp();
             let mut transient_capability_failures = Vec::new();
@@ -1012,7 +1005,10 @@ impl MetadataCandidateService {
                     trailers,
                     provider,
                     provider_id,
-                    images: generic_candidate_images(&images.images, item_type),
+                    images: images_response
+                        .as_ref()
+                        .map(|response| generic_candidate_images(&response.images, item_type))
+                        .unwrap_or_default(),
                     actors,
                     metadata_fetched: details.is_some(),
                     score: direct_provider_id.as_ref().map(|_| 100.0),
@@ -1036,7 +1032,7 @@ impl MetadataCandidateService {
         let provider_key = provider_key_from_plugin_id(scraper.provider_key());
         let mut rows = self
             .database
-            .list_unexpired_pending_metadata_candidates_for_item(item_id, 50)
+            .list_unexpired_pending_metadata_candidates_for_item(item_id, &provider_key, 50)
             .await?;
         rows.retain(|row| provider_key_from_plugin_id(&row.provider) == provider_key);
         rows.truncate(2);
@@ -1988,6 +1984,7 @@ fn generic_candidate_actors(
 async fn enrich_actor_metadata(scraper: &ScraperProvider, actors: &mut [ActorCredit]) {
     let requests = actors
         .iter()
+        .take(MAX_ACTOR_DETAIL_FETCHES)
         .enumerate()
         .filter_map(|(index, actor)| {
             let provider_id = actor.id.trim();
@@ -2510,7 +2507,7 @@ impl MetadataSelectionService {
             .find_metadata_candidate(item_id, candidate_id)
             .await?
             .ok_or(MetadataSelectionError::CandidateNotFound)?;
-        let mut actors = candidate_payload(&candidate)?.actors;
+        let mut actors = candidate_actor_credits(&candidate.candidate_json)?;
         if actors.is_empty() {
             return Ok(0);
         }
@@ -3729,6 +3726,20 @@ fn candidate_rating(value: &Value) -> Result<Option<f64>, MetadataSelectionError
     Ok(Some(rating))
 }
 
+#[derive(Deserialize)]
+struct CandidateActorCredits {
+    #[serde(default)]
+    actors: Vec<ActorCredit>,
+}
+
+fn candidate_actor_credits(
+    candidate_json: &str,
+) -> Result<Vec<ActorCredit>, MetadataSelectionError> {
+    let candidate = serde_json::from_str::<CandidateActorCredits>(candidate_json)
+        .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))?;
+    validate_candidate_actors(candidate.actors)
+}
+
 fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelectionError> {
     let Some(raw) = value.get("actors") else {
         return Ok(Vec::new());
@@ -3736,13 +3747,25 @@ fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelection
     let actors = raw.as_array().ok_or_else(|| {
         MetadataSelectionError::InvalidCandidate("actors must be an array".to_owned())
     })?;
-    actors
+    let actors = actors
         .iter()
         .take(MAX_MOVIE_NFO_ACTORS)
         .map(|actor| {
-            let actor = serde_json::from_value::<ActorCredit>(actor.clone()).map_err(|error| {
+            serde_json::from_value::<ActorCredit>(actor.clone()).map_err(|error| {
                 MetadataSelectionError::InvalidCandidate(format!("actor is invalid: {error}"))
-            })?;
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_candidate_actors(actors)
+}
+
+fn validate_candidate_actors(
+    actors: Vec<ActorCredit>,
+) -> Result<Vec<ActorCredit>, MetadataSelectionError> {
+    actors
+        .into_iter()
+        .take(MAX_MOVIE_NFO_ACTORS)
+        .map(|actor| {
             let id = actor.id.trim();
             let name = actor.name.trim();
             if (!id.is_empty() && !valid_person_id(id)) || name.is_empty() {
@@ -3968,13 +3991,14 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
-        MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
-        SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
-        credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
-        generic_candidate_actors, generic_candidate_images, image_attempt_identities,
-        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
-        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
-        parse_image_selection_policy, selected_scraper_provider_id,
+        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
+        MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors,
+        capability_needs_request, completeness_capabilities, credits_are_missing,
+        default_image_selection_policy, enrich_actor_metadata, generic_candidate_actors,
+        generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
+        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
+        selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
@@ -4097,6 +4121,54 @@ mod tests {
         assert!(actors.iter().all(|actor| actor.person.is_some()));
         assert!(maximum.load(Ordering::SeqCst) > 1);
         assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn actor_metadata_enrichment_keeps_the_cast_limit_separate_from_detail_fetches() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let scraper = ScraperProvider::from_adapter(DelayedActorAdapter { active, maximum });
+        let mut actors = (0..100)
+            .map(|index| super::ActorCredit {
+                id: index.to_string(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: format!("Actor {index}"),
+                character: None,
+                order: Some(index),
+                profile_url: None,
+                person: None,
+            })
+            .collect::<Vec<_>>();
+
+        enrich_actor_metadata(&scraper, &mut actors).await;
+
+        assert!(
+            actors
+                .iter()
+                .take(MAX_ACTOR_DETAIL_FETCHES)
+                .all(|actor| actor.person.is_some())
+        );
+        assert!(
+            actors
+                .iter()
+                .skip(MAX_ACTOR_DETAIL_FETCHES)
+                .all(|actor| actor.person.is_none())
+        );
+    }
+
+    #[test]
+    fn actor_enrichment_decodes_only_the_candidate_cast() {
+        let actors = candidate_actor_credits(
+            r#"{"actors":[{"id":"9","name":" Actor ","character":"Role","order":2}],"images":{"FANART":["https://example.test/backdrop.jpg"]},"largeUnusedField":{"value":"ignored"}}"#,
+        )
+        .expect("decode candidate cast");
+
+        assert_eq!(actors.len(), 1);
+        assert_eq!(actors[0].id, "9");
+        assert_eq!(actors[0].name, "Actor");
+        assert_eq!(actors[0].character.as_deref(), Some("Role"));
+        assert_eq!(actors[0].order, Some(2));
     }
 
     #[test]

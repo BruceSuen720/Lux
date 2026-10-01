@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use super::*;
 
 impl PeopleService {
@@ -6,6 +8,17 @@ impl PeopleService {
         actor: &ActorCredit,
         identities: &[PersonIdentity],
         bridge_person_key: Option<&str>,
+    ) -> Result<Option<String>, PeopleError> {
+        self.resolve_person_key_with_mapped_identities(actor, identities, bridge_person_key, None)
+            .await
+    }
+
+    async fn resolve_person_key_with_mapped_identities(
+        &self,
+        actor: &ActorCredit,
+        identities: &[PersonIdentity],
+        bridge_person_key: Option<&str>,
+        preloaded_identities: Option<&[(String, String, String)]>,
     ) -> Result<Option<String>, PeopleError> {
         if identities.is_empty() {
             return Ok(bridge_person_key.map(str::to_owned));
@@ -18,10 +31,13 @@ impl PeopleService {
             .iter()
             .map(|identity| (identity.provider.clone(), identity.id.clone()))
             .collect::<Vec<_>>();
-        let mapped_identities = database
-            .find_canonical_people_by_identities(&identity_pairs)
-            .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mapped_identities = match preloaded_identities {
+            Some(identities) => identities.to_vec(),
+            None => database
+                .find_canonical_people_by_identities(&identity_pairs)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?,
+        };
         let mut mapped_person: Option<String> = None;
         for (_, _, candidate_id) in &mapped_identities {
             if mapped_person
@@ -314,14 +330,63 @@ impl PeopleService {
             None
         };
 
-        let mut stored = Vec::new();
-        let mut pending_assets = Vec::new();
         let provider = provider.trim().to_ascii_lowercase();
+        let mut prepared_actors = Vec::with_capacity(actors.len().min(MAX_ACTORS));
         for actor in actors.iter().take(MAX_ACTORS) {
             if actor.name.trim().is_empty() {
                 continue;
             }
             let mut identities = actor_identities(actor, &provider);
+            let bridge_candidates = same_media_bridge_candidates(previous_relation.as_ref(), actor);
+            if identities.is_empty()
+                && let Some(previous) = bridge_candidates
+                    .first()
+                    .filter(|_| bridge_candidates.len() == 1)
+            {
+                identities = previous.identities.clone();
+                if identities.is_empty()
+                    && let (Some(id), provider) =
+                        (previous.id.as_deref(), previous.provider.as_str())
+                    && is_valid_person_id(id)
+                    && is_valid_person_id(provider)
+                {
+                    identities.push(PersonIdentity {
+                        provider: provider.to_owned(),
+                        id: id.to_owned(),
+                    });
+                }
+            }
+            prepared_actors.push((actor, identities, bridge_candidates));
+        }
+
+        let mut identity_pairs = Vec::new();
+        let mut seen_identities = HashSet::new();
+        for (_, identities, _) in &prepared_actors {
+            for identity in identities {
+                let pair = (identity.provider.clone(), identity.id.clone());
+                if seen_identities.insert(pair.clone()) {
+                    identity_pairs.push(pair);
+                }
+            }
+        }
+        let mut person_by_identity = HashMap::new();
+        if let Some(database) = &self.database
+            && !identity_pairs.is_empty()
+        {
+            let matches = database
+                .find_canonical_people_by_identities(&identity_pairs)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            person_by_identity.extend(
+                matches
+                    .into_iter()
+                    .map(|(provider, id, person_key)| ((provider, id), person_key)),
+            );
+        }
+
+        let mut stored = Vec::with_capacity(prepared_actors.len());
+        let mut pending_assets = Vec::new();
+        for (actor, identities, bridge_candidates) in prepared_actors {
             let primary = identities.first();
             let actor_id = primary
                 .map(|identity| identity.id.as_str())
@@ -329,7 +394,6 @@ impl PeopleService {
             let actor_provider = primary
                 .map(|identity| identity.provider.as_str())
                 .unwrap_or_default();
-            let bridge_candidates = same_media_bridge_candidates(previous_relation.as_ref(), actor);
             if bridge_candidates.len() > 1
                 && !identities.is_empty()
                 && let Some(database) = &self.database
@@ -411,24 +475,6 @@ impl PeopleService {
             let bridge_person_key = (bridge_candidates.len() == 1)
                 .then(|| bridge_candidates[0].person_key.as_deref())
                 .flatten();
-            if identities.is_empty()
-                && let Some(previous) = bridge_candidates
-                    .first()
-                    .filter(|_| bridge_candidates.len() == 1)
-            {
-                identities = previous.identities.clone();
-                if identities.is_empty()
-                    && let (Some(id), provider) =
-                        (previous.id.as_deref(), previous.provider.as_str())
-                    && is_valid_person_id(id)
-                    && is_valid_person_id(provider)
-                {
-                    identities.push(PersonIdentity {
-                        provider: provider.to_owned(),
-                        id: id.to_owned(),
-                    });
-                }
-            }
             let primary = identities.first();
             let actor_id = primary
                 .map(|identity| identity.id.as_str())
@@ -436,9 +482,40 @@ impl PeopleService {
             let actor_provider = primary
                 .map(|identity| identity.provider.as_str())
                 .unwrap_or_default();
-            let person_key = self
-                .resolve_person_key(actor, &identities, bridge_person_key)
-                .await?;
+            let mapped_identities = identities
+                .iter()
+                .filter_map(|identity| {
+                    person_by_identity
+                        .get(&(identity.provider.clone(), identity.id.clone()))
+                        .map(|person_key| {
+                            (
+                                identity.provider.clone(),
+                                identity.id.clone(),
+                                person_key.clone(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            let person_key = if identities.is_empty() {
+                self.resolve_person_key(actor, &identities, bridge_person_key)
+                    .await?
+            } else {
+                self.resolve_person_key_with_mapped_identities(
+                    actor,
+                    &identities,
+                    bridge_person_key,
+                    Some(&mapped_identities),
+                )
+                .await?
+            };
+            if let Some(person_key) = person_key.as_deref() {
+                for identity in &identities {
+                    person_by_identity.insert(
+                        (identity.provider.clone(), identity.id.clone()),
+                        person_key.to_owned(),
+                    );
+                }
+            }
             let has_stable_identity = person_key.is_some();
             let assets = if has_stable_identity {
                 self.persist_person_assets(
