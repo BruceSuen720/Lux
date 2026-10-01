@@ -7601,6 +7601,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：报告组件与唯一调用方删除未使用的 `jobId` prop；API client 删除未使用的 `Library` 类型；HEVC 播放引擎删除未被读取的 `streamTask` 字段，并以 `void` 明确保留后台 `consumeSource` 执行。取消、generation 隔离、错误上报及 MSE 结束逻辑保持不变。`pnpm --dir web exec tsc --noEmit --noUnusedLocals --noUnusedParameters`、冻结依赖安装、完整 Web 测试（76 个文件 / 548 项）和生产构建通过。构建输出中 HEVC chunk 为 197.74 kB / gzip 49.68 kB；不据微小 bundle 差异推断播放性能提升。
 
+#### LUX-335 将 TypeScript 未使用符号检查加入 Web 构建
+
+范围：在 Web TypeScript 项目配置中启用 `noUnusedLocals` 与 `noUnusedParameters`。检查范围沿用现有 `tsconfig.json` 的 `src` 和 `vite.config.ts`，不扩展到独立测试文件，也不改变运行时代码。
+
+验收：
+
+- [x] 当前生产源码与 Vite 配置通过两项未使用符号检查。
+- [x] `pnpm --dir web build` 将自动执行检查；完整 Web 测试和构建通过。
+
+预计文件：`web/tsconfig.json`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：`noUnusedLocals` 与 `noUnusedParameters` 已在生产 TypeScript 项目中启用；冻结依赖安装、`pnpm --dir web build`、Node 样式检查（108 项）和 Vitest（76 个文件 / 548 项）通过。首次完整测试有 5 项首页异步轮播断言失败；隔离重跑 `home-page.test.tsx`（15 项）及随后完整测试均通过，未复现，未改动测试或运行时代码。构建产物中的 HLS chunk 为 371.83 kB / gzip 117.93 kB；本任务没有运行时性能变更，不据 bundle 清理推断实际播放性能提升。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
