@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Download, Globe2, PackageOpen, RefreshCw, Save, Settings2, Trash2, X } from "lucide-react";
+import { Download, Globe2, PackageOpen, RefreshCw, Save, Settings2, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -430,7 +430,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, originalLanguageField?.defaultValue, overwriteField?.defaultValue, plugin.configFields, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
-    <article className="lux-admin-panel lux-admin-plugin-card">
+    <article className="lux-admin-plugin-card">
       <div className="lux-admin-plugin-icon" aria-hidden="true"><PackageOpen size={22} /></div>
       <div className="lux-admin-plugin-content">
         <div className="lux-admin-plugin-heading-line">
@@ -443,21 +443,20 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
         <p title={plugin.description}>{plugin.description}</p>
       </div>
       <div className="lux-admin-plugin-actions">
-        {plugin.installed && installedManagement ? (
+        {installedManagement && plugin.installed ? (
           <>
-            {plugin.updateAvailable ? <button className="lux-button lux-button-secondary" type="button" aria-label={`更新插件 ${plugin.name}`} disabled={updating || uninstalling} onClick={onUpdate}><RefreshCw size={14} /> {updating ? "更新中…" : "更新插件"}</button> : null}
+            {plugin.updateAvailable ? <button className="lux-button lux-button-secondary lux-admin-plugin-update-button" type="button" aria-label={`更新插件 ${plugin.name}`} disabled={updating || uninstalling} onClick={onUpdate}><RefreshCw size={14} /> {updating ? "更新中…" : "更新插件"}</button> : null}
             <button className={`lux-admin-plugin-enable-switch${plugin.enabled ? " is-enabled" : ""}`} type="button" role="switch" aria-checked={plugin.enabled} aria-label={toggleBlockedByProvider ? `由其他插件停用 ${plugin.name}` : `${plugin.enabled ? "禁用" : "启用"} ${plugin.name}`} disabled={toggling || uninstalling || toggleBlockedByProvider} onClick={() => onToggleEnabled(!plugin.enabled)}>
               <span className="lux-admin-plugin-enable-switch-track" aria-hidden="true"><span /></span>
               <span>{plugin.enabled ? "已启用" : "已禁用"}</span>
             </button>
-            <button className="lux-admin-plugin-uninstall-button" type="button" aria-label={`卸载 ${plugin.name}`} disabled={uninstalling} onClick={() => setUninstallDialogOpen(true)}><Trash2 size={14} /> 卸载</button>
+            {canConfigure ? <button className="lux-admin-plugin-config-button" type="button" aria-label={`配置 ${plugin.name}`} onClick={() => setOpen(true)}><Settings2 size={15} /> 配置</button> : null}
           </>
         ) : plugin.installed ? (
-          <>{plugin.updateAvailable ? <button className="lux-button lux-button-secondary" type="button" aria-label={`更新插件 ${plugin.name}`} disabled={updating} onClick={onUpdate}><RefreshCw size={14} /> {updating ? "更新中…" : "更新插件"}</button> : <span className="lux-admin-plugin-install-status is-installed" role="status" aria-label="插件状态：已安装"><CheckCircle2 size={15} /> 已安装</span>}</>
+          <button className="lux-admin-plugin-uninstall-button" type="button" aria-label={`卸载 ${plugin.name}`} disabled={uninstalling} onClick={() => setUninstallDialogOpen(true)}><Trash2 size={14} /> 卸载</button>
         ) : (
           <button className="lux-admin-plugin-install-status is-install" type="button" aria-label={`安装 ${plugin.name}`} disabled={installing} onClick={onInstall}><Download size={15} /> {installing ? "安装中…" : "安装"}</button>
         )}
-        {canConfigure ? <button className="lux-admin-plugin-config-button" type="button" aria-label={`配置 ${plugin.name}`} onClick={() => setOpen(true)}><Settings2 size={15} /> 配置</button> : null}
       </div>
       {open && canConfigure ? (
         <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
