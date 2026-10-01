@@ -7431,6 +7431,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-09-29）：workflow 3 本地 movie poster worker 首个 item 保留快速路径，其余 item 每 16 个组成一页，经 LUX-305 原子批量图片事务写入；系列 artwork 路径、NFO 顺序和网络刮削策略未改。失败重试回归用触发器令第二页写入失败，确认该页无部分 poster 落库、stage 不标记完成，重试后 3 个 poster 全部入库。相关 Rust 目标 `scanned_metadata`、`scanned_series_metadata`、`scanning_jobs` 共 94 项通过。性能结果见 `docs/PERFORMANCE.md`：四组 local poster queue 中位数缩短 17.1%–78.3%，活动扫描期间 p95 最大回退 3.0%；队列完成后的 10k PostgreSQL p95 有 +4 ms 变化，已保留说明。性能数据仅代表本机 ARM64 与本地 PostgreSQL 16.15，不能外推 NAS/x86_64。此前全目标验证中的 `metadata_selection::completed_scan_automatically_matches_and_writes_metadata` 实际是 workflow 2 旧自动匹配合同，却使用默认 workflow 3 manifest，导致读取不到旧 `metadata_reidentify_jobs` 记录并报 `RowNotFound`；现已明确设为 workflow 2 并改名。修正后 `cargo test --locked --test metadata_selection` 29 项通过。最终 `cargo test --locked --all-targets` 的 582 项库测试通过，但在无关的 `emby_auth` 目标因 3 个用户名大小写断言失败而停止（实际返回小写，断言期待首字母大写）；需作为独立问题处理。此前 build、fmt、clippy 门禁通过。
 
+#### LUX-323：完整性结果按条目分片且只提交一次
+
+范围：修正扫描完整性消费者在 FILL_MISSING 条目超过 100 项时，对每个调度分片重复提交整批完整性结果的情况。完整性结果按 item ID 与调度条目共同分片，每条新 claim 的结果只进入一个存储事务；不具备在线调度资格的已 claim 结果仍须保存。允许对已有 READY 且确认缺失、但本轮没有新 claim 的条目传入空结果集以触发补缺调度。保留每个存储事务内缺失结果与对应调度意向原子提交、每个调度分片最多 100 个 item，以及最多 256 个 source 的 outbox 合同。
+
+验收：
+
+- [x] 超过 100 个合格 item、每项含多个 capability、以及非合格但已 claim 的结果，分片后每条结果恰好提交一次；每个 eligible item 恰好进入一个调度分片。
+- [x] 已 READY 的缺失 item 即使没有新 claim 结果，仍可排入 FILL_MISSING；在线策略关闭时已 claim 结果仍会持久化。
+- [x] 测试证明 256-source / 最多 512 capability 结果批次的结果 UPDATE 尝试数从最多 1,536 降至最多 512；不据此推断墙钟耗时。
+- [x] 保持当前 SQLite/PostgreSQL 事务和失败重试语义；定向 scanner 测试、格式检查与 Clippy 通过。
+
+依赖：LUX-293、LUX-302、LUX-303。预计文件：`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。此任务仅调整结果分片，不改变存储公共模型、schema 或数据库事务实现。
+
+结果（2026-10-02）：完整性结果先按最多 100 个 eligible item 分片，再依 item ID 分配已 claim 结果；不属于调度列表的结果落入首个事务，每条结果只提交一次。无新 claim 但有 READY/missing eligible item 时仍产生空结果提交批次；没有在线调度资格时仍提交 claim 结果。256 个 source、最多 512 个 capability 结果由最多 3 个事务各提交至多 100 个 eligible item；结果 UPDATE 尝试上界从 512×3=1,536 降至 512。SQLite/PostgreSQL 原子事务实现未修改。两个定向 scanner 测试、`cargo build --locked`、fmt 和 all-target Clippy 通过。`cargo test --locked --all-targets` 库测试 640 项通过、10 项忽略、2 项在并行全目标负载下遇到 2 秒子进程超时；隔离重跑 `application::embedded_subtitle::tests` 3 项通过。性能推导与限制见 `docs/PERFORMANCE.md`；没有据 SQL 次数变化推断墙钟耗时。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

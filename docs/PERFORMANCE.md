@@ -1042,3 +1042,11 @@ poster-worker A/B 使用每个 movie 一张有效 1×1 PNG。候选父目录快�
 候选四组均在剩余 poster queue 完成前结束 scan job；本地队列中位数四组均缩短。首 poster 中位数在 SQLite/1k、PostgreSQL/1k、PostgreSQL/10k 分别变化 +4、+17、+4 ms，处于 20 ms 观察粒度内；SQLite/10k 提前 100 ms。活动扫描期间目录 p95 四组回退均低于 5% 门槛。10k PostgreSQL 队列完成后的 p95 中位数从 59 增至 63 ms（+4 ms、+6.8%），该差异单独保留记录，不计入活动扫描期间 p95 门槛。
 
 一次额外的 SQLite/1k 基准候选运行触发了 poster 必须早于 scan 完成的断言；该次未留下时间样本。加入具体时间的断言错误信息后，诊断复跑通过，且正式三轮均通过。该失败被如实记录，不并入正式三轮统计。以上仅是本机 ARM64 与本地 PostgreSQL 容器 A/B，不外推到 NAS/x86_64，也不代表部署后或真实客户端验收；阶段 23 总体验收仍开放。
+
+### LUX-323 完整性结果分片：结果 UPDATE 次数推导
+
+2026-10-02 对扫描本地 metadata completeness 消费路径做静态计数，不作为耗时基准。每个 claim 批次最多 512 条 capability 结果，在线补缺候选最多 256 个 item，每个 FILL_MISSING 调度分片最多 100 个 item，因此最多分成 3 个事务。
+
+存储事务对每条传入的完整性结果执行一次 `UPDATE item_metadata_completeness`。旧循环对每个调度分片重复传入整批结果，最坏为 512 × 3 = 1,536 次结果 UPDATE 尝试；新逻辑按 item ID 将结果分配至唯一事务，结果 UPDATE 尝试最多 512 次，减少最多 1,024 次（约 66.7%）。非 eligible 的 claim 结果随首个事务保存；已 READY/missing 但没有新 claim 的 eligible item 仍可通过空结果事务进入补缺调度。
+
+该变化只计算完整性结果 UPDATE 尝试，不代表全部 SQL 数或端到端时延变化。仍保留最多 3 个事务、每个事务内结果与补缺意向原子提交的结构；没有新增 SQLite/PostgreSQL 性能样本。
