@@ -42,11 +42,14 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     let viewer = luxd::auth::users::UserStore::new(database.clone())?
         .create_user("viewer", "Viewer", "viewer password", false)
         .await?;
-    let _denied = luxd::auth::users::UserStore::new(database.clone())?
+    let denied = luxd::auth::users::UserStore::new(database.clone())?
         .create_user("denied", "Denied", "denied password", false)
         .await?;
     let library = LibraryService::new(database.clone())
         .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    let unrelated_library = LibraryService::new(database.clone())
+        .create_library("Unrelated", LibraryKind::Movie, false)
         .await?;
     sqlx::query(
         "INSERT INTO user_library_access (user_id, library_id, can_view)
@@ -54,6 +57,14 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     )
     .bind(viewer.id.to_string())
     .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(denied.id.to_string())
+    .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
 
@@ -437,12 +448,23 @@ async fn lux_person_favorites_are_user_scoped_and_require_person_acl_and_csrf()
     let library = LibraryService::new(database.clone())
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
+    let unrelated_library = LibraryService::new(database.clone())
+        .create_library("Unrelated", LibraryKind::Series, false)
+        .await?;
     sqlx::query(
         "INSERT INTO media_items (
             id, library_id, item_type, title, sort_title, identification_status
          ) VALUES ('item-person-favorite', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
     )
     .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(denied.id.to_string())
+    .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
     sqlx::query(
