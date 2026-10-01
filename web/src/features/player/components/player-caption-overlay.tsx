@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import {
   activeCaptionCues,
   CAPTION_LIMITS,
-  parseCaptionText,
   type LuxCaptionCue,
 } from "../caption-parser";
 import {

@@ -7573,6 +7573,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：HLS.js light build 保留 Lux 自有服务端 fMP4 单视频/单音轨播放所需 API，并排除播放器未使用的 HLS 字幕、备用音轨及 DRM 等功能。播放器测试先验证非原生 HLS 分支，再改为 light build；原生 HLS 路径仍不加载 HLS.js。播放器定向测试 3 项通过，完整 Web 测试 76 个文件 / 548 项通过，冻结安装与生产构建通过。HLS chunk 从 594.13 kB / gzip 185.60 kB 降至 371.83 kB / gzip 117.93 kB；gzip 传输字节减少 67.67 kB（约 36.5%），入口 chunk 保持 113.77 kB / gzip 30.20 kB，构建不再产生大 chunk 警告。浏览器 LCP、MSE 实际首帧和播放启动时延未测量，不能据此声称这些时延已改善。
 
+#### LUX-333 清理播放器中的未使用导入
+
+范围：移除 TypeScript 未使用符号诊断确认的播放器死导入，不改字幕/弹幕解析、Matroska 转码或 HLS 播放逻辑。HLS 引擎保留 `PlayerPage` 中的动态导入，只删除未使用的静态导入。
+
+验收：
+
+- [x] 四个未使用导入从对应模块删除，运行时路径与公开行为不变。
+- [x] 冻结依赖安装、完整 Web 测试与生产构建通过。
+- [x] 单独的 TypeScript 未使用符号诊断确认这四处不再报告。
+
+预计文件：`web/src/features/player/PlayerPage.tsx`、`web/src/features/player/components/player-caption-overlay.tsx`、`web/src/features/player/components/player-danmaku-overlay.tsx`、`web/src/features/player/mkv-transcode-worker.ts`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：移除 4 个未使用导入；`PlayerPage` 的 HLS 引擎动态导入保持不变。TypeScript 未使用符号诊断从 7 处降至 3 处；剩余的是迁移报告组件的未使用 `jobId` 参数、HEVC 引擎未读取的 `streamTask` 字段和 API client 中未使用的 `Library` 类型导入，将分别审查，不纳入本任务。`pnpm --dir web install --frozen-lockfile`、完整 Web 测试（76 个文件 / 548 项）和生产构建通过；本任务没有性能收益声明。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

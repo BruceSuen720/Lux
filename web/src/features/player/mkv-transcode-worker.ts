@@ -3,7 +3,7 @@ import { Box, createFile, DataStream, ISOFile } from "mp4box";
 import processPolyfill from "process";
 import type { MatroskaSample, MatroskaStreamDemuxer, MatroskaTrack } from "./matroska-demuxer";
 import { parseMatroskaSubtitleSample } from "./matroska-subtitles";
-import { addMatroskaVideoTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "./mkv-remux";
+import { addMatroskaVideoTrack, concatBuffers, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "./mkv-remux";
 import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, matroskaSampleRoute, toAnnexB } from "./mkv-transcode";
 
 type WorkerMessage =
