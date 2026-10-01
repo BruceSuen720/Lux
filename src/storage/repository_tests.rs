@@ -9119,6 +9119,36 @@ async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
             .await
             .expect("claim first run")
     );
+    assert!(
+        database
+            .update_person_index_rebuild_progress(&library_id, "run-a", "item-a", 1, 2)
+            .await
+            .expect("record first run progress")
+            .is_some()
+    );
+    assert!(
+        database
+            .request_person_index_rebuild_job_cancel(&library_id)
+            .await
+            .expect("request first run cancellation")
+    );
+    let active_jobs = database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("keep a current run active");
+    assert_eq!(active_jobs[0].status, "RUNNING");
+    let active_job: (Option<String>, i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT cursor_id, processed_count, total_count, cancel_requested, run_token
+         FROM person_index_rebuild_jobs WHERE library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("current run fields");
+    assert_eq!(
+        active_job,
+        (Some("item-a".to_owned()), 1, 2, 1, Some("run-a".to_owned()))
+    );
     sqlx::query(
         "UPDATE person_index_rebuild_jobs
              SET updated_at = unixepoch() - 61
@@ -9202,6 +9232,133 @@ async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
         .expect("list jobs");
     assert_eq!(jobs[0].status, "COMPLETED");
     assert_eq!(jobs[0].processed_count, 2);
+}
+
+#[tokio::test]
+async fn syncing_person_rebuild_jobs_batches_libraries_and_skips_noop_updates() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let mut enabled_library_ids = Vec::new();
+    for index in 0..4 {
+        let library = libraries
+            .create_library(&format!("People {index}"), LibraryKind::Movie, false)
+            .await
+            .expect("enabled library");
+        enabled_library_ids.push(library.id.to_string());
+    }
+    let disabled_library = libraries
+        .create_library("Disabled People", LibraryKind::Movie, false)
+        .await
+        .expect("disabled library");
+    let disabled_library_id = disabled_library.id.to_string();
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(&disabled_library_id)
+        .execute(database.pool())
+        .await
+        .expect("disable library");
+
+    database.reset_query_count();
+    let jobs = database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("create jobs for enabled libraries");
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(jobs.len(), enabled_library_ids.len());
+    let disabled_job_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_index_rebuild_jobs WHERE library_id = ?")
+            .bind(&disabled_library_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("disabled library job count");
+    assert_eq!(disabled_job_count, 0);
+
+    sqlx::query("CREATE TABLE person_index_rebuild_update_probe (count INTEGER NOT NULL)")
+        .execute(database.pool())
+        .await
+        .expect("create update probe");
+    sqlx::query("INSERT INTO person_index_rebuild_update_probe (count) VALUES (0)")
+        .execute(database.pool())
+        .await
+        .expect("initialize update probe");
+    sqlx::query(
+        "CREATE TRIGGER person_index_rebuild_update_probe_trigger
+         AFTER UPDATE ON person_index_rebuild_jobs
+         BEGIN
+             UPDATE person_index_rebuild_update_probe SET count = count + 1;
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("create update trigger");
+
+    database.reset_query_count();
+    database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("sync unchanged jobs");
+    assert_eq!(database.query_count(), 2);
+    let unchanged_update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_index_rebuild_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("unchanged update count");
+    assert_eq!(unchanged_update_count, 0);
+
+    sqlx::query(
+        "UPDATE person_index_rebuild_jobs
+         SET status = 'RUNNING', cursor_id = 'checkpoint', processed_count = 2,
+             total_count = 4, cancel_requested = 1, run_token = 'run-token', error = 'old'
+         WHERE library_id = ?",
+    )
+    .bind(&enabled_library_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("prepare old-schema job");
+    sqlx::query("UPDATE person_index_rebuild_update_probe SET count = 0")
+        .execute(database.pool())
+        .await
+        .expect("reset update probe");
+
+    database.reset_query_count();
+    database
+        .sync_person_index_rebuild_jobs(2)
+        .await
+        .expect("reset jobs for new schema");
+    assert_eq!(database.query_count(), 2);
+    type PersonIndexRebuildSchemaResetRow = (
+        i64,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+    let schema_changed: PersonIndexRebuildSchemaResetRow = sqlx::query_as(
+        "SELECT schema_version, status, cursor_id, processed_count, total_count,
+                    cancel_requested, run_token, error
+             FROM person_index_rebuild_jobs WHERE library_id = ?",
+    )
+    .bind(&enabled_library_ids[0])
+    .fetch_one(database.pool())
+    .await
+    .expect("schema-changed job");
+    assert_eq!(
+        schema_changed,
+        (2, "QUEUED".to_owned(), None, 0, 0, 0, None, None)
+    );
+    let schema_change_update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_index_rebuild_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("schema change update count");
+    assert_eq!(schema_change_update_count, enabled_library_ids.len() as i64);
 }
 
 #[tokio::test]

@@ -7531,6 +7531,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：人物身份归属预检查和 INSERT 都改为每批最多 100 个身份。storage 查询计数从 4 身份时 11→5、205 身份时 413→9；冲突回归确认冲突检查在人物写入前完成，既有冲突身份不被移动，新身份与人物均不落库。storage 定向测试 3 项通过；Rust build、all-target 测试（649 通过、10 忽略）、fmt、all-target Clippy、shell 语法、Python 检查（3/3 与 2/2）通过。本机架构 `arm64`。首次 `./scripts/check-all.sh` 在 Web 测试中有一个剧集加载期间播放导航用例失败；定向复跑、完整 Vitest 复跑（546/546）、随后 `pnpm --dir web test`（Node 108/108、Vitest 546/546）和 Web 生产构建均通过。失败未复现，未修改 Web 文件；完整脚本的首次退出码 1 如实保留。性能记录只报告 storage SQL 查询调用计数，不推断墙钟耗时。
 
+#### LUX-330：避免人物重建启动时的无变化任务写入
+
+范围：人物索引恢复启动时先读取启用库 ID，再逐库 upsert 重建任务；冲突分支无条件更新 `updated_at`，即使 schema 与任务状态均未变也会写行。改为从启用库集合执行一条批量 upsert，并且只在 schema 版本变化或 `RUNNING` 已超过 60 秒时更新已有任务。保持禁用库过滤、schema 重置、过期运行回收和最终任务列表语义。
+
+验收：
+
+- [x] 4 个启用库同步时 storage 查询计数由 6 条降为 2 条；单条批量 upsert 覆盖所有启用库。
+- [x] 同步未变化任务不会触发 UPDATE；过期 `RUNNING` 与 schema 变更仍重置所需字段，活动任务仍保留 run token、游标、进度和取消状态。
+- [x] `storage` 定向测试、build、fmt 和 all-target Clippy 通过；性能记录分别报告查询与写入计数，不据此推断墙钟耗时。
+
+依赖：LUX-188 人物索引重建任务合同。预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改人物索引算法、任务恢复期限、并发领取或 schema。
+
+结果（2026-10-02）：启用库筛选、任务创建/恢复与最终列表查询合并为单条批量 upsert 加一次列表读取；4 个启用库的 SQL 调用计数为 6→2。SQLite UPDATE 触发器验证未变化同步写入 0 行，schema 变化更新 4 行；任务状态测试覆盖过期运行回收与活动运行的 token、游标、进度、取消标记保留。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 最终通过：build、all-target 测试（650 个库测试通过、10 个忽略，所有集成目标通过）、fmt、Clippy、shell/Python 检查及 Web 冻结安装、测试和生产构建均通过。首次脚本运行仅因新增测试的 Clippy `type_complexity` 报错退出；为测试 SQL 行定义命名类型别名后，独立 Clippy 与完整脚本复跑通过。本机架构 `arm64`。性能记录只报告 SQL 与 UPDATE 行计数，不推断耗时收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

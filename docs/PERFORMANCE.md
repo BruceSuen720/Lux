@@ -1079,3 +1079,9 @@ poster-worker A/B 使用每个 movie 一张有效 1×1 PNG。候选父目录快�
 `restore_canonical_person` 的 storage 查询计数回归以 SQLite 为准。4 个身份时，逐项归属 SELECT、逐项身份 INSERT 和人物/序列/回读共发出 11 条查询；改为最多 100 个身份一批后，归属查询与身份 INSERT 各合并成一条，总计 5 条，减少 6 条（约 54.5%）。205 个身份时，旧路径为 413 条，新路径将归属检查与 INSERT 各拆成 3 个有界批次，并保留 3 条固定写/回读，总计 9 条，减少 404 条（约 97.8%）。
 
 计数来自 `Database` storage 查询计数器，衡量的是 SQL 查询调用次数，不是数据库往返的网络采样或墙钟基准。实现每批最多 100 个身份，归属检查最多 200 个绑定值、批量 INSERT 最多 700 个绑定值；不据调用次数变化推断端到端耗时收益。
+
+### LUX-330 人物索引重建任务启动同步
+
+使用 4 个启用库和 1 个禁用库的 storage 测试，原路径在同步时查询一次启用库列表、逐库 upsert 四次、最后读取任务列表一次，共 6 条 SQL；批量 `INSERT ... SELECT ... ON CONFLICT` 后与最终列表共 2 条 SQL。SQLite UPDATE 触发器确认相同 schema 的未变化任务同步触发 0 次行 UPDATE；schema 版本变化时仍由同一批量 upsert 更新 4 行并重置字段。现有回归也覆盖了活动任务保持、超过 60 秒的 RUNNING 任务回收。
+
+这些结果是 storage SQL 调用和 SQLite 行 UPDATE 触发计数，不是耗时基准；没有据此推断启动时长或 PostgreSQL/NAS 性能变化。

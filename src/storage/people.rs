@@ -61,70 +61,67 @@ impl Database {
         &self,
         schema_version: i64,
     ) -> Result<Vec<StoredPersonIndexRebuildJob>, StorageError> {
-        for library_id in self.list_enabled_library_ids().await? {
-            self.query(
-                "INSERT INTO person_index_rebuild_jobs (library_id, schema_version)
-                 VALUES (?, ?)
-                 ON CONFLICT(library_id) DO UPDATE SET
-                    schema_version = excluded.schema_version,
-                    status = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN 'QUEUED'
-                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
-                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
-                            THEN 'QUEUED'
-                        ELSE person_index_rebuild_jobs.status
-                    END,
-                    cursor_id = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN NULL
-                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
-                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
-                            THEN person_index_rebuild_jobs.cursor_id
-                        ELSE person_index_rebuild_jobs.cursor_id
-                    END,
-                    processed_count = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN 0
-                        ELSE person_index_rebuild_jobs.processed_count
-                    END,
-                    total_count = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN 0
-                        ELSE person_index_rebuild_jobs.total_count
-                    END,
-                    cancel_requested = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN 0
-                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
-                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
-                            THEN 0
-                        ELSE person_index_rebuild_jobs.cancel_requested
-                    END,
-                    run_token = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN NULL
-                        WHEN person_index_rebuild_jobs.status = 'RUNNING'
-                            AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
-                            THEN NULL
-                        ELSE person_index_rebuild_jobs.run_token
-                    END,
-                    error = CASE
-                        WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
-                            THEN NULL
-                        ELSE person_index_rebuild_jobs.error
-                    END,
-                    updated_at = unixepoch()",
-            )
-            .bind(&library_id)
-            .bind(schema_version)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        self.query(
+            "INSERT INTO person_index_rebuild_jobs (library_id, schema_version)
+             SELECT id, ? FROM libraries WHERE is_enabled = 1
+             ON CONFLICT(library_id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                status = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN 'QUEUED'
+                    WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                        AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                        THEN 'QUEUED'
+                    ELSE person_index_rebuild_jobs.status
+                END,
+                cursor_id = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN NULL
+                    ELSE person_index_rebuild_jobs.cursor_id
+                END,
+                processed_count = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN 0
+                    ELSE person_index_rebuild_jobs.processed_count
+                END,
+                total_count = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN 0
+                    ELSE person_index_rebuild_jobs.total_count
+                END,
+                cancel_requested = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN 0
+                    WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                        AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                        THEN 0
+                    ELSE person_index_rebuild_jobs.cancel_requested
+                END,
+                run_token = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN NULL
+                    WHEN person_index_rebuild_jobs.status = 'RUNNING'
+                        AND person_index_rebuild_jobs.updated_at < unixepoch() - 60
+                        THEN NULL
+                    ELSE person_index_rebuild_jobs.run_token
+                END,
+                error = CASE
+                    WHEN person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                        THEN NULL
+                    ELSE person_index_rebuild_jobs.error
+                END,
+                updated_at = unixepoch()
+             WHERE person_index_rebuild_jobs.schema_version <> excluded.schema_version
+                OR (person_index_rebuild_jobs.status = 'RUNNING'
+                    AND person_index_rebuild_jobs.updated_at < unixepoch() - 60)",
+        )
+        .bind(schema_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         self.list_person_index_rebuild_jobs(0, 500).await
     }
 
