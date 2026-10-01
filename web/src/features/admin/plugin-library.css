@@ -69,6 +69,8 @@
 
 .lux-admin-plugin-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 0;
+  row-gap: 0;
 }
 
 .lux-admin-plugin-grid > .lux-admin-empty {
@@ -77,15 +79,30 @@
 
 .lux-admin-plugin-card {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr) auto;
-  align-items: start;
+  grid-template-columns: 48px minmax(0, 1fr) minmax(112px, auto);
+  align-items: center;
   gap: 16px;
-  min-height: 104px;
-  padding: 20px 22px;
+  min-width: 0;
+  min-height: 132px;
+  padding: 24px 24px 24px 12px;
+  border-bottom: 1px solid var(--lux-line-soft);
+}
+
+.lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd) {
+  padding-right: 24px;
+  border-right: 1px solid var(--lux-line-soft);
+}
+
+.lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(even) {
+  padding-left: 32px;
+}
+
+.lux-admin-plugin-grid > .lux-admin-plugin-card:last-child {
+  border-bottom: 0;
 }
 
 .lux-admin-plugin-icon {
-  align-self: start;
+  align-self: center;
 }
 
 .lux-admin-plugin-content {
@@ -121,7 +138,7 @@
   font-size: .8rem;
   line-height: 1.5;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 1;
+  -webkit-line-clamp: 2;
 }
 
 .lux-admin-plugin-meta {
@@ -154,9 +171,16 @@
   grid-row: 1;
   flex-direction: column;
   align-items: flex-end;
-  justify-content: flex-start;
-  gap: 8px;
-  min-width: 92px;
+  justify-content: center;
+  gap: 4px;
+  min-width: 112px;
+}
+
+.lux-admin-plugin-update-button {
+  align-self: flex-end;
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: .72rem;
 }
 
 .lux-admin-plugin-install-status,
@@ -273,6 +297,8 @@
 }
 
 .lux-admin-plugin-config-button {
+  align-self: flex-end;
+  min-height: 34px;
   padding: 0 10px;
   border: 1px solid transparent;
   color: var(--lux-muted);
@@ -463,17 +489,41 @@
   margin-top: 5px;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 1440px) {
   .lux-admin-plugin-grid {
     grid-template-columns: 1fr;
+  }
+
+  .lux-admin-plugin-grid > .lux-admin-plugin-card,
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd) {
+    padding-right: 12px;
+    padding-left: 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--lux-line-soft);
+  }
+
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:last-child {
+    border-bottom: 0;
   }
 }
 
 @media (max-width: 640px) {
   .lux-admin-plugin-card {
-    grid-template-columns: 42px minmax(0, 1fr) auto;
+    grid-template-columns: 40px minmax(0, 1fr);
     gap: 12px;
-    padding: 16px;
+    min-height: 0;
+    padding: 18px 4px;
+  }
+
+  .lux-admin-plugin-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .lux-admin-plugin-grid > .lux-admin-plugin-card,
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd) {
+    padding-right: 4px;
+    padding-left: 4px;
   }
 
   .lux-admin-plugin-heading-line {
@@ -482,12 +532,24 @@
     gap: 6px;
   }
 
+  .lux-admin-plugin-heading-line h2 {
+    display: -webkit-box;
+    overflow: hidden;
+    white-space: normal;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
   .lux-admin-plugin-meta {
     white-space: normal;
   }
 
   .lux-admin-plugin-actions {
-    min-width: 78px;
+    grid-column: 2;
+    grid-row: 2;
+    align-items: flex-start;
+    min-width: 0;
+    margin-top: 2px;
   }
 
   .lux-admin-plugin-install-status {
