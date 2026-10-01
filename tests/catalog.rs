@@ -1258,10 +1258,19 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(viewer_home.status(), reqwest::StatusCode::OK);
     let viewer_home_body: Value = viewer_home.json().await?;
-    assert_eq!(viewer_home_body["recentlyAddedTotal"], 0);
+    assert_eq!(viewer_home_body["recentlyAddedTotal"], 2);
+    let viewer_library_ids = viewer_home_body["libraries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|library| library["id"].as_str())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        viewer_home_body["libraries"].as_array().map(Vec::len),
-        Some(0)
+        viewer_library_ids,
+        [library.id.to_string(), series_library.id.to_string()]
+            .into_iter()
+            .collect()
     );
 
     let web_login = client
