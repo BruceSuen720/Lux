@@ -65,21 +65,31 @@ async fn playback_webhooks_and_home_events_follow_emby_progress()
     setup.complete("Admin", "Admin", "correct password").await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
-        .create_library("Movies", LibraryKind::Movie, false)
+        .create_library("Shows", LibraryKind::Series, false)
         .await?;
-    let root = temp_dir.path().join("Movies");
-    tokio::fs::create_dir_all(&root).await?;
-    tokio::fs::write(root.join("Playback Hook Movie 2024.mkv"), b"video").await?;
+    let root = temp_dir.path().join("Shows");
+    for (season, episode) in [(1, "First Night S01E01.mkv"), (2, "Second Night S02E01.mkv")] {
+        let season_dir = root.join(format!("Playback Hook Show/Season {season:02}"));
+        tokio::fs::create_dir_all(&season_dir).await?;
+        tokio::fs::write(season_dir.join(episode), b"video").await?;
+    }
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
     LibraryScanner::new(database.clone())
-        .scan_movie_library(library.id)
+        .scan_series_library(library.id)
         .await?;
-    let item_id: String =
-        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
-            .fetch_one(database.pool())
-            .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE item_type = 'EPISODE' AND season_number = 2 AND episode_number = 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let item_title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(item_title, "Second Night");
     let emby_item_id = emby_public_id(&item_id);
 
     let webhook_service = WebhookService::new(database.clone(), temp_dir.path().join("config"))?;
@@ -150,12 +160,18 @@ async fn playback_webhooks_and_home_events_follow_emby_progress()
         serde_json::from_slice(&receiver.recv().await.ok_or("missing started event")?)?;
     assert_eq!(started["eventType"], "PLAYBACK_STARTED");
     assert_eq!(started["itemId"], emby_item_id);
-    assert_eq!(started["itemTitle"], "Playback Hook Movie");
+    assert_eq!(started["itemTitle"], "Second Night");
+    assert_eq!(started["seriesTitle"], "Playback Hook Show");
+    assert_eq!(started["seasonNumber"], 2);
+    assert_eq!(started["seriesSeasonCount"], 2);
     assert_eq!(started["userName"], "Admin");
     assert_eq!(started["playMethod"], "DirectPlay");
     assert_eq!(started["resumed"], false);
     assert_eq!(started["source"], "lux");
-    assert_eq!(started["title"], "Admin开始播放 Playback Hook Movie");
+    assert_eq!(
+        started["title"],
+        "Admin开始播放 Playback Hook Show · 第2季 · Second Night"
+    );
     assert_eq!(started["body"], started["content"]);
     assert!(started["content"].as_str().is_some_and(|value| {
         value.contains("直接播放") && value.contains("设备：PlaybackHookTest · Mac")

@@ -1625,6 +1625,9 @@ fn event_type_is_stopped(event_type: WebhookEventType) -> bool {
 #[derive(Clone, Debug, Default)]
 struct PlaybackNotificationContext {
     item_title: Option<String>,
+    series_title: Option<String>,
+    season_number: Option<i64>,
+    series_season_count: Option<i64>,
     container: Option<String>,
     size: Option<i64>,
     bitrate: Option<i64>,
@@ -1665,8 +1668,30 @@ async fn playback_notification_context(
     let play_method = requested_play_method
         .map(normalize_play_method)
         .or_else(|| source.map(|source| default_play_method(&source.source_kind).to_owned()));
+    let series = if item.item_type == "EPISODE" {
+        match item.series_id.as_deref() {
+            Some(series_id) => catalog.find_item(principal, series_id).await.ok().flatten(),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let series_title = (item.item_type == "EPISODE")
+        .then(|| {
+            series
+                .as_ref()
+                .map(|series| series.title.as_str())
+                .or(item.series_name.as_deref())
+        })
+        .flatten()
+        .and_then(|title| bounded_playback_text(Some(title)));
     PlaybackNotificationContext {
         item_title: bounded_playback_text(Some(&item.title)),
+        series_title,
+        season_number: item.season_number.filter(|number| *number >= 0),
+        series_season_count: series
+            .and_then(|series| series.season_count)
+            .filter(|count| *count > 0),
         container: source.and_then(|source| bounded_playback_text(source.container.as_deref())),
         size: source.and_then(|source| source.size.filter(|value| *value >= 0)),
         bitrate: source.and_then(|source| source.bitrate.filter(|value| *value >= 0)),
@@ -1738,6 +1763,9 @@ pub(super) async fn publish_playback_webhook(
     let data = json!({
         "itemId": emby_public_id(item_id),
         "itemTitle": context.item_title,
+        "seriesTitle": context.series_title,
+        "seasonNumber": context.season_number,
+        "seriesSeasonCount": context.series_season_count,
         "userName": bounded_playback_text(Some(user_name)),
         "mediaSourceId": media_source_id,
         "playSessionId": play_session_id,

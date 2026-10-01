@@ -23,7 +23,7 @@ pub(crate) fn render(
 fn readable_title(event_type: &str, data: &Map<String, Value>) -> String {
     if event_type.starts_with("PLAYBACK_") {
         let user = string_value(data, "userName");
-        let item = string_value(data, "itemTitle");
+        let item = playback_display_title(data);
         let action = match event_type {
             "PLAYBACK_STARTED" if data.get("resumed").and_then(Value::as_bool) == Some(true) => {
                 "恢复播放"
@@ -65,6 +65,33 @@ fn readable_title(event_type: &str, data: &Map<String, Value>) -> String {
         "JOB_FAILED" => job_failed_title(data),
         _ => "Lux 通知".to_owned(),
     }
+}
+
+fn playback_display_title(data: &Map<String, Value>) -> String {
+    let episode = string_value(data, "itemTitle");
+    let series = string_value(data, "seriesTitle");
+    if series.is_empty() {
+        return episode;
+    }
+
+    let season = match (
+        data.get("seriesSeasonCount")
+            .and_then(Value::as_i64)
+            .filter(|count| *count > 1),
+        data.get("seasonNumber")
+            .and_then(Value::as_i64)
+            .filter(|number| *number >= 0),
+    ) {
+        (Some(_), Some(0)) => Some("特别篇".to_owned()),
+        (Some(_), Some(number)) => Some(format!("第{number}季")),
+        _ => None,
+    };
+
+    [Some(series), season, (!episode.is_empty()).then_some(episode)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn contextual_title(action: &str, data: &Map<String, Value>) -> String {
@@ -413,4 +440,71 @@ fn format_timestamp(timestamp: i64) -> String {
         .ok()
         .and_then(|value| value.format(&Rfc3339).ok())
         .unwrap_or_else(|| timestamp.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+    use serde_json::{Value, json};
+
+    fn playback_title(data: Value) -> String {
+        let fields = data.as_object().expect("test fields should be an object");
+        render("PLAYBACK_STARTED", 1_700_000_000, fields)["title"]
+            .as_str()
+            .expect("rendered title should be text")
+            .to_owned()
+    }
+
+    #[test]
+    fn playback_title_orders_series_multi_season_and_episode() {
+        assert_eq!(
+            playback_title(json!({
+                "userName": "alice",
+                "itemTitle": "第二夜",
+                "seriesTitle": "九门",
+                "seasonNumber": 2,
+                "seriesSeasonCount": 2,
+            })),
+            "alice开始播放 九门 · 第2季 · 第二夜"
+        );
+    }
+
+    #[test]
+    fn playback_title_omits_single_season_number() {
+        assert_eq!(
+            playback_title(json!({
+                "userName": "alice",
+                "itemTitle": "下雨的街头又冷又难走",
+                "seriesTitle": "四月是你的谎言",
+                "seasonNumber": 1,
+                "seriesSeasonCount": 1,
+            })),
+            "alice开始播放 四月是你的谎言 · 下雨的街头又冷又难走"
+        );
+    }
+
+    #[test]
+    fn playback_title_labels_special_episodes() {
+        assert_eq!(
+            playback_title(json!({
+                "userName": "alice",
+                "itemTitle": "特别篇标题",
+                "seriesTitle": "九门",
+                "seasonNumber": 0,
+                "seriesSeasonCount": 2,
+            })),
+            "alice开始播放 九门 · 特别篇 · 特别篇标题"
+        );
+    }
+
+    #[test]
+    fn playback_title_falls_back_to_item_title_without_series() {
+        assert_eq!(
+            playback_title(json!({
+                "userName": "alice",
+                "itemTitle": "起源",
+            })),
+            "alice开始播放 起源"
+        );
+    }
 }
