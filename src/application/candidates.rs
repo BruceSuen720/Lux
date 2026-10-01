@@ -1040,52 +1040,51 @@ impl MetadataCandidateService {
             .await?;
         rows.retain(|row| provider_key_from_plugin_id(&row.provider) == provider_key);
         rows.truncate(2);
-        let Some(best) = rows.first_mut() else {
+        if rows.is_empty() {
             return Ok(None);
-        };
-        let mut best_candidate_value = if plan.needs_metadata {
-            let mut value = serde_json::from_str::<Value>(&best.candidate_json)
-                .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
-            if !Self::candidate_metadata_was_fetched(&value) {
-                let item_type = match current.item_type.as_str() {
-                    "MOVIE" => ScraperItemType::Movie,
-                    "SERIES" => ScraperItemType::Series,
-                    _ => return Ok(None),
-                };
-                let details = scraper
-                    .get_generic(ScraperGetRequest::new(
-                        item_type,
-                        best.provider_id.clone(),
-                        "zh-CN",
-                    ))
-                    .await
-                    .map_err(MetadataCandidateError::Scraper)?;
-                value = Self::merge_scraper_metadata_into_candidate(value, &details)?;
-                let candidate_json = serde_json::to_string(&value).map_err(|error| {
-                    MetadataCandidateError::InvalidCandidateJson(error.to_string())
-                })?;
-                if !self
-                    .database
-                    .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
-                    .await?
-                {
-                    return Ok(None);
+        }
+        let mut candidate_values = Vec::with_capacity(rows.len());
+        if plan.needs_metadata {
+            let item_type = match current.item_type.as_str() {
+                "MOVIE" => ScraperItemType::Movie,
+                "SERIES" => ScraperItemType::Series,
+                _ => return Ok(None),
+            };
+            for row in &mut rows {
+                let mut value =
+                    serde_json::from_str::<Value>(&row.candidate_json).map_err(|error| {
+                        MetadataCandidateError::InvalidCandidateJson(error.to_string())
+                    })?;
+                if !Self::candidate_metadata_was_fetched(&value) {
+                    let details = scraper
+                        .get_generic(ScraperGetRequest::new(
+                            item_type,
+                            row.provider_id.clone(),
+                            "zh-CN",
+                        ))
+                        .await
+                        .map_err(MetadataCandidateError::Scraper)?;
+                    value = Self::merge_scraper_metadata_into_candidate(value, &details)?;
+                    let candidate_json = serde_json::to_string(&value).map_err(|error| {
+                        MetadataCandidateError::InvalidCandidateJson(error.to_string())
+                    })?;
+                    if !self
+                        .database
+                        .update_pending_metadata_candidate_json(item_id, &row.id, &candidate_json)
+                        .await?
+                    {
+                        return Ok(None);
+                    }
+                    row.candidate_json = candidate_json;
                 }
-                best.candidate_json = candidate_json;
+                candidate_values.push(Some(value));
             }
-            Some(value)
-        } else {
-            None
-        };
+        }
         let items = rows
             .into_iter()
             .enumerate()
             .map(|(index, row)| {
-                let candidate = if index == 0 {
-                    best_candidate_value.take()
-                } else {
-                    None
-                };
+                let candidate = candidate_values.get_mut(index).and_then(Option::take);
                 match candidate {
                     Some(candidate) => Ok(candidate_view_with_value(row, Some(current), candidate)),
                     None => candidate_view(row, Some(current)),
@@ -3973,10 +3972,9 @@ mod tests {
         SCRAPER_IMAGE_TYPES, candidate_actors, capability_needs_request, completeness_capabilities,
         credits_are_missing, default_image_selection_policy, enrich_actor_metadata,
         generic_candidate_actors, generic_candidate_images, image_attempt_identities,
-        local_metadata_completeness_plan,
-        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
-        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
-        selected_scraper_provider_id,
+        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
+        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
+        parse_image_selection_policy, selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
@@ -4395,10 +4393,9 @@ mod tests {
 
     #[test]
     fn old_candidate_metadata_cache_is_not_treated_as_complete_details() {
-        let missing_version = serde_json::from_str::<serde_json::Value>(
-            r#"{"metadataFetched":true}"#,
-        )
-        .expect("valid candidate JSON");
+        let missing_version =
+            serde_json::from_str::<serde_json::Value>(r#"{"metadataFetched":true}"#)
+                .expect("valid candidate JSON");
         let not_fetched = serde_json::from_str::<serde_json::Value>(
             r#"{"metadataFetched":false,"metadataDetailsVersion":2}"#,
         )
@@ -4407,15 +4404,15 @@ mod tests {
             r#"{"metadataFetched":true,"metadataDetailsVersion":2}"#,
         )
         .expect("valid candidate JSON");
-        assert!(
-            !MetadataCandidateService::candidate_metadata_was_fetched(&missing_version)
-        );
-        assert!(
-            !MetadataCandidateService::candidate_metadata_was_fetched(&not_fetched)
-        );
-        assert!(
-            MetadataCandidateService::candidate_metadata_was_fetched(&current_details)
-        );
+        assert!(!MetadataCandidateService::candidate_metadata_was_fetched(
+            &missing_version
+        ));
+        assert!(!MetadataCandidateService::candidate_metadata_was_fetched(
+            &not_fetched
+        ));
+        assert!(MetadataCandidateService::candidate_metadata_was_fetched(
+            &current_details
+        ));
     }
 
     #[test]
