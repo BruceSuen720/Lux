@@ -115,6 +115,10 @@ fn generic_scraper_decodes_provider_neutral_responses() {
             "Type": "Movie",
             "Name": "二毛",
             "Rating": 8.6,
+            "BelongsToCollection": {
+                "Id": 10,
+                "Name": "Example Collection"
+            },
             "ProviderIds": {
                 "Tmdb": "123",
                 "Imdb": "tt1234567",
@@ -125,6 +129,37 @@ fn generic_scraper_decodes_provider_neutral_responses() {
     .expect("metadata response should decode");
     assert_eq!(metadata.provider_id("Douban"), Some("douban-123"));
     assert_eq!(metadata.rating, Some(8.6));
+    assert_eq!(
+        metadata
+            .collection
+            .as_ref()
+            .and_then(|collection| collection.provider_id.as_deref()),
+        Some("10")
+    );
+    assert_eq!(
+        metadata
+            .collection
+            .as_ref()
+            .and_then(|collection| collection.name.as_deref()),
+        Some("Example Collection")
+    );
+
+    let string_collection_metadata = decode_metadata_response(json!({
+        "metadata": {
+            "BelongsToCollection": {
+                "Id": "11",
+                "Name": "String ID Collection"
+            }
+        }
+    }))
+    .expect("metadata with a string collection ID should decode");
+    assert_eq!(
+        string_collection_metadata
+            .collection
+            .as_ref()
+            .and_then(|collection| collection.provider_id.as_deref()),
+        Some("11")
+    );
 
     let images = decode_images_response(json!({
         "images": [{

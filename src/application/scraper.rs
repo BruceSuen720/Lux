@@ -983,10 +983,32 @@ impl ScraperMetadata {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct ScraperCollectionReference {
-    #[serde(rename = "Id", alias = "id", default)]
+    #[serde(
+        rename = "Id",
+        alias = "id",
+        default,
+        deserialize_with = "deserialize_optional_string_id"
+    )]
     pub provider_id: Option<String>,
     #[serde(rename = "Name", alias = "name", default)]
     pub name: Option<String>,
+}
+
+fn deserialize_optional_string_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) if value.is_i64() || value.is_u64() => {
+            Ok(Some(value.to_string()))
+        }
+        Some(_) => Err(serde::de::Error::custom(
+            "expected a string or integer provider ID",
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]

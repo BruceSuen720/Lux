@@ -382,6 +382,8 @@ ImageType
 值必须是字符串，键由插件定义（例如 `Tmdb`、`Douban`）；Lux 只把它当作不透明 ID 保存，不能
 假设是数字或 TMDb URL。图片必须返回完整 HTTPS `Url`，并声明 `Type`、语言和可选尺寸。
 插件缺少某种媒体类型或能力时，应返回 `PLUGIN_PROVIDER_NOT_FOUND`，不能伪造空的 TMDb 数据。
+详情中的 `BelongsToCollection.Id` 可返回 JSON 整数或字符串；Lux 会将其规范化为字符串 ID。此兼容
+不改变 `ProviderIds` 映射值必须为字符串的约定。
 
 图片请求的 `language` 为空字符串时表示手动搜索的“不限语言”模式；插件此时不得套用管理员的
 元数据首选/备选语言，也不得添加 `language` 或 `include_image_language` 过滤条件，应返回上游可用的
