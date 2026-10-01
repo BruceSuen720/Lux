@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.11",
+    date: "2026-10-01",
+    sections: [
+      { kind: "changed", items: [
+        "普通用户的媒体库访问范围规则更加明确：未选择媒体库或清空选择时，可访问全部已启用媒体库；选择部分媒体库后，仅可访问所选媒体库。禁用的媒体库不会开放给普通用户。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.10",
     date: "2026-10-01",
     sections: [
