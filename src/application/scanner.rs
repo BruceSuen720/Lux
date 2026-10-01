@@ -27,6 +27,7 @@ use std::os::{
 };
 use tokio::{
     fs,
+    io::AsyncReadExt,
     sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinHandle, JoinSet},
 };
@@ -91,7 +92,7 @@ const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
 const MANIFEST_STREAMED_INDEX_BATCH_SIZE: usize = 8_000;
 const MANIFEST_STREAMED_ENTRY_BATCH_SIZE: usize = 8_192;
 const DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE: usize = 200;
-const MAX_MANIFEST_STRM_TARGET_BYTES: usize = 1024 * 1024;
+const MAX_STRM_TARGET_BYTES: usize = 1024 * 1024;
 
 struct ManifestDirectoryBatch {
     child_directories: Vec<String>,
@@ -1336,12 +1337,12 @@ fn read_manifest_strm_target_sync(
             "manifest STRM target has an invalid size",
         ),
     })?;
-    if file_size > MAX_MANIFEST_STRM_TARGET_BYTES {
+    if file_size > MAX_STRM_TARGET_BYTES {
         return Err(ScannerError::Io {
             path: root_path.join(relative_path),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "manifest STRM target exceeds the size limit",
+                "STRM target exceeds the size limit",
             ),
         });
     }
@@ -1356,18 +1357,18 @@ fn read_manifest_strm_target_sync(
     }
     let mut contents = String::with_capacity(file_size);
     let bytes_read = file
-        .take(u64::try_from(MAX_MANIFEST_STRM_TARGET_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
+        .take(u64::try_from(MAX_STRM_TARGET_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_string(&mut contents)
         .map_err(|source| ScannerError::Io {
             path: root_path.join(relative_path),
             source,
         })?;
-    if bytes_read > MAX_MANIFEST_STRM_TARGET_BYTES {
+    if bytes_read > MAX_STRM_TARGET_BYTES {
         return Err(ScannerError::Io {
             path: root_path.join(relative_path),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "manifest STRM target exceeds the size limit",
+                "STRM target exceeds the size limit",
             ),
         });
     }
@@ -13382,12 +13383,30 @@ fn is_strm_file(path: &Path) -> bool {
 }
 
 async fn read_strm_target(path: &Path) -> Result<StrmTarget, ScannerError> {
-    let contents = fs::read_to_string(path)
+    let file = fs::File::open(path)
         .await
         .map_err(|source| ScannerError::Io {
             path: path.to_owned(),
             source,
         })?;
+    let mut contents = String::new();
+    let bytes_read = file
+        .take(u64::try_from(MAX_STRM_TARGET_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_string(&mut contents)
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if bytes_read > MAX_STRM_TARGET_BYTES {
+        return Err(ScannerError::Io {
+            path: path.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "STRM target exceeds the size limit",
+            ),
+        });
+    }
     Ok(classify_strm_target(&contents))
 }
 
@@ -13525,18 +13544,18 @@ mod tests {
 
     use super::{
         LibraryScanner, MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader, ManifestFilenameInput,
-        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
-        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
-        ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
-        configured_scan_concurrency, infer_sibling_movie_variant_suffix,
+        MANIFEST_STREAMED_INDEX_BATCH_SIZE, MAX_STRM_TARGET_BYTES, ManifestDirectoryReader,
+        ManifestFilenameInput, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
+        MixedClassification, MixedClassificationCache, MixedManifestClassification,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
+        PreparedManifestFilename, ScanJobService, ScannerError, classify_manifest_removal_outcomes,
+        classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
         is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
         normalize_incremental_path, parse_episode_filename, parse_movie_filename,
-        prepare_manifest_filename, read_manifest_strm_target, safe_scan_activity_label,
-        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
-        stat_manifest_root_sync,
+        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
+        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -15151,6 +15170,29 @@ mod tests {
             observation,
         )
         .await;
+
+        assert!(matches!(
+            result,
+            Err(ScannerError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_manifest_strm_read_rejects_oversized_target_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let strm_path = temp_dir.path().join("oversized.strm");
+        std::fs::write(
+            &strm_path,
+            format!(
+                "https://example.invalid/{}",
+                "x".repeat(MAX_STRM_TARGET_BYTES)
+            ),
+        )?;
+
+        let result = read_strm_target(&strm_path).await;
 
         assert!(matches!(
             result,

@@ -7461,6 +7461,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：`merge_series_in_transaction` 保留目标/源季度查询和全部逐条写操作，将两侧有效季度的分集改为单条 CTE 查询，并按 parent season 分组复用；每个源剧集仍顺序处理，所以前一个源新增的季度仍会被后一个源查询并匹配。新增用例先在旧实现测得 32 条存储查询，再在新实现测得 21 条（减少 11 条，约 34.4%）；这是 12 个空源季度的 SQL 调用计数，不是时延基准。SQLite 存储测试 2 项、`item_merge` 1 项、扫描重扫回归 1 项通过；`cargo build --locked`、`cargo test --locked --all-targets`（644 项通过、10 项忽略）、fmt 和 all-target Clippy 通过。查询形状使用 SQLite/PostgreSQL 通用 CTE 与固定 4 个 bind 参数，没有 PostgreSQL 实例运行本任务行为测试。
 
+#### LUX-325：统一限制 STRM 扫描读取大小
+
+范围：workflow 3 manifest 已将 `.strm` 文件内容限制为 1 MiB，但旧扫描/回退读取仍调用无界 `read_to_string`。统一所有扫描路径的读取上限为 1 MiB；最多读取上限加 1 字节以发现超限，超限时返回与 manifest 路径一致的无效数据错误。上限内仍按首个非空行分类，播放目标原文与协议语义不变。
+
+验收：
+
+- [x] legacy、manifest 回退与 manifest 读取都最多读取 1 MiB 加 1 字节用于超限判定，保留的 STRM 内容也有相同上界。
+- [x] 超过上限的 STRM 明确报错；有效边界内的 BOM、空行、首个非空目标和 UTF-8 校验行为保持不变。
+- [x] 增加非 manifest 读取的超限回归测试，既有 STRM 分类与扫描测试通过；fmt 和 Clippy 通过。
+
+依赖：无。预计文件：`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。该任务只统一文件读取边界，不修改存储模型或扫描调度。
+
+结果（2026-10-02）：统一 STRM 上限常量；普通扫描与 manifest 回退路径从无界 `read_to_string` 改为最多读取 1 MiB 加 1 字节，manifest 路径继续使用 root-relative 安全打开并执行同一上限检查。超限均返回 `InvalidData`。非 manifest 和 manifest 超限回归测试通过；既有首个非空行/BOM/目标分类合同不变。`cargo build --locked`、`cargo test --locked --all-targets`（645 项库测试通过、10 项忽略及全部集成目标通过）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。本任务确认了读取字节上界，没有新增 I/O 次数或耗时基准，也不推断端到端性能变化。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
