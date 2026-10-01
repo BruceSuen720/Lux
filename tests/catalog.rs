@@ -556,6 +556,32 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let empty_optional_favorite_body: Value = empty_optional_favorite.json().await?;
     assert_eq!(empty_optional_favorite_body["TotalRecordCount"], 2);
 
+    let avdb_library_count = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={emby_library_id}&Recursive=true&IncludeItemTypes=Movie,Video&Limit=0&EnableTotalRecordCount=true",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(avdb_library_count.status(), reqwest::StatusCode::OK);
+    let avdb_library_count_body: Value = avdb_library_count.json().await?;
+    assert_eq!(avdb_library_count_body["Items"], serde_json::json!([]));
+    assert_eq!(avdb_library_count_body["TotalRecordCount"], 2);
+
+    let zero_limit_without_count = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Limit=0",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        zero_limit_without_count.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
     let latest_with_empty_optional_favorite = client
         .get(format!(
             "{base_url}/emby/Users/{}/Items/Latest?ParentId={}&Limit=16&IsFavorite=",

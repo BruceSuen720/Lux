@@ -3008,7 +3008,8 @@ pub(super) fn emby_person_image_tag(person_id: &str) -> String {
 pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
-    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
+    let count_only = limit == 0 && query.enable_total_record_count == Some(true);
+    if offset < 0 || (!count_only && !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit)) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -3049,7 +3050,7 @@ pub(super) fn emby_person_sort(value: Option<&str>) -> Result<PersonSort, Status
         .to_ascii_lowercase()
         .as_str()
     {
-        "name" => Ok(PersonSort::Name),
+        "name" | "sortname" => Ok(PersonSort::Name),
         "datecreated" => Ok(PersonSort::DateCreated),
         _ => Err(StatusCode::BAD_REQUEST),
     }

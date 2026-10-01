@@ -1508,13 +1508,14 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - IncludeItemTypes、ExcludeItemTypes。
 - Recursive。
 - StartIndex、Limit。
+- Emby `GET /Items` 与 `GET /Users/{UserId}/Items` 在 `EnableTotalRecordCount=true` 时接受 `Limit=0` 作为只计数请求，返回空 `Items` 和完整 `TotalRecordCount`；未启用总数时，`Limit` 仍须为 1..=1000。
 - SortBy、SortOrder。
 - Filters、IsPlayed、IsFavorite。
 - Years。
 - Fields。
 - EnableImages、ImageTypeLimit。
 - `GET /Library/MediaFolders` 只返回已经建立的物理 `FOLDER` 条目，使用 `LibraryId` 或 `ParentId` 筛选并按 `StartIndex`/`Limit` 分页；`POST /Items/{FolderId}/Refresh` 将具体 FOLDER ID 映射到其媒体库根目录和相对路径，只创建局部 `INCREMENTAL_SCAN`。媒体库 ID 可作为未解析到具体 FOLDER 时的根目录级增量兜底，不得退化为同步整库扫描。
-- `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes=Actor` 返回去重后的演员。人物 DTO 使用 `Type=Person`，并提供 `ServerId`、`ImageTags`、`BackdropImageTags`。响应必须保持 Emby 的 `Items`、`TotalRecordCount` 结构且不额外返回 `StartIndex`；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
+- `/Persons` 使用 `ParentId` 指定媒体库；`Recursive=true` 聚合媒体库所有后代媒体条目，`Recursive=false` 只聚合直接子条目，未传 `Recursive` 时按递归查询处理以兼容旧客户端；`PersonTypes` 包含 `Actor` 时返回去重后的演员。`SortBy=SortName` 与 `SortBy=Name` 都按人物姓名排序，另支持 `DateCreated`。人物 DTO 使用 `Type=Person`，并提供 `ServerId`、`ImageTags`、`BackdropImageTags`。响应必须保持 Emby 的 `Items`、`TotalRecordCount` 结构且不额外返回 `StartIndex`；接受任意正整数 `Limit`，不额外施加服务端上限；`Fields`、`SortBy`、`SortOrder` 必须在数据库分页前生效；`DateCreated` 使用演员首次出现在该媒体库媒体条目中的最早 `added_at`。人物关系由持久化索引提供，不能在请求中扫描 metadata 目录。
 - TotalRecordCount 与 Items 的一致性。
 
 人物详情兼容合同：

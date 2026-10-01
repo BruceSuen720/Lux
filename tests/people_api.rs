@@ -1255,6 +1255,18 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(actor_c["Name"], "演员丙");
     assert!(actors.iter().any(|actor| actor["Id"] == "104"));
 
+    let avdb_persons = client
+        .get(format!(
+            "http://{address}/Persons?ParentId={}&Recursive=true&StartIndex=0&Limit=48&Fields=PrimaryImageAspectRatio,ImageTags,ChildCount,RecursiveItemCount,ServerId&api_key={key}&SortBy=SortName&SortOrder=Ascending&PersonTypes=Actor,GuestStar",
+            library.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(avdb_persons.status(), reqwest::StatusCode::OK);
+    let avdb_persons_body: serde_json::Value = avdb_persons.json().await?;
+    assert_eq!(avdb_persons_body["TotalRecordCount"], 4);
+    assert_eq!(avdb_persons_body["Items"].as_array().map(Vec::len), Some(4));
+
     let full_query = format!(
         "ParentId={}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=999999&Fields=DateCreated,Overview&SortBy=DateCreated&SortOrder=Descending&userid={}&api_key={key}",
         library.id, admin.id
