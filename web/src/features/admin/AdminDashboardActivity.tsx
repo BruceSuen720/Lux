@@ -13,11 +13,13 @@ function ActivityRow({ event }: { event: AdminActivityEvent }) {
   const detail = activityDetail(event.metadata);
   const remoteIp = event.remoteIp || metadataText(event.metadata, "remoteIp");
   const location = locationDetail(event.remoteIpLocation);
+  const hasSeriesTitle = Boolean(event.targetSeriesTitle?.trim());
+  const targetTitle = activityTargetTitle(event);
   return (
     <li className="lux-admin-activity-row">
       <span className={`lux-admin-activity-icon is-${activityTone(event.eventType)}`} aria-hidden="true">{activityIcon(event.eventType)}</span>
       <div className="lux-admin-activity-copy">
-        <p><strong>{event.userName || "未知账户"}</strong><span>{activityLabel(event.eventType)}</span>{event.targetTitle ? <em>{event.targetTitle}</em> : null}</p>
+        <p><strong>{event.userName || "未知账户"}</strong><span>{activityLabel(event.eventType)}</span>{targetTitle ? <em className={hasSeriesTitle ? "lux-admin-activity-series-title" : undefined}>{targetTitle}</em> : null}</p>
         <div>
           <time dateTime={new Date(event.createdAt * 1000).toISOString()}>{formatActivityTime(event.createdAt)}</time>
           {detail ? <span>· {detail}</span> : null}
@@ -27,6 +29,21 @@ function ActivityRow({ event }: { event: AdminActivityEvent }) {
       </div>
     </li>
   );
+}
+
+function activityTargetTitle(event: AdminActivityEvent) {
+  const seriesTitle = event.targetSeriesTitle?.trim();
+  const episodeTitle = event.targetTitle?.trim();
+  if (!seriesTitle) return episodeTitle;
+
+  const season = event.targetSeriesSeasonCount != null
+    && event.targetSeriesSeasonCount > 1
+    && event.targetSeasonNumber != null
+    ? event.targetSeasonNumber === 0 ? "特别篇" : `第${event.targetSeasonNumber}季`
+    : undefined;
+  return [seriesTitle, season, episodeTitle]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ") || undefined;
 }
 
 function activityDetail(metadata?: Record<string, unknown>) {

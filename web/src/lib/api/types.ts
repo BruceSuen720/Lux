@@ -723,6 +723,9 @@ export type AdminActivityEvent = {
   targetType?: string | null;
   targetId?: string | null;
   targetTitle?: string | null;
+  targetSeriesTitle?: string | null;
+  targetSeasonNumber?: number | null;
+  targetSeriesSeasonCount?: number | null;
   metadata?: Record<string, unknown>;
   remoteIp?: string | null;
   remoteIpLocation?: AdminIpLocation | null;
