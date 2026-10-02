@@ -9412,6 +9412,74 @@ async fn local_metadata_completeness_dependencies_are_read_in_bounded_batches()
 }
 
 #[tokio::test]
+async fn item_scraper_configurations_are_read_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library_with_scraper(
+            "Scraper configuration",
+            LibraryKind::Movie,
+            false,
+            Some("legacy-tmdb"),
+            true,
+        )
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("scraper-config-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        database
+            .query(
+                "SELECT ls.scraper_id, ls.position, ls.role
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN library_scrapers ls ON ls.library_id = l.id
+                 WHERE mi.id = ? AND mi.removed_at IS NULL
+                 ORDER BY ls.position",
+            )
+            .bind(item_id)
+            .fetch_all(database.pool())
+            .await?;
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT);
+
+    database.reset_query_count();
+    let configurations = database
+        .list_item_scraper_configurations_by_ids(&item_ids)
+        .await?;
+    assert_eq!(configurations.len(), ITEM_COUNT);
+    let (configured, legacy) = &configurations[&item_ids[0]];
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].scraper_id, "legacy-tmdb");
+    assert_eq!(legacy.as_deref(), Some("legacy-tmdb"));
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_media_metadata_with_libraries_uses_one_bounded_query()
 -> Result<(), Box<dyn std::error::Error>> {
     const ITEM_COUNT: usize = 205;

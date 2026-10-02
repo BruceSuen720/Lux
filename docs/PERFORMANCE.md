@@ -1228,3 +1228,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个 active movie item，分别读取媒体策略、图片索引和 metadata attempt 状态。旧路径对每个 item 各执行一次查询，共 615 次；新路径按最多 500 个 ID 批量读取三类依赖，共 3 次，减少 612 次（约 99.5%）。
 
 批量计划仍逐 item 执行本地图片文件存在性、NFO 投影和人物关系文件检查；这些文件读取、后续刮削器资格查询和完整 worker 墙钟不在本次计数范围。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数量，不代表数据库写入量、PostgreSQL、NAS 或生产收益。
+
+### LUX-362 刮削器配置预读调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个使用同一有序 `library_scrapers` 配置的 movie item。旧 resolver 配置读取逐 item 发出 205 次查询；新 storage 入口按最多 500 个 ID 一批读取，共 1 次，减少 204 次（约 99.5%）。另以无有序配置的 item 验证 legacy `libraries.scraper_id` fallback 仍只在单 item resolver 中触发。
+
+该计数只覆盖配置读取，不包含后续插件客户端解析、RPC、缓存命中或 scanner 墙钟；SQLite 查询调用数不代表 PostgreSQL、NAS 或生产收益。

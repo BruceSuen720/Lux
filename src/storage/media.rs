@@ -532,55 +532,57 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_item_scraper_id(
+    pub(crate) async fn list_item_scraper_configurations_by_ids(
         &self,
-        item_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let value = self
-            .query_scalar::<String>(
-                "SELECT COALESCE(l.scraper_id, '')
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.id = ? AND mi.removed_at IS NULL",
-            )
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(value.filter(|value| !value.trim().is_empty()))
-    }
-
-    pub(crate) async fn find_item_scrapers(
-        &self,
-        item_id: &str,
-    ) -> Result<Vec<StoredLibraryScraper>, StorageError> {
-        self.query(
-            "SELECT ls.scraper_id, ls.position, ls.role
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             JOIN library_scrapers ls ON ls.library_id = l.id
-             WHERE mi.id = ? AND mi.removed_at IS NULL
-             ORDER BY ls.position",
-        )
-        .bind(item_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredLibraryScraper {
-                    scraper_id: row.get("scraper_id"),
-                    position: row.get("position"),
-                    role: row.get("role"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        item_ids: &[String],
+    ) -> Result<HashMap<String, (Vec<StoredLibraryScraper>, Option<String>)>, StorageError> {
+        let mut configurations = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, l.scraper_id AS legacy_scraper_id,
+                        ls.scraper_id AS selected_scraper_id, ls.position, ls.role
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN library_scrapers ls ON ls.library_id = l.id
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
+                 ORDER BY mi.id, ls.position"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
+                let legacy_scraper_id = row
+                    .get::<Option<String>, _>("legacy_scraper_id")
+                    .filter(|value| !value.trim().is_empty());
+                let entry = configurations
+                    .entry(item_id)
+                    .or_insert_with(|| (Vec::new(), legacy_scraper_id.clone()));
+                if let Some(scraper_id) = row.get::<Option<String>, _>("selected_scraper_id") {
+                    entry.0.push(StoredLibraryScraper {
+                        scraper_id,
+                        position: row.get::<Option<i64>, _>("position").unwrap_or_default(),
+                        role: row.get::<Option<String>, _>("role").unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        Ok(configurations)
     }
 
     pub(crate) async fn insert_filesystem_entry(

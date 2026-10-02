@@ -8006,6 +8006,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：新增 205 item 的逐项与批量对照回归；媒体策略、图片索引和 attempt 状态由旧路径 615 次 SQL 调用降为 3 次，减少 612 次（约 99.5%）。scanner 改为一次批量计划预读后按 item 回填，保留本地图片/NFO/人物文件检查、fallback 和重试语义；schema、公共 API 与事务边界未改变。本机 `uname -m=arm64`，SQLite 计数不外推 PostgreSQL、NAS 或端到端墙钟。
 
+#### LUX-362：合并有序与 legacy 刮削器配置读取
+
+范围：刮削器 resolver 先查询 `library_scrapers`，没有可用有序配置时再次查询 legacy `libraries.scraper_id`。使用有界联合查询同时取得两种配置，保留有序配置优先、主/备用顺序、legacy fallback 和插件不可用错误语义；为后续批量资格检查提供存储入口。本任务只修改配置读取及现有单 item resolver，不提前接入 scanner。
+
+验收：
+
+- [x] 205 个 item 的配置批量读取为 1 次有界查询；空有序配置的现有单 item resolver 总配置读取由 410 次降为 205 次。
+- [x] 有序配置、legacy fallback、未选择刮削器、无效 role、不可用插件、移除 item 与禁用库的现有解析语义保持不变。
+- [x] 批量读取覆盖超过 500 个 ID、空输入、重复 ID、顺序和各 item 隔离；单次绑定不超过 500 个值。
+- [x] storage 与 scraper 回归通过；不改变 schema、公共 API 或插件协议。
+- [x] 性能记录只报告固定 SQLite fixture 的配置读取 SQL 调用数，不推断插件 RPC 墙钟或生产收益。
+
+依赖：LUX-361。预计文件：`src/storage/media.rs`、`src/storage/repository_tests.rs`、`src/application/scraper.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加逐 item 与批量配置读取计数回归，再合并现有 resolver 的配置读取。
+
+结果（2026-10-03）：有序配置读取在 205 item fixture 中由 205 次逐项查询降为 1 次有界批量查询；单 item resolver 统一复用同一配置读取并保留 legacy fallback。storage、scraper、reidentify 回归通过，本机 `uname -m=arm64`；未改变 schema、公共 API、插件协议或 scanner 的逐 item 资格检查。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
