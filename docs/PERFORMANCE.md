@@ -1116,3 +1116,9 @@ light build 的 HLS chunk 减少 222.30 kB（约 37.4%），gzip 减少 67.67 kB
 未变化剧集回退路径的原 mark-seen 操作同样执行状态 UPDATE 与恢复查询，再单独更新 inode；现在 inode 随 mark-seen UPDATE 写入，计数从 3 降至 2。测试另验证 mark-seen 后 generation、inode 与 missing 状态。扫描器把当前 inode 一并传给电影、剧集和 sidecar 的已有条目更新。
 
 SQL 调用计数不等于墙钟耗时或磁盘写入量，也没有 PostgreSQL/NAS 实测；未据此推断时延收益。
+
+### LUX-341 轻量 Manifest 根初始化读取计数
+
+2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 数据库中，以 4 个根初始化轻量 Manifest discovery session，其中 2 个根状态为 `COMPLETE` / `UNAVAILABLE`，另 2 个根需要 baseline 检查。旧流程先列出根 ID，再逐根读取状态，并只为活跃根查询 filesystem entry：`1 + 4 + 2 = 7` 次 SQL 调用。合并状态和 baseline 的查询后，真实 service 初始化只调用 1 次 SQL，下降约 85.7%；终态根继续跳过，两个活跃根的 baseline 标志保持正确。
+
+该数值由 SQLite 查询计数器记录调用数，不是网络往返、数据库写入量或墙钟测量；没有 PostgreSQL 实例，也不据此推断时延或 NAS/x86_64 性能。

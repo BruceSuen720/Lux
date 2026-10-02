@@ -3684,24 +3684,15 @@ impl ScanJobService {
             }
         }
 
-        let root_ids = self
+        let roots = self
             .database
-            .list_scan_manifest_root_ids(manifest_id)
+            .list_scan_manifest_root_discovery_baselines(manifest_id)
             .await?;
         let mut session = LiteManifestDiscoverySession::default();
-        for root_id in root_ids {
-            let state = self
-                .database
-                .get_scan_manifest_root_identity(manifest_id, &root_id)
-                .await?
-                .map(|(state, _, _)| state);
-            if matches!(state.as_deref(), Some("COMPLETE" | "UNAVAILABLE")) {
+        for (root_id, state, has_filesystem_entries) in roots {
+            if matches!(state.as_str(), "COMPLETE" | "UNAVAILABLE") {
                 continue;
             }
-            let has_filesystem_entries = self
-                .database
-                .scan_manifest_root_has_filesystem_entries(&root_id)
-                .await?;
             session
                 .directories
                 .push_back((root_id, String::new(), has_filesystem_entries));
@@ -12572,6 +12563,83 @@ mod tests {
         assert!(!is_lite_manifest_discovery(1, 3, "LITE"));
         assert!(!is_lite_manifest_discovery(2, 2, "LITE"));
         assert!(!is_lite_manifest_discovery(2, 3, "PERSISTED"));
+    }
+
+    #[tokio::test]
+    async fn lite_manifest_session_loads_root_baselines_with_one_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library_service = LibraryService::new(database.clone());
+        let library = library_service
+            .create_library("Multi-root", LibraryKind::Movie, false)
+            .await?;
+        let mut root_ids = Vec::new();
+        for index in 0..4 {
+            let root_path = temp_dir.path().join(format!("root-{index}"));
+            std::fs::create_dir_all(&root_path)?;
+            let root = library_service
+                .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+                .await?
+                .root;
+            root_ids.push(root.id.to_string());
+        }
+
+        let jobs = ScanJobService::new(database.clone());
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let manifest = database
+            .get_scan_manifest_by_job(&job.id)
+            .await?
+            .ok_or("scan manifest was not created")?;
+        for (root_id, state) in [(&root_ids[0], "COMPLETE"), (&root_ids[1], "UNAVAILABLE")] {
+            sqlx::query(
+                "UPDATE scan_manifest_roots SET state = ?
+                 WHERE manifest_id = ? AND library_root_id = ?",
+            )
+            .bind(state)
+            .bind(&manifest.id)
+            .bind(root_id)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation
+             ) VALUES ('existing-entry', ?, 'existing.mkv', 'FILE', 1, 1, 'generation')",
+        )
+        .bind(&root_ids[3])
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        jobs.ensure_lite_manifest_discovery_session(&manifest.id)
+            .await?;
+        assert_eq!(database.query_count(), 1);
+
+        let directories = jobs.pop_lite_manifest_directories(&manifest.id, 10);
+        assert_eq!(directories.len(), 2);
+        let baselines = directories
+            .into_iter()
+            .map(|(root_id, relative_directory, has_filesystem_entries)| {
+                assert!(relative_directory.is_empty());
+                (root_id, has_filesystem_entries)
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(!baselines.contains_key(&root_ids[0]));
+        assert!(!baselines.contains_key(&root_ids[1]));
+        assert_eq!(baselines.get(&root_ids[2]), Some(&false));
+        assert_eq!(baselines.get(&root_ids[3]), Some(&true));
+        Ok(())
     }
 
     #[test]

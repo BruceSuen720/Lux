@@ -3980,22 +3980,30 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_scan_manifest_root_ids(
+    pub(crate) async fn list_scan_manifest_root_discovery_baselines(
         &self,
         manifest_id: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query(
-            "SELECT library_root_id
-             FROM scan_manifest_roots
-             WHERE manifest_id = ?
-             ORDER BY library_root_id",
+    ) -> Result<Vec<(String, String, bool)>, StorageError> {
+        self.query_as(
+            "SELECT root.library_root_id, root.state,
+                    CAST(CASE
+                    WHEN root.state IN ('COMPLETE', 'UNAVAILABLE') THEN 0
+                    WHEN EXISTS (
+                        SELECT 1 FROM filesystem_entries entry
+                        WHERE entry.library_root_id = root.library_root_id
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS has_filesystem_entries
+             FROM scan_manifest_roots root
+             WHERE root.manifest_id = ?
+             ORDER BY root.library_root_id",
         )
         .bind(manifest_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
+        .map(|rows: Vec<(String, String, i64)>| {
             rows.into_iter()
-                .map(|row| row.get("library_root_id"))
+                .map(|(root_id, state, has_filesystem_entries)| {
+                    (root_id, state, has_filesystem_entries != 0)
+                })
                 .collect()
         })
         .map_err(|source| StorageError::Sqlx {
@@ -4389,21 +4397,6 @@ impl Database {
             path: self.path.clone(),
             source,
         })
-    }
-
-    pub(crate) async fn scan_manifest_root_has_filesystem_entries(
-        &self,
-        library_root_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query("SELECT 1 FROM filesystem_entries WHERE library_root_id = ? LIMIT 1")
-            .bind(library_root_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map(|row| row.is_some())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
     }
 
     pub(crate) async fn list_scan_manifest_removal_candidates(
@@ -10942,50 +10935,6 @@ mod tests {
         NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
-
-    #[tokio::test]
-    async fn scan_manifest_root_baseline_probe_detects_first_file_entry()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        database
-            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
-            .execute(database.pool())
-            .await?;
-        database
-            .query(
-                "INSERT INTO library_roots (
-                     id, library_id, canonical_path, display_path, is_available, is_writable
-                 ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
-            )
-            .execute(database.pool())
-            .await?;
-
-        assert!(
-            !database
-                .scan_manifest_root_has_filesystem_entries("root")
-                .await?
-        );
-        database
-            .query(
-                "INSERT INTO filesystem_entries (
-                     id, library_root_id, relative_path, entry_kind, size, modified_at,
-                     last_seen_generation
-                 ) VALUES ('entry', 'root', 'Movie.2024.mkv', 'FILE', 1, 1, 'generation')",
-            )
-            .execute(database.pool())
-            .await?;
-        assert!(
-            database
-                .scan_manifest_root_has_filesystem_entries("root")
-                .await?
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn scan_manifest_creation_is_atomic_and_idempotent()

@@ -7687,6 +7687,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：已有电影、剧集和 sidecar filesystem entry 更新现在在同一条状态 UPDATE 中写入 inode；指纹未变化路径也在 mark-seen UPDATE 中更新 inode。保留恢复缺失媒体条目的事务逻辑，identity-repair 的单独 inode 更新因没有前序状态写入而维持原样。SQLite 存储回归将有变化与 mark-seen 两种路径都从 3 条 SQL 调用降为 2 条，并核对状态字段。`scanner` 17 项、`scanning_jobs` 81 项通过；`cargo test --locked --all-targets` 的库测试为 653 passed / 10 ignored，集成目标全部通过；`cargo build --locked`、`cargo fmt --all -- --check` 和全目标 Clippy 通过。本机 `uname -m=arm64`。PostgreSQL 实例不可用，因此 PostgreSQL 专项按要求忽略；性能记录只报告 SQL 调用数，不推断墙钟或 NAS 收益。
 
+#### LUX-341：合并轻量 Manifest 根状态读取
+
+范围：轻量 Manifest discovery session 初始化先列出根 ID，再逐根查询 Manifest 状态；对尚未完成或不可用的根又逐根查询是否存在 filesystem entry。将根 ID、Manifest 状态和是否已有 filesystem entry 合并到一次按 Manifest 有界读取中。保留根排序、跳过 `COMPLETE` / `UNAVAILABLE` 根及 `skip_baseline_queries` 判断；不读取或改变后续使用的根设备/inode 身份合同。
+
+验收：
+
+- [x] 多根初始化由 `1 + 根数 + 可处理根数` 条 SQL 调用降为 1 条，不随根数量增长。
+- [x] 自动化测试通过真实轻量 Manifest session 初始化，验证 `COMPLETE` / `UNAVAILABLE` 根仍跳过，以及活跃根已有文件的 baseline 标志不变。
+- [x] `scanner`、`scanning_jobs` 回归、全局 Rust 完成门、格式检查和 Clippy 通过。
+- [x] 性能记录报告固定 fixture 与 SQL 调用数，不据此推断墙钟、PostgreSQL 或 NAS 时延。
+
+依赖：LUX-340。预计文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改数据库 schema、持久化 workflow、根身份验证或扫描语义。
+
+结果（2026-10-02）：轻量 Manifest session 现在通过一条有界查询读取有序根 ID、Manifest 状态和 filesystem entry baseline；仍跳过 `COMPLETE` / `UNAVAILABLE` 根，且不执行根设备/inode 身份读取。四根 SQLite fixture 含两个终态根、两个待处理根；旧路径为 1 次根列表查询、4 次状态读取和 2 次 baseline 查询，共 7 次 SQL 调用，新路径为 1 次。新测试通过真实服务初始化验证状态筛选、baseline 标志和查询数。scanner 模块 31 项、`tests/scanner.rs` 17 项、`tests/scanning_jobs.rs` 81 项及 `cargo test --locked --all-targets` 全部通过；PostgreSQL 专项因环境无实例而忽略。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和全目标 Clippy 通过；本机 `uname -m=arm64`。性能记录仅报告该固定 fixture 的 SQL 调用数，不推断墙钟、PostgreSQL 或 NAS 收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
