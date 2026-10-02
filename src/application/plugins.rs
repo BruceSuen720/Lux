@@ -1111,16 +1111,25 @@ impl PluginService {
         limit: i64,
     ) -> Result<ChapterSourcePage, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
+        let detector_plugins = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| is_chapter_detector_plugin(plugin))
+            .collect::<Vec<_>>();
+        let detector_plugin_ids = detector_plugins
+            .iter()
+            .map(|plugin| plugin.manifest.id.clone())
+            .collect::<Vec<_>>();
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&detector_plugin_ids)
+            .await?;
         let mut sources = Vec::new();
-        for plugin in &catalog.plugins {
-            if !is_chapter_detector_plugin(plugin) {
+        for plugin in detector_plugins {
+            if installation_statuses.get(&plugin.manifest.id) != Some(&true) {
                 continue;
             }
-            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
-            if !installed || !enabled {
-                continue;
-            }
-            let view = self.dynamic_view(plugin, installed, enabled).await?;
+            let view = self.dynamic_view(plugin, true, true).await?;
             if view.available {
                 sources.push(ChapterSourceView {
                     id: view.id,
@@ -1776,12 +1785,24 @@ impl PluginService {
 
     pub async fn sync_manifest_scheduled_tasks(&self) -> Result<(), PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
-        for plugin in &catalog.plugins {
+        let scheduled_plugins = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| !plugin.manifest.scheduled_tasks.is_empty())
+            .collect::<Vec<_>>();
+        let scheduled_plugin_ids = scheduled_plugins
+            .iter()
+            .map(|plugin| plugin.manifest.id.clone())
+            .collect::<Vec<_>>();
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&scheduled_plugin_ids)
+            .await?;
+        for plugin in scheduled_plugins {
             let plugin_id = &plugin.manifest.id;
-            if plugin.manifest.scheduled_tasks.is_empty() {
-                continue;
-            }
-            let (installed, enabled) = self.plugin_state(plugin_id).await?;
+            let status = installation_statuses.get(plugin_id).copied();
+            let installed = status.is_some();
+            let enabled = status == Some(true);
             if !installed {
                 for task in &plugin.manifest.scheduled_tasks {
                     self.database
@@ -2341,26 +2362,37 @@ impl PluginService {
     async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {
         let mut plugin_ids = Vec::new();
         let catalog = self.catalog_snapshot().await;
+        let mut candidate_ids = Vec::new();
+        let mut seen_candidate_ids = HashSet::new();
         for plugin_id in [IP_HIOFD_PLUGIN_ID] {
             if let Some(plugin) = catalog.get(plugin_id)
                 && is_ip_location_plugin(plugin)
-                && self.database.is_plugin_installed(plugin_id).await?
             {
-                plugin_ids.push(plugin_id.to_owned());
+                let plugin_id = plugin_id.to_owned();
+                if seen_candidate_ids.insert(plugin_id.clone()) {
+                    candidate_ids.push(plugin_id);
+                }
             }
         }
         for plugin in &catalog.plugins {
             if plugin.manifest.id == IP138_PLUGIN_ID
                 || plugin.manifest.id == IP_HIOFD_PLUGIN_ID
                 || !is_ip_location_plugin(plugin)
-                || !self
-                    .database
-                    .is_plugin_installed(&plugin.manifest.id)
-                    .await?
             {
                 continue;
             }
-            plugin_ids.push(plugin.manifest.id.clone());
+            if seen_candidate_ids.insert(plugin.manifest.id.clone()) {
+                candidate_ids.push(plugin.manifest.id.clone());
+            }
+        }
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&candidate_ids)
+            .await?;
+        for plugin_id in candidate_ids {
+            if installation_statuses.get(&plugin_id) == Some(&true) {
+                plugin_ids.push(plugin_id);
+            }
         }
         Ok(plugin_ids)
     }

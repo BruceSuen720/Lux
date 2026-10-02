@@ -8100,6 +8100,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：修复器先按冲突 item 批量预读 `item_images`，候选循环改为内存路径判断；成功写回前仍执行一次数据库占用复核。既有图片修复和系列重扫回归、本机 `uname -m=arm64`、library Clippy 与格式检查通过；未据静态上界推断端到端时延。
 
+#### LUX-368：插件状态批量读取覆盖剩余服务循环
+
+范围：章节源列表、Manifest scheduled task 同步和 IP location provider 选择仍在循环中逐个读取插件安装状态。复用批量安装状态读取，保持动态视图、配置校验、插件优先级、任务禁用/注册和 IP138 互斥语义；不改变插件协议或任务存储合同。
+
+验收：
+
+- [x] 章节源列表、Manifest task 同步和 IP location provider 选择各自按候选插件 ID 批量读取安装状态。
+- [x] 未安装、已禁用和已启用插件的既有过滤、排序和互斥行为保持不变。
+- [x] 章节检测、插件管理和 IP location 回归通过；保留 IP location provider 的既有优先级，不改变 schema、配置文件或 RPC 边界。
+- [x] 性能记录只报告静态循环调用上界，不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-367。预计文件：`src/application/plugins.rs`、`tests/ip_location_plugins.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-03）：剩余三个插件服务循环统一复用批量安装状态，保留原过滤、动态视图、任务语义和 IP location provider 优先级。新增优先级回归与章节检测、插件管理、IP location 回归、本机 `uname -m=arm64`、library Clippy 和格式检查通过；未据静态调用上界推断端到端收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
