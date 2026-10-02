@@ -7821,6 +7821,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：205 个有效成员新增由旧实现的 208 次调用（合集读取、collection id/max sort 两次预读和 205 次逐项 INSERT）降为 5 次（合集读取、合并后的 collection id/max sort 读取和 3 条 100/100/5 多行 INSERT）；成员数量与顺序保持不变。205 个成员删除由 206 次调用降为 2 次（合集读取和一条 205-ID DELETE）。新增仍过滤跨库/已移除条目，重复 ID 仍由唯一约束幂等处理；删除空输入不发成员 DELETE。storage 回归通过；本任务未实测 PostgreSQL 墙钟、NAS 或生产负载。
 
+#### LUX-350：批量领取本地元数据完整性检查
+
+范围：本地扫描每个完整性批次最多提交 512 个 item/capability 检查，但存储层当前对每条检查分别执行 upsert 和 claim UPDATE。将检查按最多 100 条合并为多行 upsert 和批量 claim，保留重复校验、输入指纹替换、失败重试、并发 worker 只能领取一次和返回原始索引的语义，不改变 schema 或扫描调度。
+
+验收：
+
+- [x] 205 条完整性检查从 410 次 SQL 调用降至 6 次，205 个原始索引全部返回。
+- [x] 同指纹 READY/RUNNING 行不重复领取，失败/CANCELLED 和新指纹仍可重新领取。
+- [x] 并发 worker 不会重复领取同一个检查，重复输入/空指纹/超限批次仍拒绝。
+- [x] 性能记录只报告固定 fixture 的 SQL 调用数，不推断墙钟或生产数据库收益。
+
+依赖：无。预计文件：`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 205 条 storage 查询计数回归，确认旧实现调用数，再实现有界多行语句。
+
+结果（2026-10-02）：205 条完整性检查由旧实现每条一次 upsert 加一次 claim、共 410 次 SQL 调用，降为 3 条多行 upsert 与 3 条批量 claim、共 6 次（约减少 98.5%）。批量 claim 通过 `RETURNING item_id, capability` 映射回原始索引；现有版本替换、READY/RUNNING 重复领取、失败重试和并发互斥回归通过。每批最多 100 条、每条语句最多 300 个绑定值；本机 `uname -m=arm64`。性能记录只报告 SQLite SQL 调用数，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

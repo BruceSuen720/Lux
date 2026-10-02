@@ -2519,6 +2519,65 @@ async fn progressive_scan_metadata_completeness_batches_are_atomic_and_versioned
 }
 
 #[tokio::test]
+async fn metadata_completeness_claims_use_bounded_sql_batches() {
+    const CHECK_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let item_ids = (0..CHECK_COUNT)
+        .map(|index| format!("completeness-batch-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let checks = item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-batch-v1",
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let claimed = database
+        .prepare_and_claim_item_metadata_completeness_checks(&checks)
+        .await
+        .expect("claim completeness batch");
+    assert_eq!(database.query_count(), 6);
+    assert_eq!(claimed, (0..CHECK_COUNT).collect::<Vec<_>>());
+    let running_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness WHERE local_state = 'RUNNING'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("running completeness count");
+    assert_eq!(running_count, CHECK_COUNT as i64);
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn image_source_urls_are_checked_with_one_bounded_query() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
