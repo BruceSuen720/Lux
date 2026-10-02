@@ -2305,19 +2305,26 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for library_id in library_ids {
-            self.query(
+        const MAX_LIBRARY_MEMBERS_PER_INSERT: usize = 100;
+        for batch in library_ids.chunks(MAX_LIBRARY_MEMBERS_PER_INSERT) {
+            let values = std::iter::repeat_n("(?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
-                 VALUES (?, ?)",
-            )
-            .bind(plan_id)
-            .bind(library_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for library_id in batch {
+                statement = statement.bind(plan_id).bind(library_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -3045,6 +3052,66 @@ mod scheduled_task_plan_mirror_tests {
         .await
         .expect("split reconciliation plan count should be queryable");
         assert_eq!(split_plan_count, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_members_are_inserted_in_bounded_batches() {
+        const LIBRARY_COUNT: usize = 205;
+
+        let (_temp_dir, database) = test_database().await;
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|index| format!("plan-batch-library-{index:03}"))
+            .collect::<Vec<_>>();
+        for library_id in &library_ids {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await
+                .expect("library should be inserted");
+        }
+        sqlx::query(
+            "INSERT INTO scheduled_task_plans (
+                id, task_type, plan_name, task_name, task_description,
+                source_type, cron_or_interval, is_enabled, resource_limit_json,
+                scope_type, is_default
+             ) VALUES (
+                'plan-batch', 'RECONCILIATION_SCAN', 'Batch plan', 'Scan', 'Scan',
+                'SYSTEM', '0 3 * * *', 1, '{}', 'LIBRARY', 0
+             )",
+        )
+        .execute(database.pool())
+        .await
+        .expect("plan should be inserted");
+
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        database.reset_query_count();
+        database
+            .move_libraries_to_scheduled_task_plan(
+                &mut transaction,
+                "plan-batch",
+                "RECONCILIATION_SCAN",
+                "Scan",
+                "Scan",
+                "SYSTEM",
+                None,
+                Some("0 3 * * *"),
+                true,
+                "{}",
+                &library_ids,
+            )
+            .await
+            .expect("plan members should be moved");
+        transaction.commit().await.expect("transaction commit");
+
+        assert_eq!(database.query_count(), 5);
+        let member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plan_libraries WHERE plan_id = 'plan-batch'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("plan member count");
+        assert_eq!(member_count, LIBRARY_COUNT as i64);
     }
 
     #[tokio::test]
