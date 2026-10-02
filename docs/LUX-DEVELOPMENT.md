@@ -7747,6 +7747,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：先新增“无 requestAnimationFrame 但有 cancelAnimationFrame”回归，旧实现失败，因为 timeout handle 被交给错误的取消 API；实现改为带 `kind` 的 animation/timeout 句柄，分别走对应清理函数。HEVC 轨道类型现由 `createFile().onReady` 推导，移除其 `unknown` 双重断言；播放器源码中已无 `as unknown as`。时间线与 HEVC 定向测试 10/10、严格 TypeScript 检查通过；冻结安装、完整 Web 测试（Node 108/108，Vitest 76 个文件 / 553 项通过）和生产构建通过。本任务修正了取消 API 选择，不量化或声称播放时延提升。
 
+#### LUX-345：清理 build 与 API handler 的 Clippy 条件告警
+
+范围：目前全局 `clippy::collapsible_if = "allow"` 隐藏了 `build.rs` 以及部分 API handler 中可按现有 Rust let-chain 风格表达的嵌套条件。本任务处理 `build.rs`、全局媒体策略验证、用户配置复制、Emby DTO 序列化这 9 处告警；其余应用层告警和 Cargo 全局规则留给后续独立任务。仅重排等价条件，不改变请求验证顺序、错误响应、用户配置复制或 DTO 字段。
+
+验收：
+
+- [x] `build.rs`、`admin_handlers.rs`、`emby_handlers.rs`、`emby_catalog.rs` 中这 9 处 `collapsible_if` 告警消除，`.git` 信息读取、校验失败响应、用户配置复制和 Emby 序列化结果不变。
+- [x] `libraries_api`、`emby_auth`、`catalog` 定向集成回归、build、fmt 通过；Clippy 诊断不再在本任务修改文件报告 `collapsible_if`。
+- [x] 只改本任务列出的 Rust 文件与本节文档，不声称有运行时性能提升。
+
+依赖：无。预计文件：`build.rs`、`src/api/admin_handlers.rs`、`src/api/emby_handlers.rs`、`src/api/emby_catalog.rs`、`docs/LUX-DEVELOPMENT.md`。本任务范围为 4 个代码文件与 1 个文档文件；其余 40 余项 Clippy 告警与 Cargo 级豁免分开处理。
+
+结果（2026-10-02）：将 build 脚本、全局/媒体库策略校验、用户 Emby 配置复制、Emby 人员/播放状态/同步字段/主图比例序列化中的 9 处条件按 let-chain 等价合并。带 `-W clippy::collapsible_if` 的全目标诊断确认这 4 个源码文件及 `build.rs` 不再产生该告警；其他模块仍有 35 处待后续任务处理。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 及 `libraries_api`、`emby_auth`、`catalog`、`emby_counts` 集成目标（25 项）通过。本任务为条件表达式清理，不声称运行时性能提升。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
