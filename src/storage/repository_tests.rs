@@ -9182,6 +9182,201 @@ async fn chapter_detection_job_items_are_inserted_in_bounded_batches() {
 }
 
 #[tokio::test]
+async fn media_probe_streams_are_replaced_in_bounded_batches() {
+    const STREAM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Probe batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('probe-batch-item', ?, 'MOVIE', 'Probe', 'probe', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, container, probe_status)
+         VALUES ('probe-batch-source', 'probe-batch-item', 'LOCAL_FILE', 'mp4', 'PENDING')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("media source");
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type)
+         VALUES ('probe-stale-stream', 'probe-batch-source', 999, 'AUDIO')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("stale stream");
+
+    let new_stream = |index: usize, stream_index: i64| {
+        let stream_type = match index % 3 {
+            0 => "VIDEO",
+            1 => "AUDIO",
+            _ => "SUBTITLE",
+        };
+        let is_external = stream_type == "SUBTITLE";
+        MediaStreamUpdate {
+            stream_index,
+            stream_type,
+            codec: Some("test-codec"),
+            language: Some("eng"),
+            title: Some("Test stream"),
+            details_json: Some(r#"{"generated":true}"#),
+            external_path: is_external.then_some("subs/eng.srt"),
+            is_external,
+            is_default: index == 0,
+            is_forced: index == 5,
+        }
+    };
+    let streams = (0..STREAM_COUNT)
+        .map(|index| new_stream(index, index as i64))
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .save_media_probe(MediaProbeUpdate {
+            source_id: "probe-batch-source",
+            container: Some("mkv"),
+            source_size: Some(42),
+            duration_ticks: Some(456),
+            bitrate: Some(789),
+            streams: &streams,
+        })
+        .await
+        .expect("save probe result");
+    assert_eq!(database.query_count(), 5);
+
+    let stored_indices: Vec<i64> = sqlx::query_scalar(
+        "SELECT stream_index FROM media_streams
+         WHERE media_source_id = 'probe-batch-source' ORDER BY stream_index",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("stored stream indexes");
+    assert_eq!(stored_indices, (0..STREAM_COUNT as i64).collect::<Vec<_>>());
+    #[derive(sqlx::FromRow)]
+    struct StoredMediaStream {
+        stream_type: String,
+        codec: Option<String>,
+        language: Option<String>,
+        title: Option<String>,
+        details_json: Option<String>,
+        is_external: i64,
+        is_default: i64,
+        is_forced: i64,
+    }
+    let stored_subtitle: StoredMediaStream = sqlx::query_as(
+        "SELECT stream_type, codec, language, title, details_json, is_external, is_default, is_forced
+         FROM media_streams
+         WHERE media_source_id = 'probe-batch-source' AND stream_index = 2",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored subtitle stream");
+    assert_eq!(stored_subtitle.stream_type, "SUBTITLE");
+    assert_eq!(stored_subtitle.codec.as_deref(), Some("test-codec"));
+    assert_eq!(stored_subtitle.language.as_deref(), Some("eng"));
+    assert_eq!(stored_subtitle.title.as_deref(), Some("Test stream"));
+    assert_eq!(
+        stored_subtitle.details_json.as_deref(),
+        Some(r#"{"generated":true}"#)
+    );
+    assert_eq!(stored_subtitle.is_external, 1);
+    assert_eq!(stored_subtitle.is_default, 0);
+    assert_eq!(stored_subtitle.is_forced, 0);
+    let stored_external_path: Option<String> = sqlx::query_scalar(
+        "SELECT external_path FROM media_streams
+         WHERE media_source_id = 'probe-batch-source' AND stream_index = 2",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored external subtitle path");
+    assert_eq!(stored_external_path.as_deref(), Some("subs/eng.srt"));
+
+    let mut invalid_streams = (0..STREAM_COUNT)
+        .map(|index| new_stream(index, index as i64))
+        .collect::<Vec<_>>();
+    invalid_streams[STREAM_COUNT - 1].stream_index = 0;
+    database.reset_query_count();
+    assert!(
+        database
+            .save_media_probe(MediaProbeUpdate {
+                source_id: "probe-batch-source",
+                container: Some("invalid"),
+                source_size: Some(100),
+                duration_ticks: Some(200),
+                bitrate: Some(300),
+                streams: &invalid_streams,
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(database.query_count(), 5);
+    let retained_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams WHERE media_source_id = 'probe-batch-source'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("retained stream count after rollback");
+    assert_eq!(retained_count, STREAM_COUNT as i64);
+    let retained_source: (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT container, size, duration_ticks, bitrate, probe_status
+             FROM media_sources WHERE id = 'probe-batch-source'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("retained media source after rollback");
+    assert_eq!(
+        retained_source,
+        (
+            Some("mp4".to_owned()),
+            Some(42),
+            Some(456),
+            Some(789),
+            "READY".to_owned()
+        )
+    );
+
+    database.reset_query_count();
+    database
+        .save_media_probe(MediaProbeUpdate {
+            source_id: "probe-batch-source",
+            container: None,
+            source_size: None,
+            duration_ticks: None,
+            bitrate: None,
+            streams: &[],
+        })
+        .await
+        .expect("save probe result with no streams");
+    assert_eq!(database.query_count(), 2);
+    let empty_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams WHERE media_source_id = 'probe-batch-source'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("empty stream count");
+    assert_eq!(empty_count, 0);
+    database.close().await;
+}
+
+#[tokio::test]
 async fn scan_job_status_counts_are_aggregated_in_storage() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

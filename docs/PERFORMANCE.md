@@ -1140,3 +1140,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中写入 205 个章节检测条目。旧实现逐项 INSERT，共 205 次存储 SQL 调用；新实现每批最多 100 条，多行 INSERT 共 3 次，减少 202 次（约 98.5%）。回归同时验证 205 行和 PENDING 状态、source/input fingerprint、context 标记；空输入为 0 次调用，第三批重复 source 触发约束错误后整页回滚。
 
 每行绑定 7 个参数，批次上限 100 使每条语句最多 700 个绑定值。该多行 VALUES 语法由 SQLite 验证，且不依赖数据库专有扩展；没有 PostgreSQL 实例复测。计数来自 SQLite storage 查询计数器，只表示 SQL 调用数量，不是事务数、磁盘写入量、墙钟基准或端到端任务时延；不据此推断 PostgreSQL、NAS 或 x86_64 性能。
+
+### LUX-347 媒体探测轨道替换调用数
+
+2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中，为一个媒体源替换 205 条探测轨道。旧实现执行 source UPDATE、旧轨道 DELETE 和 205 次逐条 INSERT，共 207 次存储 SQL 调用；新实现每批最多 75 条轨道，发出 source UPDATE、DELETE 和 3 条多行 INSERT，共 5 次，减少 202 次（约 97.6%）。回归验证了 205 条轨道的顺序、字段、字幕外部路径和 disposition 标记，空轨道只执行 UPDATE 与 DELETE，第三批重复索引触发约束错误时 source 与旧轨道保持不变。
+
+每行绑定 12 个值，批次上限 75 使每条语句最多 900 个绑定值。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是事务数、磁盘写入量、墙钟基准或端到端探测时延；没有 PostgreSQL、NAS 或 x86_64 实测，不据此推断部署收益。

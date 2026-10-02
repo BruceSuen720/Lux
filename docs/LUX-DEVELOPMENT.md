@@ -7776,6 +7776,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：205 个候选条目从逐项 205 次 INSERT 改为最多 100 条一批的多行 INSERT，共 3 次 SQL 调用（约减少 98.5%）。回归在旧实现上先观察到 205 次并失败，再验证新实现的行数、PENDING 状态、source/input fingerprint 与 context 标记；空输入 0 次 SQL，第三批冲突会回滚整页。新语句每批最多 700 个绑定值。定向 storage 测试通过；`cargo build --locked`、`cargo test --locked --all-targets`、fmt、全目标/全 feature Clippy、脚本语法与 Python 工具测试通过；冻结 Web 安装、553 项 Web 测试和生产构建通过。本机 `uname -m=arm64`。性能记录只报告 SQLite 固定 fixture 的查询调用数；本任务未实测 PostgreSQL、墙钟时延或 NAS。
 
+#### LUX-347：批量替换媒体探测音视频轨道
+
+范围：每个媒体源的探测结果写入时，存储层先更新 media source、删除旧轨道，再逐条 INSERT 新轨道。将新轨道 INSERT 改为每批最多 75 条的多行语句；每行 12 个参数，最多 900 个绑定值。保留原子替换、输入顺序、轨道字段、旧轨道删除和空轨道行为，不更改探测调度或 schema。
+
+验收：
+
+- [x] SQLite 回归以 205 条轨道验证替换后字段、轨道数与顺序正确，SQL 调用从 207 次降至 5 次。
+- [x] 空轨道仍删除旧轨道且不执行 INSERT；第三批重复索引导致整笔更新回滚，已有 source 与轨道记录不变。
+- [x] SQL 使用 SQLite/PostgreSQL 通用多行 VALUES；不改探测状态机或流 DTO。
+- [x] 性能记录报告固定 fixture 的 SQL 调用数，不推断端到端耗时、PostgreSQL 或 NAS 收益。
+
+依赖：无。预计文件：`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加查询计数、替换和回滚测试，确认逐条写入的基准，再实现有界批量 INSERT。
+
+结果（2026-10-02）：205 条探测轨道从逐项 205 次 INSERT 改为最多 75 条一批的多行 INSERT，共 3 次批量 INSERT；连同 source UPDATE 和旧轨道 DELETE，SQL 调用从 207 次降至 5 次（约减少 97.6%）。回归验证了轨道字段、索引顺序、字幕外部路径、空轨道清理和第三批约束失败时的整笔回滚；新语句每批最多 900 个绑定值。`probe`、`strm_probe` 定向目标、全目标 Rust 测试、fmt、全目标/全 feature Clippy、脚本语法、Python 工具测试和 Web 553 项测试/生产构建通过。本机 `uname -m=arm64`。性能记录只报告 SQLite 固定 fixture 的查询调用数；本任务未实测 PostgreSQL、墙钟时延或 NAS。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
