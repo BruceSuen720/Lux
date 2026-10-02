@@ -118,42 +118,44 @@ impl Database {
             })? != 0;
 
         if primary.item_type == "MOVIE" {
-            for merged_item_id in &merged_item_ids {
-                self.merge_sources_in_transaction(
-                    &mut transaction,
-                    merged_item_id,
-                    primary_item_id,
-                    primary_has_default,
-                )
-                .await?;
-            }
+            self.merge_movie_sources_in_transaction(
+                &mut transaction,
+                &merged_item_ids,
+                primary_item_id,
+                primary_has_default,
+            )
+            .await?;
+            self.merge_user_item_states_in_transaction(
+                &mut transaction,
+                &merged_item_ids,
+                primary_item_id,
+            )
+            .await?;
+            self.mark_items_merged_in_transaction(
+                &mut transaction,
+                &merged_item_ids,
+                primary_item_id,
+            )
+            .await?;
         } else {
             for merged_item_id in &merged_item_ids {
                 self.merge_series_in_transaction(&mut transaction, merged_item_id, primary_item_id)
                     .await?;
             }
-        }
-
-        for merged_item_id in &merged_item_ids {
-            self.merge_user_item_state_in_transaction(
-                &mut transaction,
-                merged_item_id,
-                primary_item_id,
-            )
-            .await?;
-            self.query(
-                "UPDATE media_items
-                 SET merged_into_item_id = ?, updated_at = unixepoch()
-                 WHERE id = ? AND merged_into_item_id IS NULL",
-            )
-            .bind(primary_item_id)
-            .bind(merged_item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            for merged_item_id in &merged_item_ids {
+                self.merge_user_item_state_in_transaction(
+                    &mut transaction,
+                    merged_item_id,
+                    primary_item_id,
+                )
+                .await?;
+                self.mark_items_merged_in_transaction(
+                    &mut transaction,
+                    std::slice::from_ref(merged_item_id),
+                    primary_item_id,
+                )
+                .await?;
+            }
         }
 
         transaction
@@ -195,6 +197,67 @@ impl Database {
         })?;
         self.normalize_default_source_in_transaction(transaction, target_item_id)
             .await
+    }
+
+    async fn merge_movie_sources_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_item_ids: &[String],
+        target_item_id: &str,
+        target_has_default: bool,
+    ) -> Result<(), StorageError> {
+        let placeholders = std::iter::repeat_n("?", source_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "UPDATE media_sources
+             SET item_id = ?, is_default = CASE WHEN ? = 1 THEN 0 ELSE is_default END,
+                 updated_at = unixepoch()
+             WHERE item_id IN ({placeholders})"
+        )));
+        query = query
+            .bind(target_item_id)
+            .bind(database_flag(target_has_default));
+        for source_item_id in source_item_ids {
+            query = query.bind(source_item_id);
+        }
+        query
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.normalize_default_source_in_transaction(transaction, target_item_id)
+            .await
+    }
+
+    async fn mark_items_merged_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_ids: &[String],
+        target_item_id: &str,
+    ) -> Result<(), StorageError> {
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "UPDATE media_items
+             SET merged_into_item_id = ?, updated_at = unixepoch()
+             WHERE id IN ({placeholders}) AND merged_into_item_id IS NULL"
+        )));
+        query = query.bind(target_item_id);
+        for item_id in item_ids {
+            query = query.bind(item_id);
+        }
+        query
+            .execute(&mut **transaction)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     async fn normalize_default_source_in_transaction(
@@ -455,15 +518,30 @@ impl Database {
         source_item_id: &str,
         target_item_id: &str,
     ) -> Result<(), StorageError> {
+        let source_item_ids = [source_item_id.to_owned()];
+        self.merge_user_item_states_in_transaction(transaction, &source_item_ids, target_item_id)
+            .await
+    }
+
+    async fn merge_user_item_states_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_item_ids: &[String],
+        target_item_id: &str,
+    ) -> Result<(), StorageError> {
         let max_function = self.scalar_max_function();
+        let placeholders = std::iter::repeat_n("?", source_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let query = format!("INSERT INTO user_item_state (
                          user_id, item_id, position_ticks, is_played, is_favorite,
                          play_count, last_played_at, version
                      )
-                     SELECT user_id, ?, position_ticks, is_played, is_favorite,
-                            play_count, last_played_at, version
+                     SELECT user_id, ?, MAX(position_ticks), MAX(is_played), MAX(is_favorite),
+                            MAX(play_count), MAX(last_played_at), MAX(version)
                      FROM user_item_state
-                     WHERE item_id = ?
+                     WHERE item_id IN ({placeholders})
+                     GROUP BY user_id
                      ON CONFLICT(user_id, item_id) DO UPDATE SET
                          position_ticks = {max_function}(user_item_state.position_ticks, excluded.position_ticks),
                          is_played = {max_function}(user_item_state.is_played, excluded.is_played),
@@ -476,17 +554,28 @@ impl Database {
                              ELSE user_item_state.last_played_at
                          END,
                          version = user_item_state.version + 1");
-        self.query(sqlx::AssertSqlSafe(query))
-            .bind(target_item_id)
-            .bind(source_item_id)
+        let mut query = self.query(sqlx::AssertSqlSafe(query));
+        query = query.bind(target_item_id);
+        for source_item_id in source_item_ids {
+            query = query.bind(source_item_id);
+        }
+        query
             .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query("DELETE FROM user_item_state WHERE item_id = ?")
-            .bind(source_item_id)
+        let placeholders = std::iter::repeat_n("?", source_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM user_item_state WHERE item_id IN ({placeholders})"
+        )));
+        for source_item_id in source_item_ids {
+            query = query.bind(source_item_id);
+        }
+        query
             .execute(&mut **transaction)
             .await
             .map(|_| ())
@@ -525,7 +614,11 @@ fn validate_merge_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+    use crate::{
+        application::{libraries::LibraryService, setup::SetupService},
+        config::Config,
+        library::LibraryKind,
+    };
 
     struct MergeTestItem<'a> {
         id: &'a str,
@@ -775,6 +868,9 @@ mod tests {
             config_dir: temp_dir.path().join("config"),
         };
         let database = Database::connect(&config).await?;
+        let admin = SetupService::new(database.clone())?
+            .complete("Admin", "Admin", "correct password")
+            .await?;
         let library = LibraryService::new(database.clone())
             .create_library("Movies", LibraryKind::Movie, false)
             .await?;
@@ -798,12 +894,63 @@ mod tests {
             .await?;
         }
 
+        for (index, item_id) in item_ids[1..3].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                 VALUES (?, ?, 'LOCAL_FILE', 1, 'PENDING')",
+            )
+            .bind(format!("merge-source-{index}"))
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        for (item_id, position_ticks, is_played, is_favorite, play_count, last_played_at) in [
+            (&item_ids[1], 100_i64, 0_i64, 1_i64, 1_i64, 10_i64),
+            (&item_ids[2], 200_i64, 1_i64, 0_i64, 3_i64, 20_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO user_item_state (
+                     user_id, item_id, position_ticks, is_played, is_favorite,
+                     play_count, last_played_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(admin.id.to_string())
+            .bind(item_id)
+            .bind(position_ticks)
+            .bind(is_played)
+            .bind(is_favorite)
+            .bind(play_count)
+            .bind(last_played_at)
+            .execute(database.pool())
+            .await?;
+        }
+
         database.reset_query_count();
         let result = database.merge_media_items(&item_ids[0], &item_ids).await?;
 
         assert_eq!(result.merged_item_ids.len(), ITEM_COUNT - 1);
         assert_eq!(result.merged_item_ids, item_ids[1..].to_vec());
-        assert_eq!(database.query_count(), 497);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = ?")
+                .bind(&item_ids[0])
+                .fetch_one(database.pool())
+                .await?,
+            2
+        );
+        let merged_state = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            "SELECT position_ticks, is_played, is_favorite, play_count, last_played_at
+             FROM user_item_state WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(admin.id.to_string())
+        .bind(&item_ids[0])
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(merged_state, (200, 1, 1, 3, 20));
+        assert_eq!(
+            database.query_count(),
+            7,
+            "movie merge should batch source, user-state, and root updates"
+        );
         Ok(())
     }
 }
