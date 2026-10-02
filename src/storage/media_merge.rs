@@ -219,6 +219,13 @@ impl Database {
         let source_seasons = self
             .list_series_seasons_in_transaction(transaction, source_series_id)
             .await?;
+        let episodes_by_season = self
+            .list_series_episodes_by_season_in_transaction(
+                transaction,
+                source_series_id,
+                target_series_id,
+            )
+            .await?;
         for source_season in source_seasons {
             let target_season = source_season
                 .season_number
@@ -228,9 +235,10 @@ impl Database {
                         .find(|season| season.season_number == Some(number))
                 })
                 .map(|season| season.id.clone());
-            let source_episodes = self
-                .list_series_episodes_in_transaction(transaction, &source_season.id)
-                .await?;
+            let source_episodes = episodes_by_season
+                .get(&source_season.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let Some(target_season_id) = target_season else {
                 self.query(
                     "UPDATE media_items
@@ -253,7 +261,7 @@ impl Database {
                          WHERE id = ? AND item_type = 'EPISODE'",
                     )
                     .bind(target_series_id)
-                    .bind(episode.id)
+                    .bind(&episode.id)
                     .execute(&mut **transaction)
                     .await
                     .map_err(|source| StorageError::Sqlx {
@@ -284,9 +292,10 @@ impl Database {
                 source,
             })?;
 
-            let target_episodes = self
-                .list_series_episodes_in_transaction(transaction, &target_season_id)
-                .await?;
+            let target_episodes = episodes_by_season
+                .get(&target_season_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             for source_episode in source_episodes {
                 let target_episode = source_episode
                     .episode_number
@@ -331,7 +340,7 @@ impl Database {
                     )
                     .bind(&target_season_id)
                     .bind(target_series_id)
-                    .bind(source_episode.id)
+                    .bind(&source_episode.id)
                     .execute(&mut **transaction)
                     .await
                     .map_err(|source| StorageError::Sqlx {
@@ -376,30 +385,46 @@ impl Database {
         })
     }
 
-    async fn list_series_episodes_in_transaction(
+    async fn list_series_episodes_by_season_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        season_id: &str,
-    ) -> Result<Vec<MergeHierarchyItem>, StorageError> {
+        source_series_id: &str,
+        target_series_id: &str,
+    ) -> Result<HashMap<String, Vec<MergeHierarchyItem>>, StorageError> {
         self.query(
-            "SELECT id, season_number, episode_number
-             FROM media_items
-             WHERE item_type = 'EPISODE' AND removed_at IS NULL
-               AND merged_into_item_id IS NULL
-               AND parent_id = ?
-             ORDER BY episode_number, id",
+            "WITH merge_seasons AS (
+                 SELECT id
+                 FROM media_items
+                 WHERE item_type = 'SEASON' AND removed_at IS NULL
+                   AND merged_into_item_id IS NULL
+                   AND (series_id IN (?, ?) OR parent_id IN (?, ?))
+             )
+             SELECT episode.id, episode.parent_id, episode.episode_number
+             FROM media_items episode
+             JOIN merge_seasons season ON season.id = episode.parent_id
+             WHERE episode.item_type = 'EPISODE' AND episode.removed_at IS NULL
+               AND episode.merged_into_item_id IS NULL
+             ORDER BY episode.parent_id, episode.episode_number, episode.id",
         )
-        .bind(season_id)
+        .bind(source_series_id)
+        .bind(target_series_id)
+        .bind(source_series_id)
+        .bind(target_series_id)
         .fetch_all(&mut **transaction)
         .await
         .map(|rows| {
-            rows.into_iter()
-                .map(|row| MergeHierarchyItem {
-                    id: row.get("id"),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                })
-                .collect()
+            let mut episodes_by_season = HashMap::<String, Vec<MergeHierarchyItem>>::new();
+            for row in rows {
+                episodes_by_season
+                    .entry(row.get("parent_id"))
+                    .or_default()
+                    .push(MergeHierarchyItem {
+                        id: row.get("id"),
+                        season_number: None,
+                        episode_number: row.get("episode_number"),
+                    });
+            }
+            episodes_by_season
         })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
@@ -478,4 +503,247 @@ fn validate_merge_root(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+    struct MergeTestItem<'a> {
+        id: &'a str,
+        item_type: &'a str,
+        parent_id: Option<&'a str>,
+        series_id: Option<&'a str>,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+    }
+
+    async fn insert_merge_item(
+        database: &Database,
+        library_id: &str,
+        item: MergeTestItem<'_>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id,
+                 season_number, episode_number, title, sort_title, identification_status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item.id)
+        .bind(library_id)
+        .bind(item.item_type)
+        .bind(item.parent_id)
+        .bind(item.series_id)
+        .bind(item.season_number)
+        .bind(item.episode_number)
+        .bind(item.id)
+        .bind(item.id.to_lowercase())
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn series_merge_batches_episode_reads_across_source_seasons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Mixed, false)
+            .await?;
+        let target_series_id = "merge-target-series";
+        let source_series_id = "merge-source-series";
+
+        for (series_id, title) in [
+            (target_series_id, "Target Series"),
+            (source_series_id, "Source Series"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'SERIES', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(series_id)
+            .bind(library.id.to_string())
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await?;
+        }
+
+        for season_number in 1..=12 {
+            let season_id = format!("merge-source-season-{season_number:02}");
+            let season_title = format!("Season {season_number:02}");
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id,
+                     season_number, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'SEASON', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(season_id)
+            .bind(library.id.to_string())
+            .bind(source_series_id)
+            .bind(source_series_id)
+            .bind(season_number)
+            .bind(&season_title)
+            .bind(season_title.to_lowercase())
+            .execute(database.pool())
+            .await?;
+        }
+
+        database.reset_query_count();
+        database
+            .merge_media_items(
+                target_series_id,
+                &[target_series_id.to_owned(), source_series_id.to_owned()],
+            )
+            .await?;
+
+        assert_eq!(
+            database.query_count(),
+            21,
+            "expected one batched episode read instead of one read per source season"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_merge_reuses_season_attached_by_an_earlier_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Mixed, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let target_series_id = "merge-target-series";
+        let first_source_series_id = "merge-first-source-series";
+        let second_source_series_id = "merge-second-source-series";
+        let first_source_season_id = "merge-first-source-season";
+        let second_source_season_id = "merge-second-source-season";
+        let first_source_episode_id = "merge-first-source-episode";
+        let second_source_episode_id = "merge-second-source-episode";
+
+        for series_id in [
+            target_series_id,
+            first_source_series_id,
+            second_source_series_id,
+        ] {
+            insert_merge_item(
+                &database,
+                &library_id,
+                MergeTestItem {
+                    id: series_id,
+                    item_type: "SERIES",
+                    parent_id: None,
+                    series_id: None,
+                    season_number: None,
+                    episode_number: None,
+                },
+            )
+            .await?;
+        }
+        insert_merge_item(
+            &database,
+            &library_id,
+            MergeTestItem {
+                id: first_source_season_id,
+                item_type: "SEASON",
+                parent_id: Some(first_source_series_id),
+                series_id: Some(first_source_series_id),
+                season_number: Some(1),
+                episode_number: None,
+            },
+        )
+        .await?;
+        insert_merge_item(
+            &database,
+            &library_id,
+            MergeTestItem {
+                id: second_source_season_id,
+                item_type: "SEASON",
+                parent_id: Some(second_source_series_id),
+                series_id: Some(second_source_series_id),
+                season_number: Some(1),
+                episode_number: None,
+            },
+        )
+        .await?;
+        insert_merge_item(
+            &database,
+            &library_id,
+            MergeTestItem {
+                id: first_source_episode_id,
+                item_type: "EPISODE",
+                parent_id: Some(first_source_season_id),
+                series_id: Some(first_source_series_id),
+                season_number: Some(1),
+                episode_number: Some(1),
+            },
+        )
+        .await?;
+        insert_merge_item(
+            &database,
+            &library_id,
+            MergeTestItem {
+                id: second_source_episode_id,
+                item_type: "EPISODE",
+                parent_id: Some(second_source_season_id),
+                series_id: Some(second_source_series_id),
+                season_number: Some(1),
+                episode_number: Some(1),
+            },
+        )
+        .await?;
+
+        database
+            .merge_media_items(
+                target_series_id,
+                &[
+                    target_series_id.to_owned(),
+                    first_source_series_id.to_owned(),
+                    second_source_series_id.to_owned(),
+                ],
+            )
+            .await?;
+
+        let first_season_parent = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT parent_id FROM media_items WHERE id = ?",
+        )
+        .bind(first_source_season_id)
+        .fetch_one(database.pool())
+        .await?;
+        let second_season_merged_into = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT merged_into_item_id FROM media_items WHERE id = ?",
+        )
+        .bind(second_source_season_id)
+        .fetch_one(database.pool())
+        .await?;
+        let second_episode_merged_into = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT merged_into_item_id FROM media_items WHERE id = ?",
+        )
+        .bind(second_source_episode_id)
+        .fetch_one(database.pool())
+        .await?;
+
+        assert_eq!(first_season_parent.as_deref(), Some(target_series_id));
+        assert_eq!(
+            second_season_merged_into.as_deref(),
+            Some(first_source_season_id)
+        );
+        assert_eq!(
+            second_episode_merged_into.as_deref(),
+            Some(first_source_episode_id)
+        );
+        Ok(())
+    }
 }

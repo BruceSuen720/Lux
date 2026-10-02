@@ -9,6 +9,7 @@ const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
 const MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES: usize = 4096;
 const MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE: i64 = 100;
 const MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE: usize = 512;
+const ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE: usize = 100;
 
 fn validate_item_metadata_completeness_key(
     item_id: &str,
@@ -58,12 +59,24 @@ impl Database {
 
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let item_ids = checks
+            .iter()
+            .map(|check| check.item_id.to_owned())
+            .collect::<Vec<_>>();
+        self.lock_media_items_for_update(&mut transaction, &item_ids)
+            .await?;
         let mut claimed_indices = Vec::with_capacity(checks.len());
-        for (index, check) in checks.iter().enumerate() {
-            self.query(
+        for (batch_index, batch) in checks
+            .chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE)
+            .enumerate()
+        {
+            let values = std::iter::repeat_n("(?, ?, 'PENDING', NULL, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO item_metadata_completeness (
                      item_id, capability, local_state, is_missing, input_fingerprint
-                 ) VALUES (?, ?, 'PENDING', NULL, ?)
+                 ) VALUES {values}
                  ON CONFLICT(item_id, capability) DO UPDATE SET
                      local_state = 'PENDING', is_missing = NULL,
                      input_fingerprint = excluded.input_fingerprint,
@@ -71,37 +84,69 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')",
-            )
-            .bind(check.item_id)
-            .bind(check.capability.trim())
-            .bind(check.input_fingerprint.to_vec())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            let claimed = self
-                .query_scalar::<String>(
-                    "UPDATE item_metadata_completeness
-                     SET local_state = 'RUNNING', is_missing = NULL, checked_at = NULL,
-                         retry_after = NULL, error = NULL, updated_at = unixepoch()
-                     WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
-                       AND local_state = 'PENDING'
-                     RETURNING item_id",
-                )
-                .bind(check.item_id)
-                .bind(check.capability.trim())
-                .bind(check.input_fingerprint.to_vec())
-                .fetch_optional(&mut *transaction)
+                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for check in batch {
+                statement = statement
+                    .bind(check.item_id)
+                    .bind(check.capability.trim())
+                    .bind(check.input_fingerprint.to_vec());
+            }
+            statement
+                .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            if claimed.is_some() {
-                claimed_indices.push(index);
+
+            let claim_values = std::iter::repeat_n("(?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let claim_query = format!(
+                "WITH requested(item_id, capability, input_fingerprint) AS (VALUES {claim_values})
+                 UPDATE item_metadata_completeness
+                 SET local_state = 'RUNNING', is_missing = NULL, checked_at = NULL,
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE local_state = 'PENDING'
+                   AND EXISTS (
+                       SELECT 1 FROM requested
+                       WHERE requested.item_id = item_metadata_completeness.item_id
+                         AND requested.capability = item_metadata_completeness.capability
+                         AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                   )
+                 RETURNING item_id, capability"
+            );
+            let mut claim_statement = self.query(sqlx::AssertSqlSafe(claim_query));
+            for check in batch {
+                claim_statement = claim_statement
+                    .bind(check.item_id)
+                    .bind(check.capability.trim())
+                    .bind(check.input_fingerprint.to_vec());
+            }
+            let claimed_keys = claim_statement
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("item_id"),
+                        row.get::<String, _>("capability"),
+                    )
+                })
+                .collect::<HashSet<_>>();
+            for (offset, check) in batch.iter().enumerate() {
+                if claimed_keys
+                    .contains(&(check.item_id.to_owned(), check.capability.trim().to_owned()))
+                {
+                    claimed_indices
+                        .push(batch_index * ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE + offset);
+                }
             }
         }
         transaction
@@ -202,41 +247,67 @@ impl Database {
             .map(|result| result.item_id.to_owned())
             .chain(eligible_ids.iter().cloned())
             .collect::<Vec<_>>();
-        self.lock_metadata_reidentify_items_for_update(&mut transaction, &lock_ids)
+        self.lock_media_items_for_update(&mut transaction, &lock_ids)
             .await?;
 
         let mut commit = ItemMetadataCompletenessCommit::default();
         let mut confirmed_missing = HashSet::new();
-        for result in results {
-            let updated_item = self
-                .query_scalar::<String>(
-                    "UPDATE item_metadata_completeness
-                     SET local_state = 'READY', is_missing = ?, checked_at = ?,
-                         retry_after = NULL, error = NULL, updated_at = unixepoch()
-                     WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
-                       AND local_state = 'RUNNING'
-                       AND EXISTS (
-                           SELECT 1 FROM media_items
-                           WHERE id = item_metadata_completeness.item_id
-                             AND library_id = ? AND removed_at IS NULL
-                       )
-                     RETURNING item_id",
-                )
-                .bind(database_flag(result.is_missing))
-                .bind(result.checked_at)
-                .bind(result.item_id)
-                .bind(result.capability.trim())
-                .bind(result.input_fingerprint.to_vec())
+        for batch in results.chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(item_id, capability, input_fingerprint, is_missing, checked_at) AS (VALUES {values})
+                 UPDATE item_metadata_completeness
+                 SET local_state = 'READY',
+                     is_missing = (
+                         SELECT requested.is_missing FROM requested
+                         WHERE requested.item_id = item_metadata_completeness.item_id
+                           AND requested.capability = item_metadata_completeness.capability
+                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                     ),
+                     checked_at = (
+                         SELECT requested.checked_at FROM requested
+                         WHERE requested.item_id = item_metadata_completeness.item_id
+                           AND requested.capability = item_metadata_completeness.capability
+                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                     ),
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE local_state = 'RUNNING'
+                   AND EXISTS (
+                       SELECT 1 FROM requested
+                       WHERE requested.item_id = item_metadata_completeness.item_id
+                         AND requested.capability = item_metadata_completeness.capability
+                         AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM media_items
+                       WHERE id = item_metadata_completeness.item_id
+                         AND library_id = ? AND removed_at IS NULL
+                   )
+                 RETURNING item_id, is_missing"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for result in batch {
+                statement = statement
+                    .bind(result.item_id)
+                    .bind(result.capability.trim())
+                    .bind(result.input_fingerprint.to_vec())
+                    .bind(database_flag(result.is_missing))
+                    .bind(result.checked_at);
+            }
+            let rows = statement
                 .bind(library_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            if let Some(item_id) = updated_item {
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
                 commit.updated_count = commit.updated_count.saturating_add(1);
-                if result.is_missing {
+                if row.get::<i64, _>("is_missing") != 0 {
                     confirmed_missing.insert(item_id);
                 }
             }
@@ -390,6 +461,9 @@ impl Database {
         validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let item_ids = vec![item_id.to_owned()];
+        self.lock_media_items_for_update(&mut transaction, &item_ids)
+            .await?;
         let changed = self
             .query_scalar::<String>(
                 "INSERT INTO item_metadata_completeness (

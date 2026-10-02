@@ -384,12 +384,18 @@ describe("LuxShell user control", () => {
       libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
     });
     vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
-    const latest = vi.spyOn(api, "homeLibraryLatest")
+    const latest = vi.spyOn(api, "homeLibrariesLatest")
       .mockResolvedValueOnce({
-        items: [{ id: "movie-1", title: "刮削电影", itemType: "MOVIE", imageTags: { poster: "poster-v1" } }],
+        libraries: [{
+          libraryId: "library-1",
+          items: [{ id: "movie-1", title: "刮削电影", itemType: "MOVIE", imageTags: { poster: "poster-v1" } }],
+        }],
       })
       .mockResolvedValueOnce({
-        items: [{ id: "movie-1", title: "刮削电影", itemType: "MOVIE", imageTags: { poster: "poster-v2" } }],
+        libraries: [{
+          libraryId: "library-1",
+          items: [{ id: "movie-1", title: "刮削电影", itemType: "MOVIE", imageTags: { poster: "poster-v2" } }],
+        }],
       });
 
     container = document.createElement("div");

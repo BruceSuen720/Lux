@@ -460,7 +460,7 @@ function MigrationDetails({ job, tab, page, onTabChange, onPageChange, onCancel,
       {job.error ? <InlineError message={job.error} /> : null}
       <details className="lux-emby-reports" open={reportsOpen} onToggle={(event) => setReportsOpen(event.currentTarget.open)}>
         <summary>查看迁移报告 <span>用户、媒体、导入、人物收藏</span></summary>
-        {reportsOpen ? <EmbyMigrationReports jobId={job.id} tab={tab} report={report} onTabChange={onTabChange} onPageChange={onPageChange} /> : null}
+        {reportsOpen ? <EmbyMigrationReports tab={tab} report={report} onTabChange={onTabChange} onPageChange={onPageChange} /> : null}
       </details>
     </section>
   );

@@ -4,7 +4,7 @@ version = "0.5.12"
 edition = "2024"
 rust-version = "1.94"
 description = "Lux personal media server"
-license = "MIT"
+license-file = "LICENSE"
 
 [dependencies]
 argon2 = "0.5.3"

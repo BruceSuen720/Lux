@@ -1,6 +1,8 @@
 use super::*;
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
+const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
+const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
@@ -4276,32 +4278,40 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for stream in update.streams {
-            self.query(
+        for batch in update.streams.chunks(MEDIA_STREAM_INSERT_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO media_streams (
                     id, media_source_id, stream_index, stream_type,
                     codec, language, title, details_json, external_path,
                     is_external, is_default, is_forced
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(update.source_id)
-            .bind(stream.stream_index)
-            .bind(stream.stream_type)
-            .bind(stream.codec)
-            .bind(stream.language)
-            .bind(stream.title)
-            .bind(stream.details_json)
-            .bind(stream.external_path)
-            .bind(database_flag(stream.is_external))
-            .bind(database_flag(stream.is_default))
-            .bind(database_flag(stream.is_forced))
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for stream in batch {
+                statement = statement
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(update.source_id)
+                    .bind(stream.stream_index)
+                    .bind(stream.stream_type)
+                    .bind(stream.codec)
+                    .bind(stream.language)
+                    .bind(stream.title)
+                    .bind(stream.details_json)
+                    .bind(stream.external_path)
+                    .bind(database_flag(stream.is_external))
+                    .bind(database_flag(stream.is_default))
+                    .bind(database_flag(stream.is_forced));
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()
@@ -4607,26 +4617,34 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for item in items {
-            self.query(
+        for batch in items.chunks(CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, 'PENDING')", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO chapter_detection_job_items (
                     job_id, source_id, item_id, season_id, source_fingerprint,
                     input_fingerprint, is_context, status
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
-            )
-            .bind(item.job_id)
-            .bind(item.source_id)
-            .bind(item.item_id)
-            .bind(item.season_id)
-            .bind(item.source_fingerprint)
-            .bind(item.input_fingerprint)
-            .bind(database_flag(item.is_context))
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item in batch {
+                statement = statement
+                    .bind(item.job_id)
+                    .bind(item.source_id)
+                    .bind(item.item_id)
+                    .bind(item.season_id)
+                    .bind(item.source_fingerprint)
+                    .bind(item.input_fingerprint)
+                    .bind(database_flag(item.is_context));
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()

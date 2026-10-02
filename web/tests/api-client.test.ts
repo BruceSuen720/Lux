@@ -139,6 +139,10 @@ describe("LuxApiClient", () => {
         ["/api/v1/libraries", () => client.homeLibraries()],
         ["/api/v1/continue-watching?page=1&pageSize=10", () => client.homeContinueWatching()],
         ["/api/v1/libraries/library-1/latest", () => client.homeLibraryLatest("library-1")],
+        [
+          "/api/v1/home/libraries/latest?libraryId=library-1&libraryId=library-2",
+          () => client.homeLibrariesLatest(["library-1", "library-2"]),
+        ],
       ] as const;
       for (const [, run] of requests) {
         requestSignal = undefined;
@@ -156,6 +160,50 @@ describe("LuxApiClient", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("requests and decodes latest items for multiple home libraries", async () => {
+    const responseBody = {
+      libraries: [
+        { libraryId: "library-2", items: [{ id: "item-2", title: "Second" }] },
+        { libraryId: "library-1", items: [{ id: "item-1", title: "First" }] },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(responseBody), { status: 200 }),
+    );
+
+    const response = await new LuxApiClient().homeLibrariesLatest([
+      "library-1",
+      "library-2",
+    ]);
+
+    expect(response).toEqual(responseBody);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/home/libraries/latest?libraryId=library-1&libraryId=library-2",
+    );
+  });
+
+  it("aborts the batched home library request when its caller cancels", async () => {
+    const controller = new AbortController();
+    let requestSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) =>
+      new Promise((_resolve, reject) => {
+        requestSignal = init?.signal as AbortSignal | undefined;
+        requestSignal?.addEventListener("abort", () => {
+          reject(new DOMException("The request was aborted", "AbortError"));
+        }, { once: true });
+      }),
+    );
+
+    const request = new LuxApiClient().homeLibrariesLatest(
+      ["library-1", "library-2"],
+      controller.signal,
+    );
+    controller.abort();
+
+    expect(requestSignal?.aborted).toBe(true);
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
   });
 
   it("decodes chapters scoped to each Lux media source", async () => {

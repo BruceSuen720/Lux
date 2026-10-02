@@ -8,7 +8,7 @@ export const queryKeys = {
   home: ["home"] as const,
   homeCarousel: ["home", "carousel"] as const,
   homeContinueWatching: ["home", "continue-watching"] as const,
-  homeLatest: (libraryId: string) => ["home", "latest", libraryId] as const,
+  homeLatestLibraries: (libraryIds: readonly string[]) => ["home", "latest-libraries", [...libraryIds]] as const,
   favorites: ["favorites"] as const,
   libraries: ["libraries"] as const,
   library: (

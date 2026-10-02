@@ -195,8 +195,15 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .json(&json!({ "name": "Shows", "kind": "SERIES" }))
         .send()
         .await?;
-    assert_eq!(edited.status(), reqwest::StatusCode::OK);
-    let edited_library = edited.json::<Value>().await?["library"].clone();
+    let edited_status = edited.status();
+    let edited_body = edited.text().await?;
+    assert_eq!(
+        edited_status,
+        reqwest::StatusCode::OK,
+        "library update response: {edited_body}"
+    );
+    let edited_body: Value = serde_json::from_str(&edited_body)?;
+    let edited_library = edited_body["library"].clone();
     assert_eq!(edited_library["name"], "Shows");
     assert_eq!(edited_library["kind"], "SERIES");
 

@@ -22,8 +22,11 @@ function mockHomeSections(response: HomeResponse) {
     items: continueWatching,
     total: response.continueWatchingTotal ?? continueWatching.length,
   });
-  vi.spyOn(api, "homeLibraryLatest").mockImplementation(async (libraryId) => ({
-    items: response.libraries?.find((library) => library.id === libraryId)?.latest ?? [],
+  return vi.spyOn(api, "homeLibrariesLatest").mockImplementation(async (libraryIds) => ({
+    libraries: libraryIds.map((libraryId) => ({
+      libraryId,
+      items: response.libraries?.find((library) => library.id === libraryId)?.latest ?? [],
+    })),
   }));
 }
 
@@ -50,12 +53,16 @@ describe("HomePage shelves", () => {
       libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
     });
     vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
-    vi.spyOn(api, "homeLibraryLatest").mockResolvedValue({
-      items: [{
-        id: "scraped-movie",
-        title: "刚刮削完成",
-        itemType: "MOVIE",
-        imageTags: { poster: "poster-v2" },
+    vi.spyOn(api, "homeLibraryLatest");
+    vi.spyOn(api, "homeLibrariesLatest").mockResolvedValue({
+      libraries: [{
+        libraryId: "library-1",
+        items: [{
+          id: "scraped-movie",
+          title: "刚刮削完成",
+          itemType: "MOVIE",
+          imageTags: { poster: "poster-v2" },
+        }],
       }],
     });
 
@@ -191,7 +198,7 @@ describe("HomePage shelves", () => {
   });
 
   it("renders homepage library shelves in the current account's saved order", async () => {
-    mockHomeSections({
+    const latest = mockHomeSections({
       libraries: [
         { id: "library-2", name: "剧集库", kind: "SERIES", latest: [{ id: "series-latest", title: "剧集最新", itemType: "SERIES" }] },
         { id: "library-1", name: "电影库", kind: "MOVIE", latest: [{ id: "movie-latest", title: "电影最新", itemType: "MOVIE" }] },
@@ -199,6 +206,7 @@ describe("HomePage shelves", () => {
       recommended: [],
       continueWatching: [],
     });
+    const legacyLatest = vi.spyOn(api, "homeLibraryLatest");
 
     container = document.createElement("div");
     document.body.append(container);
@@ -222,6 +230,20 @@ describe("HomePage shelves", () => {
       .toEqual(["剧集库", "电影库"]);
     expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
       .toEqual(["我的媒体库", "最新剧集库", "最新电影库"]);
+    expect(latest).toHaveBeenCalledTimes(1);
+    expect(latest.mock.calls[0]?.[0]).toEqual(["library-2", "library-1"]);
+    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新剧集库"]')?.textContent)
+      .toContain("剧集最新"));
+    await vi.waitFor(() => expect(container.querySelector('[aria-label="最新电影库"]')?.textContent)
+      .toContain("电影最新"));
+    expect(legacyLatest).not.toHaveBeenCalled();
+    const latestQuery = queryClient.getQueryCache().find({
+      queryKey: queryKeys.homeLatestLibraries(["library-2", "library-1"]),
+      exact: true,
+    });
+    expect(homeRefetchInterval(latestQuery?.state.data)).toBe(queryRefreshIntervals.mediaSurface);
+    expect(queryKeys.homeLatestLibraries(["library-2", "library-1"]))
+      .not.toEqual(queryKeys.homeLatestLibraries(["library-1", "library-2"]));
   });
 
   it("hides homepage media-library and continue-watching sections when the account disables them", async () => {
@@ -264,7 +286,7 @@ describe("HomePage shelves", () => {
   });
 
   it("renders every returned continue-watching item and shows the server total", async () => {
-    mockHomeSections({
+    const latest = mockHomeSections({
       libraries: [],
       recommended: [],
       continueWatching: [
@@ -297,6 +319,46 @@ describe("HomePage shelves", () => {
     expect(container.querySelectorAll(".lux-continue-card")).toHaveLength(3);
     expect(container.querySelector("#continue-watching-heading")?.parentElement?.textContent)
       .toContain("3 项");
+    expect(latest).not.toHaveBeenCalled();
+  });
+
+  it("keeps other homepage sections visible when the batched latest request fails", async () => {
+    vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [
+      { id: "library-1", name: "电影库", kind: "MOVIE" },
+      { id: "library-2", name: "剧集库", kind: "SERIES" },
+    ] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({
+      items: [{ id: "resume-1", title: "继续中的电影", itemType: "MOVIE" }],
+      total: 1,
+    });
+    const latest = vi.spyOn(api, "homeLibrariesLatest").mockRejectedValue(new Error("最新资源接口暂不可用"));
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(1));
+    expect(container.querySelector('[aria-label="我的媒体库"] .lux-library-card')?.textContent)
+      .toContain("电影库");
+    expect(container.querySelector(".lux-continue-card")?.textContent)
+      .toContain("继续中的电影");
+    expect(container.querySelector('[aria-label="最新电影库"] [role="alert"]')?.textContent)
+      .toContain("最新资源加载失败");
+    expect(container.querySelector('[aria-label="最新剧集库"] [role="alert"]')?.textContent)
+      .toContain("最新资源加载失败");
   });
 
   it("keeps carousel controls in the same row as the playback actions", async () => {
@@ -575,7 +637,9 @@ describe("HomePage shelves", () => {
       libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
     });
     vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
-    vi.spyOn(api, "homeLibraryLatest").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "homeLibrariesLatest").mockResolvedValue({
+      libraries: [{ libraryId: "library-1", items: [] }],
+    });
 
     container = document.createElement("div");
     document.body.append(container);

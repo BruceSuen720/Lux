@@ -1427,24 +1427,31 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for (position, library_id) in library_ids.iter().enumerate() {
-            self.query(
+        const MAX_ROWS_PER_BATCH: usize = 100;
+        for (batch_index, batch) in library_ids.chunks(MAX_ROWS_PER_BATCH).enumerate() {
+            let values = std::iter::repeat_n("(?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO user_library_order (user_id, library_id, position)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(user_id)
-            .bind(library_id)
-            .bind(
-                i64::try_from(position).map_err(|_| {
-                    StorageError::Serialization("媒体库排序位置超出范围".to_owned())
-                })?,
-            )
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (offset, library_id) in batch.iter().enumerate() {
+                let position = batch_index * MAX_ROWS_PER_BATCH + offset;
+                statement = statement.bind(user_id).bind(library_id).bind(
+                    i64::try_from(position).map_err(|_| {
+                        StorageError::Serialization("媒体库排序位置超出范围".to_owned())
+                    })?,
+                );
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()

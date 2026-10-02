@@ -821,11 +821,10 @@ pub(crate) async fn admin_update_settings(
         )
         .into_response();
     }
-    if let Some(scraper_id) = media_strategy.scraper_id.as_deref() {
-        if let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
-        {
-            return response;
-        }
+    if let Some(scraper_id) = media_strategy.scraper_id.as_deref()
+        && let Err(response) = validate_scraper_selection(&headers, &state, Some(scraper_id)).await
+    {
+        return response;
     }
     let media_strategy_json = match serde_json::to_string(&media_strategy) {
         Ok(value) => value,
@@ -8671,12 +8670,11 @@ pub(crate) async fn admin_update_library(
                 )
                 .into_response();
             }
-            if let Some(scraper_id) = strategy.scraper_id.as_deref() {
-                if let Err(response) =
+            if let Some(scraper_id) = strategy.scraper_id.as_deref()
+                && let Err(response) =
                     validate_scraper_selection(&headers, &state, Some(scraper_id)).await
-                {
-                    return response;
-                }
+            {
+                return response;
             }
             match serde_json::to_string(strategy) {
                 Ok(value) => Some(Some(value)),

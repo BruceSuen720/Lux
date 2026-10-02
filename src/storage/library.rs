@@ -1746,6 +1746,43 @@ impl Database {
         plugin_id: Option<&str>,
         library_ids: &[String],
     ) -> Result<(), StorageError> {
+        if library_ids.is_empty() {
+            return Err(StorageError::Conflict(
+                "执行计划至少需要一个媒体库".to_owned(),
+            ));
+        }
+        const MAX_LIBRARY_IDS_PER_QUERY: usize = 100;
+        let mut configs =
+            HashMap::<String, (String, Option<String>)>::with_capacity(library_ids.len());
+        for batch in library_ids.chunks(MAX_LIBRARY_IDS_PER_QUERY) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query =
+                self.query_as::<(String, String, Option<String>)>(sqlx::AssertSqlSafe(format!(
+                    "SELECT owner_id, source_type, plugin_id
+                     FROM scheduled_task_configs
+                     WHERE owner_type = 'LIBRARY' AND task_type = ?
+                       AND owner_id IN ({placeholders})"
+                )));
+            query = query.bind(task_type);
+            for library_id in batch {
+                query = query.bind(library_id);
+            }
+            let rows = query
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            configs.extend(rows.into_iter().map(
+                |(library_id, actual_source_type, actual_plugin_id)| {
+                    (library_id, (actual_source_type, actual_plugin_id))
+                },
+            ));
+        }
+
         let mut seen = HashSet::with_capacity(library_ids.len());
         for library_id in library_ids {
             if !seen.insert(library_id) {
@@ -1753,21 +1790,7 @@ impl Database {
                     "同一媒体库不能在计划中重复选择".to_owned(),
                 ));
             }
-            let config: Option<(String, Option<String>)> = self
-                .query_as(
-                    "SELECT source_type, plugin_id
-                     FROM scheduled_task_configs
-                     WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = ?",
-                )
-                .bind(library_id)
-                .bind(task_type)
-                .fetch_optional(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            let Some((actual_source_type, actual_plugin_id)) = config else {
+            let Some((actual_source_type, actual_plugin_id)) = configs.get(library_id) else {
                 return Err(StorageError::Conflict(format!(
                     "媒体库 {library_id} 尚未注册任务 {task_type}"
                 )));
@@ -1777,11 +1800,6 @@ impl Database {
                     "一个执行计划不能混合不同的插件来源".to_owned(),
                 ));
             }
-        }
-        if library_ids.is_empty() {
-            return Err(StorageError::Conflict(
-                "执行计划至少需要一个媒体库".to_owned(),
-            ));
         }
         Ok(())
     }
@@ -2033,31 +2051,45 @@ impl Database {
                         path: self.path.clone(),
                         source,
                     })?;
-                for library_id in removed_ids {
-                    self.query(
-                        "DELETE FROM scheduled_task_plan_libraries
-                         WHERE plan_id = ? AND library_id = ?",
-                    )
-                    .bind(plan_id)
-                    .bind(&library_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                    self.query(
+                const MAX_MOVED_LIBRARY_IDS_PER_BATCH: usize = 500;
+                for batch in removed_ids.chunks(MAX_MOVED_LIBRARY_IDS_PER_BATCH) {
+                    let placeholders = std::iter::repeat_n("?", batch.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut insert_query = self.query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
-                         VALUES (?, ?) ON CONFLICT DO NOTHING",
-                    )
-                    .bind(&default_plan_id)
-                    .bind(library_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                         SELECT ?, library_id
+                         FROM scheduled_task_plan_libraries
+                         WHERE plan_id = ? AND library_id IN ({placeholders})
+                         ON CONFLICT DO NOTHING"
+                    )));
+                    insert_query = insert_query.bind(&default_plan_id).bind(plan_id);
+                    for library_id in batch {
+                        insert_query = insert_query.bind(library_id);
+                    }
+                    insert_query
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+
+                    let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
+                        "DELETE FROM scheduled_task_plan_libraries
+                         WHERE plan_id = ? AND library_id IN ({placeholders})"
+                    )));
+                    delete_query = delete_query.bind(plan_id);
+                    for library_id in batch {
+                        delete_query = delete_query.bind(library_id);
+                    }
+                    delete_query
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
                 }
             }
         }
@@ -2305,19 +2337,26 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for library_id in library_ids {
-            self.query(
+        const MAX_LIBRARY_MEMBERS_PER_INSERT: usize = 100;
+        for batch in library_ids.chunks(MAX_LIBRARY_MEMBERS_PER_INSERT) {
+            let values = std::iter::repeat_n("(?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
-                 VALUES (?, ?)",
-            )
-            .bind(plan_id)
-            .bind(library_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for library_id in batch {
+                statement = statement.bind(plan_id).bind(library_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -3045,6 +3084,324 @@ mod scheduled_task_plan_mirror_tests {
         .await
         .expect("split reconciliation plan count should be queryable");
         assert_eq!(split_plan_count, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_members_are_inserted_in_bounded_batches() {
+        const LIBRARY_COUNT: usize = 205;
+
+        let (_temp_dir, database) = test_database().await;
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|index| format!("plan-batch-library-{index:03}"))
+            .collect::<Vec<_>>();
+        for library_id in &library_ids {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await
+                .expect("library should be inserted");
+        }
+        sqlx::query(
+            "INSERT INTO scheduled_task_plans (
+                id, task_type, plan_name, task_name, task_description,
+                source_type, cron_or_interval, is_enabled, resource_limit_json,
+                scope_type, is_default
+             ) VALUES (
+                'plan-batch', 'RECONCILIATION_SCAN', 'Batch plan', 'Scan', 'Scan',
+                'SYSTEM', '0 3 * * *', 1, '{}', 'LIBRARY', 0
+             )",
+        )
+        .execute(database.pool())
+        .await
+        .expect("plan should be inserted");
+
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        database.reset_query_count();
+        database
+            .move_libraries_to_scheduled_task_plan(
+                &mut transaction,
+                "plan-batch",
+                "RECONCILIATION_SCAN",
+                "Scan",
+                "Scan",
+                "SYSTEM",
+                None,
+                Some("0 3 * * *"),
+                true,
+                "{}",
+                &library_ids,
+            )
+            .await
+            .expect("plan members should be moved");
+        transaction.commit().await.expect("transaction commit");
+
+        assert_eq!(database.query_count(), 5);
+        let member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plan_libraries WHERE plan_id = 'plan-batch'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("plan member count");
+        assert_eq!(member_count, LIBRARY_COUNT as i64);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_validation_uses_bounded_batches() {
+        const LIBRARY_COUNT: usize = 205;
+
+        let (_temp_dir, database) = test_database().await;
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|index| format!("plan-validation-library-{index:03}"))
+            .collect::<Vec<_>>();
+        for library_id in &library_ids {
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id
+                 ) VALUES ('LIBRARY', ?, 'RECONCILIATION_SCAN', 'Scan', 'Scan', 'SYSTEM', NULL)",
+            )
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("library task config should be inserted");
+        }
+
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        database.reset_query_count();
+        database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &library_ids,
+            )
+            .await
+            .expect("library task configs should validate");
+        transaction.rollback().await.expect("transaction rollback");
+
+        assert_eq!(database.query_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_validation_preserves_input_errors() {
+        let (_temp_dir, database) = test_database().await;
+        for (library_id, source_type, plugin_id) in [
+            ("validation-library-a", "SYSTEM", None),
+            (
+                "validation-library-b",
+                "PLUGIN",
+                Some("org.example.scraper"),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id
+                 ) VALUES ('LIBRARY', ?, 'RECONCILIATION_SCAN', 'Scan', 'Scan', ?, ?)",
+            )
+            .bind(library_id)
+            .bind(source_type)
+            .bind(plugin_id)
+            .execute(database.pool())
+            .await
+            .expect("library task config should be inserted");
+        }
+
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &[],
+            )
+            .await
+            .expect_err("empty library selection should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let duplicate_ids = vec![
+            "validation-library-a".to_owned(),
+            "validation-library-a".to_owned(),
+        ];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &duplicate_ids,
+            )
+            .await
+            .expect_err("duplicate library selection should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let missing_ids = vec![
+            "validation-library-a".to_owned(),
+            "validation-library-missing".to_owned(),
+        ];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &missing_ids,
+            )
+            .await
+            .expect_err("missing library task config should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let error_order_ids = vec![
+            "validation-library-missing".to_owned(),
+            "validation-library-a".to_owned(),
+            "validation-library-a".to_owned(),
+        ];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &error_order_ids,
+            )
+            .await
+            .expect_err("the first input error should be preserved");
+        assert!(matches!(
+            error,
+            StorageError::Conflict(message)
+                if message == "媒体库 validation-library-missing 尚未注册任务 RECONCILIATION_SCAN"
+        ));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let plugin_ids = vec!["validation-library-b".to_owned()];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &plugin_ids,
+            )
+            .await
+            .expect_err("mixed plugin source should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+    }
+
+    #[tokio::test]
+    async fn updating_a_plan_moves_removed_libraries_in_bounded_batches() {
+        const LIBRARY_COUNT: usize = 705;
+        const CUSTOM_PLAN_ID: &str = "custom-plan-batch-move";
+        const DEFAULT_PLAN_ID: &str = "default-plan-batch-move";
+
+        let (_temp_dir, database) = test_database().await;
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|index| format!("plan-move-library-{index:03}"))
+            .collect::<Vec<_>>();
+        for (plan_id, plan_name, is_default) in [
+            (CUSTOM_PLAN_ID, "Custom plan", 0_i64),
+            (DEFAULT_PLAN_ID, "Default plan", 1_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_task_plans (
+                    id, task_type, plan_name, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, scope_type, is_default
+                 ) VALUES (?, 'RECONCILIATION_SCAN', ?, 'Scan', 'Scan',
+                           'SYSTEM', NULL, '0 3 * * *', 1, '{}', 'LIBRARY', ?)",
+            )
+            .bind(plan_id)
+            .bind(plan_name)
+            .bind(is_default)
+            .execute(database.pool())
+            .await
+            .expect("scheduled task plan should be inserted");
+        }
+        for library_id in &library_ids {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await
+                .expect("library should be inserted");
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, plan_id
+                 ) VALUES ('LIBRARY', ?, 'RECONCILIATION_SCAN', 'Scan', 'Scan',
+                           'SYSTEM', NULL, '0 3 * * *', 1, '{}', ?)",
+            )
+            .bind(library_id)
+            .bind(CUSTOM_PLAN_ID)
+            .execute(database.pool())
+            .await
+            .expect("library task config should be inserted");
+            sqlx::query(
+                "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+                 VALUES (?, ?)",
+            )
+            .bind(CUSTOM_PLAN_ID)
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("custom plan library should be inserted");
+        }
+
+        let kept_library_id = library_ids[0].clone();
+        database.reset_query_count();
+        database
+            .update_scheduled_task_plan(
+                CUSTOM_PLAN_ID,
+                "Updated plan",
+                Some("0 4 * * *"),
+                true,
+                std::slice::from_ref(&kept_library_id),
+                "Scan",
+                "Scan",
+                "SYSTEM",
+                None,
+                "{}",
+            )
+            .await
+            .expect("plan should be updated");
+
+        assert_eq!(database.query_count(), 16);
+        let custom_member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plan_libraries WHERE plan_id = ?",
+        )
+        .bind(CUSTOM_PLAN_ID)
+        .fetch_one(database.pool())
+        .await
+        .expect("custom plan member count");
+        assert_eq!(custom_member_count, 1);
+        let default_member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plan_libraries WHERE plan_id = ?",
+        )
+        .bind(DEFAULT_PLAN_ID)
+        .fetch_one(database.pool())
+        .await
+        .expect("default plan member count");
+        assert_eq!(default_member_count, (LIBRARY_COUNT - 1) as i64);
+        let moved_config_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_configs
+             WHERE plan_id = ? AND owner_type = 'LIBRARY'",
+        )
+        .bind(DEFAULT_PLAN_ID)
+        .fetch_one(database.pool())
+        .await
+        .expect("moved task config count");
+        assert_eq!(moved_config_count, (LIBRARY_COUNT - 1) as i64);
     }
 
     #[tokio::test]

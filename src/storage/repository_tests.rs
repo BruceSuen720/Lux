@@ -13,6 +13,7 @@ use crate::{
     storage::{
         ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
         NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMetadataCandidate,
+        NewNotificationDestination, NewNotificationEvent,
     },
 };
 
@@ -1283,6 +1284,312 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
 }
 
 #[tokio::test]
+async fn scan_local_metadata_backfill_roots_register_in_one_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Backfill roots", LibraryKind::Movie, false)
+        .await?;
+
+    database.reset_query_count();
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "an empty root list uses one query"
+    );
+
+    for index in 0..4 {
+        let root_path = temp_dir.path().join(format!("root-{index}"));
+        std::fs::create_dir_all(&root_path)?;
+        libraries
+            .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+            .await?;
+    }
+
+    database.reset_query_count();
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        4
+    );
+    assert_eq!(database.query_count(), 1, "four roots use one query");
+    let row_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM scan_local_metadata_backfills")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(row_count, 4);
+
+    database.reset_query_count();
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "idempotent registration uses one query"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn notification_deliveries_are_written_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let mut destination_ids = Vec::new();
+    for index in 0..205 {
+        let id = format!("notification-destination-{index:03}");
+        database
+            .create_notification_destination(NewNotificationDestination {
+                id: &id,
+                name: &id,
+                url: "https://example.test/webhook",
+                enabled: true,
+                allow_private_network: false,
+                event_types_json: "[]",
+                payload_format: "LUX",
+                provider_plugin_id: "builtin.webhook",
+                provider_config_json: "{}",
+            })
+            .await?;
+        destination_ids.push(id);
+    }
+
+    let event_id = "notification-event-batch";
+    let event = || NewNotificationEvent {
+        id: event_id,
+        event_type: "ITEM_ADDED",
+        schema_version: 1,
+        occurred_at: 1_800_000_000,
+        dedupe_key: "notification-event-batch-key",
+        payload_json: "{}",
+    };
+    sqlx::query(
+        "CREATE TRIGGER reject_notification_delivery_batch
+         BEFORE INSERT ON notification_deliveries
+         WHEN NEW.destination_id = 'notification-destination-100'
+         BEGIN
+             SELECT RAISE(ABORT, 'forced delivery batch failure');
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .insert_notification_event_with_deliveries(event(), &destination_ids)
+            .await
+            .is_err()
+    );
+    let rolled_back_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notification_events WHERE id = ?")
+            .bind(event_id)
+            .fetch_one(database.pool())
+            .await?;
+    let rolled_back_deliveries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notification_deliveries WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(rolled_back_events, 0);
+    assert_eq!(rolled_back_deliveries, 0);
+    sqlx::query("DROP TRIGGER reject_notification_delivery_batch")
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    assert!(
+        database
+            .insert_notification_event_with_deliveries(event(), &destination_ids)
+            .await?
+    );
+    assert_eq!(
+        database.query_count(),
+        4,
+        "one event plus three batches of at most 100 deliveries"
+    );
+
+    let delivery_rows: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM notification_deliveries WHERE event_id = ?")
+        .bind(event_id)
+        .fetch_one(database.pool())
+        .await?;
+    let pending_rows: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM notification_deliveries
+             WHERE event_id = ? AND status = 'PENDING'",
+        )
+        .bind(event_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(delivery_rows, 205);
+    assert_eq!(pending_rows, 205);
+
+    database.reset_query_count();
+    assert!(
+        !database
+            .insert_notification_event_with_deliveries(event(), &destination_ids)
+            .await?
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "deduped events skip delivery inserts"
+    );
+
+    database.reset_query_count();
+    assert!(
+        database
+            .insert_notification_event_with_deliveries(
+                NewNotificationEvent {
+                    id: "notification-event-empty",
+                    event_type: "ITEM_ADDED",
+                    schema_version: 1,
+                    occurred_at: 1_800_000_001,
+                    dedupe_key: "notification-event-empty-key",
+                    payload_json: "{}",
+                },
+                &[],
+            )
+            .await?
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "empty destination list only inserts event"
+    );
+
+    let event_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM notification_events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(event_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_notification_deliveries_are_written_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = crate::config::DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let assertions = async {
+        let mut destination_ids = Vec::new();
+        for index in 0..205 {
+            let id = format!("postgres-notification-destination-{index:03}");
+            database
+                .create_notification_destination(NewNotificationDestination {
+                    id: &id,
+                    name: &id,
+                    url: "https://example.test/webhook",
+                    enabled: true,
+                    allow_private_network: false,
+                    event_types_json: "[]",
+                    payload_format: "LUX",
+                    provider_plugin_id: "builtin.webhook",
+                    provider_config_json: "{}",
+                })
+                .await?;
+            destination_ids.push(id);
+        }
+
+        let event_id = "postgres-notification-event-batch";
+        let event = || NewNotificationEvent {
+            id: event_id,
+            event_type: "ITEM_ADDED",
+            schema_version: 1,
+            occurred_at: 1_800_000_000,
+            dedupe_key: "postgres-notification-event-batch-key",
+            payload_json: "{}",
+        };
+        database.reset_query_count();
+        assert!(
+            database
+                .insert_notification_event_with_deliveries(event(), &destination_ids)
+                .await?
+        );
+        assert_eq!(database.query_count(), 4);
+        let delivery_rows: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM notification_deliveries WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(delivery_rows, 205);
+
+        database.reset_query_count();
+        assert!(
+            !database
+                .insert_notification_event_with_deliveries(event(), &destination_ids)
+                .await?
+        );
+        assert_eq!(database.query_count(), 1);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -2207,6 +2514,240 @@ async fn progressive_scan_metadata_completeness_batches_are_atomic_and_versioned
             .prepare_and_claim_item_metadata_completeness_checks(&oversized_checks)
             .await
             .is_err()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_completeness_claims_use_bounded_sql_batches() {
+    const CHECK_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let item_ids = (0..CHECK_COUNT)
+        .map(|index| format!("completeness-batch-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let checks = item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-batch-v1",
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let claimed = database
+        .prepare_and_claim_item_metadata_completeness_checks(&checks)
+        .await
+        .expect("claim completeness batch");
+    assert_eq!(database.query_count(), 6);
+    assert_eq!(claimed, (0..CHECK_COUNT).collect::<Vec<_>>());
+    let running_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness WHERE local_state = 'RUNNING'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("running completeness count");
+    assert_eq!(running_count, CHECK_COUNT as i64);
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_completeness_results_use_bounded_update_batches() {
+    const RESULT_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness result batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let item_ids = (0..RESULT_COUNT)
+        .map(|index| format!("completeness-result-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let checks = item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-result-v1",
+        })
+        .collect::<Vec<_>>();
+    database
+        .prepare_and_claim_item_metadata_completeness_checks(&checks)
+        .await
+        .expect("claim completeness results");
+    let results = item_ids
+        .iter()
+        .enumerate()
+        .map(|(index, item_id)| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-result-v1",
+            is_missing: index % 2 == 0,
+            checked_at: 10,
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let commit = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &results,
+            &[],
+            Some(false),
+        )
+        .await
+        .expect("complete completeness results");
+    assert_eq!(database.query_count(), 4);
+    assert_eq!(commit.updated_count, RESULT_COUNT);
+    let ready_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness WHERE local_state = 'READY'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("ready completeness count");
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness
+         WHERE local_state = 'READY' AND is_missing = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("missing completeness count");
+    assert_eq!(ready_count, RESULT_COUNT as i64);
+    assert_eq!(missing_count, RESULT_COUNT.div_ceil(2) as i64);
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn user_library_order_is_replaced_in_bounded_batches() {
+    const LIBRARY_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user_id = "library-order-batch-user";
+    database
+        .insert_user(
+            user_id,
+            user_id,
+            "Library order user",
+            "test-hash",
+            false,
+            true,
+        )
+        .await
+        .expect("user");
+    let library_ids = (0..LIBRARY_COUNT)
+        .map(|index| format!("library-order-batch-{index:03}"))
+        .collect::<Vec<_>>();
+    for library_id in &library_ids {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(library_id)
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("library");
+    }
+
+    database.reset_query_count();
+    database
+        .replace_user_library_order(user_id, &library_ids)
+        .await
+        .expect("replace library order");
+    assert_eq!(database.query_count(), 4);
+    let stored = database
+        .user_library_order(user_id)
+        .await
+        .expect("library order");
+    assert_eq!(stored, library_ids);
+    let positions: Vec<i64> = sqlx::query_scalar(
+        "SELECT position FROM user_library_order WHERE user_id = ? ORDER BY position",
+    )
+    .bind(user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("stored positions");
+    assert_eq!(positions, (0..LIBRARY_COUNT as i64).collect::<Vec<_>>());
+
+    let mut invalid_ids = library_ids.clone();
+    invalid_ids[LIBRARY_COUNT - 1] = invalid_ids[0].clone();
+    database.reset_query_count();
+    assert!(
+        database
+            .replace_user_library_order(user_id, &invalid_ids)
+            .await
+            .is_err()
+    );
+    assert_eq!(database.query_count(), 4);
+    assert_eq!(
+        database
+            .user_library_order(user_id)
+            .await
+            .expect("rollback order"),
+        library_ids
+    );
+
+    database.reset_query_count();
+    database
+        .replace_user_library_order(user_id, &[])
+        .await
+        .expect("clear library order");
+    assert_eq!(database.query_count(), 1);
+    assert!(
+        database
+            .user_library_order(user_id)
+            .await
+            .expect("cleared library order")
+            .is_empty()
     );
     database.close().await;
 }
@@ -3413,6 +3954,9 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         database: database_name.clone(),
         ..admin_connection
     };
+    let raw_database_url = DatabaseConfiguration::Postgres(connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL test URL")?;
     let database =
         Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
             .await?;
@@ -3467,6 +4011,151 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let check_b = check_b?;
     assert_eq!(check_a.len() + check_b.len(), 2);
     assert!(check_a.is_empty() || check_b.is_empty());
+
+    const DEADLOCK_TEST_ADVISORY_KEY: i64 = 913_579_246_813_579;
+    let raw_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&raw_database_url)
+        .await?;
+    sqlx::query(
+        r#"CREATE FUNCTION test_completeness_lock_order_trigger() RETURNS trigger
+           LANGUAGE plpgsql AS $$
+           BEGIN
+               IF NEW.local_state = 'PENDING' AND NEW.capability = 'DEADLOCK_TEST' THEN
+                   PERFORM pg_advisory_xact_lock(913579246813579);
+                   PERFORM 1 FROM media_items WHERE id = NEW.item_id FOR KEY SHARE;
+               END IF;
+               RETURN NEW;
+           END;
+           $$"#,
+    )
+    .execute(&raw_pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER test_completeness_lock_order
+         BEFORE UPDATE ON item_metadata_completeness
+         FOR EACH ROW EXECUTE FUNCTION test_completeness_lock_order_trigger()",
+    )
+    .execute(&raw_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_metadata_completeness
+             (item_id, capability, local_state, is_missing, input_fingerprint)
+         VALUES ($1, 'DEADLOCK_TEST', 'RUNNING', NULL, $2)",
+    )
+    .bind(&replay_item_id)
+    .bind(b"old".as_slice())
+    .execute(&raw_pool)
+    .await?;
+
+    let mut advisory_connection = raw_pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(DEADLOCK_TEST_ADVISORY_KEY)
+        .execute(&mut *advisory_connection)
+        .await?;
+    let mut parent_transaction = raw_pool.begin().await?;
+    sqlx::query("SELECT id FROM media_items WHERE id = $1 FOR UPDATE")
+        .bind(&replay_item_id)
+        .fetch_one(&mut *parent_transaction)
+        .await?;
+
+    let completion_database = database.clone();
+    let completion_library_id = library.id.to_string();
+    let completion_item_id = replay_item_id.clone();
+    let completion_task = tokio::spawn(async move {
+        let results = [NewItemMetadataCompletenessResult {
+            item_id: &completion_item_id,
+            capability: "DEADLOCK_TEST",
+            input_fingerprint: b"old",
+            is_missing: false,
+            checked_at: 2_000,
+        }];
+        completion_database
+            .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+                &completion_library_id,
+                &results,
+                &[],
+                Some(false),
+            )
+            .await
+    });
+    let mut completion_waiting_for_parent = false;
+    for _ in 0..100 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND query LIKE '%SELECT id FROM media_items%'",
+        )
+        .fetch_one(&raw_pool)
+        .await?;
+        if waiting > 0 {
+            completion_waiting_for_parent = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        completion_waiting_for_parent,
+        "completion transaction did not reach the parent-row lock"
+    );
+
+    let claim_database = database.clone();
+    let claim_item_id = replay_item_id.clone();
+    let claim_task = tokio::spawn(async move {
+        let checks = [NewItemMetadataCompletenessCheck {
+            item_id: &claim_item_id,
+            capability: "DEADLOCK_TEST",
+            input_fingerprint: b"new",
+        }];
+        claim_database
+            .prepare_and_claim_item_metadata_completeness_checks(&checks)
+            .await
+    });
+    parent_transaction.commit().await?;
+
+    let mut claim_waiting_for_advisory = false;
+    for _ in 0..300 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks
+             WHERE locktype = 'advisory' AND granted = false",
+        )
+        .fetch_one(&raw_pool)
+        .await?;
+        if waiting > 0 {
+            claim_waiting_for_advisory = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        claim_waiting_for_advisory,
+        "claim transaction did not reach the controlled parent-lock point"
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(DEADLOCK_TEST_ADVISORY_KEY)
+        .execute(&mut *advisory_connection)
+        .await?;
+    let (claim_result, completion_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(claim_task, completion_task)
+        })
+        .await?;
+    let claim_result = claim_result.map_err(|error| std::io::Error::other(error.to_string()))??;
+    let completion_result =
+        completion_result.map_err(|error| std::io::Error::other(error.to_string()))??;
+    assert_eq!(claim_result, vec![0]);
+    assert_eq!(completion_result.updated_count, 1);
+    sqlx::query(
+        "DELETE FROM item_metadata_completeness
+         WHERE item_id = $1 AND capability = 'DEADLOCK_TEST'",
+    )
+    .bind(&replay_item_id)
+    .execute(&raw_pool)
+    .await?;
+    drop(advisory_connection);
+    raw_pool.close().await;
+
     let completeness_results = [
         NewItemMetadataCompletenessResult {
             item_id: &item_id,
@@ -5417,6 +6106,120 @@ async fn collection_refresh_uses_provider_index_and_batch_insert() {
 }
 
 #[tokio::test]
+async fn emby_collection_member_mutations_use_bounded_batches() {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Manual collections", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let other_library = LibraryService::new(database.clone())
+        .create_library("Other manual collections", LibraryKind::Movie, false)
+        .await
+        .expect("other library");
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("manual-collection-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let foreign_item_id = "manual-collection-foreign";
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+    )
+    .bind(foreign_item_id)
+    .bind(other_library.id.to_string())
+    .bind(foreign_item_id)
+    .bind(foreign_item_id)
+    .execute(database.pool())
+    .await
+    .expect("foreign media item");
+    let removed_item_id = "manual-collection-removed";
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status, removed_at
+         ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', unixepoch())",
+    )
+    .bind(removed_item_id)
+    .bind(&library_id)
+    .bind(removed_item_id)
+    .bind(removed_item_id)
+    .execute(database.pool())
+    .await
+    .expect("removed media item");
+
+    let collection = database
+        .create_emby_collection("Manual batch", &[item_ids[0].clone()])
+        .await
+        .expect("create collection")
+        .expect("collection");
+    let mut requested_ids = item_ids.clone();
+    requested_ids.extend([foreign_item_id.to_owned(), removed_item_id.to_owned()]);
+
+    database.reset_query_count();
+    database
+        .add_emby_collection_items(&collection.collection_item_id, &requested_ids)
+        .await
+        .expect("add collection members")
+        .expect("collection exists");
+    assert_eq!(database.query_count(), 5);
+    let stored_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT mi.id
+         FROM collection_items ci
+         JOIN collections c ON c.id = ci.collection_id
+         JOIN media_items mi ON mi.id = ci.item_id
+         WHERE c.item_id = ?
+         ORDER BY ci.sort_order, mi.id",
+    )
+    .bind(&collection.collection_item_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("stored collection members");
+    assert_eq!(stored_ids, item_ids);
+
+    database.reset_query_count();
+    database
+        .remove_emby_collection_items(&collection.collection_item_id, &requested_ids)
+        .await
+        .expect("remove collection members")
+        .expect("collection exists");
+    assert_eq!(database.query_count(), 2);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM collection_items ci
+         JOIN collections c ON c.id = ci.collection_id
+         WHERE c.item_id = ?",
+    )
+    .bind(&collection.collection_item_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining collection members");
+    assert_eq!(remaining, 0);
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn favorite_catalog_filter_uses_favorite_state_index() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -6630,10 +7433,28 @@ async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_perso
         .expect("first canonical person");
 
     let error = database
-        .restore_canonical_person("lux-000002", "另一位演员", &[("tmdb", "57975")])
+        .restore_canonical_person(
+            "lux-000002",
+            "另一位演员",
+            &[("douban", "new-id"), ("tmdb", "57975")],
+        )
         .await
         .expect_err("conflicting manifest must be rejected");
     assert!(matches!(error, StorageError::Conflict(_)));
+    let new_identity_owner: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities
+         WHERE provider = 'douban' AND provider_id = 'new-id'",
+    )
+    .fetch_optional(database.pool())
+    .await
+    .expect("new identity lookup");
+    assert!(new_identity_owner.is_none());
+    let restored_person: Option<String> =
+        sqlx::query_scalar("SELECT id FROM people WHERE id = 'lux-000002'")
+            .fetch_optional(database.pool())
+            .await
+            .expect("restored person lookup");
+    assert!(restored_person.is_none());
     assert_eq!(
         database
             .find_canonical_person_by_identity("tmdb", "57975")
@@ -6643,6 +7464,67 @@ async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_perso
             .id,
         "lux-000001"
     );
+}
+
+#[tokio::test]
+async fn restoring_a_person_manifest_batches_identity_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let identities = [
+        ("tmdb", "57975"),
+        ("douban", "1313123"),
+        ("imdb", "nm0000001"),
+        ("anilist", "42"),
+    ];
+
+    database.reset_query_count();
+    database
+        .restore_canonical_person("lux-000001", "华晨宇", &identities)
+        .await
+        .expect("restore person");
+
+    assert_eq!(database.query_count(), 5);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_identities WHERE person_id = 'lux-000001'")
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+    assert_eq!(identity_count, identities.len() as i64);
+}
+
+#[tokio::test]
+async fn restoring_a_person_manifest_chunks_large_identity_sets() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let owned_identities = (0..205)
+        .map(|index| ("tmdb".to_owned(), format!("id-{index}")))
+        .collect::<Vec<_>>();
+    let identities = owned_identities
+        .iter()
+        .map(|(provider, provider_id)| (provider.as_str(), provider_id.as_str()))
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    database
+        .restore_canonical_person("lux-000001", "Person", &identities)
+        .await
+        .expect("restore person with many identities");
+
+    assert_eq!(database.query_count(), 9);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_identities WHERE person_id = 'lux-000001'")
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+    assert_eq!(identity_count, owned_identities.len() as i64);
 }
 
 #[tokio::test]
@@ -8619,6 +9501,378 @@ async fn chapter_detection_job_creation_is_atomic_per_library() {
 }
 
 #[tokio::test]
+async fn chapter_detection_job_items_are_inserted_in_bounded_batches() {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Chapter batch", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('chapter-season-batch', ?, 'SEASON', 'Season 1', 'season-1', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("season item");
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < ?
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         )
+         SELECT 'chapter-item-' || value, ?, 'EPISODE', 'Episode ' || value,
+                'episode-' || value, 'LOCAL_CONFIRMED'
+         FROM sequence",
+    )
+    .bind(ITEM_COUNT as i64)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("episode items");
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < ?
+         )
+         INSERT INTO media_sources (id, item_id, source_kind, probe_status)
+         SELECT 'chapter-source-' || value, 'chapter-item-' || value, 'LOCAL_FILE', 'READY'
+         FROM sequence",
+    )
+    .bind(ITEM_COUNT as i64)
+    .execute(database.pool())
+    .await
+    .expect("media sources");
+
+    let source_ids = (1..=ITEM_COUNT)
+        .map(|index| format!("chapter-source-{index}"))
+        .collect::<Vec<_>>();
+    let item_ids = (1..=ITEM_COUNT)
+        .map(|index| format!("chapter-item-{index}"))
+        .collect::<Vec<_>>();
+    let job_id = "chapter-job-batch-insert";
+    let new_job = |id| NewChapterDetectionJob {
+        id,
+        library_id: &library_id,
+        plugin_id: "org.lux.intro-outro-detector",
+        concurrency: 1,
+        intro_window_seconds: 180,
+        credits_window_seconds: 180,
+        match_threshold: 0.8,
+        total_count: ITEM_COUNT as i64,
+    };
+    assert!(
+        database
+            .create_chapter_detection_job(new_job(job_id))
+            .await
+            .expect("create chapter job")
+    );
+
+    database.reset_query_count();
+    database
+        .insert_chapter_detection_job_items(&[])
+        .await
+        .expect("empty input should be a no-op");
+    assert_eq!(database.query_count(), 0);
+
+    let input_fingerprint = [0x24; 32];
+    let source_fingerprint = b"source-fingerprint";
+    let items = source_ids
+        .iter()
+        .zip(&item_ids)
+        .enumerate()
+        .map(|(index, (source_id, item_id))| NewChapterDetectionJobItem {
+            job_id,
+            source_id,
+            item_id,
+            season_id: "chapter-season-batch",
+            source_fingerprint,
+            input_fingerprint: &input_fingerprint,
+            is_context: index % 2 == 0,
+        })
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .insert_chapter_detection_job_items(&items)
+        .await
+        .expect("insert chapter job items");
+    assert_eq!(database.query_count(), 3);
+    let persisted_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_detection_job_items WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("persisted item count");
+    assert_eq!(persisted_count, ITEM_COUNT as i64);
+    let context_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chapter_detection_job_items
+         WHERE job_id = ? AND is_context = 1",
+    )
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("context item count");
+    assert_eq!(context_count, ITEM_COUNT.div_ceil(2) as i64);
+    let stored_item: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT status, source_fingerprint, input_fingerprint
+         FROM chapter_detection_job_items WHERE job_id = ? AND source_id = ?",
+    )
+    .bind(job_id)
+    .bind(&source_ids[0])
+    .fetch_one(database.pool())
+    .await
+    .expect("stored item fields");
+    assert_eq!(stored_item.0, "PENDING");
+    assert_eq!(stored_item.1, source_fingerprint);
+    assert_eq!(stored_item.2, input_fingerprint);
+
+    sqlx::query("UPDATE chapter_detection_jobs SET status = 'COMPLETED' WHERE id = ?")
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .expect("complete first job");
+    let rollback_job_id = "chapter-job-batch-rollback";
+    assert!(
+        database
+            .create_chapter_detection_job(new_job(rollback_job_id))
+            .await
+            .expect("create rollback job")
+    );
+    let mut invalid_items = source_ids
+        .iter()
+        .zip(&item_ids)
+        .map(|(source_id, item_id)| NewChapterDetectionJobItem {
+            job_id: rollback_job_id,
+            source_id,
+            item_id,
+            season_id: "chapter-season-batch",
+            source_fingerprint,
+            input_fingerprint: &input_fingerprint,
+            is_context: false,
+        })
+        .collect::<Vec<_>>();
+    invalid_items[ITEM_COUNT - 1].source_id = &source_ids[0];
+    assert!(
+        database
+            .insert_chapter_detection_job_items(&invalid_items)
+            .await
+            .is_err()
+    );
+    let rolled_back_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_detection_job_items WHERE job_id = ?")
+            .bind(rollback_job_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("rolled back item count");
+    assert_eq!(rolled_back_count, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn media_probe_streams_are_replaced_in_bounded_batches() {
+    const STREAM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Probe batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('probe-batch-item', ?, 'MOVIE', 'Probe', 'probe', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, container, probe_status)
+         VALUES ('probe-batch-source', 'probe-batch-item', 'LOCAL_FILE', 'mp4', 'PENDING')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("media source");
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type)
+         VALUES ('probe-stale-stream', 'probe-batch-source', 999, 'AUDIO')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("stale stream");
+
+    let new_stream = |index: usize, stream_index: i64| {
+        let stream_type = match index % 3 {
+            0 => "VIDEO",
+            1 => "AUDIO",
+            _ => "SUBTITLE",
+        };
+        let is_external = stream_type == "SUBTITLE";
+        MediaStreamUpdate {
+            stream_index,
+            stream_type,
+            codec: Some("test-codec"),
+            language: Some("eng"),
+            title: Some("Test stream"),
+            details_json: Some(r#"{"generated":true}"#),
+            external_path: is_external.then_some("subs/eng.srt"),
+            is_external,
+            is_default: index == 0,
+            is_forced: index == 5,
+        }
+    };
+    let streams = (0..STREAM_COUNT)
+        .map(|index| new_stream(index, index as i64))
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .save_media_probe(MediaProbeUpdate {
+            source_id: "probe-batch-source",
+            container: Some("mkv"),
+            source_size: Some(42),
+            duration_ticks: Some(456),
+            bitrate: Some(789),
+            streams: &streams,
+        })
+        .await
+        .expect("save probe result");
+    assert_eq!(database.query_count(), 5);
+
+    let stored_indices: Vec<i64> = sqlx::query_scalar(
+        "SELECT stream_index FROM media_streams
+         WHERE media_source_id = 'probe-batch-source' ORDER BY stream_index",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("stored stream indexes");
+    assert_eq!(stored_indices, (0..STREAM_COUNT as i64).collect::<Vec<_>>());
+    #[derive(sqlx::FromRow)]
+    struct StoredMediaStream {
+        stream_type: String,
+        codec: Option<String>,
+        language: Option<String>,
+        title: Option<String>,
+        details_json: Option<String>,
+        is_external: i64,
+        is_default: i64,
+        is_forced: i64,
+    }
+    let stored_subtitle: StoredMediaStream = sqlx::query_as(
+        "SELECT stream_type, codec, language, title, details_json, is_external, is_default, is_forced
+         FROM media_streams
+         WHERE media_source_id = 'probe-batch-source' AND stream_index = 2",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored subtitle stream");
+    assert_eq!(stored_subtitle.stream_type, "SUBTITLE");
+    assert_eq!(stored_subtitle.codec.as_deref(), Some("test-codec"));
+    assert_eq!(stored_subtitle.language.as_deref(), Some("eng"));
+    assert_eq!(stored_subtitle.title.as_deref(), Some("Test stream"));
+    assert_eq!(
+        stored_subtitle.details_json.as_deref(),
+        Some(r#"{"generated":true}"#)
+    );
+    assert_eq!(stored_subtitle.is_external, 1);
+    assert_eq!(stored_subtitle.is_default, 0);
+    assert_eq!(stored_subtitle.is_forced, 0);
+    let stored_external_path: Option<String> = sqlx::query_scalar(
+        "SELECT external_path FROM media_streams
+         WHERE media_source_id = 'probe-batch-source' AND stream_index = 2",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored external subtitle path");
+    assert_eq!(stored_external_path.as_deref(), Some("subs/eng.srt"));
+
+    let mut invalid_streams = (0..STREAM_COUNT)
+        .map(|index| new_stream(index, index as i64))
+        .collect::<Vec<_>>();
+    invalid_streams[STREAM_COUNT - 1].stream_index = 0;
+    database.reset_query_count();
+    assert!(
+        database
+            .save_media_probe(MediaProbeUpdate {
+                source_id: "probe-batch-source",
+                container: Some("invalid"),
+                source_size: Some(100),
+                duration_ticks: Some(200),
+                bitrate: Some(300),
+                streams: &invalid_streams,
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(database.query_count(), 5);
+    let retained_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams WHERE media_source_id = 'probe-batch-source'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("retained stream count after rollback");
+    assert_eq!(retained_count, STREAM_COUNT as i64);
+    let retained_source: (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT container, size, duration_ticks, bitrate, probe_status
+             FROM media_sources WHERE id = 'probe-batch-source'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("retained media source after rollback");
+    assert_eq!(
+        retained_source,
+        (
+            Some("mp4".to_owned()),
+            Some(42),
+            Some(456),
+            Some(789),
+            "READY".to_owned()
+        )
+    );
+
+    database.reset_query_count();
+    database
+        .save_media_probe(MediaProbeUpdate {
+            source_id: "probe-batch-source",
+            container: None,
+            source_size: None,
+            duration_ticks: None,
+            bitrate: None,
+            streams: &[],
+        })
+        .await
+        .expect("save probe result with no streams");
+    assert_eq!(database.query_count(), 2);
+    let empty_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams WHERE media_source_id = 'probe-batch-source'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("empty stream count");
+    assert_eq!(empty_count, 0);
+    database.close().await;
+}
+
+#[tokio::test]
 async fn scan_job_status_counts_are_aggregated_in_storage() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -8660,6 +9914,206 @@ async fn scan_job_status_counts_are_aggregated_in_storage() {
             failed: 1,
         }
     );
+}
+
+#[tokio::test]
+async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Filesystem entry updates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root = temp_dir.path().join("filesystem-entry-updates");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().expect("UTF-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "filesystem-entry-update",
+            library_root_id: &root_id,
+            relative_path: "movie.mkv",
+            entry_kind: "FILE",
+            size: 10,
+            modified_at: 20,
+            inode: Some(30),
+            fingerprint: b"old-fingerprint",
+            last_seen_generation: "old-generation",
+        })
+        .await
+        .expect("filesystem entry");
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'filesystem-entry-update'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("mark filesystem entry missing");
+
+    database.reset_query_count();
+    database
+        .update_filesystem_entry(
+            "filesystem-entry-update",
+            40,
+            50,
+            b"new-fingerprint",
+            Some(60),
+            "new-generation",
+        )
+        .await
+        .expect("filesystem entry update");
+    assert_eq!(database.query_count(), 2);
+
+    let updated: (i64, i64, Option<i64>, Vec<u8>, String, i64) = sqlx::query_as(
+        "SELECT size, modified_at, inode, fingerprint, last_seen_generation, is_missing
+         FROM filesystem_entries WHERE id = 'filesystem-entry-update'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("updated filesystem entry");
+    assert_eq!(
+        updated,
+        (
+            40,
+            50,
+            Some(60),
+            b"new-fingerprint".to_vec(),
+            "new-generation".to_owned(),
+            0,
+        )
+    );
+
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'filesystem-entry-update'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("mark filesystem entry missing again");
+    database.reset_query_count();
+    database
+        .mark_filesystem_entry_seen("filesystem-entry-update", "seen-generation", Some(70))
+        .await
+        .expect("mark filesystem entry seen");
+    assert_eq!(database.query_count(), 2);
+
+    let seen: (Option<i64>, String, i64) = sqlx::query_as(
+        "SELECT inode, last_seen_generation, is_missing
+         FROM filesystem_entries WHERE id = 'filesystem-entry-update'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("seen filesystem entry");
+    assert_eq!(seen, (Some(70), "seen-generation".to_owned(), 0));
+}
+
+#[tokio::test]
+async fn incremental_scan_paths_are_enqueued_with_bounded_sql_and_last_change_wins() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Incremental queue", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root = temp_dir.path().join("incremental-queue");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().expect("UTF-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    database
+        .create_scan_job(
+            "incremental-queue-job",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "generation",
+            0,
+            false,
+        )
+        .await
+        .expect("scan job");
+
+    database.reset_query_count();
+    database
+        .enqueue_incremental_scan_path(
+            "incremental-queue-job",
+            &root_id,
+            "folder/file-000.mkv",
+            "CREATE",
+        )
+        .await
+        .expect("initial incremental path");
+    assert_eq!(database.query_count(), 2);
+    sqlx::query(
+        "UPDATE scan_job_paths SET processed_at = 1
+         WHERE job_id = 'incremental-queue-job' AND relative_path = 'folder/file-000.mkv'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("mark initial path processed");
+
+    let mut paths = (0..205)
+        .map(|index| {
+            (
+                root_id.clone(),
+                format!("folder/file-{index:03}.mkv"),
+                "CREATE".to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    paths.push((
+        root_id.clone(),
+        "folder/file-000.mkv".to_owned(),
+        "MODIFY".to_owned(),
+    ));
+    let paths = paths
+        .iter()
+        .map(|(root_id, relative_path, change_kind)| {
+            (
+                root_id.as_str(),
+                relative_path.as_str(),
+                change_kind.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    database
+        .enqueue_incremental_scan_paths("incremental-queue-job", &paths)
+        .await
+        .expect("incremental paths");
+
+    assert_eq!(database.query_count(), 6);
+    let stored: (i64, i64, String, Option<i64>) = sqlx::query_as(
+        "SELECT job.total_count,
+                (SELECT COUNT(*) FROM scan_job_paths WHERE job_id = job.id),
+                path.change_kind, path.processed_at
+         FROM scan_jobs job
+         JOIN scan_job_paths path ON path.job_id = job.id
+         WHERE job.id = 'incremental-queue-job'
+           AND path.relative_path = 'folder/file-000.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored incremental paths");
+    assert_eq!(stored, (205, 205, "MODIFY".to_owned(), None));
 }
 
 #[tokio::test]
@@ -9040,6 +10494,36 @@ async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
             .await
             .expect("claim first run")
     );
+    assert!(
+        database
+            .update_person_index_rebuild_progress(&library_id, "run-a", "item-a", 1, 2)
+            .await
+            .expect("record first run progress")
+            .is_some()
+    );
+    assert!(
+        database
+            .request_person_index_rebuild_job_cancel(&library_id)
+            .await
+            .expect("request first run cancellation")
+    );
+    let active_jobs = database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("keep a current run active");
+    assert_eq!(active_jobs[0].status, "RUNNING");
+    let active_job: (Option<String>, i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT cursor_id, processed_count, total_count, cancel_requested, run_token
+         FROM person_index_rebuild_jobs WHERE library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("current run fields");
+    assert_eq!(
+        active_job,
+        (Some("item-a".to_owned()), 1, 2, 1, Some("run-a".to_owned()))
+    );
     sqlx::query(
         "UPDATE person_index_rebuild_jobs
              SET updated_at = unixepoch() - 61
@@ -9123,6 +10607,133 @@ async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
         .expect("list jobs");
     assert_eq!(jobs[0].status, "COMPLETED");
     assert_eq!(jobs[0].processed_count, 2);
+}
+
+#[tokio::test]
+async fn syncing_person_rebuild_jobs_batches_libraries_and_skips_noop_updates() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let mut enabled_library_ids = Vec::new();
+    for index in 0..4 {
+        let library = libraries
+            .create_library(&format!("People {index}"), LibraryKind::Movie, false)
+            .await
+            .expect("enabled library");
+        enabled_library_ids.push(library.id.to_string());
+    }
+    let disabled_library = libraries
+        .create_library("Disabled People", LibraryKind::Movie, false)
+        .await
+        .expect("disabled library");
+    let disabled_library_id = disabled_library.id.to_string();
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(&disabled_library_id)
+        .execute(database.pool())
+        .await
+        .expect("disable library");
+
+    database.reset_query_count();
+    let jobs = database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("create jobs for enabled libraries");
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(jobs.len(), enabled_library_ids.len());
+    let disabled_job_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_index_rebuild_jobs WHERE library_id = ?")
+            .bind(&disabled_library_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("disabled library job count");
+    assert_eq!(disabled_job_count, 0);
+
+    sqlx::query("CREATE TABLE person_index_rebuild_update_probe (count INTEGER NOT NULL)")
+        .execute(database.pool())
+        .await
+        .expect("create update probe");
+    sqlx::query("INSERT INTO person_index_rebuild_update_probe (count) VALUES (0)")
+        .execute(database.pool())
+        .await
+        .expect("initialize update probe");
+    sqlx::query(
+        "CREATE TRIGGER person_index_rebuild_update_probe_trigger
+         AFTER UPDATE ON person_index_rebuild_jobs
+         BEGIN
+             UPDATE person_index_rebuild_update_probe SET count = count + 1;
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("create update trigger");
+
+    database.reset_query_count();
+    database
+        .sync_person_index_rebuild_jobs(1)
+        .await
+        .expect("sync unchanged jobs");
+    assert_eq!(database.query_count(), 2);
+    let unchanged_update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_index_rebuild_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("unchanged update count");
+    assert_eq!(unchanged_update_count, 0);
+
+    sqlx::query(
+        "UPDATE person_index_rebuild_jobs
+         SET status = 'RUNNING', cursor_id = 'checkpoint', processed_count = 2,
+             total_count = 4, cancel_requested = 1, run_token = 'run-token', error = 'old'
+         WHERE library_id = ?",
+    )
+    .bind(&enabled_library_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("prepare old-schema job");
+    sqlx::query("UPDATE person_index_rebuild_update_probe SET count = 0")
+        .execute(database.pool())
+        .await
+        .expect("reset update probe");
+
+    database.reset_query_count();
+    database
+        .sync_person_index_rebuild_jobs(2)
+        .await
+        .expect("reset jobs for new schema");
+    assert_eq!(database.query_count(), 2);
+    type PersonIndexRebuildSchemaResetRow = (
+        i64,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+    let schema_changed: PersonIndexRebuildSchemaResetRow = sqlx::query_as(
+        "SELECT schema_version, status, cursor_id, processed_count, total_count,
+                    cancel_requested, run_token, error
+             FROM person_index_rebuild_jobs WHERE library_id = ?",
+    )
+    .bind(&enabled_library_ids[0])
+    .fetch_one(database.pool())
+    .await
+    .expect("schema-changed job");
+    assert_eq!(
+        schema_changed,
+        (2, "QUEUED".to_owned(), None, 0, 0, 0, None, None)
+    );
+    let schema_change_update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_index_rebuild_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("schema change update count");
+    assert_eq!(schema_change_update_count, enabled_library_ids.len() as i64);
 }
 
 #[tokio::test]

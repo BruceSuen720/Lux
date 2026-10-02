@@ -4,8 +4,11 @@ export type PlaybackTimelineSnapshot = {
   bufferedEnd: number;
 };
 
-type FrameRequest = (callback: () => void) => number;
-type FrameCancel = (frameId: number) => void;
+type FrameHandle =
+  | { kind: "animation"; id: number }
+  | { kind: "timeout"; id: ReturnType<typeof setTimeout> };
+type FrameRequest = (callback: () => void) => FrameHandle;
+type FrameCancel = (frame: FrameHandle) => void;
 
 export type PlaybackTimelineSchedulerOptions = {
   /** Minimum interval between non-critical React timeline updates. */
@@ -15,16 +18,18 @@ export type PlaybackTimelineSchedulerOptions = {
 
 const defaultRequestFrame: FrameRequest = (callback) => {
   if (typeof globalThis.requestAnimationFrame === "function") {
-    return globalThis.requestAnimationFrame(callback);
+    return { kind: "animation", id: globalThis.requestAnimationFrame(callback) };
   }
-  return globalThis.setTimeout(callback, 0) as unknown as number;
+  return { kind: "timeout", id: globalThis.setTimeout(callback, 0) };
 };
 
-const defaultCancelFrame: FrameCancel = (frameId) => {
-  if (typeof globalThis.cancelAnimationFrame === "function") {
-    globalThis.cancelAnimationFrame(frameId);
+const defaultCancelFrame: FrameCancel = (frame) => {
+  if (frame.kind === "animation") {
+    if (typeof globalThis.cancelAnimationFrame === "function") {
+      globalThis.cancelAnimationFrame(frame.id);
+    }
   } else {
-    globalThis.clearTimeout(frameId as unknown as ReturnType<typeof setTimeout>);
+    globalThis.clearTimeout(frame.id);
   }
 };
 
@@ -38,7 +43,7 @@ export function createPlaybackTimelineScheduler(
   const minIntervalMs = Math.max(0, options.minIntervalMs ?? 0);
   const now = options.now ?? (() => Date.now());
   let pending: PlaybackTimelineSnapshot | null = null;
-  let frameId: number | null = null;
+  let frameId: FrameHandle | null = null;
   let lastFlushAt = Number.NEGATIVE_INFINITY;
 
   const flush = (immediate = false) => {

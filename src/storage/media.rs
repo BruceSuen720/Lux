@@ -1,6 +1,9 @@
 use super::*;
 use std::time::Instant;
 
+const EMBY_COLLECTION_MEMBER_INSERT_BATCH_SIZE: usize = 100;
+const EMBY_COLLECTION_MEMBER_DELETE_BATCH_SIZE: usize = 500;
+
 struct BatchHierarchyRow {
     id: String,
     library_id: String,
@@ -3772,19 +3775,28 @@ impl Database {
         let collection_id = row.get::<String, _>("id");
         let library_id = row.get::<String, _>("library_id");
         let title = row.get::<String, _>("title");
-        for item_id in item_ids {
-            self.query(
+        for chunk in item_ids.chunks(EMBY_COLLECTION_MEMBER_DELETE_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "DELETE FROM collection_items
-                 WHERE collection_id = ? AND item_id = ?",
-            )
-            .bind(&collection_id)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 WHERE collection_id = ? AND item_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(&collection_id);
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()
@@ -3807,8 +3819,15 @@ impl Database {
         library_id: &str,
         item_ids: &[String],
     ) -> Result<(), StorageError> {
-        let collection_id = self
-            .query_scalar::<String>("SELECT id FROM collections WHERE item_id = ?")
+        let row = self
+            .query(
+                "SELECT c.id,
+                        COALESCE(MAX(ci.sort_order), -1) AS max_sort_order
+                 FROM collections c
+                 LEFT JOIN collection_items ci ON ci.collection_id = c.id
+                 WHERE c.item_id = ?
+                 GROUP BY c.id",
+            )
             .bind(collection_item_id)
             .fetch_one(&mut **transaction)
             .await
@@ -3816,41 +3835,46 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let mut sort_order = self
-            .query_scalar::<Option<i64>>(
-                "SELECT MAX(sort_order) FROM collection_items WHERE collection_id = ?",
-            )
-            .bind(&collection_id)
-            .fetch_one(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .unwrap_or(-1);
+        let collection_id = row.get::<String, _>("id");
+        let mut sort_order = row.get::<i64, _>("max_sort_order");
         let mut seen = HashSet::new();
+        let mut rows = Vec::with_capacity(item_ids.len());
         for item_id in item_ids {
             if !seen.insert(item_id) {
                 continue;
             }
             sort_order = sort_order.saturating_add(1);
-            self.query(
-                "INSERT INTO collection_items (collection_id, item_id, sort_order)
-                 SELECT ?, mi.id, ?
-                 FROM media_items mi
-                 WHERE mi.id = ? AND mi.library_id = ? AND mi.removed_at IS NULL
-                 ON CONFLICT (collection_id, item_id) DO NOTHING",
-            )
-            .bind(&collection_id)
-            .bind(sort_order)
-            .bind(item_id)
-            .bind(library_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            rows.push((item_id.as_str(), sort_order));
+        }
+        for chunk in rows.chunks(EMBY_COLLECTION_MEMBER_INSERT_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(item_id, sort_order) AS (VALUES {values})
+                 INSERT INTO collection_items (collection_id, item_id, sort_order)
+                 SELECT ?, mi.id, requested.sort_order
+                 FROM requested
+                 JOIN media_items mi ON mi.id = requested.item_id
+                 WHERE mi.library_id = ? AND mi.removed_at IS NULL
+                 ON CONFLICT (collection_id, item_id) DO NOTHING"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (item_id, sort_order) in chunk {
+                statement = statement.bind(item_id).bind(*sort_order);
+            }
+            statement
+                .bind(&collection_id)
+                .bind(library_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }

@@ -4,7 +4,6 @@ import {
   activeDanmaku,
   assignDanmakuLanes,
   DANMAKU_LIMITS,
-  parseBilibiliDanmaku,
   exceedsUtf8ByteLimit,
   type DanmakuPlacement,
   type LuxDanmakuEntry,

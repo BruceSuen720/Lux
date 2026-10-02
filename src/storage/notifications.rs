@@ -1,5 +1,8 @@
 use super::*;
 
+// Three bind parameters per delivery keep each statement below SQLite's conservative limit.
+const MAX_NOTIFICATION_DELIVERY_INSERT_BATCH_SIZE: usize = 100;
+
 impl Database {
     pub(crate) async fn create_notification_destination(
         &self,
@@ -182,22 +185,34 @@ impl Database {
                 source,
             })?;
         if inserted {
-            for destination_id in destination_ids {
-                self.query(
+            for batch in destination_ids.chunks(MAX_NOTIFICATION_DELIVERY_INSERT_BATCH_SIZE) {
+                let mut sql = String::from(
                     "INSERT INTO notification_deliveries (
                         id, event_id, destination_id, status
-                     ) VALUES (?, ?, ?, 'PENDING')
-                     ON CONFLICT(event_id, destination_id) DO NOTHING",
-                )
-                .bind(Uuid::now_v7().to_string())
-                .bind(event.id)
-                .bind(destination_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                     ) VALUES ",
+                );
+                let values = batch
+                    .iter()
+                    .map(|_| "(?, ?, ?, 'PENDING')")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                sql.push_str(&values);
+                sql.push_str(" ON CONFLICT(event_id, destination_id) DO NOTHING");
+
+                let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+                for destination_id in batch {
+                    statement = statement
+                        .bind(Uuid::now_v7().to_string())
+                        .bind(event.id)
+                        .bind(destination_id);
+                }
+                statement
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             }
         }
         transaction

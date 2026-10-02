@@ -28,7 +28,6 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
-import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
 import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";

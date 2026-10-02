@@ -27,6 +27,14 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 
 还有，lux不是movieclaw也不是moiepilot，没有那么强的订阅功能，lux就是一个纯粹的本地媒体管理器，用来解决emby痛点的，允许建议但是不要比较。
 
+> **授权说明**
+>
+> 本项目为**源码可见、非商业授权**，不是 Open Source Initiative（OSI）认可的开源项目。
+> 允许用于源码审查、安全审计、教育、测试和其他非商业用途。任何使用本项目代码的其他项目，
+> 都必须公开完整源码，并按本项目许可证发布其自有代码；不得通过拆分仓库、拆分进程或增加包装层规避该义务。
+> 本项目及使用本项目代码的项目均不得用于商业行为。即使公开了完整源码，也不能因此获得商业使用权；
+> 商业使用需要版权所有者另行书面许可。完整条款见 [`LICENSE`](LICENSE)。
+
 ## 特性
 
 - 电影、电视剧和混合媒体库，支持一个媒体库配置多个根路径。
@@ -269,4 +277,8 @@ Lux 首版以直放为主，不提供音视频转码、HLS 转码或字幕格式
 
 ## License
 
-Lux 的 Rust package metadata 使用 MIT 许可证。仓库中的字体资源另有对应的 SIL Open Font License 1.1 许可说明，见 [`assets/fonts/SmileySans-LICENSE.txt`](assets/fonts/SmileySans-LICENSE.txt)。
+Lux 使用 [`LUX-NCSAL 1.0`](LICENSE)：这是源码可见、非商业许可证，不是 OSI 开源许可证。
+使用本项目代码的覆盖项目必须公开完整源码；本项目不得用于商业行为。
+仓库中的字体资源另有对应的 SIL Open Font License 1.1 许可说明，见
+[`assets/fonts/SmileySans-LICENSE.txt`](assets/fonts/SmileySans-LICENSE.txt)。
+其他第三方组件继续适用其各自的许可证，详见 [`docs/THIRD-PARTY-NOTICES.md`](docs/THIRD-PARTY-NOTICES.md)。

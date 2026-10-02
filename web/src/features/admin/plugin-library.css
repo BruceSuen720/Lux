@@ -495,7 +495,8 @@
   }
 
   .lux-admin-plugin-grid > .lux-admin-plugin-card,
-  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd) {
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd),
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(even) {
     padding-right: 12px;
     padding-left: 12px;
     border-right: 0;
@@ -521,7 +522,8 @@
   }
 
   .lux-admin-plugin-grid > .lux-admin-plugin-card,
-  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd) {
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(odd),
+  .lux-admin-plugin-grid > .lux-admin-plugin-card:nth-child(even) {
     padding-right: 4px;
     padding-left: 4px;
   }

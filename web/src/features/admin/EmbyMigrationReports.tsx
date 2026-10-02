@@ -24,7 +24,7 @@ export function useMigrationReport(jobId: string | null, tab: ReportTab, page: n
   });
 }
 
-export function EmbyMigrationReports({ jobId, tab, report, onTabChange, onPageChange }: { jobId: string; tab: ReportTab; report: ReturnType<typeof useMigrationReport>; onTabChange: (tab: ReportTab) => void; onPageChange: (page: number) => void }) {
+export function EmbyMigrationReports({ tab, report, onTabChange, onPageChange }: { tab: ReportTab; report: ReturnType<typeof useMigrationReport>; onTabChange: (tab: ReportTab) => void; onPageChange: (page: number) => void }) {
   return (
     <div className="lux-emby-report-content">
       <div className="lux-emby-report-tabs" role="tablist" aria-label="迁移报告">

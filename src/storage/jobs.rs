@@ -8,6 +8,8 @@ const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+// Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
+const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
 const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
     WHEN item_type IN ('MOVIE', 'SERIES') THEN 0
     WHEN item_type = 'SEASON' THEN 1
@@ -109,22 +111,21 @@ impl Database {
     pub(crate) async fn ensure_scan_local_metadata_backfill_roots(
         &self,
     ) -> Result<u64, StorageError> {
-        let root_ids = self
-            .query_scalar::<String>("SELECT id FROM library_roots ORDER BY id")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut inserted = 0_u64;
-        for library_root_id in root_ids {
-            inserted = inserted.saturating_add(u64::from(
-                self.ensure_scan_local_metadata_backfill_root(&library_root_id)
-                    .await?,
-            ));
-        }
-        Ok(inserted)
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        self.query(
+            "INSERT INTO scan_local_metadata_backfills (library_root_id)
+             SELECT id FROM library_roots
+             WHERE TRUE
+             ORDER BY id
+             ON CONFLICT(library_root_id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn ensure_scan_local_metadata_backfill_root(
@@ -3978,22 +3979,30 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_scan_manifest_root_ids(
+    pub(crate) async fn list_scan_manifest_root_discovery_baselines(
         &self,
         manifest_id: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query(
-            "SELECT library_root_id
-             FROM scan_manifest_roots
-             WHERE manifest_id = ?
-             ORDER BY library_root_id",
+    ) -> Result<Vec<(String, String, bool)>, StorageError> {
+        self.query_as(
+            "SELECT root.library_root_id, root.state,
+                    CAST(CASE
+                    WHEN root.state IN ('COMPLETE', 'UNAVAILABLE') THEN 0
+                    WHEN EXISTS (
+                        SELECT 1 FROM filesystem_entries entry
+                        WHERE entry.library_root_id = root.library_root_id
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS has_filesystem_entries
+             FROM scan_manifest_roots root
+             WHERE root.manifest_id = ?
+             ORDER BY root.library_root_id",
         )
         .bind(manifest_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
+        .map(|rows: Vec<(String, String, i64)>| {
             rows.into_iter()
-                .map(|row| row.get("library_root_id"))
+                .map(|(root_id, state, has_filesystem_entries)| {
+                    (root_id, state, has_filesystem_entries != 0)
+                })
                 .collect()
         })
         .map_err(|source| StorageError::Sqlx {
@@ -4387,21 +4396,6 @@ impl Database {
             path: self.path.clone(),
             source,
         })
-    }
-
-    pub(crate) async fn scan_manifest_root_has_filesystem_entries(
-        &self,
-        library_root_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query("SELECT 1 FROM filesystem_entries WHERE library_root_id = ? LIMIT 1")
-            .bind(library_root_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map(|row| row.is_some())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
     }
 
     pub(crate) async fn list_scan_manifest_removal_candidates(
@@ -5833,11 +5827,82 @@ impl Database {
         .bind(change_kind)
         .execute(&self.pool)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
+        self.refresh_incremental_scan_path_count(job_id).await
+    }
+
+    pub(crate) async fn enqueue_incremental_scan_paths(
+        &self,
+        job_id: &str,
+        paths: &[(&str, &str, &str)],
+    ) -> Result<(), StorageError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if paths.len() == 1 {
+            let (library_root_id, relative_path, change_kind) = paths[0];
+            return self
+                .enqueue_incremental_scan_path(job_id, library_root_id, relative_path, change_kind)
+                .await;
+        }
+
+        let mut latest_path_indexes: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::with_capacity(paths.len());
+        let mut unique_paths: Vec<(&str, &str, &str)> = Vec::with_capacity(paths.len());
+        for &(library_root_id, relative_path, change_kind) in paths {
+            let path_key = (library_root_id, relative_path);
+            if let Some(index) = latest_path_indexes.get(&path_key).copied() {
+                unique_paths[index].2 = change_kind;
+            } else {
+                latest_path_indexes.insert(path_key, unique_paths.len());
+                unique_paths.push((library_root_id, relative_path, change_kind));
+            }
+        }
+        if unique_paths.len() == 1 {
+            let (library_root_id, relative_path, change_kind) = unique_paths[0];
+            return self
+                .enqueue_incremental_scan_path(job_id, library_root_id, relative_path, change_kind)
+                .await;
+        }
+
+        for batch in unique_paths.chunks(INCREMENTAL_SCAN_PATH_BATCH_SIZE) {
+            let values = (0..batch.len())
+                .map(|_| "(?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = format!(
+                "INSERT INTO scan_job_paths (
+                    job_id, library_root_id, relative_path, change_kind
+                 ) VALUES {values}
+                 ON CONFLICT(job_id, library_root_id, relative_path) DO UPDATE SET
+                    change_kind = excluded.change_kind,
+                    processed_at = NULL,
+                    updated_at = unixepoch()"
+            );
+            let mut query = self.query(sqlx::AssertSqlSafe(statement));
+            for (library_root_id, relative_path, change_kind) in batch {
+                query = query
+                    .bind(job_id)
+                    .bind(library_root_id)
+                    .bind(relative_path)
+                    .bind(change_kind);
+            }
+            query
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.refresh_incremental_scan_path_count(job_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_incremental_scan_path_count(&self, job_id: &str) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
              SET total_count = (
@@ -7992,7 +8057,7 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.lock_metadata_reidentify_items_for_update(&mut transaction, item_ids)
+        self.lock_media_items_for_update(&mut transaction, item_ids)
             .await?;
         self.query(
             "INSERT INTO metadata_reidentify_jobs (
@@ -8066,7 +8131,7 @@ impl Database {
             })
     }
 
-    pub(crate) async fn lock_metadata_reidentify_items_for_update(
+    pub(crate) async fn lock_media_items_for_update(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         item_ids: &[String],
@@ -10274,6 +10339,7 @@ impl Database {
         size: i64,
         modified_at: i64,
         fingerprint: &[u8],
+        inode: Option<i64>,
         last_seen_generation: &str,
     ) -> Result<(), StorageError> {
         let mut transaction = self
@@ -10286,13 +10352,14 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET size = ?, modified_at = ?, fingerprint = ?, last_seen_generation = ?,
+             SET size = ?, modified_at = ?, fingerprint = ?, inode = ?, last_seen_generation = ?,
                  is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(size)
         .bind(modified_at)
         .bind(fingerprint)
+        .bind(inode)
         .bind(last_seen_generation)
         .bind(id)
         .execute(&mut *transaction)
@@ -10316,6 +10383,7 @@ impl Database {
         &self,
         id: &str,
         last_seen_generation: &str,
+        inode: Option<i64>,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -10327,10 +10395,11 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
+             SET last_seen_generation = ?, inode = ?, is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(last_seen_generation)
+        .bind(inode)
         .bind(id)
         .execute(&mut *transaction)
         .await
@@ -10865,50 +10934,6 @@ mod tests {
         NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
-
-    #[tokio::test]
-    async fn scan_manifest_root_baseline_probe_detects_first_file_entry()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        database
-            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
-            .execute(database.pool())
-            .await?;
-        database
-            .query(
-                "INSERT INTO library_roots (
-                     id, library_id, canonical_path, display_path, is_available, is_writable
-                 ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
-            )
-            .execute(database.pool())
-            .await?;
-
-        assert!(
-            !database
-                .scan_manifest_root_has_filesystem_entries("root")
-                .await?
-        );
-        database
-            .query(
-                "INSERT INTO filesystem_entries (
-                     id, library_root_id, relative_path, entry_kind, size, modified_at,
-                     last_seen_generation
-                 ) VALUES ('entry', 'root', 'Movie.2024.mkv', 'FILE', 1, 1, 'generation')",
-            )
-            .execute(database.pool())
-            .await?;
-        assert!(
-            database
-                .scan_manifest_root_has_filesystem_entries("root")
-                .await?
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn scan_manifest_creation_is_atomic_and_idempotent()

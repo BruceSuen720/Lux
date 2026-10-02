@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
-    io::Read,
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -15,18 +14,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-use std::os::{
-    fd::{AsRawFd, FromRawFd},
-    unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-};
 use tokio::{
     fs,
+    io::AsyncReadExt,
     sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinHandle, JoinSet},
 };
@@ -65,13 +55,11 @@ use crate::{
         NewItemMetadataCompletenessResult, NewMediaItem, NewMediaSource, NewMovieFile,
         NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
         NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
-        NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
-        NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
-        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
-        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
-        StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch, StoredScanManifestDelta,
-        StoredScanManifestFilesystemBaseline, is_lite_manifest_discovery,
-        movie_parent_folder_identity,
+        NewScanManifestSeenFilesystemEntry, NewScanManifestUnresolvedFile,
+        ReconciliationBatchCommit, StorageError, StoredEpisodeIdentityCandidate,
+        StoredFilesystemEntry, StoredLibraryRoot, StoredReconciliationScanEntry, StoredScanJob,
+        StoredScanJobPath, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
+        is_lite_manifest_discovery, movie_parent_folder_identity,
     },
 };
 
@@ -91,1777 +79,11 @@ const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
 const MANIFEST_STREAMED_INDEX_BATCH_SIZE: usize = 8_000;
 const MANIFEST_STREAMED_ENTRY_BATCH_SIZE: usize = 8_192;
 const DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE: usize = 200;
-const MAX_MANIFEST_STRM_TARGET_BYTES: usize = 1024 * 1024;
+const MAX_STRM_TARGET_BYTES: usize = 1024 * 1024;
 
-struct ManifestDirectoryBatch {
-    child_directories: Vec<String>,
-    entries: Vec<NewScanManifestEntry>,
-    completed: bool,
-    readdir_duration: Duration,
-    stat_duration: Duration,
-    readdir_entry_count: usize,
-    stat_entry_count: usize,
-}
+mod manifest;
+use manifest::*;
 
-fn record_manifest_scan_stage(
-    phase: &'static str,
-    started: Instant,
-    units: u64,
-    files: u64,
-    directories: u64,
-) {
-    record_manifest_scan_stage_duration(phase, started.elapsed(), units, files, directories);
-}
-
-fn record_manifest_scan_stage_duration(
-    phase: &'static str,
-    duration: Duration,
-    units: u64,
-    files: u64,
-    directories: u64,
-) {
-    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
-        tracing::debug!(
-            target: "lux::scan_performance",
-            phase,
-            duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
-            units,
-            files,
-            directories,
-            "manifest scan stage timing"
-        );
-    }
-}
-
-fn record_manifest_scan_activity(active_preparation_tasks: usize, active_directory_readers: usize) {
-    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
-        tracing::debug!(
-            target: "lux::scan_performance",
-            phase = "active_work",
-            active_preparation_tasks = u64::try_from(active_preparation_tasks).unwrap_or(u64::MAX),
-            active_directory_readers = u64::try_from(active_directory_readers).unwrap_or(u64::MAX),
-            "manifest scan active work"
-        );
-    }
-}
-
-struct PendingManifestDirectoryChunk {
-    relative_directory: String,
-    root_observation: NewScanManifestEntry,
-    directory_observation: NewScanManifestEntry,
-    child_directories: Vec<String>,
-    entries: Vec<NewScanManifestEntry>,
-    completed_directory: Option<String>,
-}
-
-#[derive(Default)]
-struct ManifestDiscoveryDirectoryResult {
-    observed_file_count: usize,
-    created_items: usize,
-    child_directories: Vec<String>,
-}
-
-#[derive(Default)]
-struct LiteManifestDiscoverySession {
-    directories: VecDeque<(String, String, bool)>,
-}
-
-enum PreparedManifestFile {
-    Movie(NewMovieFile),
-    Episode(NewEpisodeFile),
-    Unresolved(NewScanManifestUnresolvedFile),
-    HomeVideo(NewScanManifestUnresolvedFile),
-}
-
-enum ManifestDeltaPreparation {
-    Stable {
-        file: Option<Box<PreparedManifestFile>>,
-        sidecar_entry: Option<NewScanManifestSidecarEntry>,
-    },
-    Unstable {
-        delta_id: Option<String>,
-    },
-    RootIdentityChanged {
-        delta_id: Option<String>,
-    },
-}
-
-struct ManifestPositiveIndexSeed {
-    relative_path: String,
-    delta_kind: String,
-    base_filesystem_entry_id: Option<String>,
-    base_fingerprint: Option<Vec<u8>>,
-}
-
-// The JoinSet bounds live values to scan concurrency; boxing would allocate once per indexed
-// file on the 60k-file hot path.
-#[allow(clippy::large_enum_variant)]
-enum ManifestDiscoveryIndexPreparation {
-    Indexed(NewScanManifestPositiveIndex),
-    Unstable,
-    RootIdentityChanged,
-}
-
-struct ManifestFilePreparationContext {
-    scanner: LibraryScanner,
-    root: StoredLibraryRoot,
-    root_path: PathBuf,
-    expected_root_device: Option<i64>,
-    expected_root_inode: Option<i64>,
-    movie_folder_provider_ids_cache: Option<Arc<OnceLock<BTreeMap<String, String>>>>,
-    verify_path_after_preparation: bool,
-}
-
-#[derive(Clone, Copy)]
-struct ManifestRootDiscoveryContext<'a> {
-    job_id: &'a str,
-    manifest_id: &'a str,
-    root: &'a StoredLibraryRoot,
-    cancellation: &'a AtomicBool,
-    stream_files_during_discovery: bool,
-    skip_baseline_queries: bool,
-    library_kind: &'a str,
-    preparation_concurrency: usize,
-    expected_root_identity: Option<(i64, i64)>,
-}
-
-#[derive(Clone, Copy)]
-struct ManifestPositiveIndexPreparationContext<'a> {
-    root: &'a StoredLibraryRoot,
-    relative_directory: &'a str,
-    library_kind: &'a str,
-    preparation_concurrency: usize,
-    baselines: &'a HashMap<String, StoredScanManifestFilesystemBaseline>,
-    expected_root_identity: Option<(i64, i64)>,
-    expected_root_observation: &'a NewScanManifestEntry,
-    expected_directory_observation: &'a NewScanManifestEntry,
-    entries: &'a [NewScanManifestEntry],
-    cancellation: &'a AtomicBool,
-}
-
-#[derive(Default)]
-struct ManifestApplyPreparedFiles {
-    movie_files: Vec<NewMovieFile>,
-    episode_files: Vec<NewEpisodeFile>,
-    unresolved_files: Vec<NewScanManifestUnresolvedFile>,
-    sidecar_entries: Vec<NewScanManifestSidecarEntry>,
-    unstable_delta_ids: Vec<String>,
-    root_identity_lost: bool,
-}
-
-impl ManifestApplyPreparedFiles {
-    fn record(&mut self, preparation: ManifestDeltaPreparation) {
-        match preparation {
-            ManifestDeltaPreparation::Stable {
-                file,
-                sidecar_entry,
-                ..
-            } => {
-                if let Some(file) = file {
-                    match *file {
-                        PreparedManifestFile::Movie(file) => self.movie_files.push(file),
-                        PreparedManifestFile::Episode(file) => self.episode_files.push(file),
-                        PreparedManifestFile::Unresolved(file)
-                        | PreparedManifestFile::HomeVideo(file) => self.unresolved_files.push(file),
-                    }
-                }
-                if let Some(sidecar_entry) = sidecar_entry {
-                    self.sidecar_entries.push(sidecar_entry);
-                }
-            }
-            ManifestDeltaPreparation::Unstable { delta_id } => {
-                if let Some(delta_id) = delta_id {
-                    self.unstable_delta_ids.push(delta_id);
-                }
-            }
-            ManifestDeltaPreparation::RootIdentityChanged { delta_id } => {
-                self.root_identity_lost = true;
-                if let Some(delta_id) = delta_id {
-                    self.unstable_delta_ids.push(delta_id);
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ManifestRemovalOutcome {
-    Missing,
-    Present,
-    PathIoError,
-    InvalidPath,
-    RootIdentityChanged,
-}
-
-#[derive(Default)]
-struct ManifestRemovalDecision {
-    confirmed_missing_ids: Vec<String>,
-    unstable_ids: Vec<String>,
-    root_identity_lost: bool,
-}
-
-fn classify_manifest_removal_outcomes(
-    outcomes: &[(String, ManifestRemovalOutcome)],
-) -> ManifestRemovalDecision {
-    let root_identity_lost = outcomes
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, ManifestRemovalOutcome::RootIdentityChanged));
-    let any_path_io_error = outcomes
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, ManifestRemovalOutcome::PathIoError));
-    if root_identity_lost || any_path_io_error {
-        return ManifestRemovalDecision {
-            confirmed_missing_ids: Vec::new(),
-            unstable_ids: outcomes.iter().map(|(id, _)| id.clone()).collect(),
-            root_identity_lost,
-        };
-    }
-
-    let mut decision = ManifestRemovalDecision::default();
-    for (id, outcome) in outcomes {
-        match outcome {
-            ManifestRemovalOutcome::Missing => decision.confirmed_missing_ids.push(id.clone()),
-            ManifestRemovalOutcome::Present
-            | ManifestRemovalOutcome::InvalidPath
-            | ManifestRemovalOutcome::PathIoError
-            | ManifestRemovalOutcome::RootIdentityChanged => {
-                decision.unstable_ids.push(id.clone());
-            }
-        }
-    }
-    decision
-}
-
-impl PreparedManifestFile {
-    fn matches_observation(&self, observation: &NewScanManifestEntry) -> bool {
-        match self {
-            Self::Movie(file) => {
-                file.relative_path == observation.relative_path
-                    && file.size == observation.size
-                    && file.modified_at == observation.modified_at
-                    && file.fingerprint == observation.fingerprint
-            }
-            Self::Episode(file) => {
-                file.relative_path == observation.relative_path
-                    && file.size == observation.size
-                    && file.modified_at == observation.modified_at
-                    && file.inode == observation.inode
-                    && file.fingerprint == observation.fingerprint
-            }
-            Self::Unresolved(file) => {
-                file.relative_path == observation.relative_path
-                    && file.size == observation.size
-                    && file.modified_at == observation.modified_at
-                    && file.inode == observation.inode
-                    && file.fingerprint == observation.fingerprint
-            }
-            Self::HomeVideo(file) => {
-                file.relative_path == observation.relative_path
-                    && file.size == observation.size
-                    && file.modified_at == observation.modified_at
-                    && file.inode == observation.inode
-                    && file.fingerprint == observation.fingerprint
-            }
-        }
-    }
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-struct ManifestDirectoryReader {
-    root_path: PathBuf,
-    relative_directory: String,
-    _directory: std::fs::File,
-    entries: *mut libc::DIR,
-    root_observation: NewScanManifestEntry,
-    root_observation_emitted: bool,
-    directory_observation: NewScanManifestEntry,
-}
-
-// The DIR stream is exclusively owned and is only accessed by one blocking task at a time.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-// SAFETY: the raw pointer is created by `fdopendir`, never copied, only dereferenced while
-// the reader is moved by value into a blocking task, and closed exactly once by `Drop`.
-unsafe impl Send for ManifestDirectoryReader {}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-fn open_manifest_directory_identity(
-    root_path: &Path,
-    relative_directory: &str,
-) -> Result<(std::fs::File, NewScanManifestEntry, NewScanManifestEntry), ScannerError> {
-    if !root_path.is_absolute() {
-        return Err(ScannerError::InvalidRelativePath(
-            root_path.to_string_lossy().into_owned(),
-        ));
-    }
-    let display_path = root_path.join(relative_directory);
-    let mut directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/")
-        .map_err(|source| ScannerError::Io {
-            path: PathBuf::from("/"),
-            source,
-        })?;
-
-    for component in root_path.components() {
-        let Component::Normal(name) = component else {
-            if matches!(component, Component::RootDir) {
-                continue;
-            }
-            return Err(ScannerError::InvalidRelativePath(
-                relative_directory.to_owned(),
-            ));
-        };
-        directory = open_manifest_directory_component(
-            directory.as_raw_fd(),
-            name,
-            &display_path,
-            relative_directory,
-        )?;
-    }
-
-    let root_metadata = directory.metadata().map_err(|source| ScannerError::Io {
-        path: root_path.to_owned(),
-        source,
-    })?;
-    let root_observation =
-        manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
-
-    for component in Path::new(relative_directory).components() {
-        let Component::Normal(name) = component else {
-            return Err(ScannerError::InvalidRelativePath(
-                relative_directory.to_owned(),
-            ));
-        };
-        directory = open_manifest_directory_component(
-            directory.as_raw_fd(),
-            name,
-            &display_path,
-            relative_directory,
-        )?;
-    }
-
-    let metadata = directory.metadata().map_err(|source| ScannerError::Io {
-        path: display_path.clone(),
-        source,
-    })?;
-    let directory_observation = manifest_entry_observation(
-        relative_directory.to_owned(),
-        "DIRECTORY",
-        &metadata,
-        &display_path,
-    )?;
-    Ok((directory, root_observation, directory_observation))
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-impl ManifestDirectoryReader {
-    fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
-        let display_path = root_path.join(relative_directory);
-        let (directory, root_observation, directory_observation) =
-            open_manifest_directory_identity(root_path, relative_directory)?;
-        // SAFETY: directory owns a valid descriptor, and fcntl does not take ownership.
-        let entries_fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if entries_fd < 0 {
-            return Err(ScannerError::Io {
-                path: display_path,
-                source: std::io::Error::last_os_error(),
-            });
-        }
-        // SAFETY: entries_fd is a fresh valid descriptor for a directory; fdopendir takes
-        // ownership of it, leaving `directory` available for openat/fstatat calls.
-        let entries = unsafe { libc::fdopendir(entries_fd) };
-        if entries.is_null() {
-            let source = std::io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so ownership of entries_fd did not transfer.
-            unsafe { libc::close(entries_fd) };
-            return Err(ScannerError::Io {
-                path: display_path,
-                source,
-            });
-        }
-
-        Ok(Self {
-            root_path: root_path.to_owned(),
-            relative_directory: relative_directory.to_owned(),
-            _directory: directory,
-            entries,
-            root_observation,
-            root_observation_emitted: false,
-            directory_observation,
-        })
-    }
-
-    fn next_batch(
-        mut self,
-        max_entries: usize,
-    ) -> Result<(Self, ManifestDirectoryBatch), ScannerError> {
-        let batch_size = max_entries.clamp(1, MANIFEST_STREAMED_ENTRY_BATCH_SIZE);
-        let mut child_directories = Vec::with_capacity(batch_size);
-        let mut observations = Vec::with_capacity(batch_size);
-        let mut completed = false;
-        let measure_stages =
-            tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG);
-        let mut readdir_duration = Duration::ZERO;
-        let mut stat_duration = Duration::ZERO;
-        let mut readdir_entry_count = 0_usize;
-        let mut stat_entry_count = 0_usize;
-
-        if self.relative_directory.is_empty() && !self.root_observation_emitted {
-            observations.push(self.root_observation.clone());
-            self.root_observation_emitted = true;
-        }
-
-        for _ in 0..batch_size {
-            clear_manifest_errno();
-            let readdir_started = measure_stages.then(Instant::now);
-            // SAFETY: `entries` remains a live, exclusively owned DIR stream until Drop.
-            let entry = unsafe { libc::readdir(self.entries) };
-            if let Some(started) = readdir_started {
-                readdir_duration = readdir_duration.saturating_add(started.elapsed());
-            }
-            readdir_entry_count = readdir_entry_count.saturating_add(1);
-            if entry.is_null() {
-                let source = std::io::Error::last_os_error();
-                if source.raw_os_error().is_some_and(|code| code != 0) {
-                    return Err(ScannerError::Io {
-                        path: self.root_path.join(&self.relative_directory),
-                        source,
-                    });
-                }
-                completed = true;
-                break;
-            }
-            // SAFETY: readdir returns a dirent whose d_name is NUL-terminated and remains
-            // valid until the next readdir call; the name is copied immediately below.
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
-                .to_str()
-                .map_err(|_| ScannerError::NonUtf8Path)?;
-            if name == "." || name == ".." {
-                continue;
-            }
-            let relative_path = Path::new(&self.relative_directory)
-                .join(name)
-                .to_str()
-                .ok_or(ScannerError::NonUtf8Path)?
-                .to_owned();
-            let path = self.root_path.join(&relative_path);
-            let name_c = std::ffi::CString::new(name)
-                .map_err(|_| ScannerError::InvalidRelativePath(relative_path.clone()))?;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-            let stat_started = measure_stages.then(Instant::now);
-            // SAFETY: the directory descriptor is open, name_c is NUL-terminated, and stat
-            // points to writable storage for the duration of the call.
-            let stat_result = unsafe {
-                libc::fstatat(
-                    self._directory.as_raw_fd(),
-                    name_c.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if let Some(started) = stat_started {
-                stat_duration = stat_duration.saturating_add(started.elapsed());
-            }
-            stat_entry_count = stat_entry_count.saturating_add(1);
-            if stat_result < 0 {
-                let source = std::io::Error::last_os_error();
-                if source.raw_os_error().is_some_and(|code| {
-                    code == libc::ENOENT || code == libc::ENOTDIR || code == libc::ELOOP
-                }) {
-                    continue;
-                }
-                return Err(ScannerError::Io {
-                    path: path.clone(),
-                    source,
-                });
-            }
-            // SAFETY: fstatat initialized the struct on success.
-            let stat = unsafe { stat.assume_init() };
-            let file_type = stat.st_mode & libc::S_IFMT;
-            let is_directory = file_type == libc::S_IFDIR;
-            let is_regular_file = file_type == libc::S_IFREG;
-            if !(is_directory
-                || is_regular_file
-                    && (is_supported_movie_file(Path::new(name))
-                        || is_supported_sidecar_file(Path::new(name))))
-            {
-                continue;
-            }
-            let entry_kind = if is_directory {
-                child_directories.push(relative_path.clone());
-                Some("DIRECTORY")
-            } else if is_regular_file {
-                Some("FILE")
-            } else {
-                None
-            };
-            if let Some(entry_kind) = entry_kind {
-                observations.push(manifest_entry_observation_from_stat(
-                    relative_path,
-                    entry_kind,
-                    &stat,
-                    &path,
-                )?);
-            }
-        }
-
-        if completed && !self.directory_observation.relative_path.is_empty() {
-            observations.push(self.directory_observation.clone());
-        }
-        Ok((
-            self,
-            ManifestDirectoryBatch {
-                child_directories,
-                entries: observations,
-                completed,
-                readdir_duration,
-                stat_duration,
-                readdir_entry_count,
-                stat_entry_count,
-            },
-        ))
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn clear_manifest_errno() {
-    // SAFETY: errno location is thread-local and readdir is called synchronously afterward.
-    unsafe { *libc::__errno_location() = 0 };
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn clear_manifest_errno() {
-    // SAFETY: errno location is thread-local and readdir is called synchronously afterward.
-    unsafe { *libc::__error() = 0 };
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-impl Drop for ManifestDirectoryReader {
-    fn drop(&mut self) {
-        if !self.entries.is_null() {
-            // SAFETY: this reader uniquely owns the stream returned by fdopendir.
-            unsafe { libc::closedir(self.entries) };
-            self.entries = std::ptr::null_mut();
-        }
-    }
-}
-
-async fn stat_manifest_relative_file(
-    root_path: PathBuf,
-    relative_path: String,
-    expected_root_device: Option<i64>,
-    expected_root_inode: Option<i64>,
-) -> Result<Option<NewScanManifestEntry>, ScannerError> {
-    let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || {
-        stat_manifest_relative_file_sync(
-            &root_path,
-            &relative_path,
-            expected_root_device,
-            expected_root_inode,
-        )
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path,
-        source: std::io::Error::other(source.to_string()),
-    })?
-}
-
-async fn read_manifest_strm_target(
-    root_path: PathBuf,
-    relative_path: String,
-    expected_root_device: Option<i64>,
-    expected_root_inode: Option<i64>,
-    expected_observation: NewScanManifestEntry,
-) -> Result<StrmTarget, ScannerError> {
-    let display_path = root_path.join(&relative_path);
-    tokio::task::spawn_blocking(move || {
-        read_manifest_strm_target_sync(
-            &root_path,
-            &relative_path,
-            expected_root_device,
-            expected_root_inode,
-            &expected_observation,
-        )
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path.clone(),
-        source: std::io::Error::other(source.to_string()),
-    })?
-}
-
-async fn stat_manifest_root(root_path: PathBuf) -> Result<NewScanManifestEntry, ScannerError> {
-    let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || stat_manifest_root_sync(&root_path))
-        .await
-        .map_err(|source| ScannerError::Io {
-            path: display_path,
-            source: std::io::Error::other(source.to_string()),
-        })?
-}
-
-fn stat_manifest_root_sync(root_path: &Path) -> Result<NewScanManifestEntry, ScannerError> {
-    ManifestDirectoryReader::open(root_path, "").map(|reader| reader.root_observation.clone())
-}
-
-fn manifest_root_identity_matches(
-    expected_device: Option<i64>,
-    expected_inode: Option<i64>,
-    observed: &NewScanManifestEntry,
-) -> bool {
-    match (expected_device, expected_inode) {
-        (Some(device), Some(inode)) => {
-            observed.device == Some(device) && observed.inode == Some(inode)
-        }
-        // Without a stable root identity, a replacement mount or directory cannot be
-        // distinguished from the original root. Never authorize reconciliation deletes.
-        (None, None) => false,
-        _ => false,
-    }
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-fn stat_manifest_relative_file_sync(
-    root_path: &Path,
-    relative_path: &str,
-    expected_root_device: Option<i64>,
-    expected_root_inode: Option<i64>,
-) -> Result<Option<NewScanManifestEntry>, ScannerError> {
-    let relative = Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    let Some(file_name) = relative.file_name() else {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    };
-    let parent = relative.parent().and_then(Path::to_str).unwrap_or_default();
-    let reader = match ManifestDirectoryReader::open(root_path, parent) {
-        Ok(reader) => reader,
-        Err(ScannerError::Io { source, .. })
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            let root_observation = stat_manifest_root_sync(root_path)?;
-            if manifest_root_identity_matches(
-                expected_root_device,
-                expected_root_inode,
-                &root_observation,
-            ) {
-                return Ok(None);
-            }
-            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-        }
-        Err(error) => return Err(error),
-    };
-    if !manifest_root_identity_matches(
-        expected_root_device,
-        expected_root_inode,
-        &reader.root_observation,
-    ) {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    let file_name = std::ffi::CString::new(file_name.as_bytes())
-        .map_err(|_| ScannerError::InvalidRelativePath(relative_path.to_owned()))?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: the parent descriptor is live and file_name/stat remain valid for the call.
-    let result = unsafe {
-        libc::fstatat(
-            reader._directory.as_raw_fd(),
-            file_name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result < 0 {
-        let source = std::io::Error::last_os_error();
-        if source.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(ScannerError::Io {
-            path: root_path.join(relative_path),
-            source,
-        });
-    }
-    // SAFETY: fstatat initialized the struct on success.
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    manifest_entry_observation_from_stat(
-        relative_path.to_owned(),
-        "FILE",
-        &stat,
-        &root_path.join(relative_path),
-    )
-    .map(Some)
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn stat_manifest_relative_file_sync(
-    root_path: &Path,
-    relative_path: &str,
-    expected_root_device: Option<i64>,
-    expected_root_inode: Option<i64>,
-) -> Result<Option<NewScanManifestEntry>, ScannerError> {
-    let relative = Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    let parent = relative.parent().and_then(Path::to_str).unwrap_or_default();
-    let reader = match ManifestDirectoryReader::open(root_path, parent) {
-        Ok(reader) => reader,
-        Err(ScannerError::Io { source, .. })
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            let root_observation = stat_manifest_root_sync(root_path)?;
-            if manifest_root_identity_matches(
-                expected_root_device,
-                expected_root_inode,
-                &root_observation,
-            ) {
-                return Ok(None);
-            }
-            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-        }
-        Err(error) => return Err(error),
-    };
-    if !manifest_root_identity_matches(
-        expected_root_device,
-        expected_root_inode,
-        &reader.root_observation,
-    ) {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    let path = root_path.join(relative);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(ScannerError::Io { path, source }),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    manifest_entry_observation(relative_path.to_owned(), "FILE", &metadata, &path).map(Some)
-}
-
-fn manifest_directory_observation_matches(
-    expected: &NewScanManifestEntry,
-    observed: &NewScanManifestEntry,
-) -> bool {
-    expected.entry_kind == "DIRECTORY"
-        && observed.entry_kind == "DIRECTORY"
-        && expected.relative_path == observed.relative_path
-        && expected.device == observed.device
-        && expected.inode == observed.inode
-        && expected.device.is_some()
-        && expected.inode.is_some()
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn open_manifest_directory_for_final_check(
-    root_path: &Path,
-    expected_root_observation: &NewScanManifestEntry,
-    expected_directory_observation: &NewScanManifestEntry,
-) -> Result<Option<ManifestDirectoryReader>, ScannerError> {
-    match ManifestDirectoryReader::open(root_path, &expected_directory_observation.relative_path) {
-        Ok(reader) => {
-            if !manifest_root_identity_matches(
-                expected_root_observation.device,
-                expected_root_observation.inode,
-                &reader.root_observation,
-            ) || !manifest_directory_observation_matches(
-                expected_directory_observation,
-                &reader.directory_observation,
-            ) {
-                return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-            }
-            Ok(Some(reader))
-        }
-        Err(ScannerError::Io { source, .. })
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            let current_root = stat_manifest_root_sync(root_path)?;
-            if manifest_root_identity_matches(
-                expected_root_observation.device,
-                expected_root_observation.inode,
-                &current_root,
-            ) {
-                Ok(None)
-            } else {
-                Err(ScannerError::RootIdentityChanged(root_path.to_owned()))
-            }
-        }
-        Err(ScannerError::InvalidRelativePath(_)) => {
-            Err(ScannerError::RootIdentityChanged(root_path.to_owned()))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn verify_manifest_directory_observation(
-    root_path: PathBuf,
-    expected_root_observation: NewScanManifestEntry,
-    expected_directory_observation: NewScanManifestEntry,
-) -> Result<(), ScannerError> {
-    let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || {
-        verify_manifest_directory_observation_sync(
-            &root_path,
-            &expected_root_observation,
-            &expected_directory_observation,
-        )
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path,
-        source: std::io::Error::other(source.to_string()),
-    })?
-}
-
-async fn verify_manifest_directory_observations(
-    root_path: PathBuf,
-    observations: Vec<(NewScanManifestEntry, NewScanManifestEntry)>,
-) -> Result<(), ScannerError> {
-    let display_path = root_path.clone();
-    let directory_count = observations.len();
-    let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        for (expected_root_observation, expected_directory_observation) in observations {
-            verify_manifest_directory_observation_sync(
-                &root_path,
-                &expected_root_observation,
-                &expected_directory_observation,
-            )?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path,
-        source: std::io::Error::other(source.to_string()),
-    })?;
-    record_manifest_scan_stage(
-        "directory_identity_recheck",
-        started,
-        u64::try_from(directory_count).unwrap_or(u64::MAX),
-        0,
-        u64::try_from(directory_count).unwrap_or(u64::MAX),
-    );
-    result
-}
-
-fn verify_manifest_directory_observation_sync(
-    root_path: &Path,
-    expected_root_observation: &NewScanManifestEntry,
-    expected_directory_observation: &NewScanManifestEntry,
-) -> Result<(), ScannerError> {
-    let canonical_root = std::fs::canonicalize(root_path).map_err(|source| ScannerError::Io {
-        path: root_path.to_owned(),
-        source,
-    })?;
-    let root_metadata =
-        std::fs::symlink_metadata(root_path).map_err(|source| ScannerError::Io {
-            path: root_path.to_owned(),
-            source,
-        })?;
-    if canonical_root != root_path || !root_metadata.is_dir() {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    let current_root =
-        manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
-    if !manifest_root_identity_matches(
-        expected_root_observation.device,
-        expected_root_observation.inode,
-        &current_root,
-    ) {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-
-    let directory_path = root_path.join(&expected_directory_observation.relative_path);
-    let canonical_directory =
-        std::fs::canonicalize(&directory_path).map_err(|source| ScannerError::Io {
-            path: directory_path.clone(),
-            source,
-        })?;
-    let directory_metadata =
-        std::fs::symlink_metadata(&directory_path).map_err(|source| ScannerError::Io {
-            path: directory_path.clone(),
-            source,
-        })?;
-    if canonical_directory != directory_path || !directory_metadata.is_dir() {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    let current_directory = manifest_entry_observation(
-        expected_directory_observation.relative_path.clone(),
-        "DIRECTORY",
-        &directory_metadata,
-        &directory_path,
-    )?;
-    if !manifest_directory_observation_matches(expected_directory_observation, &current_directory) {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    Ok(())
-}
-
-async fn stat_manifest_directory_file_batch(
-    root_path: PathBuf,
-    expected_root_observation: NewScanManifestEntry,
-    expected_directory_observation: NewScanManifestEntry,
-    expected_files: Vec<NewScanManifestEntry>,
-) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
-    let display_path = root_path.clone();
-    let file_count = expected_files.len();
-    let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        stat_manifest_directory_file_batch_sync(
-            &root_path,
-            &expected_root_observation,
-            &expected_directory_observation,
-            &expected_files,
-        )
-    })
-    .await
-    .map_err(|source| ScannerError::Io {
-        path: display_path,
-        source: std::io::Error::other(source.to_string()),
-    })?;
-    record_manifest_scan_stage(
-        "positive_file_recheck",
-        started,
-        u64::try_from(file_count).unwrap_or(u64::MAX),
-        u64::try_from(file_count).unwrap_or(u64::MAX),
-        0,
-    );
-    result
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-fn stat_manifest_directory_file_batch_sync(
-    root_path: &Path,
-    expected_root_observation: &NewScanManifestEntry,
-    expected_directory_observation: &NewScanManifestEntry,
-    expected_files: &[NewScanManifestEntry],
-) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
-    let (directory, current_root, current_directory) = match open_manifest_directory_identity(
-        root_path,
-        &expected_directory_observation.relative_path,
-    ) {
-        Ok(observations) => observations,
-        Err(ScannerError::InvalidRelativePath(_)) => {
-            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-        }
-        Err(error) => return Err(error),
-    };
-    if !manifest_root_identity_matches(
-        expected_root_observation.device,
-        expected_root_observation.inode,
-        &current_root,
-    ) || !manifest_directory_observation_matches(
-        expected_directory_observation,
-        &current_directory,
-    ) {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    let current_files = stat_manifest_directory_files_from_handle(
-        root_path,
-        &directory,
-        &expected_directory_observation.relative_path,
-        expected_files,
-    )?;
-    drop(directory);
-    verify_manifest_directory_observation_sync(
-        root_path,
-        expected_root_observation,
-        expected_directory_observation,
-    )?;
-    Ok(current_files)
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn stat_manifest_directory_file_batch_sync(
-    root_path: &Path,
-    expected_root_observation: &NewScanManifestEntry,
-    expected_directory_observation: &NewScanManifestEntry,
-    expected_files: &[NewScanManifestEntry],
-) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
-    let Some(reader) = open_manifest_directory_for_final_check(
-        root_path,
-        expected_root_observation,
-        expected_directory_observation,
-    )?
-    else {
-        return Ok(vec![None; expected_files.len()]);
-    };
-    let current_files =
-        stat_manifest_directory_files_from_reader(root_path, &reader, expected_files)?;
-    drop(reader);
-    match open_manifest_directory_for_final_check(
-        root_path,
-        expected_root_observation,
-        expected_directory_observation,
-    ) {
-        Ok(Some(_reader)) => {}
-        Ok(None) => return Ok(vec![None; expected_files.len()]),
-        Err(error) => return Err(error),
-    }
-    Ok(current_files)
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-fn stat_manifest_directory_files_from_handle(
-    root_path: &Path,
-    directory: &std::fs::File,
-    relative_directory: &str,
-    expected_files: &[NewScanManifestEntry],
-) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
-    let mut observations = Vec::with_capacity(expected_files.len());
-    for expected in expected_files {
-        let relative = Path::new(&expected.relative_path);
-        if relative.parent().and_then(Path::to_str).unwrap_or_default() != relative_directory {
-            return Err(ScannerError::InvalidRelativePath(
-                expected.relative_path.clone(),
-            ));
-        }
-        let Some(file_name) = relative.file_name() else {
-            return Err(ScannerError::InvalidRelativePath(
-                expected.relative_path.clone(),
-            ));
-        };
-        let file_name = std::ffi::CString::new(file_name.as_bytes())
-            .map_err(|_| ScannerError::InvalidRelativePath(expected.relative_path.clone()))?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        // SAFETY: The secured parent directory descriptor and both C pointers stay live here.
-        let result = unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                file_name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if result < 0 {
-            observations.push(None);
-            continue;
-        }
-        // SAFETY: fstatat initialized the stat value on success.
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            observations.push(None);
-            continue;
-        }
-        observations.push(Some(manifest_entry_observation_from_stat(
-            expected.relative_path.clone(),
-            "FILE",
-            &stat,
-            &root_path.join(&expected.relative_path),
-        )?));
-    }
-    Ok(observations)
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn stat_manifest_directory_files_from_reader(
-    root_path: &Path,
-    reader: &ManifestDirectoryReader,
-    expected_files: &[NewScanManifestEntry],
-) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
-    expected_files
-        .iter()
-        .map(|expected| {
-            match stat_manifest_relative_file_sync(
-                root_path,
-                &expected.relative_path,
-                reader.root_observation.device,
-                reader.root_observation.inode,
-            ) {
-                Ok(observed) => Ok(observed),
-                Err(ScannerError::RootIdentityChanged(path)) => {
-                    Err(ScannerError::RootIdentityChanged(path))
-                }
-                Err(_) => Ok(None),
-            }
-        })
-        .collect()
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-fn read_manifest_strm_target_sync(
-    root_path: &Path,
-    relative_path: &str,
-    expected_root_device: Option<i64>,
-    expected_root_inode: Option<i64>,
-    expected_observation: &NewScanManifestEntry,
-) -> Result<StrmTarget, ScannerError> {
-    let relative = Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    let Some(file_name) = relative.file_name() else {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    };
-    let parent = relative.parent().and_then(Path::to_str).unwrap_or_default();
-    let reader = ManifestDirectoryReader::open(root_path, parent)?;
-    if !manifest_root_identity_matches(
-        expected_root_device,
-        expected_root_inode,
-        &reader.root_observation,
-    ) {
-        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
-    }
-    let file_name = std::ffi::CString::new(file_name.as_bytes())
-        .map_err(|_| ScannerError::InvalidRelativePath(relative_path.to_owned()))?;
-    // O_NOFOLLOW closes the stat/read symlink race; O_NONBLOCK prevents a replaced FIFO
-    // from blocking this bounded blocking worker before fstat can reject it.
-    // SAFETY: the parent descriptor is live and file_name is a NUL-terminated C string.
-    let descriptor = unsafe {
-        libc::openat(
-            reader._directory.as_raw_fd(),
-            file_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if descriptor < 0 {
-        return Err(ScannerError::Io {
-            path: root_path.join(relative_path),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    // SAFETY: descriptor is newly opened and ownership transfers to File.
-    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: the descriptor is live and stat is writable for fstat.
-    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
-        return Err(ScannerError::Io {
-            path: root_path.join(relative_path),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    // SAFETY: successful fstat initialized the struct.
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    let file_size = usize::try_from(stat.st_size).map_err(|_| ScannerError::Io {
-        path: root_path.join(relative_path),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "manifest STRM target has an invalid size",
-        ),
-    })?;
-    if file_size > MAX_MANIFEST_STRM_TARGET_BYTES {
-        return Err(ScannerError::Io {
-            path: root_path.join(relative_path),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "manifest STRM target exceeds the size limit",
-            ),
-        });
-    }
-    let observed = manifest_entry_observation_from_stat(
-        relative_path.to_owned(),
-        "FILE",
-        &stat,
-        &root_path.join(relative_path),
-    )?;
-    if !manifest_file_observation_matches(expected_observation, &observed) {
-        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
-    }
-    let mut contents = String::with_capacity(file_size);
-    let bytes_read = file
-        .take(u64::try_from(MAX_MANIFEST_STRM_TARGET_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
-        .read_to_string(&mut contents)
-        .map_err(|source| ScannerError::Io {
-            path: root_path.join(relative_path),
-            source,
-        })?;
-    if bytes_read > MAX_MANIFEST_STRM_TARGET_BYTES {
-        return Err(ScannerError::Io {
-            path: root_path.join(relative_path),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "manifest STRM target exceeds the size limit",
-            ),
-        });
-    }
-    Ok(classify_strm_target(&contents))
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn read_manifest_strm_target_sync(
-    _root_path: &Path,
-    relative_path: &str,
-    _expected_root_device: Option<i64>,
-    _expected_root_inode: Option<i64>,
-    _expected_observation: &NewScanManifestEntry,
-) -> Result<StrmTarget, ScannerError> {
-    Err(ScannerError::InvalidRelativePath(relative_path.to_owned()))
-}
-
-fn manifest_file_observation_matches(
-    expected: &NewScanManifestEntry,
-    observed: &NewScanManifestEntry,
-) -> bool {
-    expected.relative_path == observed.relative_path
-        && expected.entry_kind == observed.entry_kind
-        && expected.size == observed.size
-        && expected.modified_at == observed.modified_at
-        && expected.device == observed.device
-        && expected.inode == observed.inode
-        && expected.fingerprint == observed.fingerprint
-}
-
-fn manifest_discovery_index_from_preparation(
-    seed: ManifestPositiveIndexSeed,
-    preparation: ManifestDeltaPreparation,
-) -> ManifestDiscoveryIndexPreparation {
-    match preparation {
-        ManifestDeltaPreparation::Stable {
-            file,
-            sidecar_entry,
-            ..
-        } => {
-            let file = if let Some(file) = file {
-                match *file {
-                    PreparedManifestFile::Movie(file) => NewScanManifestIndexedFile::Movie(file),
-                    PreparedManifestFile::Episode(file) => {
-                        NewScanManifestIndexedFile::Episode(file)
-                    }
-                    PreparedManifestFile::Unresolved(file) => {
-                        NewScanManifestIndexedFile::Unresolved(file)
-                    }
-                    PreparedManifestFile::HomeVideo(file) => {
-                        NewScanManifestIndexedFile::Unresolved(file)
-                    }
-                }
-            } else if let Some(sidecar_entry) = sidecar_entry {
-                NewScanManifestIndexedFile::Sidecar(sidecar_entry)
-            } else {
-                let filesystem_entry_id = seed
-                    .base_filesystem_entry_id
-                    .clone()
-                    .unwrap_or_else(|| FilesystemEntryId::new().to_string());
-                NewScanManifestIndexedFile::Sidecar(NewScanManifestSidecarEntry {
-                    filesystem_entry_id,
-                    relative_path: seed.relative_path.clone(),
-                })
-            };
-            ManifestDiscoveryIndexPreparation::Indexed(NewScanManifestPositiveIndex {
-                relative_path: seed.relative_path,
-                delta_kind: seed.delta_kind,
-                base_filesystem_entry_id: seed.base_filesystem_entry_id,
-                base_fingerprint: seed.base_fingerprint,
-                file,
-            })
-        }
-        ManifestDeltaPreparation::Unstable { .. } => ManifestDiscoveryIndexPreparation::Unstable,
-        ManifestDeltaPreparation::RootIdentityChanged { .. } => {
-            ManifestDiscoveryIndexPreparation::RootIdentityChanged
-        }
-    }
-}
-
-async fn prepare_manifest_delta(
-    context: ManifestFilePreparationContext,
-    delta: StoredScanManifestDelta,
-    classification: Option<MixedClassification>,
-    library_kind: &str,
-) -> ManifestDeltaPreparation {
-    let StoredScanManifestDelta {
-        id,
-        relative_path,
-        delta_kind,
-        entry_kind,
-        size,
-        modified_at,
-        device,
-        inode,
-        fingerprint,
-        ..
-    } = delta;
-    let delta_id = Some(id);
-    let (Some(entry_kind), Some(size), Some(modified_at), Some(fingerprint)) =
-        (entry_kind, size, modified_at, fingerprint)
-    else {
-        return ManifestDeltaPreparation::Unstable { delta_id };
-    };
-    let observed = NewScanManifestEntry {
-        relative_path,
-        entry_kind,
-        size,
-        modified_at,
-        device,
-        inode,
-        fingerprint,
-    };
-    let filename_input = if library_kind == "HOMEVIDEOS" {
-        ManifestFilenameInput::HomeVideos
-    } else {
-        ManifestFilenameInput::LegacyMixed(classification)
-    };
-    prepare_manifest_observation(
-        context,
-        observed,
-        delta_kind == "ADD",
-        delta_id,
-        filename_input,
-    )
-    .await
-}
-
-async fn prepare_manifest_observation(
-    context: ManifestFilePreparationContext,
-    observed: NewScanManifestEntry,
-    is_add: bool,
-    delta_id: Option<String>,
-    filename_input: ManifestFilenameInput,
-) -> ManifestDeltaPreparation {
-    let ManifestFilePreparationContext {
-        scanner,
-        root,
-        root_path,
-        expected_root_device,
-        expected_root_inode,
-        movie_folder_provider_ids_cache,
-        verify_path_after_preparation,
-    } = context;
-    if observed.entry_kind != "FILE" {
-        return ManifestDeltaPreparation::Unstable { delta_id };
-    }
-    let path = root_path.join(&observed.relative_path);
-    let is_media = is_supported_movie_file(Path::new(&observed.relative_path));
-    let is_sidecar = is_supported_sidecar_file(Path::new(&observed.relative_path));
-    if !is_media && !is_sidecar {
-        return ManifestDeltaPreparation::Unstable { delta_id };
-    }
-    let prepared_filename = if is_media {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return ManifestDeltaPreparation::Unstable { delta_id };
-        };
-        let inferred_suffix = if filename_input.is_movie() {
-            infer_sibling_movie_variant_suffix(&path).await
-        } else {
-            None
-        };
-        let prepared_filename = if let Some(suffix) = inferred_suffix.as_deref() {
-            prepare_manifest_filename_with_variant_suffix(file_name, filename_input, Some(suffix))
-        } else {
-            prepare_manifest_filename(file_name, filename_input)
-        };
-        let Some(prepared_filename) = prepared_filename else {
-            return ManifestDeltaPreparation::Unstable { delta_id };
-        };
-        Some(prepared_filename)
-    } else {
-        None
-    };
-    let movie_folder_provider_ids = prepared_filename
-        .as_ref()
-        .filter(|prepared| matches!(prepared, PreparedManifestFilename::Movie(_)))
-        .and(movie_folder_provider_ids_cache.as_ref())
-        .map(|cache| cache.get_or_init(|| movie_folder_provider_ids(&path)));
-    let prepared_file = if is_media {
-        let Some(prepared_filename) = prepared_filename else {
-            return ManifestDeltaPreparation::Unstable { delta_id };
-        };
-        let manifest_strm_target = if is_strm_file(&path) {
-            match read_manifest_strm_target(
-                root_path.clone(),
-                observed.relative_path.clone(),
-                expected_root_device,
-                expected_root_inode,
-                observed.clone(),
-            )
-            .await
-            {
-                Ok(target) => Some(target),
-                Err(ScannerError::RootIdentityChanged(_)) => {
-                    return ManifestDeltaPreparation::RootIdentityChanged { delta_id };
-                }
-                Err(_) => return ManifestDeltaPreparation::Unstable { delta_id },
-            }
-        } else {
-            None
-        };
-        let prepared = match prepared_filename {
-            PreparedManifestFilename::Movie(parsed_name) => scanner
-                .prepare_manifest_movie_file(
-                    &path,
-                    &observed,
-                    manifest_strm_target,
-                    parsed_name,
-                    movie_folder_provider_ids,
-                )
-                .await
-                .map(|file| file.map(PreparedManifestFile::Movie)),
-            PreparedManifestFilename::Episode(parsed_name) => scanner
-                .prepare_manifest_episode_file(
-                    &root.id,
-                    &path,
-                    &observed,
-                    manifest_strm_target,
-                    parsed_name,
-                )
-                .await
-                .map(|file| file.map(PreparedManifestFile::Episode)),
-            PreparedManifestFilename::Unresolved => scanner
-                .prepare_manifest_unresolved_file(&root, &path, &observed, manifest_strm_target)
-                .await
-                .map(|file| Some(PreparedManifestFile::Unresolved(file))),
-            PreparedManifestFilename::HomeVideo => scanner
-                .prepare_manifest_home_video_file(&root, &path, &observed, manifest_strm_target)
-                .await
-                .map(|file| Some(PreparedManifestFile::HomeVideo(file))),
-        };
-        match prepared {
-            Ok(Some(file)) if file.matches_observation(&observed) => Some(file),
-            Ok(_) | Err(_) => return ManifestDeltaPreparation::Unstable { delta_id },
-        }
-    } else {
-        None
-    };
-    if !verify_path_after_preparation {
-        let sidecar_entry = (is_sidecar && is_add).then(|| NewScanManifestSidecarEntry {
-            filesystem_entry_id: FilesystemEntryId::new().to_string(),
-            relative_path: observed.relative_path,
-        });
-        return ManifestDeltaPreparation::Stable {
-            file: prepared_file.map(Box::new),
-            sidecar_entry,
-        };
-    }
-    match stat_manifest_relative_file(
-        root_path,
-        observed.relative_path.clone(),
-        expected_root_device,
-        expected_root_inode,
-    )
-    .await
-    {
-        Ok(Some(current)) if manifest_file_observation_matches(&observed, &current) => {
-            let sidecar_entry = (is_sidecar && is_add).then(|| NewScanManifestSidecarEntry {
-                filesystem_entry_id: FilesystemEntryId::new().to_string(),
-                relative_path: observed.relative_path,
-            });
-            ManifestDeltaPreparation::Stable {
-                file: prepared_file.map(Box::new),
-                sidecar_entry,
-            }
-        }
-        Err(ScannerError::RootIdentityChanged(_)) => {
-            ManifestDeltaPreparation::RootIdentityChanged { delta_id }
-        }
-        Ok(_) | Err(_) => ManifestDeltaPreparation::Unstable { delta_id },
-    }
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-fn open_manifest_directory_component(
-    parent_descriptor: std::os::fd::RawFd,
-    name: &std::ffi::OsStr,
-    display_path: &Path,
-    relative_directory: &str,
-) -> Result<std::fs::File, ScannerError> {
-    let name_c = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| ScannerError::InvalidRelativePath(relative_directory.to_owned()))?;
-    // SAFETY: parent_descriptor remains owned by the caller and name_c is NUL-terminated.
-    let descriptor = unsafe {
-        libc::openat(
-            parent_descriptor,
-            name_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        let source = std::io::Error::last_os_error();
-        if source.raw_os_error() == Some(libc::ELOOP) {
-            return Err(ScannerError::InvalidRelativePath(
-                relative_directory.to_owned(),
-            ));
-        }
-        return Err(ScannerError::Io {
-            path: display_path.to_owned(),
-            source,
-        });
-    }
-    // SAFETY: descriptor is a newly opened directory and ownership transfers to File.
-    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-struct ManifestDirectoryReader {
-    root_path: PathBuf,
-    relative_directory: String,
-    directory_path: PathBuf,
-    entries: std::fs::ReadDir,
-    root_observation: NewScanManifestEntry,
-    root_observation_emitted: bool,
-    directory_observation: NewScanManifestEntry,
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-impl ManifestDirectoryReader {
-    fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
-        let canonical_root_path =
-            std::fs::canonicalize(root_path).map_err(|source| ScannerError::Io {
-                path: root_path.to_owned(),
-                source,
-            })?;
-        if canonical_root_path != root_path {
-            return Err(ScannerError::InvalidRelativePath(
-                root_path.to_string_lossy().into_owned(),
-            ));
-        }
-        let root_metadata =
-            std::fs::metadata(&canonical_root_path).map_err(|source| ScannerError::Io {
-                path: canonical_root_path.clone(),
-                source,
-            })?;
-        let root_observation = manifest_entry_observation(
-            String::new(),
-            "DIRECTORY",
-            &root_metadata,
-            &canonical_root_path,
-        )?;
-        let directory_path = root_path.join(relative_directory);
-        let canonical_directory_path =
-            std::fs::canonicalize(&directory_path).map_err(|source| ScannerError::Io {
-                path: directory_path.clone(),
-                source,
-            })?;
-        if !canonical_directory_path.starts_with(root_path)
-            || canonical_directory_path != directory_path
-        {
-            return Err(ScannerError::InvalidRelativePath(
-                relative_directory.to_owned(),
-            ));
-        }
-        let metadata =
-            std::fs::metadata(&canonical_directory_path).map_err(|source| ScannerError::Io {
-                path: canonical_directory_path.clone(),
-                source,
-            })?;
-        let directory_observation = manifest_entry_observation(
-            relative_directory.to_owned(),
-            "DIRECTORY",
-            &metadata,
-            &canonical_directory_path,
-        )?;
-        let entries =
-            std::fs::read_dir(&canonical_directory_path).map_err(|source| ScannerError::Io {
-                path: canonical_directory_path.clone(),
-                source,
-            })?;
-        Ok(Self {
-            root_path: root_path.to_owned(),
-            relative_directory: relative_directory.to_owned(),
-            directory_path: canonical_directory_path,
-            entries,
-            root_observation,
-            root_observation_emitted: false,
-            directory_observation,
-        })
-    }
-
-    fn next_batch(
-        mut self,
-        max_entries: usize,
-    ) -> Result<(Self, ManifestDirectoryBatch), ScannerError> {
-        let batch_size = max_entries.clamp(1, MANIFEST_STREAMED_ENTRY_BATCH_SIZE);
-        let mut child_directories = Vec::with_capacity(batch_size);
-        let mut observations = Vec::with_capacity(batch_size);
-        let mut completed = false;
-        let measure_stages =
-            tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG);
-        let mut readdir_duration = Duration::ZERO;
-        let mut stat_duration = Duration::ZERO;
-        let mut readdir_entry_count = 0_usize;
-        let mut stat_entry_count = 0_usize;
-        if self.relative_directory.is_empty() && !self.root_observation_emitted {
-            observations.push(self.root_observation.clone());
-            self.root_observation_emitted = true;
-        }
-        for _ in 0..batch_size {
-            let readdir_started = measure_stages.then(Instant::now);
-            let Some(entry) = self.entries.next() else {
-                if let Some(started) = readdir_started {
-                    readdir_duration = readdir_duration.saturating_add(started.elapsed());
-                }
-                readdir_entry_count = readdir_entry_count.saturating_add(1);
-                completed = true;
-                break;
-            };
-            if let Some(started) = readdir_started {
-                readdir_duration = readdir_duration.saturating_add(started.elapsed());
-            }
-            readdir_entry_count = readdir_entry_count.saturating_add(1);
-            let entry = entry.map_err(|source| ScannerError::Io {
-                path: self.directory_path.clone(),
-                source,
-            })?;
-            let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| ScannerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if !(file_type.is_dir()
-                || file_type.is_file()
-                    && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
-            {
-                continue;
-            }
-            let relative_path = path
-                .strip_prefix(&self.root_path)
-                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
-                .to_str()
-                .ok_or(ScannerError::NonUtf8Path)?
-                .to_owned();
-            let stat_started = measure_stages.then(Instant::now);
-            let metadata = entry.metadata().map_err(|source| ScannerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if let Some(started) = stat_started {
-                stat_duration = stat_duration.saturating_add(started.elapsed());
-            }
-            stat_entry_count = stat_entry_count.saturating_add(1);
-            let entry_kind = if file_type.is_dir() {
-                child_directories.push(relative_path.clone());
-                "DIRECTORY"
-            } else {
-                "FILE"
-            };
-            observations.push(manifest_entry_observation(
-                relative_path,
-                entry_kind,
-                &metadata,
-                &path,
-            )?);
-        }
-        if completed && !self.directory_observation.relative_path.is_empty() {
-            observations.push(self.directory_observation.clone());
-        }
-        Ok((
-            self,
-            ManifestDirectoryBatch {
-                child_directories,
-                entries: observations,
-                completed,
-                readdir_duration,
-                stat_duration,
-                readdir_entry_count,
-                stat_entry_count,
-            },
-        ))
-    }
-}
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
@@ -2226,6 +448,7 @@ impl LibraryScanner {
                 for path in files {
                     let classification =
                         classify_mixed_file(&root_path, &path, &mut classification_cache).await;
+                    let mut inferred_movie_variant_suffix = None;
                     let quick_report = match classification {
                         MixedClassification::Movie => {
                             let relative_path = path
@@ -2237,13 +460,24 @@ impl LibraryScanner {
                                 .ok_or(ScannerError::NonUtf8Path)?;
                             match existing_entries.get(relative_path) {
                                 Some(existing_entry) => {
-                                    self.scan_movie_file_if_unchanged(
-                                        &root.id,
-                                        &root_path,
-                                        &path,
-                                        existing_entry,
-                                    )
-                                    .await?
+                                    let quick_result = self
+                                        .scan_movie_file_if_unchanged(
+                                            &root.id,
+                                            &root_path,
+                                            &path,
+                                            existing_entry,
+                                        )
+                                        .await?;
+                                    match quick_result {
+                                        MovieQuickScanResult::Unchanged { entry_id, report } => {
+                                            Some((entry_id, report))
+                                        }
+                                        MovieQuickScanResult::Rescan => None,
+                                        MovieQuickScanResult::RescanWithVariantSuffix(suffix) => {
+                                            inferred_movie_variant_suffix = Some(suffix);
+                                            None
+                                        }
+                                    }
                                 }
                                 None => None,
                             }
@@ -2320,16 +554,29 @@ impl LibraryScanner {
                         }
                     }
                     let result = match classification {
-                        MixedClassification::Movie => {
-                            self.scan_movie_file(
-                                &library_id_text,
-                                &root,
-                                &root_path,
-                                &path,
-                                &generation,
-                            )
-                            .await?
-                        }
+                        MixedClassification::Movie => match inferred_movie_variant_suffix {
+                            Some(suffix) => {
+                                self.scan_movie_file_with_inferred_suffix(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                    &generation,
+                                    Some(&suffix),
+                                )
+                                .await?
+                            }
+                            None => {
+                                self.scan_movie_file(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                            }
+                        },
                         MixedClassification::Episode => {
                             self.scan_episode_file_with_provider_cache(
                                 &library_id_text,
@@ -2576,10 +823,7 @@ impl LibraryScanner {
                     .await?;
             }
             self.database
-                .mark_filesystem_entry_seen(&existing_entry.id, generation)
-                .await?;
-            self.database
-                .update_filesystem_entry_inode(&existing_entry.id, inode)
+                .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                 .await?;
             return Ok(ScanReport {
                 discovered_files: 1,
@@ -2614,10 +858,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
-                    .await?;
-                self.database
-                    .update_filesystem_entry_inode(&existing_entry.id, inode)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
@@ -2633,11 +874,9 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
-                .await?;
-            self.database
-                .update_filesystem_entry_inode(&existing_entry.id, inode)
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -2768,6 +1007,7 @@ impl LibraryScanner {
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let inode = inode.and_then(|value| i64::try_from(value).ok());
         if let Some(existing_entry) = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
@@ -2799,7 +1039,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
@@ -2813,6 +1053,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
                 .await?;
@@ -2888,7 +1129,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
-                inode: inode.and_then(|value| i64::try_from(value).ok()),
+                inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })
@@ -3199,13 +1440,20 @@ impl LibraryScanner {
         let mut report = ScanReport::default();
         let mut seen_entry_ids = Vec::with_capacity(files.len());
         let mut new_paths = Vec::new();
-        let mut changed_paths = Vec::new();
+        let mut changed_paths = Vec::<(PathBuf, Option<String>)>::new();
         for (path, quick_result) in files.iter().zip(quick_results) {
-            if let Some((entry_id, quick_report)) = quick_result {
-                seen_entry_ids.push(entry_id);
-                report.merge(quick_report);
-                continue;
-            }
+            let inferred_variant_suffix = match quick_result {
+                MovieQuickScanResult::Unchanged {
+                    entry_id,
+                    report: quick_report,
+                } => {
+                    seen_entry_ids.push(entry_id);
+                    report.merge(quick_report);
+                    continue;
+                }
+                MovieQuickScanResult::Rescan => None,
+                MovieQuickScanResult::RescanWithVariantSuffix(suffix) => Some(suffix),
+            };
             let relative_path = path
                 .strip_prefix(root_path)
                 .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
@@ -3215,7 +1463,7 @@ impl LibraryScanner {
                 new_paths.push(path.clone());
                 continue;
             }
-            changed_paths.push(path.clone());
+            changed_paths.push((path.clone(), inferred_variant_suffix));
         }
         for changed_report in self
             .scan_movie_files_with_concurrency(
@@ -3269,7 +1517,7 @@ impl LibraryScanner {
         library_id_text: &str,
         root: &StoredLibraryRoot,
         root_path: &Path,
-        paths: &[PathBuf],
+        paths: &[(PathBuf, Option<String>)],
         generation: &str,
         configured_concurrency: usize,
     ) -> Result<Vec<ScanReport>, ScannerError> {
@@ -3282,10 +1530,13 @@ impl LibraryScanner {
         // therefore stay in input order; otherwise two source variants can
         // both observe the pre-repair rows and create duplicate logical items.
         // Different identities remain eligible for concurrent processing.
-        let mut grouped_paths = Vec::<Vec<(usize, PathBuf)>>::new();
+        let mut grouped_paths = Vec::<Vec<(usize, PathBuf, Option<String>)>>::new();
         let mut group_indexes = HashMap::<String, usize>::new();
-        for (index, path) in paths.iter().cloned().enumerate() {
-            let inferred_suffix = infer_sibling_movie_variant_suffix(&path).await;
+        for (index, (path, cached_suffix)) in paths.iter().cloned().enumerate() {
+            let inferred_suffix = match cached_suffix {
+                Some(suffix) => Some(suffix),
+                None => infer_sibling_movie_variant_suffix(&path).await,
+            };
             let group_key = reconciliation_regular_group_key(
                 &root.id,
                 &path,
@@ -3297,7 +1548,7 @@ impl LibraryScanner {
                 grouped_paths.push(Vec::new());
                 grouped_paths.len() - 1
             });
-            grouped_paths[group_index].push((index, path));
+            grouped_paths[group_index].push((index, path, inferred_suffix));
         }
         let mut tasks: JoinSet<ReconciliationRegularGroupTask> = JoinSet::new();
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
@@ -3312,9 +1563,16 @@ impl LibraryScanner {
             let generation = generation.to_owned();
             tasks.spawn(async move {
                 let mut reports = Vec::with_capacity(group.len());
-                for (index, path) in group {
+                for (index, path, inferred_suffix) in group {
                     let report = scanner
-                        .scan_movie_file(&library_id_text, &root, &root_path, &path, &generation)
+                        .scan_movie_file_with_inferred_suffix(
+                            &library_id_text,
+                            &root,
+                            &root_path,
+                            &path,
+                            &generation,
+                            inferred_suffix.as_deref(),
+                        )
                         .await?;
                     reports.push((index, report));
                 }
@@ -3333,12 +1591,12 @@ impl LibraryScanner {
         root_path: &Path,
         path: &Path,
         existing_entry: &StoredFilesystemEntry,
-    ) -> Result<Option<(String, ScanReport)>, ScannerError> {
+    ) -> Result<MovieQuickScanResult, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         };
         if parse_movie_filename(file_name).is_none() || is_strm_file(path) {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         }
         let relative_path = path
             .strip_prefix(root_path)
@@ -3364,28 +1622,30 @@ impl LibraryScanner {
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         }
         let expected_parent_identity =
             movie_parent_folder_identity(library_root_id, &relative_path);
         if existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref() {
-            return Ok(None);
+            return Ok(MovieQuickScanResult::Rescan);
         }
         // CD-part and version-marker entries need the regular path to refresh their identity.
-        if has_multi_part_marker(file_name)
-            || has_source_variant_marker(file_name)
-            || infer_sibling_movie_variant_suffix(path).await.is_some()
-        {
-            return Ok(None);
+        if has_multi_part_marker(file_name) || has_source_variant_marker(file_name) {
+            return Ok(MovieQuickScanResult::Rescan);
         }
-        Ok(Some((
-            existing_entry.id.clone(),
-            ScanReport {
+        if let Some(inferred_variant_suffix) = infer_sibling_movie_variant_suffix(path).await {
+            return Ok(MovieQuickScanResult::RescanWithVariantSuffix(
+                inferred_variant_suffix,
+            ));
+        }
+        Ok(MovieQuickScanResult::Unchanged {
+            entry_id: existing_entry.id.clone(),
+            report: ScanReport {
                 discovered_files: 1,
                 skipped_files: 1,
                 ..ScanReport::default()
             },
-        )))
+        })
     }
 
     async fn scan_movie_files_if_unchanged(
@@ -3395,8 +1655,10 @@ impl LibraryScanner {
         paths: &[PathBuf],
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
         configured_concurrency: usize,
-    ) -> Result<Vec<Option<(String, ScanReport)>>, ScannerError> {
-        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+    ) -> Result<Vec<MovieQuickScanResult>, ScannerError> {
+        let mut results = (0..paths.len())
+            .map(|_| MovieQuickScanResult::Rescan)
+            .collect::<Vec<_>>();
         let mut tasks: JoinSet<MovieFingerprintTask> = JoinSet::new();
         let concurrency = configured_concurrency.clamp(1, FINGERPRINT_CHECK_CONCURRENCY);
         for (index, path) in paths.iter().enumerate() {
@@ -3736,11 +1998,9 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
-                .await?;
-            self.database
-                .update_filesystem_entry_inode(&existing_entry.id, inode)
                 .await?;
             return Ok((existing_entry.id.clone(), true));
         }
@@ -4349,12 +2609,31 @@ impl LibraryScanner {
         path: &Path,
         generation: &str,
     ) -> Result<ScanReport, ScannerError> {
+        let inferred_suffix = infer_sibling_movie_variant_suffix(path).await;
+        self.scan_movie_file_with_inferred_suffix(
+            library_id_text,
+            root,
+            root_path,
+            path,
+            generation,
+            inferred_suffix.as_deref(),
+        )
+        .await
+    }
+
+    async fn scan_movie_file_with_inferred_suffix(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        generation: &str,
+        inferred_suffix: Option<&str>,
+    ) -> Result<ScanReport, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(ScanReport::default());
         };
-        let inferred_suffix = infer_sibling_movie_variant_suffix(path).await;
         let parsed_name = inferred_suffix
-            .as_deref()
             .and_then(|suffix| parse_movie_filename_with_variant_suffix(file_name, suffix))
             .or_else(|| parse_movie_filename(file_name));
         let Some(parsed_name) = parsed_name else {
@@ -4395,6 +2674,7 @@ impl LibraryScanner {
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let inode = inode.and_then(|value| i64::try_from(value).ok());
         let mut report = ScanReport {
             discovered_files: 1,
             ..ScanReport::default()
@@ -4429,7 +2709,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 report.skipped_files = 1;
                 return Ok(report);
@@ -4440,6 +2720,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
                 .await?;
@@ -4516,7 +2797,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 report.created_items = usize::from(created_item);
                 report.changed_files = usize::from(reassigned);
@@ -4529,6 +2810,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
                 .await?;
@@ -4558,7 +2840,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
-                inode: inode.and_then(|value| i64::try_from(value).ok()),
+                inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })
@@ -4963,6 +3245,50 @@ type PendingLocalMetadataCompletenessCheck = (String, String, Vec<u8>, bool, boo
 
 const METADATA_FILL_MISSING_AUTO_BATCH_LIMIT: usize = 100;
 
+fn local_metadata_completeness_commit_batches<'a>(
+    results: &[NewItemMetadataCompletenessResult<'a>],
+    eligible_item_ids: &[String],
+) -> Vec<(Vec<NewItemMetadataCompletenessResult<'a>>, Vec<String>)> {
+    if results.is_empty() && eligible_item_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let eligible_chunks = eligible_item_ids
+        .chunks(METADATA_FILL_MISSING_AUTO_BATCH_LIMIT)
+        .map(<[String]>::to_vec)
+        .collect::<Vec<_>>();
+    let batch_count = eligible_chunks.len().max(1);
+    let mut batches = (0..batch_count)
+        .map(|index| {
+            (
+                Vec::new(),
+                eligible_chunks.get(index).cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut batch_by_item_id = HashMap::with_capacity(eligible_item_ids.len());
+    for (batch_index, item_ids) in eligible_chunks.iter().enumerate() {
+        for item_id in item_ids {
+            batch_by_item_id.insert(item_id.as_str(), batch_index);
+        }
+    }
+
+    for result in results {
+        let batch_index = batch_by_item_id.get(result.item_id).copied().unwrap_or(0);
+        batches[batch_index]
+            .0
+            .push(NewItemMetadataCompletenessResult {
+                item_id: result.item_id,
+                capability: result.capability,
+                input_fingerprint: result.input_fingerprint,
+                is_missing: result.is_missing,
+                checked_at: result.checked_at,
+            });
+    }
+
+    batches
+}
+
 async fn complete_local_metadata_completeness(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
@@ -5128,19 +3454,14 @@ async fn complete_local_metadata_completeness_for_item_ids(
                     }
                 })
                 .collect::<Vec<_>>();
-            let eligible_chunks = if metadata_fill_missing.is_empty() {
-                vec![&[][..]]
-            } else {
-                metadata_fill_missing
-                    .chunks(METADATA_FILL_MISSING_AUTO_BATCH_LIMIT)
-                    .collect::<Vec<_>>()
-            };
-            for eligible_chunk in eligible_chunks {
+            let commit_batches =
+                local_metadata_completeness_commit_batches(&results, &metadata_fill_missing);
+            for (batch_results, eligible_chunk) in commit_batches {
                 let completion = database
                     .complete_local_metadata_and_enqueue_fill_missing_with_policy(
                         &library_id,
-                        &results,
-                        eligible_chunk,
+                        &batch_results,
+                        &eligible_chunk,
                         auto_match_policy_override,
                     )
                     .await;
@@ -5363,24 +3684,15 @@ impl ScanJobService {
             }
         }
 
-        let root_ids = self
+        let roots = self
             .database
-            .list_scan_manifest_root_ids(manifest_id)
+            .list_scan_manifest_root_discovery_baselines(manifest_id)
             .await?;
         let mut session = LiteManifestDiscoverySession::default();
-        for root_id in root_ids {
-            let state = self
-                .database
-                .get_scan_manifest_root_identity(manifest_id, &root_id)
-                .await?
-                .map(|(state, _, _)| state);
-            if matches!(state.as_deref(), Some("COMPLETE" | "UNAVAILABLE")) {
+        for (root_id, state, has_filesystem_entries) in roots {
+            if matches!(state.as_str(), "COMPLETE" | "UNAVAILABLE") {
                 continue;
             }
-            let has_filesystem_entries = self
-                .database
-                .scan_manifest_root_has_filesystem_entries(&root_id)
-                .await?;
             session
                 .directories
                 .push_back((root_id, String::new(), has_filesystem_entries));
@@ -5657,16 +3969,19 @@ impl ScanJobService {
             )
             .await?;
         self.cancellation_flag(&job.id);
-        for (root_id, relative_path, kind) in valid_changes {
-            self.database
-                .enqueue_incremental_scan_path(
-                    &job.id,
-                    &root_id,
-                    &relative_path,
-                    change_kind_name(kind),
+        let paths = valid_changes
+            .iter()
+            .map(|(root_id, relative_path, kind)| {
+                (
+                    root_id.as_str(),
+                    relative_path.as_str(),
+                    change_kind_name(*kind),
                 )
-                .await?;
-        }
+            })
+            .collect::<Vec<_>>();
+        self.database
+            .enqueue_incremental_scan_paths(&job.id, &paths)
+            .await?;
         self.record_event(
             &job.id,
             "INFO",
@@ -5739,11 +4054,13 @@ impl ScanJobService {
             .get_or_create_incremental_scan_job_reusing_active(&library_id, false)
             .await?;
         self.cancellation_flag(&job.id);
-        for root in roots {
-            self.database
-                .enqueue_incremental_scan_path(&job.id, &root.id, ".", "MODIFY")
-                .await?;
-        }
+        let paths = roots
+            .iter()
+            .map(|root| (root.id.as_str(), ".", "MODIFY"))
+            .collect::<Vec<_>>();
+        self.database
+            .enqueue_incremental_scan_paths(&job.id, &paths)
+            .await?;
         self.record_event(
             &job.id,
             "WARN",
@@ -7122,12 +5439,20 @@ impl ScanJobService {
         let mut movie_identity_reassigned = false;
         for relative_path in relative_paths {
             let path = root_path.join(relative_path);
-            if infer_sibling_movie_variant_suffix(&path).await.is_none() {
+            let inferred_suffix = infer_sibling_movie_variant_suffix(&path).await;
+            if inferred_suffix.is_none() {
                 continue;
             }
             let report = self
                 .scanner
-                .scan_movie_file(&job.library_id, &root, root_path, &path, &job.generation)
+                .scan_movie_file_with_inferred_suffix(
+                    &job.library_id,
+                    &root,
+                    root_path,
+                    &path,
+                    &job.generation,
+                    inferred_suffix.as_deref(),
+                )
                 .await?;
             movie_identity_reassigned |= report.changed_files > 0;
         }
@@ -9737,7 +8062,8 @@ impl ScanJobService {
             ));
         }
 
-        let mut grouped_regular_works = Vec::<Vec<(usize, ReconciliationRegularWork)>>::new();
+        let mut grouped_regular_works =
+            Vec::<Vec<(usize, ReconciliationRegularWork, Option<String>)>>::new();
         let mut regular_group_indexes = HashMap::<String, usize>::new();
         for (regular_index, work) in regular_works.iter().cloned().enumerate() {
             let inferred_suffix = if matches!(work.classification, MixedClassification::Movie) {
@@ -9756,7 +8082,7 @@ impl ScanJobService {
                 grouped_regular_works.push(Vec::new());
                 grouped_regular_works.len() - 1
             });
-            grouped_regular_works[group_index].push((regular_index, work));
+            grouped_regular_works[group_index].push((regular_index, work, inferred_suffix));
         }
         let mut regular_tasks: JoinSet<ReconciliationRegularGroupTask> = JoinSet::new();
         let mut regular_results = (0..regular_works.len()).map(|_| None).collect::<Vec<_>>();
@@ -9786,18 +8112,19 @@ impl ScanJobService {
             let generation = job.generation.clone();
             regular_tasks.spawn(async move {
                 let mut reports = Vec::with_capacity(group.len());
-                for (regular_index, work) in group {
+                for (regular_index, work, inferred_suffix) in group {
                     let root = work.root;
                     let path = work.path;
                     let report = match work.classification {
                         MixedClassification::Movie => {
                             scanner
-                                .scan_movie_file(
+                                .scan_movie_file_with_inferred_suffix(
                                     &library_id,
                                     &root,
                                     Path::new(&root.canonical_path),
                                     &path,
                                     &generation,
+                                    inferred_suffix.as_deref(),
                                 )
                                 .await?
                         }
@@ -12144,12 +10471,21 @@ type MoviePreparationOutput = (
     Option<NewMovieFile>,
 );
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
-type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+type MovieFingerprintTask = Result<(usize, MovieQuickScanResult), ScannerError>;
 type EpisodeQuickResult = Option<(String, ScanReport, Option<(String, String)>)>;
 type EpisodeFingerprintTask = Result<(usize, EpisodeQuickResult), ScannerError>;
 type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 type ReconciliationRegularTask = Result<(usize, ScanReport), ScannerError>;
 type ReconciliationRegularGroupTask = Result<Vec<(usize, ScanReport)>, ScannerError>;
+
+enum MovieQuickScanResult {
+    Unchanged {
+        entry_id: String,
+        report: ScanReport,
+    },
+    Rescan,
+    RescanWithVariantSuffix(String),
+}
 
 fn reconciliation_regular_group_key(
     root_id: &str,
@@ -12193,7 +10529,7 @@ fn reconciliation_regular_group_key(
 
 async fn collect_movie_fingerprint_task(
     tasks: &mut JoinSet<MovieFingerprintTask>,
-    results: &mut [Option<(String, ScanReport)>],
+    results: &mut [MovieQuickScanResult],
 ) -> Result<(), ScannerError> {
     let (index, result) = match tasks.join_next().await {
         Some(Ok(result)) => result?,
@@ -13279,6 +11615,22 @@ fn trailing_hyphen_variant_candidates(filename: &str) -> Option<Vec<(&str, &str)
 }
 
 async fn infer_sibling_movie_variant_suffix(path: &Path) -> Option<String> {
+    infer_sibling_movie_variant_suffix_with_probe(path, |sibling| async move {
+        fs::symlink_metadata(sibling)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+    })
+    .await
+}
+
+async fn infer_sibling_movie_variant_suffix_with_probe<F, Fut>(
+    path: &Path,
+    mut is_regular_file: F,
+) -> Option<String>
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let filename = path.file_name()?.to_str()?;
     let candidates = trailing_hyphen_variant_candidates(filename)?;
     let directory = path.parent()?;
@@ -13295,10 +11647,7 @@ async fn infer_sibling_movie_variant_suffix(path: &Path) -> Option<String> {
     for (base, suffix) in candidates.iter().rev() {
         for extension in &extensions {
             let sibling = directory.join(format!("{base}.{extension}"));
-            if fs::symlink_metadata(sibling)
-                .await
-                .is_ok_and(|metadata| metadata.file_type().is_file())
-            {
+            if is_regular_file(sibling).await {
                 matched_suffixes.insert(*suffix);
                 break;
             }
@@ -13343,12 +11692,30 @@ fn is_strm_file(path: &Path) -> bool {
 }
 
 async fn read_strm_target(path: &Path) -> Result<StrmTarget, ScannerError> {
-    let contents = fs::read_to_string(path)
+    let file = fs::File::open(path)
         .await
         .map_err(|source| ScannerError::Io {
             path: path.to_owned(),
             source,
         })?;
+    let mut contents = String::new();
+    let bytes_read = file
+        .take(u64::try_from(MAX_STRM_TARGET_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_string(&mut contents)
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if bytes_read > MAX_STRM_TARGET_BYTES {
+        return Err(ScannerError::Io {
+            path: path.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "STRM target exceeds the size limit",
+            ),
+        });
+    }
     Ok(classify_strm_target(&contents))
 }
 
@@ -13482,22 +11849,29 @@ fn configured_scan_concurrency(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::{
         LibraryScanner, MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader, ManifestFilenameInput,
-        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
-        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
-        ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
-        configured_scan_concurrency, infer_sibling_movie_variant_suffix,
-        is_lite_manifest_discovery, manifest_file_observation_matches,
-        manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
-        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
-        prepare_manifest_filename, read_manifest_strm_target, safe_scan_activity_label,
-        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
-        stat_manifest_root_sync,
+        MANIFEST_STREAMED_INDEX_BATCH_SIZE, MAX_STRM_TARGET_BYTES, ManifestDirectoryReader,
+        ManifestFilenameInput, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
+        MixedClassification, MixedClassificationCache, MixedManifestClassification,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
+        PreparedManifestFilename, ScanJobService, ScannerError, classify_manifest_removal_outcomes,
+        classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
+        infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
+        manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
+        merge_movie_provider_ids, normalize_incremental_path, parse_episode_filename,
+        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
+        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -13505,12 +11879,148 @@ mod tests {
         ScraperMetadata, ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest,
         ScraperSearchResponse, ScraperTrailersResponse,
     };
+    use crate::storage::NewItemMetadataCompletenessResult;
     use tokio::sync::{Notify, Semaphore};
 
     #[derive(Clone)]
     struct GateSearchScraper {
         search_started: Arc<Notify>,
         release_search: Arc<Semaphore>,
+    }
+
+    fn assert_local_metadata_results_are_partitioned_once(
+        batches: &[(Vec<NewItemMetadataCompletenessResult<'_>>, Vec<String>)],
+        results: &[NewItemMetadataCompletenessResult<'_>],
+        eligible_item_ids: &[String],
+    ) {
+        let committed_result_count = batches
+            .iter()
+            .map(|(batch_results, _)| batch_results.len())
+            .sum::<usize>();
+        assert_eq!(committed_result_count, results.len());
+
+        let mut scheduled_item_occurrences = HashMap::<&str, usize>::new();
+        for (_, item_ids) in batches {
+            for item_id in item_ids {
+                *scheduled_item_occurrences
+                    .entry(item_id.as_str())
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(scheduled_item_occurrences.len(), eligible_item_ids.len());
+        assert!(
+            eligible_item_ids
+                .iter()
+                .all(|item_id| { scheduled_item_occurrences.get(item_id.as_str()) == Some(&1) })
+        );
+
+        let mut result_occurrences = HashMap::<(&str, &str), usize>::new();
+        for (batch_results, _) in batches {
+            for result in batch_results {
+                *result_occurrences
+                    .entry((result.item_id, result.capability))
+                    .or_default() += 1;
+            }
+        }
+        assert!(result_occurrences.values().all(|count| *count == 1));
+    }
+
+    #[test]
+    fn local_metadata_completeness_commit_batches_write_512_results_once() {
+        let eligible_item_ids = (0..256)
+            .map(|index| format!("item-{index:03}"))
+            .collect::<Vec<_>>();
+        let input_fingerprint = b"local-completeness-input-v1";
+        let results = eligible_item_ids
+            .iter()
+            .flat_map(|item_id| {
+                ["POSTER", "METADATA"].map(|capability| NewItemMetadataCompletenessResult {
+                    item_id,
+                    capability,
+                    input_fingerprint,
+                    is_missing: true,
+                    checked_at: 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        let batches =
+            super::local_metadata_completeness_commit_batches(&results, &eligible_item_ids);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, item_ids)| item_ids.len())
+                .collect::<Vec<_>>(),
+            [100, 100, 56]
+        );
+        assert!(batches.iter().all(|(_, item_ids)| item_ids.len() <= 100));
+        assert_eq!(results.len(), 512);
+        assert_local_metadata_results_are_partitioned_once(&batches, &results, &eligible_item_ids);
+        assert_eq!(results.len() * batches.len(), 1_536);
+    }
+
+    #[test]
+    fn local_metadata_completeness_commit_batches_keep_ready_and_ineligible_results() {
+        let mut eligible_item_ids = (0..201)
+            .map(|index| format!("item-{index:03}"))
+            .collect::<Vec<_>>();
+        let previously_ready_missing_item_id = "ready-without-new-claim".to_owned();
+        eligible_item_ids.push(previously_ready_missing_item_id.clone());
+        let input_fingerprint = b"local-completeness-input-v1";
+        let mut results = eligible_item_ids[..100]
+            .iter()
+            .chain(eligible_item_ids[200..201].iter())
+            .flat_map(|item_id| {
+                ["POSTER", "METADATA"].map(|capability| NewItemMetadataCompletenessResult {
+                    item_id,
+                    capability,
+                    input_fingerprint,
+                    is_missing: true,
+                    checked_at: 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        results.push(NewItemMetadataCompletenessResult {
+            item_id: "not-eligible",
+            capability: "METADATA",
+            input_fingerprint,
+            is_missing: true,
+            checked_at: 1,
+        });
+
+        let batches =
+            super::local_metadata_completeness_commit_batches(&results, &eligible_item_ids);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, item_ids)| item_ids.len())
+                .collect::<Vec<_>>(),
+            [100, 100, 2]
+        );
+        assert!(batches[1].0.is_empty());
+        assert!(batches[2].1.contains(&previously_ready_missing_item_id));
+        assert!(
+            !batches[2]
+                .0
+                .iter()
+                .any(|result| result.item_id == previously_ready_missing_item_id)
+        );
+        assert!(
+            batches[0]
+                .0
+                .iter()
+                .any(|result| result.item_id == "not-eligible")
+        );
+        assert_local_metadata_results_are_partitioned_once(&batches, &results, &eligible_item_ids);
+
+        let result_only_batches =
+            super::local_metadata_completeness_commit_batches(&results[results.len() - 1..], &[]);
+        assert_eq!(result_only_batches.len(), 1);
+        assert_eq!(result_only_batches[0].0.len(), 1);
+        assert!(result_only_batches[0].1.is_empty());
     }
 
     fn unsupported_scraper_call<T: Send + 'static>(
@@ -13950,12 +12460,186 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inferred_variant_counts_candidate_metadata_probes() {
+        let variant_path = PathBuf::from("/virtual/ADN-725-Alternate-Cut.mp4");
+        let base_path = variant_path
+            .parent()
+            .expect("variant parent")
+            .join("ADN-725.mp4");
+        let expected_base_path = Arc::new(base_path);
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let inferred_suffix = infer_sibling_movie_variant_suffix_with_probe(&variant_path, {
+            let expected_base_path = Arc::clone(&expected_base_path);
+            let probe_count = Arc::clone(&probe_count);
+            move |candidate| {
+                let expected_base_path = Arc::clone(&expected_base_path);
+                let probe_count = Arc::clone(&probe_count);
+                async move {
+                    probe_count.fetch_add(1, Ordering::Relaxed);
+                    candidate == *expected_base_path
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(inferred_suffix.as_deref(), Some("Alternate-Cut"));
+        assert_eq!(probe_count.load(Ordering::Relaxed), 13);
+    }
+
+    #[tokio::test]
+    async fn movie_variant_rescan_reuses_the_suffix_found_by_the_quick_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        let movie_dir = media_root.join("ADN-725");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("ADN-725.mp4"), b"base").await?;
+        let variant_path = movie_dir.join("ADN-725-Alternate-Cut.mp4");
+        tokio::fs::write(&variant_path, b"variant").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF-8 media root")?,
+            )
+            .await?;
+        let scanner = LibraryScanner::new(database.clone());
+        scanner.scan_movie_library(library.id).await?;
+
+        sqlx::query(
+            "UPDATE media_sources SET edition_name = NULL
+             WHERE filesystem_entry_id = (
+                 SELECT id FROM filesystem_entries
+                 WHERE relative_path = 'ADN-725/ADN-725-Alternate-Cut.mp4'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        scanner.scan_movie_library(library.id).await?;
+        let edition: Option<String> = sqlx::query_scalar(
+            "SELECT source.edition_name
+             FROM media_sources source
+             JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+             WHERE entry.relative_path = 'ADN-725/ADN-725-Alternate-Cut.mp4'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(edition.as_deref(), Some("Alternate-Cut"));
+
+        tokio::fs::write(&variant_path, b"variant content changed").await?;
+        let report = scanner.scan_movie_library(library.id).await?;
+        assert_eq!(report.changed_files, 1);
+
+        let edition: Option<String> = sqlx::query_scalar(
+            "SELECT source.edition_name
+             FROM media_sources source
+             JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+             WHERE entry.relative_path = 'ADN-725/ADN-725-Alternate-Cut.mp4'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(edition.as_deref(), Some("Alternate-Cut"));
+        Ok(())
+    }
+
     #[test]
     fn lite_manifest_discovery_requires_the_streamed_v3_contract() {
         assert!(is_lite_manifest_discovery(2, 3, "LITE"));
         assert!(!is_lite_manifest_discovery(1, 3, "LITE"));
         assert!(!is_lite_manifest_discovery(2, 2, "LITE"));
         assert!(!is_lite_manifest_discovery(2, 3, "PERSISTED"));
+    }
+
+    #[tokio::test]
+    async fn lite_manifest_session_loads_root_baselines_with_one_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library_service = LibraryService::new(database.clone());
+        let library = library_service
+            .create_library("Multi-root", LibraryKind::Movie, false)
+            .await?;
+        let mut root_ids = Vec::new();
+        for index in 0..4 {
+            let root_path = temp_dir.path().join(format!("root-{index}"));
+            std::fs::create_dir_all(&root_path)?;
+            let root = library_service
+                .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+                .await?
+                .root;
+            root_ids.push(root.id.to_string());
+        }
+
+        let jobs = ScanJobService::new(database.clone());
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let manifest = database
+            .get_scan_manifest_by_job(&job.id)
+            .await?
+            .ok_or("scan manifest was not created")?;
+        for (root_id, state) in [(&root_ids[0], "COMPLETE"), (&root_ids[1], "UNAVAILABLE")] {
+            sqlx::query(
+                "UPDATE scan_manifest_roots SET state = ?
+                 WHERE manifest_id = ? AND library_root_id = ?",
+            )
+            .bind(state)
+            .bind(&manifest.id)
+            .bind(root_id)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation
+             ) VALUES ('existing-entry', ?, 'existing.mkv', 'FILE', 1, 1, 'generation')",
+        )
+        .bind(&root_ids[3])
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        jobs.ensure_lite_manifest_discovery_session(&manifest.id)
+            .await?;
+        assert_eq!(database.query_count(), 1);
+
+        let directories = jobs.pop_lite_manifest_directories(&manifest.id, 10);
+        assert_eq!(directories.len(), 2);
+        let baselines = directories
+            .into_iter()
+            .map(|(root_id, relative_directory, has_filesystem_entries)| {
+                assert!(relative_directory.is_empty());
+                (root_id, has_filesystem_entries)
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(!baselines.contains_key(&root_ids[0]));
+        assert!(!baselines.contains_key(&root_ids[1]));
+        assert_eq!(baselines.get(&root_ids[2]), Some(&false));
+        assert_eq!(baselines.get(&root_ids[3]), Some(&true));
+        Ok(())
     }
 
     #[test]
@@ -14976,6 +13660,29 @@ mod tests {
             observation,
         )
         .await;
+
+        assert!(matches!(
+            result,
+            Err(ScannerError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_manifest_strm_read_rejects_oversized_target_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let strm_path = temp_dir.path().join("oversized.strm");
+        std::fs::write(
+            &strm_path,
+            format!(
+                "https://example.invalid/{}",
+                "x".repeat(MAX_STRM_TARGET_BYTES)
+            ),
+        )?;
+
+        let result = read_strm_target(&strm_path).await;
 
         assert!(matches!(
             result,

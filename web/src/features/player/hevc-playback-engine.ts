@@ -10,14 +10,7 @@ export type HevcRuntimeAssets = {
   wasmBinaryUrl: string;
 };
 
-type Mp4Track = {
-  id: number;
-  type: "video" | "audio" | string;
-  codec: string;
-  timescale: number;
-  duration: number;
-  nb_samples: number;
-};
+type Mp4Track = Parameters<NonNullable<ReturnType<typeof createFile>["onReady"]>>[0]["tracks"][number];
 
 export function segmentSampleCount(track: Pick<Mp4Track, "nb_samples" | "duration" | "timescale">, segmentSeconds = 2) {
   if (track.nb_samples <= 0 || track.duration <= 0 || track.timescale <= 0) return 1;
@@ -133,7 +126,6 @@ export class ClientHevcEngine implements PlaybackEngine {
   private durationSeconds: number | null = null;
   private transcodedMediaDurationMs = 0;
   private transcodedProcessingDurationMs = 0;
-  private streamTask: Promise<void> | null = null;
   private generation = 0;
 
   constructor(
@@ -197,8 +189,7 @@ export class ClientHevcEngine implements PlaybackEngine {
         const next = previous.then(() => this.processSegment(id, buffer, trackKinds, initialization, resolvePlaybackReady));
         segmentChains.set(id, next);
       };
-      file.onReady = (rawInfo) => {
-        const info = rawInfo as unknown as { tracks: Mp4Track[] };
+      file.onReady = (info) => {
         for (const track of info.tracks) trackKinds.set(track.id, track.type);
         void this.configureTracks(info.tracks, file, mediaSource, openPromise, worker)
           .then(() => resolveInitialization())
@@ -210,7 +201,7 @@ export class ClientHevcEngine implements PlaybackEngine {
         resolveTracksReady();
       };
 
-      this.streamTask = this.consumeSource(response.body, file, segmentChains, tracksReady, initialization, mediaSource, generation, () => playbackReady, rejectPlaybackReady);
+      void this.consumeSource(response.body, file, segmentChains, tracksReady, initialization, mediaSource, generation, () => playbackReady, rejectPlaybackReady);
       await playbackReadyPromise;
     } catch (error) {
       this.destroy();
@@ -262,8 +253,6 @@ export class ClientHevcEngine implements PlaybackEngine {
       } else {
         this.element.dispatchEvent(new Event("error"));
       }
-    } finally {
-      if (generation === this.generation) this.streamTask = null;
     }
   }
 
@@ -378,7 +367,6 @@ export class ClientHevcEngine implements PlaybackEngine {
     this.generation += 1;
     this.abortController?.abort();
     this.abortController = null;
-    this.streamTask = null;
     this.worker?.destroy();
     this.worker = null;
     if (this.mediaSource?.readyState === "open") {

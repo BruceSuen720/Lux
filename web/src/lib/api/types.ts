@@ -273,6 +273,13 @@ export type HomeCarouselResponse = {
   recommended?: MediaItem[];
 };
 
+export type HomeLatestLibrariesResponse = {
+  libraries: Array<{
+    libraryId: string;
+    items: MediaItem[];
+  }>;
+};
+
 export type PageResponse<T> = {
   items?: T[];
   page?: number;

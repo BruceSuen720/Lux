@@ -990,14 +990,13 @@ pub(super) async fn emby_create_user(
             tracing::error!(error = %error, "failed to copy emby user library settings");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        if let Ok(Some(configuration)) = database.find_user_emby_configuration(&source_id).await {
-            if let Err(error) = database
+        if let Ok(Some(configuration)) = database.find_user_emby_configuration(&source_id).await
+            && let Err(error) = database
                 .set_user_emby_configuration(&target_id, &configuration)
                 .await
-            {
-                tracing::error!(error = %error, "failed to copy emby user configuration");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
+        {
+            tracing::error!(error = %error, "failed to copy emby user configuration");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         created = match users.find_by_id(&target_id).await {
             Ok(Some(user)) => user,

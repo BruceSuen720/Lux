@@ -1570,17 +1570,15 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
             let source = sources.remove(index);
             sources.insert(0, source);
         }
-        if include_people {
-            if let Value::Object(object) = &mut value {
-                let mut people = actors
-                    .into_iter()
-                    .map(|actor| emby_person_json(actor, &state.server_id))
-                    .collect::<Vec<_>>();
-                if let Some(nfo) = nfo.as_ref() {
-                    people.extend(emby_nfo_crew_json(nfo));
-                }
-                object.insert("People".to_owned(), Value::Array(people));
+        if include_people && let Value::Object(object) = &mut value {
+            let mut people = actors
+                .into_iter()
+                .map(|actor| emby_person_json(actor, &state.server_id))
+                .collect::<Vec<_>>();
+            if let Some(nfo) = nfo.as_ref() {
+                people.extend(emby_nfo_crew_json(nfo));
             }
+            object.insert("People".to_owned(), Value::Array(people));
         }
         items.push(value);
     }
@@ -3241,10 +3239,10 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
     if let Some(played_percentage) = played_percentage {
         user_data.insert("PlayedPercentage".to_owned(), json!(played_percentage));
     }
-    if let Some(last_played_at) = user_state.and_then(|state| state.last_played_at) {
-        if let Some(last_played_date) = emby_timestamp(last_played_at) {
-            user_data.insert("LastPlayedDate".to_owned(), json!(last_played_date));
-        }
+    if let Some(last_played_at) = user_state.and_then(|state| state.last_played_at)
+        && let Some(last_played_date) = emby_timestamp(last_played_at)
+    {
+        user_data.insert("LastPlayedDate".to_owned(), json!(last_played_date));
     }
     if let Some(unplayed_item_count) = unplayed_item_count
         && matches!(item.item_type.as_str(), "SERIES" | "SEASON")
@@ -3552,10 +3550,10 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         if emby_fields_include(fields, "BasicSyncInfo") {
             object.insert("SupportsSync".to_owned(), json!(supports_sync));
         }
-        if emby_fields_include(fields, "DateModified") {
-            if let Some(modified) = emby_timestamp(item.updated_at) {
-                object.insert("DateModified".to_owned(), json!(modified));
-            }
+        if emby_fields_include(fields, "DateModified")
+            && let Some(modified) = emby_timestamp(item.updated_at)
+        {
+            object.insert("DateModified".to_owned(), json!(modified));
         }
         if (emby_fields_include(fields, "DateCreated")
             || emby_fields_include(fields, "DateLastSaved"))
@@ -4045,10 +4043,10 @@ pub(super) async fn emby_primary_image_aspect_ratio(
         .find_primary_image_dimensions(item_id)
         .await
         .ok()?
+        && width > 0
+        && height > 0
     {
-        if width > 0 && height > 0 {
-            return Some(f64::from(width) / f64::from(height));
-        }
+        return Some(f64::from(width) / f64::from(height));
     }
 
     let images = state.images.as_ref()?;
