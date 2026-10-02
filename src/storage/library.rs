@@ -2051,31 +2051,45 @@ impl Database {
                         path: self.path.clone(),
                         source,
                     })?;
-                for library_id in removed_ids {
-                    self.query(
-                        "DELETE FROM scheduled_task_plan_libraries
-                         WHERE plan_id = ? AND library_id = ?",
-                    )
-                    .bind(plan_id)
-                    .bind(&library_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                    self.query(
+                const MAX_MOVED_LIBRARY_IDS_PER_BATCH: usize = 500;
+                for batch in removed_ids.chunks(MAX_MOVED_LIBRARY_IDS_PER_BATCH) {
+                    let placeholders = std::iter::repeat_n("?", batch.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut insert_query = self.query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
-                         VALUES (?, ?) ON CONFLICT DO NOTHING",
-                    )
-                    .bind(&default_plan_id)
-                    .bind(library_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                         SELECT ?, library_id
+                         FROM scheduled_task_plan_libraries
+                         WHERE plan_id = ? AND library_id IN ({placeholders})
+                         ON CONFLICT DO NOTHING"
+                    )));
+                    insert_query = insert_query.bind(&default_plan_id).bind(plan_id);
+                    for library_id in batch {
+                        insert_query = insert_query.bind(library_id);
+                    }
+                    insert_query
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+
+                    let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
+                        "DELETE FROM scheduled_task_plan_libraries
+                         WHERE plan_id = ? AND library_id IN ({placeholders})"
+                    )));
+                    delete_query = delete_query.bind(plan_id);
+                    for library_id in batch {
+                        delete_query = delete_query.bind(library_id);
+                    }
+                    delete_query
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
                 }
             }
         }
@@ -3282,6 +3296,112 @@ mod scheduled_task_plan_mirror_tests {
             .expect_err("mixed plugin source should be rejected");
         assert!(matches!(error, StorageError::Conflict(_)));
         transaction.rollback().await.expect("transaction rollback");
+    }
+
+    #[tokio::test]
+    async fn updating_a_plan_moves_removed_libraries_in_bounded_batches() {
+        const LIBRARY_COUNT: usize = 705;
+        const CUSTOM_PLAN_ID: &str = "custom-plan-batch-move";
+        const DEFAULT_PLAN_ID: &str = "default-plan-batch-move";
+
+        let (_temp_dir, database) = test_database().await;
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|index| format!("plan-move-library-{index:03}"))
+            .collect::<Vec<_>>();
+        for (plan_id, plan_name, is_default) in [
+            (CUSTOM_PLAN_ID, "Custom plan", 0_i64),
+            (DEFAULT_PLAN_ID, "Default plan", 1_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_task_plans (
+                    id, task_type, plan_name, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, scope_type, is_default
+                 ) VALUES (?, 'RECONCILIATION_SCAN', ?, 'Scan', 'Scan',
+                           'SYSTEM', NULL, '0 3 * * *', 1, '{}', 'LIBRARY', ?)",
+            )
+            .bind(plan_id)
+            .bind(plan_name)
+            .bind(is_default)
+            .execute(database.pool())
+            .await
+            .expect("scheduled task plan should be inserted");
+        }
+        for library_id in &library_ids {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await
+                .expect("library should be inserted");
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, plan_id
+                 ) VALUES ('LIBRARY', ?, 'RECONCILIATION_SCAN', 'Scan', 'Scan',
+                           'SYSTEM', NULL, '0 3 * * *', 1, '{}', ?)",
+            )
+            .bind(library_id)
+            .bind(CUSTOM_PLAN_ID)
+            .execute(database.pool())
+            .await
+            .expect("library task config should be inserted");
+            sqlx::query(
+                "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+                 VALUES (?, ?)",
+            )
+            .bind(CUSTOM_PLAN_ID)
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("custom plan library should be inserted");
+        }
+
+        let kept_library_id = library_ids[0].clone();
+        database.reset_query_count();
+        database
+            .update_scheduled_task_plan(
+                CUSTOM_PLAN_ID,
+                "Updated plan",
+                Some("0 4 * * *"),
+                true,
+                std::slice::from_ref(&kept_library_id),
+                "Scan",
+                "Scan",
+                "SYSTEM",
+                None,
+                "{}",
+            )
+            .await
+            .expect("plan should be updated");
+
+        assert_eq!(database.query_count(), 16);
+        let custom_member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plan_libraries WHERE plan_id = ?",
+        )
+        .bind(CUSTOM_PLAN_ID)
+        .fetch_one(database.pool())
+        .await
+        .expect("custom plan member count");
+        assert_eq!(custom_member_count, 1);
+        let default_member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plan_libraries WHERE plan_id = ?",
+        )
+        .bind(DEFAULT_PLAN_ID)
+        .fetch_one(database.pool())
+        .await
+        .expect("default plan member count");
+        assert_eq!(default_member_count, (LIBRARY_COUNT - 1) as i64);
+        let moved_config_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_configs
+             WHERE plan_id = ? AND owner_type = 'LIBRARY'",
+        )
+        .bind(DEFAULT_PLAN_ID)
+        .fetch_one(database.pool())
+        .await
+        .expect("moved task config count");
+        assert_eq!(moved_config_count, (LIBRARY_COUNT - 1) as i64);
     }
 
     #[tokio::test]
