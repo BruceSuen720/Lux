@@ -3954,6 +3954,9 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         database: database_name.clone(),
         ..admin_connection
     };
+    let raw_database_url = DatabaseConfiguration::Postgres(connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL test URL")?;
     let database =
         Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
             .await?;
@@ -4008,6 +4011,151 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let check_b = check_b?;
     assert_eq!(check_a.len() + check_b.len(), 2);
     assert!(check_a.is_empty() || check_b.is_empty());
+
+    const DEADLOCK_TEST_ADVISORY_KEY: i64 = 913_579_246_813_579;
+    let raw_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&raw_database_url)
+        .await?;
+    sqlx::query(
+        r#"CREATE FUNCTION test_completeness_lock_order_trigger() RETURNS trigger
+           LANGUAGE plpgsql AS $$
+           BEGIN
+               IF NEW.local_state = 'PENDING' AND NEW.capability = 'DEADLOCK_TEST' THEN
+                   PERFORM pg_advisory_xact_lock(913579246813579);
+                   PERFORM 1 FROM media_items WHERE id = NEW.item_id FOR KEY SHARE;
+               END IF;
+               RETURN NEW;
+           END;
+           $$"#,
+    )
+    .execute(&raw_pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER test_completeness_lock_order
+         BEFORE UPDATE ON item_metadata_completeness
+         FOR EACH ROW EXECUTE FUNCTION test_completeness_lock_order_trigger()",
+    )
+    .execute(&raw_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_metadata_completeness
+             (item_id, capability, local_state, is_missing, input_fingerprint)
+         VALUES ($1, 'DEADLOCK_TEST', 'RUNNING', NULL, $2)",
+    )
+    .bind(&replay_item_id)
+    .bind(b"old".as_slice())
+    .execute(&raw_pool)
+    .await?;
+
+    let mut advisory_connection = raw_pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(DEADLOCK_TEST_ADVISORY_KEY)
+        .execute(&mut *advisory_connection)
+        .await?;
+    let mut parent_transaction = raw_pool.begin().await?;
+    sqlx::query("SELECT id FROM media_items WHERE id = $1 FOR UPDATE")
+        .bind(&replay_item_id)
+        .fetch_one(&mut *parent_transaction)
+        .await?;
+
+    let completion_database = database.clone();
+    let completion_library_id = library.id.to_string();
+    let completion_item_id = replay_item_id.clone();
+    let completion_task = tokio::spawn(async move {
+        let results = [NewItemMetadataCompletenessResult {
+            item_id: &completion_item_id,
+            capability: "DEADLOCK_TEST",
+            input_fingerprint: b"old",
+            is_missing: false,
+            checked_at: 2_000,
+        }];
+        completion_database
+            .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+                &completion_library_id,
+                &results,
+                &[],
+                Some(false),
+            )
+            .await
+    });
+    let mut completion_waiting_for_parent = false;
+    for _ in 0..100 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND query LIKE '%SELECT id FROM media_items%'",
+        )
+        .fetch_one(&raw_pool)
+        .await?;
+        if waiting > 0 {
+            completion_waiting_for_parent = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        completion_waiting_for_parent,
+        "completion transaction did not reach the parent-row lock"
+    );
+
+    let claim_database = database.clone();
+    let claim_item_id = replay_item_id.clone();
+    let claim_task = tokio::spawn(async move {
+        let checks = [NewItemMetadataCompletenessCheck {
+            item_id: &claim_item_id,
+            capability: "DEADLOCK_TEST",
+            input_fingerprint: b"new",
+        }];
+        claim_database
+            .prepare_and_claim_item_metadata_completeness_checks(&checks)
+            .await
+    });
+    parent_transaction.commit().await?;
+
+    let mut claim_waiting_for_advisory = false;
+    for _ in 0..300 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks
+             WHERE locktype = 'advisory' AND granted = false",
+        )
+        .fetch_one(&raw_pool)
+        .await?;
+        if waiting > 0 {
+            claim_waiting_for_advisory = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        claim_waiting_for_advisory,
+        "claim transaction did not reach the controlled parent-lock point"
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(DEADLOCK_TEST_ADVISORY_KEY)
+        .execute(&mut *advisory_connection)
+        .await?;
+    let (claim_result, completion_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(claim_task, completion_task)
+        })
+        .await?;
+    let claim_result = claim_result.map_err(|error| std::io::Error::other(error.to_string()))??;
+    let completion_result =
+        completion_result.map_err(|error| std::io::Error::other(error.to_string()))??;
+    assert_eq!(claim_result, vec![0]);
+    assert_eq!(completion_result.updated_count, 1);
+    sqlx::query(
+        "DELETE FROM item_metadata_completeness
+         WHERE item_id = $1 AND capability = 'DEADLOCK_TEST'",
+    )
+    .bind(&replay_item_id)
+    .execute(&raw_pool)
+    .await?;
+    drop(advisory_connection);
+    raw_pool.close().await;
+
     let completeness_results = [
         NewItemMetadataCompletenessResult {
             item_id: &item_id,

@@ -59,6 +59,12 @@ impl Database {
 
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let item_ids = checks
+            .iter()
+            .map(|check| check.item_id.to_owned())
+            .collect::<Vec<_>>();
+        self.lock_media_items_for_update(&mut transaction, &item_ids)
+            .await?;
         let mut claimed_indices = Vec::with_capacity(checks.len());
         for (batch_index, batch) in checks
             .chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE)
@@ -241,7 +247,7 @@ impl Database {
             .map(|result| result.item_id.to_owned())
             .chain(eligible_ids.iter().cloned())
             .collect::<Vec<_>>();
-        self.lock_metadata_reidentify_items_for_update(&mut transaction, &lock_ids)
+        self.lock_media_items_for_update(&mut transaction, &lock_ids)
             .await?;
 
         let mut commit = ItemMetadataCompletenessCommit::default();
@@ -455,6 +461,9 @@ impl Database {
         validate_item_metadata_completeness_key(item_id, capability, input_fingerprint)?;
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let item_ids = vec![item_id.to_owned()];
+        self.lock_media_items_for_update(&mut transaction, &item_ids)
+            .await?;
         let changed = self
             .query_scalar::<String>(
                 "INSERT INTO item_metadata_completeness (

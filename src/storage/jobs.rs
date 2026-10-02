@@ -8057,7 +8057,7 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.lock_metadata_reidentify_items_for_update(&mut transaction, item_ids)
+        self.lock_media_items_for_update(&mut transaction, item_ids)
             .await?;
         self.query(
             "INSERT INTO metadata_reidentify_jobs (
@@ -8131,7 +8131,7 @@ impl Database {
             })
     }
 
-    pub(crate) async fn lock_metadata_reidentify_items_for_update(
+    pub(crate) async fn lock_media_items_for_update(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         item_ids: &[String],
