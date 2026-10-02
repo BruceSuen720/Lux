@@ -2665,6 +2665,94 @@ async fn metadata_completeness_results_use_bounded_update_batches() {
 }
 
 #[tokio::test]
+async fn user_library_order_is_replaced_in_bounded_batches() {
+    const LIBRARY_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user_id = "library-order-batch-user";
+    database
+        .insert_user(
+            user_id,
+            user_id,
+            "Library order user",
+            "test-hash",
+            false,
+            true,
+        )
+        .await
+        .expect("user");
+    let library_ids = (0..LIBRARY_COUNT)
+        .map(|index| format!("library-order-batch-{index:03}"))
+        .collect::<Vec<_>>();
+    for library_id in &library_ids {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(library_id)
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("library");
+    }
+
+    database.reset_query_count();
+    database
+        .replace_user_library_order(user_id, &library_ids)
+        .await
+        .expect("replace library order");
+    assert_eq!(database.query_count(), 4);
+    let stored = database
+        .user_library_order(user_id)
+        .await
+        .expect("library order");
+    assert_eq!(stored, library_ids);
+    let positions: Vec<i64> = sqlx::query_scalar(
+        "SELECT position FROM user_library_order WHERE user_id = ? ORDER BY position",
+    )
+    .bind(user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("stored positions");
+    assert_eq!(positions, (0..LIBRARY_COUNT as i64).collect::<Vec<_>>());
+
+    let mut invalid_ids = library_ids.clone();
+    invalid_ids[LIBRARY_COUNT - 1] = invalid_ids[0].clone();
+    database.reset_query_count();
+    assert!(
+        database
+            .replace_user_library_order(user_id, &invalid_ids)
+            .await
+            .is_err()
+    );
+    assert_eq!(database.query_count(), 4);
+    assert_eq!(
+        database
+            .user_library_order(user_id)
+            .await
+            .expect("rollback order"),
+        library_ids
+    );
+
+    database.reset_query_count();
+    database
+        .replace_user_library_order(user_id, &[])
+        .await
+        .expect("clear library order");
+    assert_eq!(database.query_count(), 1);
+    assert!(
+        database
+            .user_library_order(user_id)
+            .await
+            .expect("cleared library order")
+            .is_empty()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn image_source_urls_are_checked_with_one_bounded_query() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
