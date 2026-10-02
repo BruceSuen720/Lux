@@ -3349,17 +3349,25 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .list_active_media_item_metadata_with_libraries(item_ids)
         .await
         .map_err(|error| error.to_string())?;
+    let plan_inputs = item_ids
+        .iter()
+        .filter_map(|item_id| {
+            metadata_by_item
+                .get(item_id)
+                .map(|(_, current)| (item_id.as_str(), current))
+        })
+        .collect::<Vec<_>>();
+    let plans_by_item = selection
+        .local_metadata_completeness_plans(&plan_inputs)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> =
         BTreeMap::new();
     for item_id in item_ids {
-        let Some((library_id, current)) = metadata_by_item.get(item_id) else {
+        let Some((library_id, _current)) = metadata_by_item.get(item_id) else {
             continue;
         };
-        let plan = selection
-            .local_metadata_completeness_plan(item_id, current)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(plan) = plan else {
+        let Some(plan) = plans_by_item.get(item_id).and_then(Option::as_ref) else {
             continue;
         };
         let eligible_for_fill_missing = if plan.has_requestable_capability
@@ -3387,19 +3395,15 @@ async fn complete_local_metadata_completeness_for_item_ids(
             false
         };
         let checks = checks_by_library.entry(library_id.clone()).or_default();
-        checks.extend(
-            plan.capabilities
-                .into_iter()
-                .map(|(capability, is_missing)| {
-                    (
-                        item_id.clone(),
-                        capability,
-                        plan.input_fingerprint.clone(),
-                        is_missing,
-                        eligible_for_fill_missing,
-                    )
-                }),
-        );
+        checks.extend(plan.capabilities.iter().map(|(capability, is_missing)| {
+            (
+                item_id.clone(),
+                capability.clone(),
+                plan.input_fingerprint.clone(),
+                *is_missing,
+                eligible_for_fill_missing,
+            )
+        }));
     }
 
     let checked_at = SystemTime::now()

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -176,6 +176,82 @@ fn metadata_request_plan_has_work(plan: MetadataRequestPlan) -> bool {
         || plan.needs_credits
         || plan.needs_external_ids
         || plan.needs_trailers
+}
+
+fn missing_image_mask(image_types: &[&str], local_image_types: &BTreeSet<String>) -> u16 {
+    image_types.iter().fold(0_u16, |mask, image_type| {
+        if local_image_types.contains(*image_type) {
+            return mask;
+        }
+        SCRAPER_IMAGE_TYPES
+            .iter()
+            .position(|candidate| *candidate == *image_type)
+            .map_or(mask, |index| mask | (1_u16 << index))
+    })
+}
+
+fn requestable_metadata_plan(
+    actual_plan: MetadataRequestPlan,
+    image_types: &[&str],
+    capability_identity: Option<&(String, String)>,
+    attempts: Option<&(
+        Vec<StoredMetadataCapabilityAttempt>,
+        Vec<crate::storage::StoredMetadataImageAttempt>,
+    )>,
+) -> MetadataRequestPlan {
+    let (capability_states, image_attempts) =
+        attempts.map_or((&[][..], &[][..]), |(capability_states, image_attempts)| {
+            (capability_states.as_slice(), image_attempts.as_slice())
+        });
+    let unavailable_image_attempts = image_attempts
+        .iter()
+        .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
+        .map(|attempt| (attempt.image_type.clone(), attempt.candidate_key.clone()))
+        .collect::<BTreeSet<_>>();
+    let image_attempt_identities = if attempts.is_some() {
+        image_attempt_identities(capability_identity)
+    } else {
+        Vec::new()
+    };
+    let mut requestable_missing_image_mask = actual_plan.missing_image_mask;
+    for image_type in image_types {
+        let Some(index) = SCRAPER_IMAGE_TYPES
+            .iter()
+            .position(|candidate| *candidate == *image_type)
+        else {
+            continue;
+        };
+        let image_mask = 1_u16 << index;
+        if actual_plan.missing_image_mask & image_mask == 0 {
+            continue;
+        }
+        let explicitly_unavailable = !image_attempt_identities.is_empty()
+            && image_attempt_identities
+                .iter()
+                .all(|(source, provider_id)| {
+                    unavailable_image_attempts.contains(&(
+                        (*image_type).to_owned(),
+                        image_no_candidate_key(source, image_type, provider_id),
+                    ))
+                });
+        if explicitly_unavailable {
+            requestable_missing_image_mask &= !image_mask;
+        }
+    }
+    let mut requestable_plan = actual_plan;
+    requestable_plan.needs_images = requestable_missing_image_mask != 0;
+    requestable_plan.missing_image_mask = requestable_missing_image_mask;
+    requestable_plan.needs_credits = requestable_plan.needs_credits
+        && capability_needs_request(capability_states, capability_identity, CAPABILITY_CREDITS);
+    requestable_plan.needs_external_ids = requestable_plan.needs_external_ids
+        && capability_needs_request(
+            capability_states,
+            capability_identity,
+            CAPABILITY_EXTERNAL_IDS,
+        );
+    requestable_plan.needs_trailers = requestable_plan.needs_trailers
+        && capability_needs_request(capability_states, capability_identity, CAPABILITY_TRAILERS);
+    requestable_plan
 }
 
 fn local_metadata_completeness_plan(
@@ -2192,27 +2268,154 @@ impl MetadataSelectionService {
         Ok(actual_plan)
     }
 
-    pub(crate) async fn local_metadata_completeness_plan(
+    pub(crate) async fn local_metadata_completeness_plans(
+        &self,
+        items: &[(&str, &StoredMediaMetadata)],
+    ) -> Result<HashMap<String, Option<LocalMetadataCompletenessPlan>>, MetadataSelectionError>
+    {
+        let supported_items = items
+            .iter()
+            .filter(|(_, current)| fill_missing_fields(&current.item_type).is_some())
+            .collect::<Vec<_>>();
+        if supported_items.is_empty() {
+            return Ok(items
+                .iter()
+                .map(|(item_id, _)| ((*item_id).to_owned(), None))
+                .collect());
+        }
+        let item_ids = supported_items
+            .iter()
+            .map(|(item_id, _)| (*item_id).to_owned())
+            .collect::<Vec<_>>();
+        let strategies = self
+            .database
+            .list_item_media_strategy_settings_by_ids(&item_ids)
+            .await?;
+        let indexed_images = self.database.list_item_images_by_ids(&item_ids).await?;
+
+        let mut actual_plans = Vec::with_capacity(supported_items.len());
+        let mut attempt_item_ids = Vec::new();
+        for (item_id, current) in &supported_items {
+            let Some((library_strategy, global_strategy)) = strategies.get(*item_id) else {
+                return Err(MetadataSelectionError::ItemNotFound);
+            };
+            let image_policy = ImageSelectionPolicy::from_json(
+                library_strategy.as_deref(),
+                global_strategy.as_deref(),
+            );
+            let image_types = image_policy.enabled_types().collect::<Vec<_>>();
+            let indexed_images = indexed_images
+                .get(*item_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let local_image_types = self
+                .images
+                .local_image_types_with_indexed_images(
+                    item_id,
+                    &image_types,
+                    image_policy.thumbnail_scraping_mode.prefers_screenshots(),
+                    indexed_images,
+                )
+                .await?;
+            let actual_missing_image_mask = missing_image_mask(&image_types, &local_image_types);
+            let (actual_plan, capability_identity) = self
+                .actual_request_plan_for_current(
+                    item_id,
+                    current,
+                    image_policy,
+                    actual_missing_image_mask,
+                )
+                .await?;
+            let should_read_attempt_state =
+                capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
+            if should_read_attempt_state {
+                attempt_item_ids.push((*item_id).to_owned());
+            }
+            actual_plans.push((
+                (*item_id).to_owned(),
+                current,
+                image_types,
+                actual_plan,
+                capability_identity,
+                should_read_attempt_state,
+            ));
+        }
+
+        let attempts = self
+            .database
+            .list_metadata_attempts_by_item_ids(&attempt_item_ids)
+            .await?;
+        let mut plans = HashMap::with_capacity(items.len());
+        for (
+            item_id,
+            current,
+            image_types,
+            actual_plan,
+            capability_identity,
+            should_read_attempt_state,
+        ) in actual_plans
+        {
+            let attempt_state = should_read_attempt_state
+                .then(|| attempts.get(&item_id))
+                .flatten();
+            let requestable_plan = requestable_metadata_plan(
+                actual_plan,
+                &image_types,
+                capability_identity.as_ref(),
+                attempt_state,
+            );
+            plans.insert(
+                item_id.clone(),
+                local_metadata_completeness_plan(&item_id, current, actual_plan, requestable_plan),
+            );
+        }
+        for (item_id, _current) in items {
+            plans.entry((*item_id).to_owned()).or_insert_with(|| None);
+        }
+        Ok(plans)
+    }
+
+    async fn actual_request_plan_for_current(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
-    ) -> Result<Option<LocalMetadataCompletenessPlan>, MetadataSelectionError> {
-        if fill_missing_fields(&current.item_type).is_none() {
-            return Ok(None);
-        }
-        let (actual_plan, requestable_plan, _) = self
-            .fill_missing_request_plans_for_current(
-                item_id,
-                current,
-                MetadataAttemptMode::RespectRetryState,
-            )
-            .await?;
-        Ok(local_metadata_completeness_plan(
-            item_id,
+        image_policy: ImageSelectionPolicy,
+        actual_missing_image_mask: u16,
+    ) -> Result<(MetadataRequestPlan, Option<(String, String)>), MetadataSelectionError> {
+        let details = current.nfo_metadata_json.as_deref().and_then(|value| {
+            serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
+        });
+        let details = if details.is_some() {
+            details
+        } else {
+            self.nfo
+                .read_item_projection(item_id)
+                .await?
+                .map(|projection| projection.details)
+        };
+        let credits_missing = match current.item_type.as_str() {
+            "MOVIE" | "SERIES" => {
+                let actor_relation_exists = self
+                    .people
+                    .item_actor_relation_exists(item_id)
+                    .await
+                    .map_err(MetadataSelectionError::People)?;
+                credits_are_missing(actor_relation_exists, details.as_ref())
+            }
+            _ => false,
+        };
+        let mut actual_plan = metadata_request_plan(
             current,
-            actual_plan,
-            requestable_plan,
-        ))
+            actual_missing_image_mask != 0,
+            credits_missing,
+            details.as_ref(),
+        );
+        actual_plan.image_policy = Some(image_policy);
+        actual_plan.missing_image_mask = actual_missing_image_mask;
+        if !has_selected_provider_id(current) {
+            actual_plan.needs_metadata = true;
+        }
+        Ok((actual_plan, selected_capability_identity(current)))
     }
 
     pub(crate) async fn supplemental_request_plan(
@@ -2268,122 +2471,33 @@ impl MetadataSelectionService {
         } else {
             self.images.local_image_types(item_id, &image_types).await?
         };
-        let mut actual_missing_image_mask = 0_u16;
-        for image_type in &image_types {
-            if local_image_types.contains(*image_type) {
-                continue;
-            }
-            let Some(index) = SCRAPER_IMAGE_TYPES
-                .iter()
-                .position(|candidate| *candidate == *image_type)
-            else {
-                continue;
-            };
-            actual_missing_image_mask |= 1_u16 << index;
-        }
-        let details = current.nfo_metadata_json.as_deref().and_then(|value| {
-            serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
-        });
-        let details = if details.is_some() {
-            details
-        } else {
-            self.nfo
-                .read_item_projection(item_id)
-                .await?
-                .map(|projection| projection.details)
-        };
-        let credits_missing = match current.item_type.as_str() {
-            "MOVIE" | "SERIES" => {
-                let actor_relation_exists = self
-                    .people
-                    .item_actor_relation_exists(item_id)
-                    .await
-                    .map_err(MetadataSelectionError::People)?;
-                credits_are_missing(actor_relation_exists, details.as_ref())
-            }
-            _ => false,
-        };
-        let mut actual_plan = metadata_request_plan(
-            current,
-            actual_missing_image_mask != 0,
-            credits_missing,
-            details.as_ref(),
-        );
-        actual_plan.image_policy = Some(image_policy);
-        actual_plan.missing_image_mask = actual_missing_image_mask;
-        if !has_selected_provider_id(current) {
-            actual_plan.needs_metadata = true;
-        }
-
-        let capability_identity = match attempt_mode {
-            MetadataAttemptMode::RespectRetryState => selected_capability_identity(current),
-            MetadataAttemptMode::IgnoreRetryState => None,
-        };
+        let actual_missing_image_mask = missing_image_mask(&image_types, &local_image_types);
+        let (actual_plan, selected_identity) = self
+            .actual_request_plan_for_current(
+                item_id,
+                current,
+                image_policy,
+                actual_missing_image_mask,
+            )
+            .await?;
+        let capability_identity = matches!(attempt_mode, MetadataAttemptMode::RespectRetryState)
+            .then_some(selected_identity)
+            .flatten();
         // Retry history only affects work that is actually missing and has a
         // confirmed provider identity. Backups use actual missing data only.
         let should_read_attempt_state =
             capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
-        let (capability_states, image_attempts) = if should_read_attempt_state {
-            self.database.list_metadata_attempts(item_id).await?
+        let attempts = if should_read_attempt_state {
+            Some(self.database.list_metadata_attempts(item_id).await?)
         } else {
-            (Vec::new(), Vec::new())
+            None
         };
-        let unavailable_image_attempts = image_attempts
-            .into_iter()
-            .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
-            .map(|attempt| (attempt.image_type, attempt.candidate_key))
-            .collect::<BTreeSet<_>>();
-        let image_attempt_identities = if should_read_attempt_state {
-            image_attempt_identities(capability_identity.as_ref())
-        } else {
-            Vec::new()
-        };
-        let mut requestable_missing_image_mask = actual_missing_image_mask;
-        for image_type in &image_types {
-            let Some(index) = SCRAPER_IMAGE_TYPES
-                .iter()
-                .position(|candidate| *candidate == *image_type)
-            else {
-                continue;
-            };
-            let image_mask = 1_u16 << index;
-            if actual_missing_image_mask & image_mask == 0 {
-                continue;
-            }
-            let explicitly_unavailable = !image_attempt_identities.is_empty()
-                && image_attempt_identities
-                    .iter()
-                    .all(|(source, provider_id)| {
-                        unavailable_image_attempts.contains(&(
-                            (*image_type).to_owned(),
-                            image_no_candidate_key(source, image_type, provider_id),
-                        ))
-                    });
-            if explicitly_unavailable {
-                requestable_missing_image_mask &= !image_mask;
-            }
-        }
-        let mut requestable_plan = actual_plan;
-        requestable_plan.needs_images = requestable_missing_image_mask != 0;
-        requestable_plan.missing_image_mask = requestable_missing_image_mask;
-        requestable_plan.needs_credits = requestable_plan.needs_credits
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_CREDITS,
-            );
-        requestable_plan.needs_external_ids = requestable_plan.needs_external_ids
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_EXTERNAL_IDS,
-            );
-        requestable_plan.needs_trailers = requestable_plan.needs_trailers
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_TRAILERS,
-            );
+        let requestable_plan = requestable_metadata_plan(
+            actual_plan,
+            &image_types,
+            capability_identity.as_ref(),
+            attempts.as_ref(),
+        );
         Ok((actual_plan, requestable_plan, actual_missing_image_mask))
     }
 

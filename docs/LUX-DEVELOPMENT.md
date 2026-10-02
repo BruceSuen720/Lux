@@ -7990,6 +7990,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：同一媒体源的 3 个 marker 由逐条 INSERT 改为一条 3 行多值 INSERT；包含 fingerprint 读取和旧 marker DELETE 的 SQL 调用从 5 次降至 3 次，减少 2 次（40%）。回归验证 marker 数量、fingerprint 校验和章节检测 API/读取行为；本任务未实测 PostgreSQL 墙钟、NAS 或生产负载。
 
+#### LUX-361：批量预读本地元数据完整性计划依赖
+
+范围：本地元数据完整性 worker 已经批量读取 item 元数据，但计划计算仍对每个 item 单独读取媒体策略、图片索引和 metadata attempt 状态。新增有界批量预读并把已读图片索引传给计划计算，保持本地文件存在性检查、NFO 投影、人物关系文件、重试语义、补缺资格和完整性队列合同不变。本任务不迁移文件读取，也不改变后续刮削器资格查询。
+
+验收：
+
+- [x] 205 个 item 的策略、图片索引和 attempt 三类依赖读取从 615 次 SQL 调用降至 3 次有界查询。
+- [x] scanner 使用批量计划结果，缺失能力、输入顺序、指纹、attempt 冷却和补缺资格保持不变。
+- [x] 图片索引预读不会跳过现有本地图片路径、fallback、缩略图策略和路径安全检查。
+- [x] 相关 storage、reidentify 和 scanner 回归通过；不改变 schema、公共 API 或数据库事务边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-358。预计文件：`src/storage/media.rs`、`src/storage/catalog.rs`、`src/storage/metadata.rs`、`src/application/images.rs`、`src/application/candidates.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加逐 item 与批量依赖读取计数回归，再接入 scanner。
+
+结果（2026-10-03）：新增 205 item 的逐项与批量对照回归；媒体策略、图片索引和 attempt 状态由旧路径 615 次 SQL 调用降为 3 次，减少 612 次（约 99.5%）。scanner 改为一次批量计划预读后按 item 回填，保留本地图片/NFO/人物文件检查、fallback 和重试语义；schema、公共 API 与事务边界未改变。本机 `uname -m=arm64`，SQLite 计数不外推 PostgreSQL、NAS 或端到端墙钟。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

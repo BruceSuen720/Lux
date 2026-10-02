@@ -1222,3 +1222,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中为一个媒体源替换同一 provider 的 3 个 marker，并启用 source fingerprint 校验。旧实现执行 fingerprint SELECT、旧 marker DELETE 和 3 次逐条 INSERT，共 5 次 storage SQL 调用；新实现将 3 行合并为 1 条多值 INSERT，共 3 次，减少 2 次（约 40%）。
 
 空 marker、fingerprint 不匹配和其他 provider 的 marker 仍沿用原有事务语义。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不代表章节检测端到端墙钟、PostgreSQL 或 NAS 生产收益。
+
+### LUX-361 本地元数据完整性计划依赖预读调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个 active movie item，分别读取媒体策略、图片索引和 metadata attempt 状态。旧路径对每个 item 各执行一次查询，共 615 次；新路径按最多 500 个 ID 批量读取三类依赖，共 3 次，减少 612 次（约 99.5%）。
+
+批量计划仍逐 item 执行本地图片文件存在性、NFO 投影和人物关系文件检查；这些文件读取、后续刮削器资格查询和完整 worker 墙钟不在本次计数范围。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数量，不代表数据库写入量、PostgreSQL、NAS 或生产收益。

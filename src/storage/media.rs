@@ -255,6 +255,51 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_item_media_strategy_settings_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, (Option<String>, Option<String>)>, StorageError> {
+        let mut strategies = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT media_items.id AS item_id,
+                        libraries.media_strategy_json AS library_strategy,
+                        server_settings.value AS global_strategy
+                 FROM media_items
+                 JOIN libraries
+                   ON libraries.id = media_items.library_id AND libraries.is_enabled = 1
+                 LEFT JOIN server_settings ON server_settings.key = 'media_strategy'
+                 WHERE media_items.id IN ({placeholders})
+                   AND media_items.removed_at IS NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                strategies.insert(
+                    row.get("item_id"),
+                    (row.get("library_strategy"), row.get("global_strategy")),
+                );
+            }
+        }
+        Ok(strategies)
+    }
+
     pub(crate) async fn find_folder_scan_path(
         &self,
         item_id: &str,

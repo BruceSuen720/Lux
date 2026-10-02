@@ -856,7 +856,7 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, false)
+        self.local_image_types_impl(item_id, image_types, false, None)
             .await
     }
 
@@ -865,7 +865,18 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, true)
+        self.local_image_types_impl(item_id, image_types, true, None)
+            .await
+    }
+
+    pub(crate) async fn local_image_types_with_indexed_images(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+        include_fallback: bool,
+        indexed_images: &[StoredItemImage],
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
+        self.local_image_types_impl(item_id, image_types, include_fallback, Some(indexed_images))
             .await
     }
 
@@ -906,6 +917,7 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
         include_fallback: bool,
+        indexed_images: Option<&[StoredItemImage]>,
     ) -> Result<BTreeSet<String>, ImageWriteError> {
         let image_types = image_types
             .iter()
@@ -914,10 +926,36 @@ impl ImageWriteService {
                     .ok_or_else(|| ImageWriteError::InvalidImageType((*image_type).to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(indexed_images) = indexed_images {
+            return self
+                .local_image_types_from_indexed_images(
+                    item_id,
+                    &image_types,
+                    include_fallback,
+                    indexed_images,
+                )
+                .await;
+        }
         let indexed_images = self.database.list_item_images(item_id).await?;
+        self.local_image_types_from_indexed_images(
+            item_id,
+            &image_types,
+            include_fallback,
+            &indexed_images,
+        )
+        .await
+    }
+
+    async fn local_image_types_from_indexed_images(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+        include_fallback: bool,
+        indexed_images: &[StoredItemImage],
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
         let mut found = BTreeSet::new();
 
-        for image_type in &image_types {
+        for &image_type in image_types {
             let mut indexed_exists = false;
             for image in indexed_images.iter().filter(|image| {
                 image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == 0
@@ -932,7 +970,7 @@ impl ImageWriteService {
                 }
             }
             if indexed_exists {
-                found.insert((*image_type).to_owned());
+                found.insert(image_type.to_owned());
             }
         }
 
@@ -943,11 +981,11 @@ impl ImageWriteService {
             reject_metadata_symlinks(&root).await?;
             reject_metadata_symlinks(&directory).await?;
             let paths = read_image_directory_entries(&directory).await?;
-            for image_type in &image_types {
+            for &image_type in image_types {
                 for image_index in 0..MAX_IMAGE_VARIANTS {
                     let stems = image_lookup_stems(image_type, None, None, image_index as i64)?;
                     if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
-                        && !found.contains(*image_type)
+                        && !found.contains(image_type)
                         && !is_legacy_episode_fanart_path_for_type(
                             image_type,
                             None,
@@ -956,17 +994,17 @@ impl ImageWriteService {
                         )
                         && (include_fallback
                             || !indexed_image_path_is_fallback(
-                                &indexed_images,
+                                indexed_images,
                                 image_type,
                                 image_index as i64,
                                 &path,
                             )
                             .await?)
-                        && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
+                        && !image_path_is_owned_by_other_type(indexed_images, image_type, &path)
                             .await?
                         && image_file_stamp(&path).await?.is_some()
                     {
-                        found.insert((*image_type).to_owned());
+                        found.insert(image_type.to_owned());
                         break;
                     }
                 }
@@ -975,8 +1013,8 @@ impl ImageWriteService {
 
         let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
         let paths = read_image_directory_entries(&directory).await?;
-        for image_type in &image_types {
-            if found.contains(*image_type) {
+        for &image_type in image_types {
+            if found.contains(image_type) {
                 continue;
             }
             for image_index in 0..MAX_IMAGE_VARIANTS {
@@ -995,17 +1033,16 @@ impl ImageWriteService {
                     )
                     && (include_fallback
                         || !indexed_image_path_is_fallback(
-                            &indexed_images,
+                            indexed_images,
                             image_type,
                             image_index as i64,
                             &path,
                         )
                         .await?)
-                    && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
-                        .await?
+                    && !image_path_is_owned_by_other_type(indexed_images, image_type, &path).await?
                     && image_file_stamp(&path).await?.is_some()
                 {
-                    found.insert((*image_type).to_owned());
+                    found.insert(image_type.to_owned());
                     break;
                 }
             }

@@ -6180,6 +6180,52 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_item_images_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Vec<StoredItemImage>>, StorageError> {
+        let mut images_by_item = HashMap::<String, Vec<StoredItemImage>>::new();
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT ii.id, ii.item_id, ii.image_type, ii.image_index,
+                        ii.local_path, ii.file_size, ii.content_tag, ii.source,
+                        MIN(lr.canonical_path) AS root_path
+                 FROM item_images ii
+                 JOIN media_items mi ON mi.id = ii.item_id
+                 LEFT JOIN library_roots lr ON lr.library_id = mi.library_id
+                 WHERE ii.item_id IN ({placeholders})
+                 GROUP BY ii.id
+                 ORDER BY ii.item_id, ii.image_type, ii.image_index, ii.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let image = stored_item_image(row);
+                images_by_item
+                    .entry(image.item_id.clone())
+                    .or_default()
+                    .push(image);
+            }
+        }
+        Ok(images_by_item)
+    }
+
     pub(crate) async fn list_item_image_path_conflicts(
         &self,
     ) -> Result<Vec<StoredItemImagePathConflict>, StorageError> {

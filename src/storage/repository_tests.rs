@@ -9338,6 +9338,80 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
 }
 
 #[tokio::test]
+async fn local_metadata_completeness_dependencies_are_read_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness dependencies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("completeness-dependency-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO metadata_capability_attempts
+             (item_id, provider, provider_id, capability, status, next_retry_at)
+         VALUES (?, 'tmdb', '42', 'CREDITS', 'UNAVAILABLE', 123)",
+    )
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO metadata_image_attempts
+             (item_id, image_type, candidate_key, status)
+         VALUES (?, 'POSTER', 'tmdb:42:POSTER', 'FAILED')",
+    )
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        database.find_item_media_strategy_settings(item_id).await?;
+        database.list_item_images(item_id).await?;
+        database.list_metadata_attempts(item_id).await?;
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT * 3);
+
+    database.reset_query_count();
+    let strategies = database
+        .list_item_media_strategy_settings_by_ids(&item_ids)
+        .await?;
+    let images = database.list_item_images_by_ids(&item_ids).await?;
+    let attempts = database
+        .list_metadata_attempts_by_item_ids(&item_ids)
+        .await?;
+
+    assert_eq!(strategies.len(), ITEM_COUNT);
+    assert_eq!(images.len(), 0);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[&item_ids[0]].0[0].capability, "CREDITS");
+    assert_eq!(attempts[&item_ids[0]].1[0].image_type, "POSTER");
+    assert_eq!(database.query_count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_media_metadata_with_libraries_uses_one_bounded_query()
 -> Result<(), Box<dyn std::error::Error>> {
     const ITEM_COUNT: usize = 205;
