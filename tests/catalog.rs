@@ -1302,6 +1302,158 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .collect()
     );
 
+    let latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[
+            ("libraryId", series_library.id.to_string()),
+            ("libraryId", library.id.to_string()),
+        ])
+        .send()
+        .await?;
+    let latest_batch_status = latest_batch.status();
+    let latest_batch_text = latest_batch.text().await?;
+    assert_eq!(
+        latest_batch_status,
+        reqwest::StatusCode::OK,
+        "{latest_batch_text}"
+    );
+    let latest_batch_body: Value = serde_json::from_str(&latest_batch_text)?;
+    assert_eq!(
+        latest_batch_body["libraries"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][0]["libraryId"],
+        series_library.id.to_string()
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][0]["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["libraryId"],
+        library.id.to_string()
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"][0]["title"],
+        "Alpha Movie"
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"][1]["title"],
+        "Beta Movie"
+    );
+
+    let movie_latest = client
+        .get(format!("{base_url}/api/v1/libraries/{}/latest", library.id))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(movie_latest.status(), reqwest::StatusCode::OK);
+    let movie_latest_body: Value = movie_latest.json().await?;
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"],
+        movie_latest_body["items"]
+    );
+
+    let empty_latest = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/latest",
+            series_library.id
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(empty_latest.status(), reqwest::StatusCode::OK);
+    let empty_latest_body: Value = empty_latest.json().await?;
+    assert_eq!(
+        latest_batch_body["libraries"][0]["items"],
+        empty_latest_body["items"]
+    );
+
+    let duplicate_latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[
+            ("libraryId", library.id.to_string()),
+            ("libraryId", library.id.to_string()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(duplicate_latest_batch.status(), reqwest::StatusCode::OK);
+    let duplicate_latest_batch_body: Value = duplicate_latest_batch.json().await?;
+    assert_eq!(
+        duplicate_latest_batch_body["libraries"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let missing_latest_batch_ids = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(
+        missing_latest_batch_ids.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let invalid_latest_batch_id = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[("libraryId", "invalid")])
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_latest_batch_id.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let excessive_ids = (0..101)
+        .map(|_| ("libraryId", library.id.to_string()))
+        .collect::<Vec<_>>();
+    let excessive_latest_batch_ids = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&excessive_ids)
+        .send()
+        .await?;
+    assert_eq!(
+        excessive_latest_batch_ids.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let mixed_access_latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[
+            ("libraryId", library.id.to_string()),
+            ("libraryId", series_library.id.to_string()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(
+        mixed_access_latest_batch.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))

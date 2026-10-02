@@ -7614,6 +7614,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：`noUnusedLocals` 与 `noUnusedParameters` 已在生产 TypeScript 项目中启用；冻结依赖安装、`pnpm --dir web build`、Node 样式检查（108 项）和 Vitest（76 个文件 / 548 项）通过。首次完整测试有 5 项首页异步轮播断言失败；隔离重跑 `home-page.test.tsx`（15 项）及随后完整测试均通过，未复现，未改动测试或运行时代码。构建产物中的 HLS chunk 为 371.83 kB / gzip 117.93 kB；本任务没有运行时性能变更，不据 bundle 清理推断实际播放性能提升。
 
+#### LUX-336 批量读取首页媒体库最新资源
+
+范围：新增 `GET /api/v1/home/libraries/latest`，以重复的 `libraryId` 查询参数一次读取多库首页最新资源。每个请求最多接受 100 个库 ID，每库仍最多返回 12 项；输入需为有效且当前用户可访问的媒体库，重复 ID 去重并保留首次出现顺序。返回 `{ "libraries": [{ "libraryId": "...", "items": [...] }] }`，空库也返回空 `items`。一次批量完成 catalog 查询和用户状态序列化；保留既有单库 `/api/v1/libraries/{libraryId}/latest` 合同。
+
+验收：
+
+- [x] 空、无效或超过 100 个 ID 返回 400；任一 ID 不可访问时返回 403，不泄露其他库资源。
+- [x] 可访问的多个媒体库一次返回，各库顺序、最新 12 项、图片标记、用户状态和元数据待处理标记与单库接口一致；重复 ID 只返回一个分组。
+- [x] API 与接口文档覆盖查询参数和响应结构；定向 `catalog` 集成测试通过。
+
+预计文件：`src/api/lux_api.rs`、`src/api/media.rs`、`tests/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：新增有界多库首页最新资源 API；100 个 ID 上限低于现有 SQLite/PostgreSQL 批量查询分块上限，catalog 读取不随库数逐项发 SQL。序列化时用户状态、候选待处理和本地待处理标记按 ID 批量读取。集成用例覆盖 query 参数边界、去重和首次顺序、空库、跨库拒绝访问，并断言批量返回的媒体对象与原单库接口逐项相等。`cargo test --locked --test catalog`（3 项）、`cargo build --locked`、全目标测试（651 个 library tests 通过、10 个忽略；PostgreSQL 专项因本机无 PostgreSQL 实例而忽略）、`cargo fmt --all -- --check`、全目标 Clippy、shell/Python 检查、冻结 Web 依赖安装、Web 测试（108 项 Node 检查、76 个文件 / 548 项 Vitest）和 Web 生产构建通过。首次总检查脚本仅因新增代码格式差异在 fmt 阶段停止；格式化后，fmt 与其余门禁逐项复跑通过。本机架构 `arm64`。本任务只新增后端批量入口，Web 仍调用旧的逐库接口，因此目前不声称首页请求或耗时已下降；Web 接入和固定多库 fixture 的请求数/延迟对比仍待后续任务。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

@@ -1,6 +1,8 @@
 use super::*;
 
 const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
+const MAX_HOME_LATEST_LIBRARY_IDS: usize = 100;
+const HOME_LATEST_ITEMS_PER_LIBRARY: i64 = 12;
 
 #[derive(Deserialize, Default)]
 pub(super) struct LuxPageQuery {
@@ -217,6 +219,129 @@ pub(super) async fn lux_home_carousel(
         Ok(items) => Json(json!({ "recommended": items })).into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+pub(super) async fn lux_list_home_library_latest(
+    headers: HeaderMap,
+    raw_query: RawQuery,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let mut requested_library_ids = Vec::new();
+    if let Some(query) = raw_query.0 {
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if name == "libraryId" {
+                if requested_library_ids.len() == MAX_HOME_LATEST_LIBRARY_IDS {
+                    return api_error(
+                        &headers,
+                        StatusCode::BAD_REQUEST,
+                        lux::ApiErrorCode::InvalidRequest,
+                        "媒体库 ID 数量必须为 1 到 100",
+                    )
+                    .into_response();
+                }
+                requested_library_ids.push(value.into_owned());
+            }
+        }
+    }
+    if requested_library_ids.is_empty() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 数量必须为 1 到 100",
+        )
+        .into_response();
+    }
+
+    let mut library_ids = Vec::with_capacity(requested_library_ids.len());
+    let mut unique_library_ids = HashSet::with_capacity(requested_library_ids.len());
+    for raw_id in requested_library_ids {
+        let library_id = match raw_id.parse::<crate::domain::ids::LibraryId>() {
+            Ok(id) => id.to_string(),
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    "媒体库 ID 无效",
+                )
+                .into_response();
+            }
+        };
+        if unique_library_ids.insert(library_id.clone()) {
+            library_ids.push(library_id);
+        }
+    }
+
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let accessible_library_ids = match access
+        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
+        .await
+    {
+        Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if library_ids
+        .iter()
+        .any(|library_id| !accessible_library_ids.contains(library_id))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let latest_groups = match catalog
+        .list_recently_added_by_library_ids(&library_ids, HOME_LATEST_ITEMS_PER_LIBRARY)
+        .await
+    {
+        Ok(groups) => groups,
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    };
+    let latest_items = latest_groups
+        .into_iter()
+        .flat_map(|(library_id, items)| {
+            items
+                .into_iter()
+                .map(move |item| (library_id.clone(), item))
+        })
+        .collect::<Vec<_>>();
+    let catalog_items = latest_items
+        .iter()
+        .map(|(_, item)| item.clone())
+        .collect::<Vec<_>>();
+    let item_values =
+        match lux_catalog_items_json_for_user(database, &user.id.to_string(), &catalog_items).await
+        {
+            Ok(values) => values,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    let mut values_by_library = HashMap::<String, Vec<Value>>::new();
+    for ((library_id, _), value) in latest_items.into_iter().zip(item_values) {
+        values_by_library.entry(library_id).or_default().push(value);
+    }
+    let libraries = library_ids
+        .into_iter()
+        .map(|library_id| {
+            json!({
+                "libraryId": library_id,
+                "items": values_by_library.remove(&library_id).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({ "libraries": libraries })).into_response()
 }
 
 pub(super) async fn lux_list_continue_watching(
