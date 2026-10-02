@@ -3708,25 +3708,44 @@ impl Database {
         })
     }
 
-    pub(crate) async fn count_strm_media_sources_for_library(
+    pub(crate) async fn list_strm_media_source_counts_for_libraries(
         &self,
-        library_id: &str,
-    ) -> Result<i64, StorageError> {
-        self.query_scalar(
-            "SELECT COUNT(*)
-             FROM media_sources ms
-             JOIN media_items mi ON mi.id = ms.item_id
-             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
-               AND fe.is_missing = 0",
-        )
-        .bind(library_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        library_ids: &[String],
+    ) -> Result<HashMap<String, i64>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut counts = HashMap::with_capacity(library_ids.len());
+        for chunk in library_ids.chunks(100) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT l.id, COUNT(fe.id) AS total_count
+                 FROM libraries l
+                 LEFT JOIN media_items mi ON mi.library_id = l.id
+                 LEFT JOIN media_sources ms
+                   ON ms.item_id = mi.id AND ms.source_kind = 'STRM_URL'
+                 LEFT JOIN filesystem_entries fe
+                   ON fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                 WHERE l.id IN ({placeholders})
+                 GROUP BY l.id"
+            )));
+            for library_id in chunk {
+                query = query.bind(library_id);
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                counts.insert(row.get("id"), row.get("total_count"));
+            }
+        }
+        Ok(counts)
     }
 
     pub(crate) async fn list_strm_media_sources_for_incremental_scan_page(

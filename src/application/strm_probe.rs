@@ -109,22 +109,24 @@ impl StrmProbeService {
             return Err(StrmProbeError::AlreadyActive);
         }
         let mut unique_ids = HashSet::new();
-        let mut libraries = Vec::with_capacity(library_ids.len());
+        let mut unique_library_ids = Vec::with_capacity(library_ids.len());
         for library_id in library_ids {
             let library_id = library_id.to_string();
             if !unique_ids.insert(library_id.clone()) {
                 continue;
             }
-            let library = self
-                .database
-                .find_library(&library_id)
-                .await?
-                .ok_or(StrmProbeError::LibraryNotFound)?;
-            let total_count = self
-                .database
-                .count_strm_media_sources_for_library(&library_id)
-                .await?;
-            libraries.push((library.id, total_count));
+            unique_library_ids.push(library_id);
+        }
+        let source_counts = self
+            .database
+            .list_strm_media_source_counts_for_libraries(&unique_library_ids)
+            .await?;
+        let mut libraries = Vec::with_capacity(unique_library_ids.len());
+        for library_id in unique_library_ids {
+            let Some(total_count) = source_counts.get(&library_id).copied() else {
+                return Err(StrmProbeError::LibraryNotFound);
+            };
+            libraries.push((library_id, total_count));
         }
         if libraries.is_empty() {
             return Err(StrmProbeError::InvalidLibraryCount);
@@ -1011,6 +1013,87 @@ mod tests {
             .expect("cleanup operation");
 
         assert!(service.operations.lock().await.is_empty());
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn create_jobs_reads_selected_libraries_and_counts_in_one_batch() {
+        const LIBRARY_COUNT: usize = MAX_LIBRARY_COUNT;
+
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|_| Uuid::now_v7().to_string())
+            .collect::<Vec<_>>();
+        for library_id in &library_ids {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await
+                .expect("library");
+        }
+        let library_ids = library_ids
+            .iter()
+            .map(|library_id| library_id.parse::<LibraryId>().expect("library id"))
+            .collect::<Vec<_>>();
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+
+        database.reset_query_count();
+        let jobs = service
+            .create_jobs(
+                &library_ids,
+                StrmProbeOptions {
+                    concurrency: 1,
+                    include_ready: false,
+                    write_sidecars: false,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: 30,
+                },
+            )
+            .await
+            .expect("STRM jobs");
+
+        assert_eq!(jobs.len(), LIBRARY_COUNT);
+        assert_eq!(database.query_count(), 131);
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn create_jobs_rejects_a_missing_library_after_batch_lookup() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+
+        let error = service
+            .create_jobs(
+                &[Uuid::now_v7()
+                    .to_string()
+                    .parse::<LibraryId>()
+                    .expect("library id")],
+                StrmProbeOptions {
+                    concurrency: 1,
+                    include_ready: false,
+                    write_sidecars: false,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: 30,
+                },
+            )
+            .await
+            .expect_err("missing library should be rejected");
+        assert!(matches!(error, StrmProbeError::LibraryNotFound));
         database.close().await;
     }
 
