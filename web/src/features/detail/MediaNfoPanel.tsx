@@ -1,76 +1,117 @@
-import { CalendarDays, ExternalLink, Link2, UsersRound } from "lucide-react";
+import { CalendarDays, CirclePlus, ExternalLink, Globe2, Languages, Link2, UsersRound } from "lucide-react";
 import type { MediaNfoCredit, MediaNfoDetails } from "../../lib/api/types";
 import { MediaInfoContent, languageLabel, type MediaInfoPanelProps } from "./MediaInfoPanel";
 
 export function MediaNfoPanel({
   details,
   mediaInfo,
+  originalTitle,
+  productionYear,
+  addedAtLabel,
 }: {
   details?: MediaNfoDetails | null;
   mediaInfo?: MediaInfoPanelProps;
+  originalTitle?: string | null;
+  productionYear?: number | null;
+  addedAtLabel?: string | null;
 }) {
   const hasNfoDetails = Boolean(details && hasDetails(details));
   if (!hasNfoDetails && !mediaInfo) return null;
 
-  const tags = [
-    ...(details?.genres ?? []).map((value) => ({ label: "类型", value })),
-    ...(details?.countries ?? []).map((value) => ({ label: "国家/地区", value })),
-    ...(details?.studios ?? []).map((value) => ({ label: "制片公司", value })),
-    ...(details?.certification ? [{ label: "分级", value: details.certification }] : []),
-    ...(details?.setName ? [{ label: "合集", value: details.setName }] : []),
-  ];
+  const genreTags = details?.genres ?? [];
+  const collection = [
+    details?.setName,
+    details?.setId ? `ID ${details.setId}` : undefined,
+  ].filter((value): value is string => Boolean(value)).join(" · ");
+  const taxonomyGroups = [
+    { label: "国家/地区", value: details?.countries?.join(" · ") },
+    { label: "制片公司", value: details?.studios?.join(" · ") },
+    { label: "分级", value: details?.certification },
+    { label: "合集", value: collection || undefined },
+  ].filter((group): group is { label: string; value: string } => Boolean(group.value));
   const providerIds = Object.entries(details?.providerIds ?? {});
-  const mediaInfoStreams = mediaInfo?.source.streams ?? [];
   const headingSource = hasNfoDetails ? "来自本地 NFO" : "媒体技术信息";
-  const headingSuffix = mediaInfoStreams.length ? ` · ${mediaInfoStreams.length} 条媒体轨` : "";
   const lastAirDate = details?.lastAirDate ?? mediaInfo?.lastAirDate;
   const status = details?.status ?? mediaInfo?.status;
   const originalLanguage = details?.originalLanguage ?? mediaInfo?.originalLanguage;
+  const hasRating = details?.rating != null;
+  const identityRows: Array<{ label: string; value?: string | null; icon?: React.ReactNode }> = [
+    { label: "原始片名", value: originalTitle, icon: <Globe2 size={14} /> },
+    { label: "年份", value: productionYear != null ? String(productionYear) : undefined, icon: <CalendarDays size={14} /> },
+    { label: "原始语言", value: originalLanguage ? languageLabel(originalLanguage) : undefined, icon: <Languages size={14} /> },
+    { label: "添加于", value: addedAtLabel, icon: <CirclePlus size={14} /> },
+  ].filter((row) => Boolean(row.value));
+  const summaryRows: Array<{ label: string; value?: string | null; icon?: React.ReactNode }> = [
+    ...(!hasRating && details?.votes != null ? [{ label: "投票数", value: `${details.votes} 票` }] : []),
+    { label: "首播日期", value: details?.premiered, icon: <CalendarDays size={14} /> },
+    { label: "发行日期", value: details?.releaseDate, icon: <CalendarDays size={14} /> },
+    { label: "播出日期", value: details?.aired, icon: <CalendarDays size={14} /> },
+    { label: "最后播出", value: lastAirDate, icon: <CalendarDays size={14} /> },
+    { label: "运行时长", value: details?.runtime != null ? `${details.runtime} 分钟` : undefined },
+    { label: "季 / 集", value: formatSeasonEpisode(details?.seasonNumber, details?.episodeNumber) },
+    { label: "状态", value: status },
+  ].filter((row) => Boolean(row.value));
 
   return (
     <section className="lux-media-nfo" aria-labelledby="media-nfo-heading">
       <div className="lux-media-nfo-heading">
         <h2 id="media-nfo-heading">更多信息</h2>
-        <span>{headingSource}{headingSuffix}</span>
+        <span>{headingSource}</span>
       </div>
+      {(genreTags.length > 0 || taxonomyGroups.length > 0) ? (
+        <div className="lux-media-nfo-taxonomy">
+          {genreTags.length ? (
+            <div className="lux-media-nfo-genre-tags" aria-label="类型">
+              {genreTags.map((genre) => <span key={genre}>{genre}</span>)}
+            </div>
+          ) : null}
+          {taxonomyGroups.length ? (
+            <div className="lux-media-nfo-taxonomy-groups">
+              {taxonomyGroups.map(({ label, value }) => (
+                <div key={label} className="lux-media-nfo-taxonomy-group">
+                  <span>{label}</span><strong>{value}</strong>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {details?.tagline ? <p className="lux-media-nfo-tagline">“{details.tagline}”</p> : null}
-      <div className="lux-media-nfo-grid">
-        {tags.length ? (
-          <div className="lux-media-nfo-tags" aria-label="本地元数据标签">
-            {tags.map(({ label, value }, index) => <span key={`${label}-${value}-${index}`} title={label}>{value}</span>)}
+      {hasNfoDetails && (hasRating || summaryRows.length > 0) ? (
+        <div className="lux-media-nfo-grid">
+          <div className={`lux-media-nfo-overview${hasRating && summaryRows.length ? " has-rating" : ""}`}>
+            {hasRating ? (
+              <div className="lux-media-nfo-rating" aria-label="评分与投票数">
+                <span>评分</span>
+                {details?.rating != null ? <strong>{details.rating}<small> / 10</small></strong> : null}
+                {details?.votes != null ? <span className="lux-media-nfo-votes">{details.votes} 票</span> : null}
+              </div>
+            ) : null}
+            {summaryRows.length ? (
+              <div className="lux-media-nfo-summary">
+                {summaryRows.map(({ label, value, icon }) => <NfoRow key={label} label={label} value={value} icon={icon} />)}
+              </div>
+            ) : null}
           </div>
-        ) : null}
-        {hasNfoDetails ? (
-          <div className="lux-media-nfo-summary">
-            <NfoRow label="评分" value={details?.rating != null ? `${details.rating} / 10` : undefined} />
-            <NfoRow label="投票数" value={details?.votes != null ? `${details.votes} 票` : undefined} />
-            <NfoRow label="首播日期" value={details?.premiered} icon={<CalendarDays size={14} />} />
-            <NfoRow label="发行日期" value={details?.releaseDate} icon={<CalendarDays size={14} />} />
-            <NfoRow label="播出日期" value={details?.aired} icon={<CalendarDays size={14} />} />
-            <NfoRow label="最后播出" value={lastAirDate} icon={<CalendarDays size={14} />} />
-            <NfoRow label="运行时长" value={details?.runtime != null ? `${details.runtime} 分钟` : undefined} />
-            <NfoRow label="季 / 集" value={formatSeasonEpisode(details?.seasonNumber, details?.episodeNumber)} />
-            <NfoRow label="状态" value={status} />
-            <NfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
-            <NfoRow label="合集 ID" value={details?.setId} />
-          </div>
-        ) : null}
-        {details?.directors?.length ? <CreditRow label="导演" credits={details.directors} /> : null}
-        {details?.writers?.length ? <CreditRow label="编剧" credits={details.writers} /> : null}
-        {providerIds.length ? (
-          <NfoRow
-            label="外部 ID"
-            value={providerIds.map(([provider, id]) => `${provider.toUpperCase()} ${id}`).join(" · ")}
-            icon={<Link2 size={14} />}
-          />
-        ) : null}
-        {mediaInfo ? (
-          <MediaInfoContent
-            {...mediaInfo}
-            includeMetadataRows={!hasNfoDetails}
-          />
-        ) : null}
-      </div>
+        </div>
+      ) : null}
+      {identityRows.length ? (
+        <div className="lux-media-nfo-identity" aria-label="影片信息">
+          {identityRows.map(({ label, value, icon }) => <IdentityItem key={label} label={label} value={value} icon={icon} />)}
+        </div>
+      ) : null}
+      {details?.directors?.length || details?.writers?.length || providerIds.length ? (
+        <div className="lux-media-nfo-secondary" aria-label="制作与来源信息">
+          {details?.directors?.length ? <CreditItem label="导演" credits={details.directors} /> : null}
+          {details?.writers?.length ? <CreditItem label="编剧" credits={details.writers} /> : null}
+          {providerIds.length ? (
+            <div className="lux-media-nfo-secondary-item">
+              <span><Link2 size={14} />外部 ID</span>
+              <strong>{providerIds.map(([provider, id]) => `${provider.toUpperCase()} ${id}`).join(" · ")}</strong>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {details?.website || details?.trailers?.length ? (
         <div className="lux-media-nfo-links" aria-label="本地 NFO 链接">
           {details?.website && isHttpUrl(details.website) ? (
@@ -85,15 +126,40 @@ export function MediaNfoPanel({
           ))}
         </div>
       ) : null}
+      {mediaInfo ? (
+        <section className="lux-media-nfo-media" aria-labelledby="media-file-heading">
+          <div className="lux-media-nfo-media-heading">
+            <h3 id="media-file-heading">媒体文件</h3>
+            <span>{mediaInfo.source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"}</span>
+          </div>
+          <MediaInfoContent
+            {...mediaInfo}
+            includeMetadataRows={!hasNfoDetails}
+            includeOriginalLanguage={false}
+            includeSourceRow={false}
+            collapseTechnicalDetails
+          />
+        </section>
+      ) : null}
     </section>
   );
 }
 
-function CreditRow({ label, credits }: { label: string; credits: MediaNfoCredit[] }) {
+function CreditItem({ label, credits }: { label: string; credits: MediaNfoCredit[] }) {
   return (
-    <div className="lux-media-nfo-credit-row">
-      <span><UsersRound size={14} /> {label}</span>
+    <div className="lux-media-nfo-secondary-item">
+      <span><UsersRound size={14} />{label}</span>
       <strong>{credits.map((credit) => credit.name).join("、")}</strong>
+    </div>
+  );
+}
+
+function IdentityItem({ label, value, icon }: { label: string; value?: string | null; icon?: React.ReactNode }) {
+  if (!value) return null;
+  return (
+    <div className="lux-media-nfo-identity-item">
+      <span>{icon}{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }

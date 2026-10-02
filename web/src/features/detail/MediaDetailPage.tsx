@@ -417,6 +417,9 @@ export function MediaDetailPage() {
           <div className="lux-detail-nfo">
             <MediaNfoPanel
               details={localNfo}
+              originalTitle={detailOriginalTitle !== detailTitle ? detailOriginalTitle : undefined}
+              productionYear={media.productionYear}
+              addedAtLabel={addedAtLabel}
               mediaInfo={source ? {
                 source,
                 itemType: media.itemType,

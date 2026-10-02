@@ -27,6 +27,9 @@ export type MediaInfoPanelProps = {
   status?: string | null;
   originalLanguage?: string | null;
   includeMetadataRows?: boolean;
+  includeOriginalLanguage?: boolean;
+  includeSourceRow?: boolean;
+  collapseTechnicalDetails?: boolean;
 };
 
 export function MediaInfoPanel(props: MediaInfoPanelProps) {
@@ -48,6 +51,9 @@ export function MediaInfoContent({
   status,
   originalLanguage,
   includeMetadataRows = true,
+  includeOriginalLanguage = true,
+  includeSourceRow = true,
+  collapseTechnicalDetails = false,
 }: MediaInfoPanelProps) {
   const streams = source.streams ?? [];
   const streamGroups = ["VIDEO", "AUDIO", "SUBTITLE"]
@@ -56,43 +62,61 @@ export function MediaInfoContent({
 
   return (
     <>
-      <div className="lux-media-nfo-summary">
+      <div className="lux-media-file-summary">
         <InfoRow label="类型" value={mediaTypeLabel(itemType)} />
         {includeMetadataRows ? <>
           <InfoRow label="最后播出" value={lastAirDate ?? undefined} />
           <InfoRow label="状态" value={status ?? undefined} />
-          <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} />
+          {includeOriginalLanguage ? <InfoRow label="原始语言" value={originalLanguage ? languageLabel(originalLanguage) : undefined} /> : null}
         </> : null}
-        <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} />
+        {includeSourceRow ? <InfoRow label="来源" value={source.sourceKind === "STRM_URL" ? "STRM 网络媒体" : "本地媒体文件"} /> : null}
         <InfoRow label="版本" value={source.qualityLabel || source.editionName || undefined} />
       </div>
       {source.externalUrl ? (
-        <div className="lux-media-nfo-row lux-media-info-address">
-          <span>媒体地址</span>
-          <code>{source.externalUrl}</code>
-        </div>
+        collapseTechnicalDetails ? (
+          <details className="lux-media-info-address">
+            <summary>媒体地址</summary>
+            <code>{source.externalUrl}</code>
+          </details>
+        ) : (
+          <div className="lux-media-nfo-row lux-media-info-address">
+            <span>媒体地址</span>
+            <code>{source.externalUrl}</code>
+          </div>
+        )
       ) : null}
-      <div className="lux-media-nfo-tags" aria-label="媒体文件摘要">
+      <div className="lux-media-file-facts" aria-label="媒体文件摘要">
         {source.container ? <span>{source.container.toUpperCase()}</span> : null}
         {formatBytes(source.size) ? <span>{formatBytes(source.size)}</span> : null}
         {formatBitrate(source.bitrate) ? <span>{formatBitrate(source.bitrate)}</span> : null}
         {runtimeLabel(source.durationTicks) ? <span>{runtimeLabel(source.durationTicks)}</span> : null}
       </div>
       {streamGroups.length ? (
-        <HorizontalScrollRail className="lux-media-stream-rail" ariaLabel="视频轨道">
-          <div className="lux-media-stream-grid">
-            {streamGroups.flatMap(({ type, streams: groupStreams }) => groupStreams.map((stream) => (
-              <MediaStreamCard
-                key={`${type}-${stream.index}`}
-                stream={stream}
-                sourceBitrate={source.bitrate}
-              />
-            )))}
-          </div>
-        </HorizontalScrollRail>
+        collapseTechnicalDetails ? (
+          <details className="lux-media-stream-disclosure">
+            <summary>轨道详情 · {streams.length} 条</summary>
+            {renderStreams()}
+          </details>
+        ) : renderStreams()
       ) : null}
     </>
   );
+
+  function renderStreams() {
+    return (
+      <HorizontalScrollRail className="lux-media-stream-rail" ariaLabel="媒体轨道">
+        <div className="lux-media-stream-grid">
+          {streamGroups.flatMap(({ type, streams: groupStreams }) => groupStreams.map((stream) => (
+            <MediaStreamCard
+              key={`${type}-${stream.index}`}
+              stream={stream}
+              sourceBitrate={source.bitrate}
+            />
+          )))}
+        </div>
+      </HorizontalScrollRail>
+    );
+  }
 }
 
 function MediaStreamCard({
