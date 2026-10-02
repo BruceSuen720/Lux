@@ -1629,21 +1629,37 @@ impl PluginService {
         self.migrate_legacy_chapter_source_selections().await?;
         self.database.disable_chapter_detection_tasks().await?;
         let catalog = self.catalog_snapshot().await;
+        let detector_plugins = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| is_chapter_detector_plugin(plugin))
+            .collect::<Vec<_>>();
+        let detector_plugin_ids = detector_plugins
+            .iter()
+            .map(|plugin| plugin.manifest.id.clone())
+            .collect::<Vec<_>>();
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&detector_plugin_ids)
+            .await?;
         let mut selected = std::collections::HashMap::<String, String>::new();
-        for plugin in &catalog.plugins {
-            if !is_chapter_detector_plugin(plugin) {
+        let mut settings_by_plugin = HashMap::new();
+        let mut libraries = None;
+        for plugin in detector_plugins {
+            if installation_statuses.get(&plugin.manifest.id) != Some(&true) {
                 continue;
             }
-            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
-            if !installed || !enabled {
-                continue;
-            }
-            match self.chapter_detector_settings(&plugin.manifest.id).await {
-                Ok(_) => {}
+            let settings = match self.chapter_detector_settings(&plugin.manifest.id).await {
+                Ok(settings) => settings,
                 Err(PluginServiceError::InvalidConfig) => continue,
                 Err(error) => return Err(error),
             };
-            let libraries = self.database.list_libraries().await?;
+            if libraries.is_none() {
+                libraries = Some(self.database.list_libraries().await?);
+            }
+            let Some(libraries) = libraries.as_ref() else {
+                continue;
+            };
             for library in libraries {
                 if !library.is_enabled
                     || library.kind == "MOVIE"
@@ -1651,11 +1667,14 @@ impl PluginService {
                 {
                     continue;
                 }
-                selected.insert(library.id, plugin.manifest.id.clone());
+                selected.insert(library.id.clone(), plugin.manifest.id.clone());
             }
+            settings_by_plugin.insert(plugin.manifest.id.clone(), settings);
         }
         for (library_id, plugin_id) in selected {
-            let settings = self.chapter_detector_settings(&plugin_id).await?;
+            let settings = settings_by_plugin
+                .get(&plugin_id)
+                .ok_or_else(|| PluginServiceError::InvalidConfig)?;
             self.database
                 .upsert_chapter_detection_task(
                     &library_id,
