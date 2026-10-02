@@ -9338,6 +9338,62 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
 }
 
 #[tokio::test]
+async fn active_media_metadata_with_libraries_uses_one_bounded_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Metadata preflight", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("metadata-preflight-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        assert!(database.find_media_item_metadata(item_id).await?.is_some());
+        assert_eq!(
+            database.find_item_library_id(item_id).await?.as_deref(),
+            Some(library_id.as_str())
+        );
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT * 2);
+
+    database.reset_query_count();
+    let metadata = database
+        .list_active_media_item_metadata_with_libraries(&item_ids)
+        .await?;
+    assert_eq!(metadata.len(), ITEM_COUNT);
+    assert!(
+        metadata
+            .values()
+            .all(|(id, item)| { id == &library_id && item.item_type == "MOVIE" })
+    );
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_jobs_reconcile_items_left_running_by_workers() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()

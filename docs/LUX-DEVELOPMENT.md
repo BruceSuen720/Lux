@@ -7945,6 +7945,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：64 个媒体库的 STRM 探测任务创建由旧实现的 322 次 storage SQL 调用降为 131 次，减少 191 次（约 59.3%）。新增聚合读取按最多 100 个媒体库 ID 分批，并保留不存在媒体库、重复输入、任务顺序和零来源计数语义；本机 `uname -m=arm64`。性能记录只报告 SQLite SQL 调用数，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-358：批量读取扫描本地元数据完整性预检
+
+范围：本地元数据完整性 worker 当前对每个 item 分别读取元数据和媒体库归属，即使两者来自同一条媒体关系。新增最多 500 个 item ID 一批的 active 元数据与媒体库联合读取，并按输入 item ID 回填；保留禁用/移除条目跳过、完整性计划、图片/NFO/人物读取、重试状态、claim 和补缺调度行为，不改变 schema 或扫描任务状态机。
+
+验收：
+
+- [x] 205 个 active item 的元数据/媒体库预检从 410 次 SQL 调用降至 1 次有界查询。
+- [x] active item 的媒体库归属和元数据字段保持一致；禁用库或已移除 item 不进入完整性检查。
+- [x] 后续完整性计划、claim、结果提交、在线补缺和增量策略快照回归保持不变。
+- [x] 性能记录只报告预检读取的 SQLite SQL 调用数，不推断完整 worker 墙钟、PostgreSQL 或 NAS 收益。
+
+依赖：LUX-293、LUX-302、LUX-303。预计文件：`src/storage/media.rs`、`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 active item 的逐项读取基线，再实现有界联合预读。
+
+结果（2026-10-03）：新增 active 元数据与 `library_id` 联合预读，205 个 item 的旧元数据/归属逐项读取为 410 次 SQL，新路径按最多 500 个 ID 一批为 1 次，减少 409 次（约 99.8%）。scanner 完整性流程复用预读结果，后续计划和调度代码未改变；storage 计数回归和 scanner 17 项回归通过。本任务未实测 PostgreSQL 墙钟、NAS 或完整 worker 端到端时延。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

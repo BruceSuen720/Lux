@@ -3345,25 +3345,18 @@ async fn complete_local_metadata_completeness_for_item_ids(
     } else {
         None
     };
+    let metadata_by_item = database
+        .list_active_media_item_metadata_with_libraries(item_ids)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> =
         BTreeMap::new();
     for item_id in item_ids {
-        let current = database
-            .find_media_item_metadata(item_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(current) = current else {
-            continue;
-        };
-        let library_id = database
-            .find_item_library_id(item_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(library_id) = library_id else {
+        let Some((library_id, current)) = metadata_by_item.get(item_id) else {
             continue;
         };
         let plan = selection
-            .local_metadata_completeness_plan(item_id, &current)
+            .local_metadata_completeness_plan(item_id, current)
             .await
             .map_err(|error| error.to_string())?;
         let Some(plan) = plan else {
@@ -3393,7 +3386,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
         } else {
             false
         };
-        let checks = checks_by_library.entry(library_id).or_default();
+        let checks = checks_by_library.entry(library_id.clone()).or_default();
         checks.extend(
             plan.capabilities
                 .into_iter()

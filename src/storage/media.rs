@@ -3138,6 +3138,58 @@ impl Database {
         Ok(metadata)
     }
 
+    pub(crate) async fn list_active_media_item_metadata_with_libraries(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, (String, StoredMediaMetadata)>, StorageError> {
+        let mut metadata = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.library_id AS library_id,
+                        mi.item_type, mi.title, mi.original_title, mi.overview,
+                        mi.production_year, mi.premiere_date, mi.last_air_date, mi.status,
+                        mi.original_language, mi.rating, mi.provider_ids_json,
+                        mi.metadata_scraper_id, mi.identification_status,
+                        mi.metadata_provenance_json, mi.locked_fields_json,
+                        mi.nfo_metadata_json, mi.series_id, mi.season_number, mi.episode_number,
+                        series.title AS series_title,
+                        series.production_year AS series_production_year,
+                        series.provider_ids_json AS series_provider_ids_json,
+                        series.metadata_scraper_id AS series_metadata_scraper_id,
+                        libraries.scraper_id AS scraper_id
+                 FROM media_items mi
+                 JOIN libraries
+                   ON libraries.id = mi.library_id AND libraries.is_enabled = 1
+                 LEFT JOIN media_items series ON series.id = mi.series_id
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
+                let library_id = row.get::<String, _>("library_id");
+                metadata.insert(item_id, (library_id, stored_media_metadata(row)));
+            }
+        }
+        Ok(metadata)
+    }
+
     pub(crate) async fn list_metadata_refresh_item_ids(
         &self,
         item_id: &str,
