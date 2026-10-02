@@ -8742,6 +8742,107 @@ async fn scan_job_status_counts_are_aggregated_in_storage() {
 }
 
 #[tokio::test]
+async fn incremental_scan_paths_are_enqueued_with_bounded_sql_and_last_change_wins() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Incremental queue", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root = temp_dir.path().join("incremental-queue");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().expect("UTF-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    database
+        .create_scan_job(
+            "incremental-queue-job",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "generation",
+            0,
+            false,
+        )
+        .await
+        .expect("scan job");
+
+    database.reset_query_count();
+    database
+        .enqueue_incremental_scan_path(
+            "incremental-queue-job",
+            &root_id,
+            "folder/file-000.mkv",
+            "CREATE",
+        )
+        .await
+        .expect("initial incremental path");
+    assert_eq!(database.query_count(), 2);
+    sqlx::query(
+        "UPDATE scan_job_paths SET processed_at = 1
+         WHERE job_id = 'incremental-queue-job' AND relative_path = 'folder/file-000.mkv'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("mark initial path processed");
+
+    let mut paths = (0..205)
+        .map(|index| {
+            (
+                root_id.clone(),
+                format!("folder/file-{index:03}.mkv"),
+                "CREATE".to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    paths.push((
+        root_id.clone(),
+        "folder/file-000.mkv".to_owned(),
+        "MODIFY".to_owned(),
+    ));
+    let paths = paths
+        .iter()
+        .map(|(root_id, relative_path, change_kind)| {
+            (
+                root_id.as_str(),
+                relative_path.as_str(),
+                change_kind.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    database
+        .enqueue_incremental_scan_paths("incremental-queue-job", &paths)
+        .await
+        .expect("incremental paths");
+
+    assert_eq!(database.query_count(), 6);
+    let stored: (i64, i64, String, Option<i64>) = sqlx::query_as(
+        "SELECT job.total_count,
+                (SELECT COUNT(*) FROM scan_job_paths WHERE job_id = job.id),
+                path.change_kind, path.processed_at
+         FROM scan_jobs job
+         JOIN scan_job_paths path ON path.job_id = job.id
+         WHERE job.id = 'incremental-queue-job'
+           AND path.relative_path = 'folder/file-000.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored incremental paths");
+    assert_eq!(stored, (205, 205, "MODIFY".to_owned(), None));
+}
+
+#[tokio::test]
 async fn reconciliation_entries_use_scan_safe_batches() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

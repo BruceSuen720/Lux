@@ -7657,6 +7657,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：首页以一次有序多库批量查询替代逐库请求，缓存键包含媒体库 ID 顺序；空库不请求，15 秒刷新和 `home` SSE 刷新保留，失败状态只显示在最新资源区块。定向首页与 LuxShell 测试 32 项通过，先确认旧实现下批量调用断言失败。检查并修正了缓存轮播测试仍 mock 旧单库 API 的遗漏。冻结依赖安装、Node 测试 108 项、标准并行 Vitest 全量 76 个文件 / 551 项及 TypeScript 检查、生产构建通过。两次早期并行全量运行曾有 5 个轮播用例因 1 秒等待超时，修正过期 mock 后标准全量通过。测试量化的是每次首页最新资源 HTTP 请求由每库一次降为一次，不代表实际延迟或 p95 已测量。
 
+#### LUX-339：批量写入增量扫描路径
+
+范围：`enqueue_incremental_changes` 目前对每条路径分别执行 upsert、扫描完整 `scan_job_paths` 计数并更新任务行。将多路径入队改为每批最多 100 条的多行 upsert，并在每批后只刷新一次 `total_count`，避免按路径重复扫描队列表和写任务行。批次大小需兼容 SQLite 与 PostgreSQL 参数上限；重复的 `(root_id, relative_path)` 以输入中的最后一个变更类型为准。单路径调用保留现有语义，可复用批量存储实现。
+
+验收：
+
+- [x] 205 条唯一路径相对原逐条实现将存储 SQL 调用从 410 降至 6；该计数是查询调用数，不声称墙钟耗时收益。
+- [x] 批量中的重复路径最后一个变更类型生效，已处理路径重新入队后清空 `processed_at`，`total_count` 等于队列中去重路径数。
+- [x] 同一批次沿用 SQLite/PostgreSQL 共用查询和占位符适配；单路径入队和多根目录刷新继续使用既有存储路径。
+- [x] 定向存储/扫描作业测试、全局 Rust 完成门通过；性能记录包含固定批量规模、查询次数和本机架构。
+
+依赖：LUX-288。预计文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改扫描 job 的进度合同、表结构、路径规范化或消费顺序。
+
+结果（2026-10-02）：增量变更和多根刷新改为调用有界批量入队，单路径 API 继续委托同一存储操作。每 100 条唯一路径执行一条多行 upsert，并刷新一次 `total_count`；205 条路径相对基线 410 次 SQL 调用降为 6 次（减少约 98.5%）。回归验证重复路径最后的变更类型胜出、已处理路径被重新打开、任务计数与去重后的队列行数一致。SQLite 存储计数测试、`tests/scanning_jobs.rs` 81 项、`cargo build --locked`、`cargo test --locked --all-targets`（652 个库测试通过、10 个 PostgreSQL 专项忽略，其余集成目标通过）、`cargo fmt --all -- --check` 和全目标 Clippy 通过。性能记录见 `docs/PERFORMANCE.md`；本机 `uname -m=arm64`。PostgreSQL 专项因测试环境没有 PostgreSQL 运行实例而未执行，本次只报告共享 SQL 形状与占位符适配，不声称 PostgreSQL 实测或墙钟耗时收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

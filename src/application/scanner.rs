@@ -3983,16 +3983,19 @@ impl ScanJobService {
             )
             .await?;
         self.cancellation_flag(&job.id);
-        for (root_id, relative_path, kind) in valid_changes {
-            self.database
-                .enqueue_incremental_scan_path(
-                    &job.id,
-                    &root_id,
-                    &relative_path,
-                    change_kind_name(kind),
+        let paths = valid_changes
+            .iter()
+            .map(|(root_id, relative_path, kind)| {
+                (
+                    root_id.as_str(),
+                    relative_path.as_str(),
+                    change_kind_name(*kind),
                 )
-                .await?;
-        }
+            })
+            .collect::<Vec<_>>();
+        self.database
+            .enqueue_incremental_scan_paths(&job.id, &paths)
+            .await?;
         self.record_event(
             &job.id,
             "INFO",
@@ -4065,11 +4068,13 @@ impl ScanJobService {
             .get_or_create_incremental_scan_job_reusing_active(&library_id, false)
             .await?;
         self.cancellation_flag(&job.id);
-        for root in roots {
-            self.database
-                .enqueue_incremental_scan_path(&job.id, &root.id, ".", "MODIFY")
-                .await?;
-        }
+        let paths = roots
+            .iter()
+            .map(|root| (root.id.as_str(), ".", "MODIFY"))
+            .collect::<Vec<_>>();
+        self.database
+            .enqueue_incremental_scan_paths(&job.id, &paths)
+            .await?;
         self.record_event(
             &job.id,
             "WARN",

@@ -8,6 +8,8 @@ const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+// Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
+const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
 const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
     WHEN item_type IN ('MOVIE', 'SERIES') THEN 0
     WHEN item_type = 'SEASON' THEN 1
@@ -5833,11 +5835,82 @@ impl Database {
         .bind(change_kind)
         .execute(&self.pool)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
+        self.refresh_incremental_scan_path_count(job_id).await
+    }
+
+    pub(crate) async fn enqueue_incremental_scan_paths(
+        &self,
+        job_id: &str,
+        paths: &[(&str, &str, &str)],
+    ) -> Result<(), StorageError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if paths.len() == 1 {
+            let (library_root_id, relative_path, change_kind) = paths[0];
+            return self
+                .enqueue_incremental_scan_path(job_id, library_root_id, relative_path, change_kind)
+                .await;
+        }
+
+        let mut latest_path_indexes: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::with_capacity(paths.len());
+        let mut unique_paths: Vec<(&str, &str, &str)> = Vec::with_capacity(paths.len());
+        for &(library_root_id, relative_path, change_kind) in paths {
+            let path_key = (library_root_id, relative_path);
+            if let Some(index) = latest_path_indexes.get(&path_key).copied() {
+                unique_paths[index].2 = change_kind;
+            } else {
+                latest_path_indexes.insert(path_key, unique_paths.len());
+                unique_paths.push((library_root_id, relative_path, change_kind));
+            }
+        }
+        if unique_paths.len() == 1 {
+            let (library_root_id, relative_path, change_kind) = unique_paths[0];
+            return self
+                .enqueue_incremental_scan_path(job_id, library_root_id, relative_path, change_kind)
+                .await;
+        }
+
+        for batch in unique_paths.chunks(INCREMENTAL_SCAN_PATH_BATCH_SIZE) {
+            let values = (0..batch.len())
+                .map(|_| "(?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = format!(
+                "INSERT INTO scan_job_paths (
+                    job_id, library_root_id, relative_path, change_kind
+                 ) VALUES {values}
+                 ON CONFLICT(job_id, library_root_id, relative_path) DO UPDATE SET
+                    change_kind = excluded.change_kind,
+                    processed_at = NULL,
+                    updated_at = unixepoch()"
+            );
+            let mut query = self.query(sqlx::AssertSqlSafe(statement));
+            for (library_root_id, relative_path, change_kind) in batch {
+                query = query
+                    .bind(job_id)
+                    .bind(library_root_id)
+                    .bind(relative_path)
+                    .bind(change_kind);
+            }
+            query
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.refresh_incremental_scan_path_count(job_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_incremental_scan_path_count(&self, job_id: &str) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
              SET total_count = (
