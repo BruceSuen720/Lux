@@ -1355,6 +1355,13 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
                 | WebhookEventType::PlaybackProgress
                 | WebhookEventType::PlaybackStopped
         ),
+        "seriesTitle" | "seasonNumber" | "seriesSeasonCount" => matches!(
+            event_type,
+            WebhookEventType::PlaybackStarted
+                | WebhookEventType::PlaybackPaused
+                | WebhookEventType::PlaybackProgress
+                | WebhookEventType::PlaybackStopped
+        ),
         "remoteIp" => matches!(event_type, WebhookEventType::PlaybackStopped),
         _ => false,
     }
@@ -1765,7 +1772,10 @@ mod tests {
             1_700_000_000,
             json!({
                 "itemId": "item-1",
-                "itemTitle": "示例电影",
+                "itemTitle": "第二集",
+                "seriesTitle": "示例剧集",
+                "seasonNumber": 2,
+                "seriesSeasonCount": 2,
                 "userName": "alice",
                 "positionTicks": 4_000,
                 "durationTicks": 10_000,
@@ -1781,7 +1791,10 @@ mod tests {
             }),
         )
         .expect("playback display payload should be accepted");
-        assert_eq!(payload["itemTitle"], "示例电影");
+        assert_eq!(payload["itemTitle"], "第二集");
+        assert_eq!(payload["seriesTitle"], "示例剧集");
+        assert_eq!(payload["seasonNumber"], 2);
+        assert_eq!(payload["seriesSeasonCount"], 2);
         assert_eq!(payload["userName"], "alice");
         assert_eq!(payload["container"], "mkv");
         assert_eq!(payload["size"], 7_690_000_000_i64);
@@ -1791,7 +1804,7 @@ mod tests {
         assert_eq!(payload["remoteIp"], "122.96.10.20");
         assert_eq!(payload["resumed"], true);
         assert_eq!(payload["source"], "lux");
-        assert_eq!(payload["title"], "alice停止播放 示例电影");
+        assert_eq!(payload["title"], "alice停止播放 示例剧集 · 第2季 · 第二集");
         assert_eq!(
             payload["content"],
             "●●●●●●●●○○○○○○○○○○○○40.00%\nMKV · 直接串流\n大小：7.69GB · 4.98Mbps\nIP：122.96.10.20\n简介：Amid nerves, crushes and big reveals."
@@ -1979,6 +1992,10 @@ mod tests {
                 "itemId": "item-1",
                 "playSessionId": "session-1",
                 "positionTicks": 42,
+                "itemTitle": "第二集",
+                "seriesTitle": "示例剧集",
+                "seasonNumber": 2,
+                "seriesSeasonCount": 2,
                 "path": "/private/movie.mkv"
             }),
         )
@@ -1987,6 +2004,8 @@ mod tests {
         assert_eq!(payload["Item"]["Id"], "item-1");
         assert_eq!(payload["PlaySessionId"], "session-1");
         assert_eq!(payload["PositionTicks"], 42);
+        assert!(payload.get("seriesTitle").is_none());
+        assert!(payload.get("seasonNumber").is_none());
         assert!(payload.get("path").is_none());
         assert!(payload.get("userId").is_none());
     }

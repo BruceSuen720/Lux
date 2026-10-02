@@ -620,6 +620,9 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 `eventId` 幂等。Webhook 目标可以选择 Lux 原生或 Emby 风格的有限 DTO payload；两者均经过字段白名单和脱敏
 处理。Lux 核心统一生成可读通知字段；内置 Webhook 和已安装的通知器插件都转发同一份通知内容。
 `org.lux.webhook` 的 URL 模板只影响目标地址，不改变正文；这仍不是 Emby Webhooks 插件的完整兼容实现。
+Lux 原生 `PLAYBACK_*` 事件保留原始 `itemTitle`，并提供可空的 `seriesTitle`、`seasonNumber` 和
+`seriesSeasonCount`。剧集通知标题按剧名、（总季数大于一季时）季号、集名排列；第 0 季显示“特别篇”。
+电影和缺少剧集关联的事件继续使用 `itemTitle`。这些新增展示字段不会加入 Emby 风格 payload。
 
 当前只提供 Webhook 渠道；Telegram、企业微信和 Email 尚未实现。
 

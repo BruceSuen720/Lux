@@ -54,6 +54,9 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         b"video",
     )
     .await?;
+    let second_season_dir = root.join("九门/Season 02");
+    tokio::fs::create_dir_all(&second_season_dir).await?;
+    tokio::fs::write(second_season_dir.join("霍三娘登场.S02E01.mkv"), b"video").await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
@@ -101,7 +104,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .ok_or("missing Emby token")?
         .to_owned();
     let item_id: String =
-        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' AND season_number = 1 AND episode_number = 2 LIMIT 1")
             .fetch_one(database.pool())
             .await?;
     let source_id: String =
@@ -270,6 +273,9 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .ok_or("missing playback activity")?;
     assert_eq!(playback_activity["remoteIp"], "203.0.113.10");
     assert_eq!(playback_activity["metadata"]["remoteIp"], "203.0.113.10");
+    assert_eq!(playback_activity["targetSeriesTitle"], "九门");
+    assert_eq!(playback_activity["targetSeasonNumber"], 1);
+    assert_eq!(playback_activity["targetSeriesSeasonCount"], 2);
     assert!(playback_activity["remoteIpLocation"].is_null());
     assert!(events.len() <= 24);
     assert!(
