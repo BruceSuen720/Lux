@@ -8022,6 +8022,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：有序配置读取在 205 item fixture 中由 205 次逐项查询降为 1 次有界批量查询；单 item resolver 统一复用同一配置读取并保留 legacy fallback。storage、scraper、reidentify 回归通过，本机 `uname -m=arm64`；未改变 schema、公共 API、插件协议或 scanner 的逐 item 资格检查。
 
+#### LUX-363：批量判断本地完整性补缺刮削器资格
+
+范围：scanner 在计划计算后仍对每个可补缺 item 单独调用 resolver 检查选中刮削器是否可用。收集有 requestable capability 的 item ID，一次批量加载配置并逐 item 复用现有客户端缓存完成可用性判断，再按 item 回填补缺资格。插件错误继续降级为不可自动补缺并保留告警，不改变手动元数据任务、插件 RPC 或队列状态机。
+
+验收：
+
+- [x] 205 个具备 requestable capability 的 item 只触发 1 次配置读取，插件客户端缓存与可用性判断仍逐 item 隔离。
+- [x] 没有 requestable capability 或关闭自动匹配的 item 不进入资格批量查询；无 resolver 时沿用 provider key 判断。
+- [x] 有序/legacy 配置、插件不可用、批量读取失败、输入重复和 item 顺序的补缺资格结果保持不变。
+- [x] scraper、reidentify、scanner 回归通过；不改变 schema、公共 API、插件协议或任务写入语义。
+- [x] 性能记录只报告固定 SQLite fixture 的配置读取 SQL 调用数，不推断插件 RPC 墙钟或生产收益。
+
+依赖：LUX-362。预计文件：`src/application/scraper.rs`、`src/application/reidentify.rs`、`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加批量资格回归，再接入 scanner。
+
+结果（2026-10-03）：scanner 只对具备 requestable capability 且未关闭自动匹配的 item 发起一次批量 resolver 配置读取，之后按 item 复用客户端缓存并隔离插件错误；无 resolver、legacy fallback 和失败降级语义保持不变。scraper、reidentify、scanner 回归及全目标 Rust 门通过，本机 `uname -m=arm64`；未改变 schema、公共 API、插件协议或任务写入语义。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

@@ -701,6 +701,16 @@ mod tests {
         }
         assert!((ITEM_COUNT..=ITEM_COUNT + 1).contains(&database.query_count()));
 
+        database.reset_query_count();
+        let available = resolver.has_selected_scrapers_for_items(&item_ids).await?;
+        assert_eq!(available.len(), ITEM_COUNT);
+        assert!(
+            available
+                .values()
+                .all(|available| matches!(available, Ok(false)))
+        );
+        assert!((1..=2).contains(&database.query_count()));
+
         Ok(())
     }
 
@@ -1547,6 +1557,29 @@ impl ScraperResolver {
             .unwrap_or_else(|| (Vec::new(), None));
         self.resolve_configured_scrapers(&configured, legacy_scraper_id.as_deref())
             .await
+    }
+
+    pub(crate) async fn has_selected_scrapers_for_items(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Result<bool, ScraperError>>, ScraperError> {
+        let configurations = self
+            .database
+            .list_item_scraper_configurations_by_ids(item_ids)
+            .await?;
+        let mut available = HashMap::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            let Some((configured, legacy_scraper_id)) = configurations.get(item_id) else {
+                available.insert(item_id.clone(), Ok(false));
+                continue;
+            };
+            let result = self
+                .resolve_configured_scrapers(configured, legacy_scraper_id.as_deref())
+                .await
+                .map(|resolved| !resolved.is_empty());
+            available.insert(item_id.clone(), result);
+        }
+        Ok(available)
     }
 }
 

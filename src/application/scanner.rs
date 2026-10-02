@@ -3361,6 +3361,35 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .local_metadata_completeness_plans(&plan_inputs)
         .await
         .map_err(|error| error.to_string())?;
+    let scraper_check_item_ids =
+        if auto_match_policy_override != Some(false) && metadata_reidentify.is_some() {
+            item_ids
+                .iter()
+                .filter(|item_id| {
+                    plans_by_item
+                        .get(*item_id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|plan| plan.has_requestable_capability)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+    let (scraper_availability_by_item, scraper_availability_error) =
+        if let Some(metadata_reidentify) = metadata_reidentify
+            && !scraper_check_item_ids.is_empty()
+        {
+            match metadata_reidentify
+                .has_selected_scrapers_for_items(&scraper_check_item_ids)
+                .await
+            {
+                Ok(available) => (available, None),
+                Err(error) => (HashMap::new(), Some(error.to_string())),
+            }
+        } else {
+            (HashMap::new(), None)
+        };
     let mut checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> =
         BTreeMap::new();
     for item_id in item_ids {
@@ -3373,19 +3402,26 @@ async fn complete_local_metadata_completeness_for_item_ids(
         let eligible_for_fill_missing = if plan.has_requestable_capability
             && auto_match_policy_override != Some(false)
         {
-            if let Some(metadata_reidentify) = metadata_reidentify {
-                match metadata_reidentify
-                    .has_selected_scraper_for_item(item_id)
-                    .await
-                {
-                    Ok(available) => available,
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %item_id,
-                            %error,
-                            "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                        );
-                        false
+            if metadata_reidentify.is_some() {
+                if let Some(error) = scraper_availability_error.as_deref() {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        error,
+                        "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                    );
+                    false
+                } else {
+                    match scraper_availability_by_item.get(item_id) {
+                        Some(Ok(available)) => *available,
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                item_id = %item_id,
+                                %error,
+                                "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                            );
+                            false
+                        }
+                        None => false,
                     }
                 }
             } else {

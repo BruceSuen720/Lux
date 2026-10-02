@@ -1042,20 +1042,32 @@ impl MetadataReidentifyService {
         Ok(Some(clients))
     }
 
-    pub(crate) async fn has_selected_scraper_for_item(
+    pub(crate) async fn has_selected_scrapers_for_items(
         &self,
-        item_id: &str,
-    ) -> Result<bool, MetadataReidentifyError> {
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Result<bool, MetadataReidentifyError>>, MetadataReidentifyError>
+    {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut available = HashMap::with_capacity(item_ids.len());
         if self.selection.is_none() {
-            return Ok(false);
+            available.extend(item_ids.iter().cloned().map(|item_id| (item_id, Ok(false))));
+            return Ok(available);
         }
-        if self.resolver.is_none() {
-            return Ok(!self.scraper.provider_key().trim().is_empty());
-        }
-        self.providers_for_item(item_id, true)
+        let Some(resolver) = &self.resolver else {
+            let value = !self.scraper.provider_key().trim().is_empty();
+            available.extend(item_ids.iter().cloned().map(|item_id| (item_id, Ok(value))));
+            return Ok(available);
+        };
+        let resolved = resolver
+            .has_selected_scrapers_for_items(item_ids)
             .await
-            .map(|providers| providers.is_some_and(|providers| !providers.is_empty()))
-            .map_err(MetadataReidentifyError::Scraper)
+            .map_err(MetadataReidentifyError::Scraper)?;
+        for (item_id, result) in resolved {
+            available.insert(item_id, result.map_err(MetadataReidentifyError::Scraper));
+        }
+        Ok(available)
     }
 
     async fn refresh_with_scraper_roles(

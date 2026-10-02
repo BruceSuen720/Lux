@@ -1234,3 +1234,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个使用同一有序 `library_scrapers` 配置的 movie item。旧 resolver 配置读取逐 item 发出 205 次查询；新 storage 入口按最多 500 个 ID 一批读取，共 1 次，减少 204 次（约 99.5%）。另以无有序配置的 item 验证 legacy `libraries.scraper_id` fallback 仍只在单 item resolver 中触发。
 
 该计数只覆盖配置读取，不包含后续插件客户端解析、RPC、缓存命中或 scanner 墙钟；SQLite 查询调用数不代表 PostgreSQL、NAS 或生产收益。
+
+### LUX-363 本地完整性补缺资格批量读取
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的 205 item fixture 上，scanner 只收集有 requestable capability 的 item，并通过 resolver 一次批量加载刮削器配置；配置 SQL 保持 1 次，随后逐 item 使用既有客户端缓存判断可用性。
+
+该记录只覆盖配置读取调用数，不把插件客户端解析、RPC、缓存命中和 scanner 墙钟混入 SQL 结果，也不推断 PostgreSQL、NAS 或生产收益。
