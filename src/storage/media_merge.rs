@@ -24,6 +24,8 @@ struct MergeHierarchyItem {
     episode_number: Option<i64>,
 }
 
+const MAX_MERGE_ROOTS_PER_QUERY: usize = 100;
+
 impl Database {
     pub(crate) async fn merge_media_items(
         &self,
@@ -44,31 +46,46 @@ impl Database {
 
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let mut roots_by_id = HashMap::<String, MergeRootItem>::with_capacity(item_ids.len());
+        for batch in item_ids.chunks(MAX_MERGE_ROOTS_PER_QUERY) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT mi.id, mi.library_id, mi.item_type,
+                        mi.merged_into_item_id, mi.removed_at
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.id IN ({placeholders})"
+            )));
+            for item_id in batch {
+                query = query.bind(item_id);
+            }
+            for row in
+                query
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                let id: String = row.get("id");
+                roots_by_id.insert(
+                    id.clone(),
+                    MergeRootItem {
+                        id,
+                        library_id: row.get("library_id"),
+                        item_type: row.get("item_type"),
+                        merged_into_item_id: row.get("merged_into_item_id"),
+                        removed_at: row.get("removed_at"),
+                    },
+                );
+            }
+        }
         let mut roots = Vec::with_capacity(item_ids.len());
         for item_id in item_ids {
-            let root = self
-                .query(
-                    "SELECT mi.id, mi.library_id, mi.item_type,
-                            mi.merged_into_item_id, mi.removed_at
-                     FROM media_items mi
-                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                     WHERE mi.id = ?",
-                )
-                .bind(item_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .map(|row| MergeRootItem {
-                    id: row.get("id"),
-                    library_id: row.get("library_id"),
-                    item_type: row.get("item_type"),
-                    merged_into_item_id: row.get("merged_into_item_id"),
-                    removed_at: row.get("removed_at"),
-                });
-            let Some(root) = root else {
+            let Some(root) = roots_by_id.remove(item_id) else {
                 return Err(StorageError::Conflict("媒体条目不存在".to_owned()));
             };
             roots.push(root);
@@ -606,8 +623,8 @@ mod tests {
 
         assert_eq!(
             database.query_count(),
-            21,
-            "expected one batched episode read instead of one read per source season"
+            20,
+            "expected batched root and episode reads instead of one read per item/season"
         );
         Ok(())
     }
@@ -744,6 +761,49 @@ mod tests {
             second_episode_merged_into.as_deref(),
             Some(first_source_episode_id)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_merge_reads_selected_roots_in_one_bounded_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ITEM_COUNT: usize = 100;
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let item_ids = (0..ITEM_COUNT)
+            .map(|index| format!("merge-movie-{index:03}"))
+            .collect::<Vec<_>>();
+        for item_id in &item_ids {
+            insert_merge_item(
+                &database,
+                &library_id,
+                MergeTestItem {
+                    id: item_id,
+                    item_type: "MOVIE",
+                    parent_id: None,
+                    series_id: None,
+                    season_number: None,
+                    episode_number: None,
+                },
+            )
+            .await?;
+        }
+
+        database.reset_query_count();
+        let result = database.merge_media_items(&item_ids[0], &item_ids).await?;
+
+        assert_eq!(result.merged_item_ids.len(), ITEM_COUNT - 1);
+        assert_eq!(result.merged_item_ids, item_ids[1..].to_vec());
+        assert_eq!(database.query_count(), 497);
         Ok(())
     }
 }
