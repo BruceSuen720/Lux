@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.13",
+    date: "2026-10-02",
+    sections: [
+      { kind: "added", items: [
+        "播放活动和通知补充剧集的系列、季和集层级信息，便于在管理台、Webhook 和通知模板中识别具体剧集。",
+        "增加项目非商业源码许可证说明，并同步完善相关开发文档。",
+      ] },
+      { kind: "changed", items: [
+        "批量优化扫描、元数据、人物关系、章节探测、计划管理和通知队列的数据库写入，减少重复操作和处理开销；首页各媒体库的最新资源请求也采用批量处理。",
+        "媒体详情页的更多信息和 NFO 信息采用更紧凑的响应式布局，移动端插件列表行的操作区域对齐方式得到改善。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.12",
     date: "2026-10-01",
     sections: [
