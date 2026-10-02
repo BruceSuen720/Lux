@@ -60,7 +60,7 @@ use crate::{
         strm_target::{StrmTargetKind, classify_strm_target},
     },
     domain::ids::LibraryId,
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, StoredLibrary},
 };
 use tokio::sync::Notify;
 
@@ -487,12 +487,21 @@ impl PluginService {
             .database
             .list_plugin_installation_statuses_by_ids(&plugin_ids)
             .await?;
+        let mut library_options = None;
         let mut views = Vec::new();
         for plugin in notification_plugins {
             let status = installation_statuses.get(&plugin.manifest.id).copied();
             let installed = status.is_some();
             let enabled = status == Some(true);
-            views.push(self.dynamic_view(plugin, installed, enabled).await?);
+            views.push(
+                self.dynamic_view_with_library_options(
+                    plugin,
+                    installed,
+                    enabled,
+                    &mut library_options,
+                )
+                .await?,
+            );
         }
         views.sort_by(|left, right| left.id.cmp(&right.id));
         let total = i64::try_from(views.len()).unwrap_or(i64::MAX);
@@ -531,6 +540,7 @@ impl PluginService {
             .database
             .list_plugin_installation_statuses_by_ids(&status_ids)
             .await?;
+        let mut library_options = None;
         let mut listed_ids = HashSet::new();
         for entry in &store_index.plugins {
             let local_plugin = catalog.get(&entry.id);
@@ -541,7 +551,14 @@ impl PluginService {
                 continue;
             }
             if let Some(plugin) = local_plugin {
-                let mut view = self.dynamic_view(plugin, installed, enabled).await?;
+                let mut view = self
+                    .dynamic_view_with_library_options(
+                        plugin,
+                        installed,
+                        enabled,
+                        &mut library_options,
+                    )
+                    .await?;
                 view.latest_version = Some(entry.version.clone());
                 view.update_available =
                     installed && is_newer_version(&entry.version, &plugin.manifest.version);
@@ -559,7 +576,15 @@ impl PluginService {
             let installed = status.is_some();
             let enabled = status == Some(true);
             if !installed_only || installed {
-                views.push(self.dynamic_view(plugin, installed, enabled).await?);
+                views.push(
+                    self.dynamic_view_with_library_options(
+                        plugin,
+                        installed,
+                        enabled,
+                        &mut library_options,
+                    )
+                    .await?,
+                );
             }
         }
         let total = i64::try_from(views.len()).unwrap_or(i64::MAX);
@@ -1124,12 +1149,15 @@ impl PluginService {
             .database
             .list_plugin_installation_statuses_by_ids(&detector_plugin_ids)
             .await?;
+        let mut library_options = None;
         let mut sources = Vec::new();
         for plugin in detector_plugins {
             if installation_statuses.get(&plugin.manifest.id) != Some(&true) {
                 continue;
             }
-            let view = self.dynamic_view(plugin, true, true).await?;
+            let view = self
+                .dynamic_view_with_library_options(plugin, true, true, &mut library_options)
+                .await?;
             if view.available {
                 sources.push(ChapterSourceView {
                     id: view.id,
@@ -1877,6 +1905,15 @@ impl PluginService {
         &self,
         plugin: &DiscoveredPlugin,
     ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
+        self.config_fields_for_plugin_with_libraries(plugin, None)
+            .await
+    }
+
+    async fn config_fields_for_plugin_with_libraries(
+        &self,
+        plugin: &DiscoveredPlugin,
+        libraries: Option<&[StoredLibrary]>,
+    ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
         let mut fields = plugin.manifest.config_fields.clone();
         if plugin.manifest.id == MEDIA_INFO_PLUGIN_ID
             && !fields.iter().any(|field| field.key == "schedule")
@@ -1905,18 +1942,23 @@ impl PluginService {
         if fields.iter().any(|field| {
             field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES)
         }) {
-            let options = self
-                .database
-                .list_libraries()
-                .await?
-                .into_iter()
+            let loaded_libraries;
+            let libraries = match libraries {
+                Some(libraries) => libraries,
+                None => {
+                    loaded_libraries = self.database.list_libraries().await?;
+                    &loaded_libraries
+                }
+            };
+            let options = libraries
+                .iter()
                 .filter(|library| {
                     library.is_enabled
                         && (!is_chapter_detector_plugin(plugin) || library.kind != "MOVIE")
                 })
                 .map(|library| PluginConfigOption {
-                    value: library.id,
-                    label: library.name,
+                    value: library.id.clone(),
+                    label: library.name.clone(),
                 })
                 .collect::<Vec<_>>();
             for field in &mut fields {
@@ -2403,6 +2445,36 @@ impl PluginService {
         installed: bool,
         enabled: bool,
     ) -> Result<PluginView, PluginServiceError> {
+        self.dynamic_view_with_libraries(plugin, installed, enabled, None)
+            .await
+    }
+
+    async fn dynamic_view_with_library_options(
+        &self,
+        plugin: &DiscoveredPlugin,
+        installed: bool,
+        enabled: bool,
+        library_options: &mut Option<Vec<StoredLibrary>>,
+    ) -> Result<PluginView, PluginServiceError> {
+        let libraries = if plugin_uses_library_options(plugin) {
+            if library_options.is_none() {
+                *library_options = Some(self.database.list_libraries().await?);
+            }
+            library_options.as_deref()
+        } else {
+            None
+        };
+        self.dynamic_view_with_libraries(plugin, installed, enabled, libraries)
+            .await
+    }
+
+    async fn dynamic_view_with_libraries(
+        &self,
+        plugin: &DiscoveredPlugin,
+        installed: bool,
+        enabled: bool,
+        libraries: Option<&[StoredLibrary]>,
+    ) -> Result<PluginView, PluginServiceError> {
         let runtime = self.supervisor.status(&plugin.manifest.id).await;
         let disabled_by_other_ip_provider = plugin.manifest.id == IP138_PLUGIN_ID
             && !self.installed_other_ip_location_plugins().await?.is_empty();
@@ -2411,7 +2483,9 @@ impl PluginService {
         } else {
             CONFIG_SOURCE_PLUGIN.to_owned()
         };
-        let config_fields = self.config_fields_for_plugin(plugin).await?;
+        let config_fields = self
+            .config_fields_for_plugin_with_libraries(plugin, libraries)
+            .await?;
         let mut stored_values = self.read_plugin_config(&plugin.manifest.id).await?;
         if is_chapter_detector_plugin(plugin) {
             stored_values.remove("libraryIds");
@@ -2519,6 +2593,13 @@ async fn discover_plugin_catalog(
             "plugin discovery task failed: {error}"
         )))
     })
+}
+
+fn plugin_uses_library_options(plugin: &DiscoveredPlugin) -> bool {
+    !is_chapter_detector_plugin(plugin)
+        && plugin.manifest.config_fields.iter().any(|field| {
+            field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES)
+        })
 }
 
 fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> Map<String, Value> {
@@ -3606,11 +3687,14 @@ mod plugin_update_tests {
 
 #[cfg(test)]
 mod plugin_discovery_tests {
-    use serde_json::Map;
+    use serde_json::{Map, json};
     use tempfile::tempdir;
 
     use super::{PluginService, discover_plugin_catalog};
-    use crate::{config::Config, storage::Database};
+    use crate::{
+        application::libraries::LibraryService, config::Config, library::LibraryKind,
+        storage::Database,
+    };
 
     #[tokio::test]
     async fn discovers_a_catalog_through_the_async_boundary() {
@@ -3641,6 +3725,72 @@ mod plugin_discovery_tests {
             .await?;
 
         assert_ne!(revision, service.scraper_client_revision());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listing_plugins_reads_library_options_once_per_plugin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FIRST_PLUGIN_ID: &str = "org.lux.test-library-options-one";
+        const SECOND_PLUGIN_ID: &str = "org.lux.test-library-options-two";
+
+        let root = tempdir()?;
+        let config_dir = root.path().join("config");
+        for (plugin_id, name) in [
+            (FIRST_PLUGIN_ID, "Library options one"),
+            (SECOND_PLUGIN_ID, "Library options two"),
+        ] {
+            let plugin_dir = config_dir.join(format!("plugins/{plugin_id}/binaries"));
+            tokio::fs::create_dir_all(&plugin_dir).await?;
+            tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+            tokio::fs::write(
+                config_dir.join(format!("plugins/{plugin_id}/manifest.json")),
+                serde_json::to_vec_pretty(&json!({
+                    "formatVersion": 1,
+                    "id": plugin_id,
+                    "name": name,
+                    "version": "1.0.0",
+                    "apiVersion": 1,
+                    "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                    "type": "metadata",
+                    "category": "SCRAPER",
+                    "capabilities": ["metadata.search"],
+                    "supportedItemTypes": ["Movie"],
+                    "configFields": [{
+                        "key": "libraryIds",
+                        "label": "媒体库",
+                        "type": "select",
+                        "multiple": true,
+                        "optionsSource": "media-libraries"
+                    }],
+                    "permissions": {"network": [], "filesystem": []},
+                    "files": []
+                }))?,
+            )
+            .await?;
+        }
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let service = PluginService::new(database.clone(), config_dir);
+        service.install(FIRST_PLUGIN_ID).await?;
+        service.install(SECOND_PLUGIN_ID).await?;
+
+        database.reset_query_count();
+        let page = service.list_installed(0, 20).await?;
+
+        assert_eq!(page.plugins.len(), 2);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the library list and scraper associations should be loaded once per page"
+        );
         Ok(())
     }
 }
