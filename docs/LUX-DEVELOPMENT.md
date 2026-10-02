@@ -7791,6 +7791,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：205 条探测轨道从逐项 205 次 INSERT 改为最多 75 条一批的多行 INSERT，共 3 次批量 INSERT；连同 source UPDATE 和旧轨道 DELETE，SQL 调用从 207 次降至 5 次（约减少 97.6%）。回归验证了轨道字段、索引顺序、字幕外部路径、空轨道清理和第三批约束失败时的整笔回滚；新语句每批最多 900 个绑定值。`probe`、`strm_probe` 定向目标、全目标 Rust 测试、fmt、全目标/全 feature Clippy、脚本语法、Python 工具测试和 Web 553 项测试/生产构建通过。本机 `uname -m=arm64`。性能记录只报告 SQLite 固定 fixture 的查询调用数；本任务未实测 PostgreSQL、墙钟时延或 NAS。
 
+#### LUX-348：章节检测复用任务级插件模式
+
+范围：章节检测任务启动时已经读取一次插件 catalog，得到 `remote_lookup`；当前每个本地/远程分集 RPC 批次的 `process_season` 又重复读取 catalog snapshot。将任务级模式传入批次处理，消除重复读取，保留本地指纹检测、远程章节查询和媒体源筛选行为，不改变插件协议、任务状态机或数据库模型。
+
+验收：
+
+- [x] 每个任务只读取一次 `remote_lookup`，分集批次不再重复读取 catalog snapshot。
+- [x] 本地检测与远程 lookup 的现有回归目标继续通过，分支选择和取消/重试语义不变。
+- [x] 不新增数据库、插件协议或公共 API 变化。
+- [x] 性能记录只报告可推导的重复读取上界，不冒充墙钟或数据库性能基准。
+
+依赖：无。预计文件：`src/application/chapter_detector.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先复用现有任务级模式并运行章节检测相关目标，再记录固定批大小下的重复 snapshot 上界。
+
+结果（2026-10-02）：`run_claimed` 计算出的任务级 `remote_lookup` 现在传入每个分集批次，`process_season` 不再重复读取 plugin catalog。章节检测 2 项、本地/远程媒体源筛选和章节检测 API 相关回归共 3 项通过；本机 `uname -m=arm64`。固定单季 10,000 集推导为本地批次最多从 157 次重复读取降至 0 次、远程批次最多从 417 次降至 0 次，任务级读取保持 1 次；该记录不代表墙钟或数据库性能收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

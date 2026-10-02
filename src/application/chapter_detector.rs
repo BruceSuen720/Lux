@@ -506,7 +506,13 @@ impl ChapterDetectionService {
                         break;
                     }
                     let (outcomes, season_failed) = self
-                        .process_season(&job, items.to_vec(), concurrency, &processed_source_ids)
+                        .process_season(
+                            &job,
+                            items.to_vec(),
+                            concurrency,
+                            remote_lookup,
+                            &processed_source_ids,
+                        )
                         .await?;
                     failed |= season_failed;
                     let mut updates = Vec::with_capacity(outcomes.len());
@@ -582,13 +588,10 @@ impl ChapterDetectionService {
         job: &StoredChapterDetectionJob,
         items: Vec<StoredChapterDetectionItem>,
         concurrency: usize,
+        remote_lookup: bool,
         protected_source_ids: &HashSet<String>,
     ) -> Result<(Vec<SourceOutcome>, bool), ChapterDetectionError> {
-        if self
-            .plugins
-            .is_chapter_lookup_plugin(&job.plugin_id)
-            .await?
-        {
+        if remote_lookup {
             return self
                 .process_remote_season(job, items, protected_source_ids)
                 .await;
