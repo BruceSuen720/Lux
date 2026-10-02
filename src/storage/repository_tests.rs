@@ -1283,6 +1283,64 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
 }
 
 #[tokio::test]
+async fn scan_local_metadata_backfill_roots_register_in_one_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Backfill roots", LibraryKind::Movie, false)
+        .await?;
+
+    database.reset_query_count();
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "an empty root list uses one query"
+    );
+
+    for index in 0..4 {
+        let root_path = temp_dir.path().join(format!("root-{index}"));
+        std::fs::create_dir_all(&root_path)?;
+        libraries
+            .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+            .await?;
+    }
+
+    database.reset_query_count();
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        4
+    );
+    assert_eq!(database.query_count(), 1, "four roots use one query");
+    let row_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM scan_local_metadata_backfills")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(row_count, 4);
+
+    database.reset_query_count();
+    assert_eq!(
+        database.ensure_scan_local_metadata_backfill_roots().await?,
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "idempotent registration uses one query"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

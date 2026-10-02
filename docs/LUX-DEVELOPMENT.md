@@ -7702,6 +7702,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：轻量 Manifest session 现在通过一条有界查询读取有序根 ID、Manifest 状态和 filesystem entry baseline；仍跳过 `COMPLETE` / `UNAVAILABLE` 根，且不执行根设备/inode 身份读取。四根 SQLite fixture 含两个终态根、两个待处理根；旧路径为 1 次根列表查询、4 次状态读取和 2 次 baseline 查询，共 7 次 SQL 调用，新路径为 1 次。新测试通过真实服务初始化验证状态筛选、baseline 标志和查询数。scanner 模块 31 项、`tests/scanner.rs` 17 项、`tests/scanning_jobs.rs` 81 项及 `cargo test --locked --all-targets` 全部通过；PostgreSQL 专项因环境无实例而忽略。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和全目标 Clippy 通过；本机 `uname -m=arm64`。性能记录仅报告该固定 fixture 的 SQL 调用数，不推断墙钟、PostgreSQL 或 NAS 收益。
 
+#### LUX-342：批量注册本地元数据回填根
+
+范围：本地元数据 worker 启动时，先读取所有 library root，再逐根执行幂等 INSERT；多根库因此反复发 SQL 并多次获取 SQLite 写锁。将启动注册改为一条 `INSERT ... SELECT ... ON CONFLICT DO NOTHING`，只获取一次写锁，并用该语句的 affected-row 数返回新增根数。保留逐根注册 API、已注册根不变和新根注册语义。
+
+验收：
+
+- [x] 空库根列表、四根首次注册和重复注册均返回正确新增数；每次批量注册固定为 1 条 SQL 调用。
+- [x] SQLite 自动化测试覆盖持久化队列行、幂等性和查询调用数；SQL 形状使用 SQLite 与 PostgreSQL 均支持的语法。
+- [x] 存储定向回归、全局 Rust 完成门、格式检查和 Clippy 通过。
+- [x] 性能记录报告固定根数与 SQL 调用数，不据此推断墙钟、PostgreSQL 或 NAS 时延。
+
+依赖：LUX-341。预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改 schema、回填资格、单根注册语义或队列消费顺序。
+
+结果（2026-10-02）：4 根 SQLite fixture 的本地元数据回填根注册从原先 1 次根列表读取加 4 次逐根 INSERT，改为单条 `INSERT ... SELECT ... ON CONFLICT DO NOTHING`；新根返回 4，空列表和重复注册返回 0，三种情况下每次均为 1 次 SQL 调用，且 4 条队列记录实际持久化。定向 storage 测试通过；`cargo test --locked --all-targets` 全目标共 1,287 passed、0 failed、31 ignored；`cargo build --locked`、fmt、`git diff --check` 和全目标/全 feature Clippy 通过。本机 `uname -m=arm64`。性能记录见 `docs/PERFORMANCE.md`，只报告 SQL 调用数；PostgreSQL 未连接实测。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

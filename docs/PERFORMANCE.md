@@ -1122,3 +1122,9 @@ SQL 调用计数不等于墙钟耗时或磁盘写入量，也没有 PostgreSQL/N
 2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 数据库中，以 4 个根初始化轻量 Manifest discovery session，其中 2 个根状态为 `COMPLETE` / `UNAVAILABLE`，另 2 个根需要 baseline 检查。旧流程先列出根 ID，再逐根读取状态，并只为活跃根查询 filesystem entry：`1 + 4 + 2 = 7` 次 SQL 调用。合并状态和 baseline 的查询后，真实 service 初始化只调用 1 次 SQL，下降约 85.7%；终态根继续跳过，两个活跃根的 baseline 标志保持正确。
 
 该数值由 SQLite 查询计数器记录调用数，不是网络往返、数据库写入量或墙钟测量；没有 PostgreSQL 实例，也不据此推断时延或 NAS/x86_64 性能。
+
+### LUX-342 本地元数据回填根注册调用计数
+
+2026-10-02 在 `uname -m=arm64` 的开发机临时 SQLite 库中，以 4 个 library root 注册本地元数据回填队列。旧流程先读取根 ID，再逐根执行幂等注册，共 5 次 SQL 调用，4 次逐根 INSERT 各自获取一次写锁；合并为单条 `INSERT ... SELECT ... ON CONFLICT DO NOTHING` 后共 1 次 SQL 调用，减少 4 次（80%），整批只获取一次写锁。测试也验证空根列表与已注册根仍各用 1 次调用，且 affected-row 数分别为 0；首次插入 4 个队列行并返回 4，重复注册返回 0。
+
+SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙钟基准；没有 PostgreSQL 实例，也不据此推断 PostgreSQL、NAS 或 x86_64 性能。

@@ -111,22 +111,21 @@ impl Database {
     pub(crate) async fn ensure_scan_local_metadata_backfill_roots(
         &self,
     ) -> Result<u64, StorageError> {
-        let root_ids = self
-            .query_scalar::<String>("SELECT id FROM library_roots ORDER BY id")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut inserted = 0_u64;
-        for library_root_id in root_ids {
-            inserted = inserted.saturating_add(u64::from(
-                self.ensure_scan_local_metadata_backfill_root(&library_root_id)
-                    .await?,
-            ));
-        }
-        Ok(inserted)
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        self.query(
+            "INSERT INTO scan_local_metadata_backfills (library_root_id)
+             SELECT id FROM library_roots
+             WHERE TRUE
+             ORDER BY id
+             ON CONFLICT(library_root_id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn ensure_scan_local_metadata_backfill_root(
