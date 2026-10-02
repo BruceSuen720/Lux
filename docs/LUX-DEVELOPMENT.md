@@ -7717,6 +7717,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：4 根 SQLite fixture 的本地元数据回填根注册从原先 1 次根列表读取加 4 次逐根 INSERT，改为单条 `INSERT ... SELECT ... ON CONFLICT DO NOTHING`；新根返回 4，空列表和重复注册返回 0，三种情况下每次均为 1 次 SQL 调用，且 4 条队列记录实际持久化。定向 storage 测试通过；`cargo test --locked --all-targets` 全目标共 1,287 passed、0 failed、31 ignored；`cargo build --locked`、fmt、`git diff --check` 和全目标/全 feature Clippy 通过。本机 `uname -m=arm64`。性能记录见 `docs/PERFORMANCE.md`，只报告 SQL 调用数；PostgreSQL 未连接实测。
 
+#### LUX-343：批量写入 Webhook 投递队列
+
+范围：Webhook 事件入队目前对每个 destination 单独执行 delivery INSERT。将 delivery 行改为每批最多 100 个 destination 的多行 INSERT，降低 SQL 调用与语句执行开销，同时保留事件先入队、事务原子性、dedupe key、delivery 唯一键冲突忽略、投递 ID 唯一性和目标顺序。事件插入冲突时仍不创建 delivery；空目标列表仍只插入事件。
+
+验收：
+
+- [x] 205 个 destination 在 SQLite 中保留 205 条 PENDING delivery，入队 SQL 调用固定为 1 条事件 INSERT 加 3 条批量 delivery INSERT；重放同一 dedupe key 不产生重复记录。
+- [x] 每批绑定参数不超过 SQLite 保守限制，SQL 使用 SQLite/PostgreSQL 均支持的多行 VALUES 与 `ON CONFLICT` 语法；不修改 schema 或 delivery 消费顺序。
+- [x] 定向存储/Webhook 回归、全局 Rust 完成门、格式检查和 Clippy 通过。
+- [x] 性能记录比较固定 fixture 的 SQL 调用数，不据此推断墙钟、PostgreSQL 或 NAS 时延。
+
+依赖：LUX-342。预计文件：`src/storage/notifications.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：delivery 行改为每批最多 100 条的多行 INSERT，每行绑定 3 个参数，最多 300 个绑定值。205 个目标从 206 次 SQL 调用降到 4 次（事件 1 次、delivery 3 批，减少约 98.1%），仍持久化 205 条 PENDING 行。SQLite 回归验证 dedupe 重放、空目标事件和第二批失败时整笔事务回滚；PostgreSQL 17 临时实例上的同一批量 fixture 验证 205 行、dedupe 和 4/1 次查询计数。定向 Webhook 与扫描集成回归通过；`cargo test --locked --all-targets` 为 1,288 passed、0 failed、32 ignored；`cargo build --locked`、fmt 和全目标/全 feature Clippy 通过。本机 `uname -m=arm64`；性能记录只报告 SQL 调用数，不推断墙钟、NAS 或 x86_64 时延。全量验收期间出现过一次无法复现的 library update 503，因此该测试现会在失败断言中包含响应体以便后续诊断。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

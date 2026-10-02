@@ -1128,3 +1128,9 @@ SQL 调用计数不等于墙钟耗时或磁盘写入量，也没有 PostgreSQL/N
 2026-10-02 在 `uname -m=arm64` 的开发机临时 SQLite 库中，以 4 个 library root 注册本地元数据回填队列。旧流程先读取根 ID，再逐根执行幂等注册，共 5 次 SQL 调用，4 次逐根 INSERT 各自获取一次写锁；合并为单条 `INSERT ... SELECT ... ON CONFLICT DO NOTHING` 后共 1 次 SQL 调用，减少 4 次（80%），整批只获取一次写锁。测试也验证空根列表与已注册根仍各用 1 次调用，且 affected-row 数分别为 0；首次插入 4 个队列行并返回 4，重复注册返回 0。
 
 SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙钟基准；没有 PostgreSQL 实例，也不据此推断 PostgreSQL、NAS 或 x86_64 性能。
+
+### LUX-343 Webhook 投递队列 SQL 调用计数
+
+2026-10-02 使用 205 个启用 destination 的固定 fixture。原实现写入 1 条 event 后逐目标执行 205 条 delivery INSERT，共 206 次 SQL 调用；新实现每批最多 100 个目标，发出 1 条 event INSERT 与 3 条多行 delivery INSERT，共 4 次，减少 202 次（约 98.1%）。SQLite 与 PostgreSQL 17 均验证 205 条投递行、重复 dedupe key 不增加投递；SQLite 另验证空目标只入事件，以及第二批失败时 event 和前一批 delivery 一起回滚。
+
+每行绑定 3 个值，批次上限 100 使单条语句最多 300 个绑定参数，低于 SQLite 保守限制。计数来自 storage 查询计数器，只衡量 SQL 语句调用数，不是落盘行数或墙钟；未据此推断 NAS 或生产负载时延。

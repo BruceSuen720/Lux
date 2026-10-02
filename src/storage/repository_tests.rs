@@ -13,6 +13,7 @@ use crate::{
     storage::{
         ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
         NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMetadataCandidate,
+        NewNotificationDestination, NewNotificationEvent,
     },
 };
 
@@ -1337,6 +1338,254 @@ async fn scan_local_metadata_backfill_roots_register_in_one_query()
         1,
         "idempotent registration uses one query"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn notification_deliveries_are_written_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let mut destination_ids = Vec::new();
+    for index in 0..205 {
+        let id = format!("notification-destination-{index:03}");
+        database
+            .create_notification_destination(NewNotificationDestination {
+                id: &id,
+                name: &id,
+                url: "https://example.test/webhook",
+                enabled: true,
+                allow_private_network: false,
+                event_types_json: "[]",
+                payload_format: "LUX",
+                provider_plugin_id: "builtin.webhook",
+                provider_config_json: "{}",
+            })
+            .await?;
+        destination_ids.push(id);
+    }
+
+    let event_id = "notification-event-batch";
+    let event = || NewNotificationEvent {
+        id: event_id,
+        event_type: "ITEM_ADDED",
+        schema_version: 1,
+        occurred_at: 1_800_000_000,
+        dedupe_key: "notification-event-batch-key",
+        payload_json: "{}",
+    };
+    sqlx::query(
+        "CREATE TRIGGER reject_notification_delivery_batch
+         BEFORE INSERT ON notification_deliveries
+         WHEN NEW.destination_id = 'notification-destination-100'
+         BEGIN
+             SELECT RAISE(ABORT, 'forced delivery batch failure');
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .insert_notification_event_with_deliveries(event(), &destination_ids)
+            .await
+            .is_err()
+    );
+    let rolled_back_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notification_events WHERE id = ?")
+            .bind(event_id)
+            .fetch_one(database.pool())
+            .await?;
+    let rolled_back_deliveries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notification_deliveries WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(rolled_back_events, 0);
+    assert_eq!(rolled_back_deliveries, 0);
+    sqlx::query("DROP TRIGGER reject_notification_delivery_batch")
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    assert!(
+        database
+            .insert_notification_event_with_deliveries(event(), &destination_ids)
+            .await?
+    );
+    assert_eq!(
+        database.query_count(),
+        4,
+        "one event plus three batches of at most 100 deliveries"
+    );
+
+    let delivery_rows: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM notification_deliveries WHERE event_id = ?")
+        .bind(event_id)
+        .fetch_one(database.pool())
+        .await?;
+    let pending_rows: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM notification_deliveries
+             WHERE event_id = ? AND status = 'PENDING'",
+        )
+        .bind(event_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(delivery_rows, 205);
+    assert_eq!(pending_rows, 205);
+
+    database.reset_query_count();
+    assert!(
+        !database
+            .insert_notification_event_with_deliveries(event(), &destination_ids)
+            .await?
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "deduped events skip delivery inserts"
+    );
+
+    database.reset_query_count();
+    assert!(
+        database
+            .insert_notification_event_with_deliveries(
+                NewNotificationEvent {
+                    id: "notification-event-empty",
+                    event_type: "ITEM_ADDED",
+                    schema_version: 1,
+                    occurred_at: 1_800_000_001,
+                    dedupe_key: "notification-event-empty-key",
+                    payload_json: "{}",
+                },
+                &[],
+            )
+            .await?
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "empty destination list only inserts event"
+    );
+
+    let event_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM notification_events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(event_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_notification_deliveries_are_written_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = crate::config::DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let assertions = async {
+        let mut destination_ids = Vec::new();
+        for index in 0..205 {
+            let id = format!("postgres-notification-destination-{index:03}");
+            database
+                .create_notification_destination(NewNotificationDestination {
+                    id: &id,
+                    name: &id,
+                    url: "https://example.test/webhook",
+                    enabled: true,
+                    allow_private_network: false,
+                    event_types_json: "[]",
+                    payload_format: "LUX",
+                    provider_plugin_id: "builtin.webhook",
+                    provider_config_json: "{}",
+                })
+                .await?;
+            destination_ids.push(id);
+        }
+
+        let event_id = "postgres-notification-event-batch";
+        let event = || NewNotificationEvent {
+            id: event_id,
+            event_type: "ITEM_ADDED",
+            schema_version: 1,
+            occurred_at: 1_800_000_000,
+            dedupe_key: "postgres-notification-event-batch-key",
+            payload_json: "{}",
+        };
+        database.reset_query_count();
+        assert!(
+            database
+                .insert_notification_event_with_deliveries(event(), &destination_ids)
+                .await?
+        );
+        assert_eq!(database.query_count(), 4);
+        let delivery_rows: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM notification_deliveries WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(delivery_rows, 205);
+
+        database.reset_query_count();
+        assert!(
+            !database
+                .insert_notification_event_with_deliveries(event(), &destination_ids)
+                .await?
+        );
+        assert_eq!(database.query_count(), 1);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
     Ok(())
 }
 
