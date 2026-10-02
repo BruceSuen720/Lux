@@ -7628,6 +7628,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：新增有界多库首页最新资源 API；100 个 ID 上限低于现有 SQLite/PostgreSQL 批量查询分块上限，catalog 读取不随库数逐项发 SQL。序列化时用户状态、候选待处理和本地待处理标记按 ID 批量读取。集成用例覆盖 query 参数边界、去重和首次顺序、空库、跨库拒绝访问，并断言批量返回的媒体对象与原单库接口逐项相等。`cargo test --locked --test catalog`（3 项）、`cargo build --locked`、全目标测试（651 个 library tests 通过、10 个忽略；PostgreSQL 专项因本机无 PostgreSQL 实例而忽略）、`cargo fmt --all -- --check`、全目标 Clippy、shell/Python 检查、冻结 Web 依赖安装、Web 测试（108 项 Node 检查、76 个文件 / 548 项 Vitest）和 Web 生产构建通过。首次总检查脚本仅因新增代码格式差异在 fmt 阶段停止；格式化后，fmt 与其余门禁逐项复跑通过。本机架构 `arm64`。本任务只新增后端批量入口，Web 仍调用旧的逐库接口，因此目前不声称首页请求或耗时已下降；Web 接入和固定多库 fixture 的请求数/延迟对比仍待后续任务。
 
+#### LUX-337：增加首页多库最新资源的 Web API 客户端方法
+
+范围：为 LUX-336 的 `GET /api/v1/home/libraries/latest` 定义 TypeScript 响应类型，并在 `LuxApiClient` 增加接受媒体库 ID 列表的方法。客户端用重复的 `libraryId` 查询参数保留输入顺序，并沿用首页请求超时和取消信号。保留既有 `homeLibraryLatest` 方法与路径；本任务不接入首页组件。
+
+验收：
+
+- [x] TypeScript 响应结构表达每库 ID 与资源数组。
+- [x] API 客户端为每个 ID 添加一个重复 query 参数、正确解码响应，并传递取消信号。
+- [x] 首页请求 15 秒超时测试覆盖新方法；Web API 客户端定向测试通过。
+
+预计文件：`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：新增 `HomeLatestLibrariesResponse` 与 `homeLibrariesLatest`，用 `URLSearchParams.append` 按输入顺序生成重复 `libraryId` 参数，并沿用首页 15 秒请求超时及调用方取消信号。新增测试覆盖批量响应解码、参数顺序、超时与主动取消；先确认旧客户端因方法不存在而失败，随后实现后定向 API client 测试 57 项通过。冻结依赖安装、Web 全量测试（Node 108 项、Vitest 76 个文件 / 550 项）和生产构建通过。本任务只增加客户端能力，首页尚未调用该方法，不据此声称运行时请求数或性能变化。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

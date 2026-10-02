@@ -46,6 +46,7 @@ import type {
   DatabaseSetupInput,
   LibraryKind,
   HomeCarouselResponse,
+  HomeLatestLibrariesResponse,
   HomeResponse,
   UserLibraryOrder,
   LibrariesResponse,
@@ -395,6 +396,20 @@ export class LuxApiClient {
     return withHomeRequestTimeout(
       (requestSignal) => this.request<PageResponse<MediaItem>>(
         `/api/v1/libraries/${encodeURIComponent(libraryId)}/latest`,
+        { signal: requestSignal },
+      ),
+      signal,
+    );
+  }
+
+  homeLibrariesLatest(libraryIds: readonly string[], signal?: AbortSignal) {
+    const params = new URLSearchParams();
+    for (const libraryId of libraryIds) {
+      params.append("libraryId", libraryId);
+    }
+    return withHomeRequestTimeout(
+      (requestSignal) => this.request<HomeLatestLibrariesResponse>(
+        `/api/v1/home/libraries/latest?${params}`,
         { signal: requestSignal },
       ),
       signal,
