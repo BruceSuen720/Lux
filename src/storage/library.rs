@@ -1746,6 +1746,43 @@ impl Database {
         plugin_id: Option<&str>,
         library_ids: &[String],
     ) -> Result<(), StorageError> {
+        if library_ids.is_empty() {
+            return Err(StorageError::Conflict(
+                "执行计划至少需要一个媒体库".to_owned(),
+            ));
+        }
+        const MAX_LIBRARY_IDS_PER_QUERY: usize = 100;
+        let mut configs =
+            HashMap::<String, (String, Option<String>)>::with_capacity(library_ids.len());
+        for batch in library_ids.chunks(MAX_LIBRARY_IDS_PER_QUERY) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query =
+                self.query_as::<(String, String, Option<String>)>(sqlx::AssertSqlSafe(format!(
+                    "SELECT owner_id, source_type, plugin_id
+                     FROM scheduled_task_configs
+                     WHERE owner_type = 'LIBRARY' AND task_type = ?
+                       AND owner_id IN ({placeholders})"
+                )));
+            query = query.bind(task_type);
+            for library_id in batch {
+                query = query.bind(library_id);
+            }
+            let rows = query
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            configs.extend(rows.into_iter().map(
+                |(library_id, actual_source_type, actual_plugin_id)| {
+                    (library_id, (actual_source_type, actual_plugin_id))
+                },
+            ));
+        }
+
         let mut seen = HashSet::with_capacity(library_ids.len());
         for library_id in library_ids {
             if !seen.insert(library_id) {
@@ -1753,21 +1790,7 @@ impl Database {
                     "同一媒体库不能在计划中重复选择".to_owned(),
                 ));
             }
-            let config: Option<(String, Option<String>)> = self
-                .query_as(
-                    "SELECT source_type, plugin_id
-                     FROM scheduled_task_configs
-                     WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = ?",
-                )
-                .bind(library_id)
-                .bind(task_type)
-                .fetch_optional(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            let Some((actual_source_type, actual_plugin_id)) = config else {
+            let Some((actual_source_type, actual_plugin_id)) = configs.get(library_id) else {
                 return Err(StorageError::Conflict(format!(
                     "媒体库 {library_id} 尚未注册任务 {task_type}"
                 )));
@@ -1777,11 +1800,6 @@ impl Database {
                     "一个执行计划不能混合不同的插件来源".to_owned(),
                 ));
             }
-        }
-        if library_ids.is_empty() {
-            return Err(StorageError::Conflict(
-                "执行计划至少需要一个媒体库".to_owned(),
-            ));
         }
         Ok(())
     }
@@ -3112,6 +3130,158 @@ mod scheduled_task_plan_mirror_tests {
         .await
         .expect("plan member count");
         assert_eq!(member_count, LIBRARY_COUNT as i64);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_validation_uses_bounded_batches() {
+        const LIBRARY_COUNT: usize = 205;
+
+        let (_temp_dir, database) = test_database().await;
+        let library_ids = (0..LIBRARY_COUNT)
+            .map(|index| format!("plan-validation-library-{index:03}"))
+            .collect::<Vec<_>>();
+        for library_id in &library_ids {
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id
+                 ) VALUES ('LIBRARY', ?, 'RECONCILIATION_SCAN', 'Scan', 'Scan', 'SYSTEM', NULL)",
+            )
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("library task config should be inserted");
+        }
+
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        database.reset_query_count();
+        database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &library_ids,
+            )
+            .await
+            .expect("library task configs should validate");
+        transaction.rollback().await.expect("transaction rollback");
+
+        assert_eq!(database.query_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_validation_preserves_input_errors() {
+        let (_temp_dir, database) = test_database().await;
+        for (library_id, source_type, plugin_id) in [
+            ("validation-library-a", "SYSTEM", None),
+            (
+                "validation-library-b",
+                "PLUGIN",
+                Some("org.example.scraper"),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id
+                 ) VALUES ('LIBRARY', ?, 'RECONCILIATION_SCAN', 'Scan', 'Scan', ?, ?)",
+            )
+            .bind(library_id)
+            .bind(source_type)
+            .bind(plugin_id)
+            .execute(database.pool())
+            .await
+            .expect("library task config should be inserted");
+        }
+
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &[],
+            )
+            .await
+            .expect_err("empty library selection should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let duplicate_ids = vec![
+            "validation-library-a".to_owned(),
+            "validation-library-a".to_owned(),
+        ];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &duplicate_ids,
+            )
+            .await
+            .expect_err("duplicate library selection should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let missing_ids = vec![
+            "validation-library-a".to_owned(),
+            "validation-library-missing".to_owned(),
+        ];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &missing_ids,
+            )
+            .await
+            .expect_err("missing library task config should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let error_order_ids = vec![
+            "validation-library-missing".to_owned(),
+            "validation-library-a".to_owned(),
+            "validation-library-a".to_owned(),
+        ];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &error_order_ids,
+            )
+            .await
+            .expect_err("the first input error should be preserved");
+        assert!(matches!(
+            error,
+            StorageError::Conflict(message)
+                if message == "媒体库 validation-library-missing 尚未注册任务 RECONCILIATION_SCAN"
+        ));
+        transaction.rollback().await.expect("transaction rollback");
+
+        let plugin_ids = vec!["validation-library-b".to_owned()];
+        let mut transaction = database.pool().begin().await.expect("transaction");
+        let error = database
+            .validate_scheduled_task_plan_libraries(
+                &mut transaction,
+                "RECONCILIATION_SCAN",
+                "SYSTEM",
+                None,
+                &plugin_ids,
+            )
+            .await
+            .expect_err("mixed plugin source should be rejected");
+        assert!(matches!(error, StorageError::Conflict(_)));
+        transaction.rollback().await.expect("transaction rollback");
     }
 
     #[tokio::test]
