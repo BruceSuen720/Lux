@@ -12,8 +12,8 @@ use crate::{
     library::LibraryKind,
     storage::{
         ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
-        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMetadataCandidate,
-        NewNotificationDestination, NewNotificationEvent,
+        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMediaChapterMarker,
+        NewMetadataCandidate, NewNotificationDestination, NewNotificationEvent,
     },
 };
 
@@ -10522,6 +10522,78 @@ async fn chapter_detection_outcomes_commit_status_state_and_progress_as_one_batc
     assert_eq!(item_status, "COMPLETED");
     assert_eq!(source_status, "NOT_FOUND");
     assert_eq!(progress, (1, source_id.to_owned()));
+}
+
+#[tokio::test]
+async fn detected_media_chapters_are_inserted_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Chapter markers", LibraryKind::Series, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    libraries
+        .add_root(library.id, root_path.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+         VALUES ('marker-item', ?, 'EPISODE', 'Episode', 'episode', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries
+         (id, library_root_id, relative_path, entry_kind, size, modified_at, fingerprint, last_seen_generation)
+         VALUES ('marker-entry', ?, 'episode.mkv', 'FILE', 1, 1, ?, 'generation')",
+    )
+    .bind(&root_id)
+    .bind(vec![1_u8])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+         VALUES ('marker-source', 'marker-item', 'LOCAL_FILE', 'marker-entry')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let markers = (0_usize..3)
+        .map(|index| NewMediaChapterMarker {
+            start_position_ticks: ((index + 1) * 10_000_000) as i64,
+            name: None,
+            marker_type: ["INTRO_START", "INTRO_END", "CREDITS_START"][index].to_owned(),
+            chapter_index: index as i64,
+            confidence: 0.9,
+        })
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    assert!(
+        database
+            .replace_detected_media_chapters("marker-source", "detector", &[1], &markers)
+            .await?
+    );
+    assert_eq!(database.query_count(), 3);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_chapters
+             WHERE media_source_id = 'marker-source' AND provider_id = 'detector'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        3
+    );
+    Ok(())
 }
 
 #[tokio::test]

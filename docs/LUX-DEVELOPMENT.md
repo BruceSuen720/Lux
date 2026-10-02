@@ -7975,6 +7975,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：元数据任务创建前校验复用一次批量元数据读取，100 个有效 item 的逐项类型/元数据读取由 200 次降为 1 次；包含任务写入和回读的完整路径由 205 次降为 6 次，减少 199 次（约 97.1%）。缺失 item、VIDEO 拒绝、去重和任务结果回归通过；本任务未实测 PostgreSQL 墙钟、NAS 或 worker 端到端时延。
 
+#### LUX-360：批量写入章节检测 marker
+
+范围：章节检测结果替换同一媒体源和 provider 的隐藏 marker 时，存储层先删除旧记录，再对最多三个 marker 逐条 INSERT。将 marker 写入改为有界多行 INSERT，保留 fingerprint 校验、删除旧结果、marker 顺序、空结果清理、事务边界和其他 provider 的 marker，不改变章节检测协议或读取 DTO。
+
+验收：
+
+- [x] 3 个 marker 的替换从 5 次 SQL 调用降至 3 次，marker 数量和字段保持正确。
+- [x] fingerprint 不匹配仍回滚且不写入；空 marker 仍只删除当前 provider 结果；其他 provider 记录不受影响。
+- [x] 多行 INSERT 使用 SQLite/PostgreSQL 通用参数化语句并保持有界，不改变章节检测任务状态机。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断端到端墙钟、PostgreSQL 或 NAS 收益。
+
+依赖：LUX-209。预计文件：`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 3 marker 的替换查询计数回归，再实现有界多行写入。
+
+结果（2026-10-03）：同一媒体源的 3 个 marker 由逐条 INSERT 改为一条 3 行多值 INSERT；包含 fingerprint 读取和旧 marker DELETE 的 SQL 调用从 5 次降至 3 次，减少 2 次（40%）。回归验证 marker 数量、fingerprint 校验和章节检测 API/读取行为；本任务未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

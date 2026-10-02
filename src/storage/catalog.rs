@@ -3,6 +3,7 @@ use super::*;
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
+const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
@@ -5167,27 +5168,38 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for marker in markers {
-            self.query(
+        for chunk in markers.chunks(MEDIA_CHAPTER_INSERT_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO media_chapters (
                     id, media_source_id, start_position_ticks, name, marker_type,
                     chapter_index, provider_id, confidence
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(source_id)
-            .bind(marker.start_position_ticks)
-            .bind(marker.name.clone())
-            .bind(marker.marker_type.clone())
-            .bind(marker.chapter_index)
-            .bind(provider_id)
-            .bind(marker.confidence)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for marker in chunk {
+                statement = statement
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(source_id)
+                    .bind(marker.start_position_ticks)
+                    .bind(marker.name.clone())
+                    .bind(marker.marker_type.clone())
+                    .bind(marker.chapter_index)
+                    .bind(provider_id)
+                    .bind(marker.confidence);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()

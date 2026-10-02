@@ -1216,3 +1216,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中创建包含 100 个有效 movie item 的元数据任务。旧实现逐 item 读取类型和完整元数据，校验阶段共 200 次 SQL；连同任务写入与回读的完整创建路径共 205 次。新实现按最多 500 个 ID 一批读取元数据，校验阶段 1 次、完整路径 6 次，减少 199 次完整路径调用（约 97.1%）。
 
 缺失 item 和 VIDEO 类型仍按输入顺序返回原错误，去重和任务上限未改变。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不代表元数据 worker 墙钟、网络请求、PostgreSQL 或 NAS 生产收益。
+
+### LUX-360 章节检测 marker 替换写入调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中为一个媒体源替换同一 provider 的 3 个 marker，并启用 source fingerprint 校验。旧实现执行 fingerprint SELECT、旧 marker DELETE 和 3 次逐条 INSERT，共 5 次 storage SQL 调用；新实现将 3 行合并为 1 条多值 INSERT，共 3 次，减少 2 次（约 40%）。
+
+空 marker、fingerprint 不匹配和其他 provider 的 marker 仍沿用原有事务语义。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不代表章节检测端到端墙钟、PostgreSQL 或 NAS 生产收益。
