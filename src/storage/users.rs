@@ -1125,6 +1125,45 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_plugin_installation_statuses_by_ids(
+        &self,
+        plugin_ids: &[String],
+    ) -> Result<HashMap<String, bool>, StorageError> {
+        let mut statuses = HashMap::with_capacity(plugin_ids.len());
+        for chunk in plugin_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT plugin_id, is_enabled
+                 FROM installed_plugins
+                 WHERE plugin_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for plugin_id in chunk {
+                statement = statement.bind(plugin_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                statuses.insert(
+                    row.get::<String, _>("plugin_id"),
+                    row.get::<i64, _>("is_enabled") != 0,
+                );
+            }
+        }
+        Ok(statuses)
+    }
+
     pub(crate) async fn is_plugin_installed(&self, plugin_id: &str) -> Result<bool, StorageError> {
         self.plugin_installation_status(plugin_id)
             .await

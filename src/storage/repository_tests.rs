@@ -9480,6 +9480,46 @@ async fn item_scraper_configurations_are_read_in_one_bounded_batch()
 }
 
 #[tokio::test]
+async fn plugin_installation_statuses_are_read_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    const PLUGIN_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let plugin_ids = (0..PLUGIN_COUNT)
+        .map(|index| format!("org.lux.batch-plugin-{index:03}"))
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "INSERT INTO installed_plugins (plugin_id, is_enabled)
+         VALUES (?, 1), (?, 0)",
+    )
+    .bind(&plugin_ids[0])
+    .bind(&plugin_ids[1])
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    for plugin_id in &plugin_ids {
+        database.plugin_installation_status(plugin_id).await?;
+    }
+    assert_eq!(database.query_count(), PLUGIN_COUNT);
+
+    database.reset_query_count();
+    let statuses = database
+        .list_plugin_installation_statuses_by_ids(&plugin_ids)
+        .await?;
+    assert_eq!(statuses.len(), 2);
+    assert_eq!(statuses[&plugin_ids[0]], true);
+    assert_eq!(statuses[&plugin_ids[1]], false);
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_media_metadata_with_libraries_uses_one_bounded_query()
 -> Result<(), Box<dyn std::error::Error>> {
     const ITEM_COUNT: usize = 205;

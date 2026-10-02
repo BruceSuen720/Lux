@@ -8054,6 +8054,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：新增批量写回上下文读取，205 个 item 的类型与源预读由 410 次逐项查询降为 1 次；直接电影源和剧集首集源回归保持一致。完整性计划复用该上下文完成图片本地检查，未改变路径安全和缺失源语义。存储批量回归、metadata selection 图片/NFO 回归、本机 `uname -m=arm64` 与 library Clippy 通过；NFO projection、人物文件和端到端 worker 墙钟未纳入本任务性能数值。
 
+#### LUX-365：批量读取插件安装状态
+
+范围：插件管理列表、已安装列表和通知插件列表在生成视图时逐个读取 `installed_plugins` 状态。新增按插件 ID 有界批量读取并在列表服务中复用，保持未安装/已禁用/已启用三态、store-only 插件和分页排序语义；不改变插件配置文件读取、运行状态或插件 RPC。
+
+验收：
+
+- [x] 205 个插件 ID 的安装状态由逐项 205 次 SQL 调用降为 1 次有界查询。
+- [x] 未安装、已禁用和已启用状态映射保持一致，重复 ID、空输入和超过 500 个 ID 的批次边界保持稳定。
+- [x] 管理插件列表、已安装列表和通知插件列表复用批量状态，不改变动态配置校验、运行状态、分页和 store/catalog 合并。
+- [x] storage、插件 API 与相关插件配置回归通过；不改变 schema、插件协议或配置文件边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 PostgreSQL、NAS 或生产墙钟收益。
+
+依赖：LUX-364。预计文件：`src/storage/users.rs`、`src/storage/repository_tests.rs`、`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-03）：新增安装状态批量读取，插件管理列表和通知插件列表先按 ID 一次加载状态，再逐插件生成既有动态视图；205 个状态由 205 次读取降为 1 次。插件 API、danmaku、media-info 与 IP location 回归通过，本机 `uname -m=arm64`，library Clippy 通过；动态视图中的配置文件读取和运行时状态查询未纳入本任务 SQL 数值。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

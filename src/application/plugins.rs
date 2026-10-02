@@ -474,12 +474,24 @@ impl PluginService {
         limit: i64,
     ) -> Result<PluginPage, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
+        let notification_plugins = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| is_notification_plugin(plugin))
+            .collect::<Vec<_>>();
+        let plugin_ids = notification_plugins
+            .iter()
+            .map(|plugin| plugin.manifest.id.clone())
+            .collect::<Vec<_>>();
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&plugin_ids)
+            .await?;
         let mut views = Vec::new();
-        for plugin in &catalog.plugins {
-            if !is_notification_plugin(plugin) {
-                continue;
-            }
-            let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
+        for plugin in notification_plugins {
+            let status = installation_statuses.get(&plugin.manifest.id).copied();
+            let installed = status.is_some();
+            let enabled = status == Some(true);
             views.push(self.dynamic_view(plugin, installed, enabled).await?);
         }
         views.sort_by(|left, right| left.id.cmp(&right.id));
@@ -503,10 +515,26 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let store_index = self.store_index().await;
         let mut views = Vec::with_capacity(catalog.plugins.len() + store_index.plugins.len() + 1);
+        let mut status_ids = Vec::with_capacity(catalog.plugins.len() + store_index.plugins.len());
+        let mut status_id_set = HashSet::new();
+        for entry in &store_index.plugins {
+            if status_id_set.insert(entry.id.clone()) {
+                status_ids.push(entry.id.clone());
+            }
+        }
+        for plugin in &catalog.plugins {
+            if status_id_set.insert(plugin.manifest.id.clone()) {
+                status_ids.push(plugin.manifest.id.clone());
+            }
+        }
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&status_ids)
+            .await?;
         let mut listed_ids = HashSet::new();
         for entry in &store_index.plugins {
             let local_plugin = catalog.get(&entry.id);
-            let status = self.database.plugin_installation_status(&entry.id).await?;
+            let status = installation_statuses.get(&entry.id).copied();
             let installed = local_plugin.is_some() && status.is_some();
             let enabled = installed && status == Some(true);
             if installed_only && !installed {
@@ -527,10 +555,7 @@ impl PluginService {
             if listed_ids.contains(&plugin.manifest.id) {
                 continue;
             }
-            let status = self
-                .database
-                .plugin_installation_status(&plugin.manifest.id)
-                .await?;
+            let status = installation_statuses.get(&plugin.manifest.id).copied();
             let installed = status.is_some();
             let enabled = status == Some(true);
             if !installed_only || installed {
