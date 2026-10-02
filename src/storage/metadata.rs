@@ -246,36 +246,62 @@ impl Database {
 
         let mut commit = ItemMetadataCompletenessCommit::default();
         let mut confirmed_missing = HashSet::new();
-        for result in results {
-            let updated_item = self
-                .query_scalar::<String>(
-                    "UPDATE item_metadata_completeness
-                     SET local_state = 'READY', is_missing = ?, checked_at = ?,
-                         retry_after = NULL, error = NULL, updated_at = unixepoch()
-                     WHERE item_id = ? AND capability = ? AND input_fingerprint = ?
-                       AND local_state = 'RUNNING'
-                       AND EXISTS (
-                           SELECT 1 FROM media_items
-                           WHERE id = item_metadata_completeness.item_id
-                             AND library_id = ? AND removed_at IS NULL
-                       )
-                     RETURNING item_id",
-                )
-                .bind(database_flag(result.is_missing))
-                .bind(result.checked_at)
-                .bind(result.item_id)
-                .bind(result.capability.trim())
-                .bind(result.input_fingerprint.to_vec())
+        for batch in results.chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(item_id, capability, input_fingerprint, is_missing, checked_at) AS (VALUES {values})
+                 UPDATE item_metadata_completeness
+                 SET local_state = 'READY',
+                     is_missing = (
+                         SELECT requested.is_missing FROM requested
+                         WHERE requested.item_id = item_metadata_completeness.item_id
+                           AND requested.capability = item_metadata_completeness.capability
+                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                     ),
+                     checked_at = (
+                         SELECT requested.checked_at FROM requested
+                         WHERE requested.item_id = item_metadata_completeness.item_id
+                           AND requested.capability = item_metadata_completeness.capability
+                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                     ),
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE local_state = 'RUNNING'
+                   AND EXISTS (
+                       SELECT 1 FROM requested
+                       WHERE requested.item_id = item_metadata_completeness.item_id
+                         AND requested.capability = item_metadata_completeness.capability
+                         AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM media_items
+                       WHERE id = item_metadata_completeness.item_id
+                         AND library_id = ? AND removed_at IS NULL
+                   )
+                 RETURNING item_id, is_missing"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for result in batch {
+                statement = statement
+                    .bind(result.item_id)
+                    .bind(result.capability.trim())
+                    .bind(result.input_fingerprint.to_vec())
+                    .bind(database_flag(result.is_missing))
+                    .bind(result.checked_at);
+            }
+            let rows = statement
                 .bind(library_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            if let Some(item_id) = updated_item {
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
                 commit.updated_count = commit.updated_count.saturating_add(1);
-                if result.is_missing {
+                if row.get::<i64, _>("is_missing") != 0 {
                     confirmed_missing.insert(item_id);
                 }
             }

@@ -2578,6 +2578,93 @@ async fn metadata_completeness_claims_use_bounded_sql_batches() {
 }
 
 #[tokio::test]
+async fn metadata_completeness_results_use_bounded_update_batches() {
+    const RESULT_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness result batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let item_ids = (0..RESULT_COUNT)
+        .map(|index| format!("completeness-result-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let checks = item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessCheck {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-result-v1",
+        })
+        .collect::<Vec<_>>();
+    database
+        .prepare_and_claim_item_metadata_completeness_checks(&checks)
+        .await
+        .expect("claim completeness results");
+    let results = item_ids
+        .iter()
+        .enumerate()
+        .map(|(index, item_id)| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-result-v1",
+            is_missing: index % 2 == 0,
+            checked_at: 10,
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let commit = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &results,
+            &[],
+            Some(false),
+        )
+        .await
+        .expect("complete completeness results");
+    assert_eq!(database.query_count(), 4);
+    assert_eq!(commit.updated_count, RESULT_COUNT);
+    let ready_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness WHERE local_state = 'READY'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("ready completeness count");
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness
+         WHERE local_state = 'READY' AND is_missing = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("missing completeness count");
+    assert_eq!(ready_count, RESULT_COUNT as i64);
+    assert_eq!(missing_count, RESULT_COUNT.div_ceil(2) as i64);
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn image_source_urls_are_checked_with_one_bounded_query() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

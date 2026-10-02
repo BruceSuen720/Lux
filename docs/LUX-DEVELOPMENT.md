@@ -7836,6 +7836,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：205 条完整性检查由旧实现每条一次 upsert 加一次 claim、共 410 次 SQL 调用，降为 3 条多行 upsert 与 3 条批量 claim、共 6 次（约减少 98.5%）。批量 claim 通过 `RETURNING item_id, capability` 映射回原始索引；现有版本替换、READY/RUNNING 重复领取、失败重试和并发互斥回归通过。每批最多 100 条、每条语句最多 300 个绑定值；本机 `uname -m=arm64`。性能记录只报告 SQLite SQL 调用数，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-351：批量提交本地元数据完整性结果
+
+范围：本地元数据完整性结果在同一事务中逐条 UPDATE `item_metadata_completeness`，批次最多 512 条。将结果按最多 100 条合并为多行更新并通过 `RETURNING` 收集成功项，保留库归属校验、输入指纹匹配、RUNNING 状态门槛、缺失集合和补缺任务的原子边界，不改变 schema 或扫描调度。
+
+验收：
+
+- [x] 205 条结果从逐条 UPDATE 降至 3 次或更少，updated_count、缺失集合和 READY 字段正确。
+- [x] 陈旧指纹、非 RUNNING 状态、已移除/跨库条目仍不会被错误更新。
+- [x] 批量结果失败时完整性行和后续补缺任务仍整体回滚。
+- [x] 性能记录只报告固定 fixture 的 SQL 调用数，不推断墙钟或生产数据库收益。
+
+依赖：无。预计文件：`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 205 条结果的 storage 查询计数回归，确认旧逐条 UPDATE 调用数，再实现有界批量更新。
+
+结果（2026-10-02）：205 条 RUNNING 完整性结果由旧实现的 205 次逐条 UPDATE 加 1 次库校验（206 次 SQL）降为 3 条批量 UPDATE 加 1 次库校验（4 次 SQL），`updated_count`、READY 状态和缺失数量保持正确。批量 `RETURNING` 只收集实际更新的 item；既有陈旧指纹、非 RUNNING、跨库/移除条目、事务回滚和补缺策略回归通过。每批最多 100 条、最多 501 个绑定值；本机 `uname -m=arm64`。性能记录只报告 SQLite SQL 调用数，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
