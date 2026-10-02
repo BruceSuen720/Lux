@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createPlaybackTimelineScheduler,
   type PlaybackTimelineSnapshot,
@@ -12,7 +12,7 @@ describe("createPlaybackTimelineScheduler", () => {
       (snapshot) => updates.push(snapshot),
       (callback) => {
         callbacks.push(callback);
-        return callbacks.length;
+        return { kind: "animation", id: callbacks.length };
       },
       () => undefined,
     );
@@ -34,7 +34,7 @@ describe("createPlaybackTimelineScheduler", () => {
       (snapshot) => updates.push(snapshot),
       (callback) => {
         callbacks.push(callback);
-        return callbacks.length;
+        return { kind: "animation", id: callbacks.length };
       },
       () => undefined,
     );
@@ -55,7 +55,7 @@ describe("createPlaybackTimelineScheduler", () => {
       (snapshot) => updates.push(snapshot),
       (callback) => {
         callbacks.push(callback);
-        return callbacks.length;
+        return { kind: "animation", id: callbacks.length };
       },
       () => undefined,
       { minIntervalMs: 100, now: () => now },
@@ -77,5 +77,45 @@ describe("createPlaybackTimelineScheduler", () => {
       { currentTime: 3, duration: 100, bufferedEnd: 6 },
     ]);
     scheduler.dispose();
+  });
+
+  it("clears a timeout fallback with clearTimeout when animation cancellation also exists", () => {
+    const timeoutHandle = { timer: true };
+    const cancelAnimationFrame = vi.fn();
+    const clearTimeout = vi.fn();
+    vi.stubGlobal("requestAnimationFrame", undefined);
+    vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+    vi.stubGlobal("setTimeout", vi.fn(() => timeoutHandle));
+    vi.stubGlobal("clearTimeout", clearTimeout);
+
+    try {
+      const scheduler = createPlaybackTimelineScheduler(() => undefined);
+      scheduler.schedule({ currentTime: 1, duration: 10, bufferedEnd: 2 });
+      scheduler.dispose();
+
+      expect(clearTimeout).toHaveBeenCalledWith(timeoutHandle);
+      expect(cancelAnimationFrame).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("cancels an animation-frame handle with cancelAnimationFrame", () => {
+    const cancelAnimationFrame = vi.fn();
+    const clearTimeout = vi.fn();
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 17));
+    vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+    vi.stubGlobal("clearTimeout", clearTimeout);
+
+    try {
+      const scheduler = createPlaybackTimelineScheduler(() => undefined);
+      scheduler.schedule({ currentTime: 1, duration: 10, bufferedEnd: 2 });
+      scheduler.dispose();
+
+      expect(cancelAnimationFrame).toHaveBeenCalledWith(17);
+      expect(clearTimeout).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

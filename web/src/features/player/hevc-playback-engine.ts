@@ -10,14 +10,7 @@ export type HevcRuntimeAssets = {
   wasmBinaryUrl: string;
 };
 
-type Mp4Track = {
-  id: number;
-  type: "video" | "audio" | string;
-  codec: string;
-  timescale: number;
-  duration: number;
-  nb_samples: number;
-};
+type Mp4Track = Parameters<NonNullable<ReturnType<typeof createFile>["onReady"]>>[0]["tracks"][number];
 
 export function segmentSampleCount(track: Pick<Mp4Track, "nb_samples" | "duration" | "timescale">, segmentSeconds = 2) {
   if (track.nb_samples <= 0 || track.duration <= 0 || track.timescale <= 0) return 1;
@@ -196,8 +189,7 @@ export class ClientHevcEngine implements PlaybackEngine {
         const next = previous.then(() => this.processSegment(id, buffer, trackKinds, initialization, resolvePlaybackReady));
         segmentChains.set(id, next);
       };
-      file.onReady = (rawInfo) => {
-        const info = rawInfo as unknown as { tracks: Mp4Track[] };
+      file.onReady = (info) => {
         for (const track of info.tracks) trackKinds.set(track.id, track.type);
         void this.configureTracks(info.tracks, file, mediaSource, openPromise, worker)
           .then(() => resolveInitialization())

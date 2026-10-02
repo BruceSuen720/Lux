@@ -7732,6 +7732,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：delivery 行改为每批最多 100 条的多行 INSERT，每行绑定 3 个参数，最多 300 个绑定值。205 个目标从 206 次 SQL 调用降到 4 次（事件 1 次、delivery 3 批，减少约 98.1%），仍持久化 205 条 PENDING 行。SQLite 回归验证 dedupe 重放、空目标事件和第二批失败时整笔事务回滚；PostgreSQL 17 临时实例上的同一批量 fixture 验证 205 行、dedupe 和 4/1 次查询计数。定向 Webhook 与扫描集成回归通过；`cargo test --locked --all-targets` 为 1,288 passed、0 failed、32 ignored；`cargo build --locked`、fmt 和全目标/全 feature Clippy 通过。本机 `uname -m=arm64`；性能记录只报告 SQL 调用数，不推断墙钟、NAS 或 x86_64 时延。全量验收期间出现过一次无法复现的 library update 503，因此该测试现会在失败断言中包含响应体以便后续诊断。
 
+#### LUX-344：移除播放器回调与调度器的双重类型断言
+
+范围：HEVC 播放器把 MP4Box `onReady` 提供的 `Movie.tracks` 通过 `as unknown as` 转为局部轨道结构，忽略了库已有类型；时间线调度器把 `requestAnimationFrame` 的 number 与 `setTimeout` 的返回句柄强行统一为 number，并按全局 API 是否存在而非实际句柄来源取消。改为从 `createFile().onReady` 推导轨道类型，并用区分动画帧/定时器的句柄类型调用匹配的取消 API。保留时间线合并、节流、立即刷新和 HEVC 轨道处理逻辑。
+
+验收：
+
+- [x] MP4Box 轨道形状从 `createFile` 的回调类型推导，播放器实现不再双重断言 `onReady` 数据。
+- [x] 时间线句柄保留创建来源，取消动画帧时使用 `cancelAnimationFrame`，取消计时器时使用 `clearTimeout`；节流和刷新语义不变。
+- [x] 回归测试验证计时器回退会用 `clearTimeout` 清理，即使 `cancelAnimationFrame` 可用；播放器 helper 与时间线目标、TypeScript 构建通过。
+- [x] Web 冻结依赖安装、全量测试和生产构建通过；不据类型清理声称运行时性能提升。
+
+依赖：LUX-335。预计文件：`web/src/features/player/hevc-playback-engine.ts`、`web/src/features/player/player-timeline-scheduler.ts`、`web/tests/player-timeline-scheduler.test.ts`、`docs/LUX-DEVELOPMENT.md`。先增加定时器句柄清理回归并运行定向 Vitest，再修改类型与取消路径。
+
+结果（2026-10-02）：先新增“无 requestAnimationFrame 但有 cancelAnimationFrame”回归，旧实现失败，因为 timeout handle 被交给错误的取消 API；实现改为带 `kind` 的 animation/timeout 句柄，分别走对应清理函数。HEVC 轨道类型现由 `createFile().onReady` 推导，移除其 `unknown` 双重断言；播放器源码中已无 `as unknown as`。时间线与 HEVC 定向测试 10/10、严格 TypeScript 检查通过；冻结安装、完整 Web 测试（Node 108/108，Vitest 76 个文件 / 553 项通过）和生产构建通过。本任务修正了取消 API 选择，不量化或声称播放时延提升。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
