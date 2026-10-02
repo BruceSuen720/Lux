@@ -580,6 +580,18 @@ impl MetadataReidentifyService {
             "FULL_REFRESH" => MetadataRefreshMode::FullRefresh,
             _ => MetadataRefreshMode::Reidentify,
         };
+        let job_library_name =
+            if self.webhooks.is_some() && !matches!(mode, MetadataRefreshMode::Reidentify) {
+                match job.library_id.as_deref() {
+                    Some(library_id) => Some(
+                        self.notification_library_name_for_enabled_id(library_id)
+                            .await,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
         if matches!(mode, MetadataRefreshMode::FullRefresh) {
             self.scraper.clear_response_cache().await;
         }
@@ -645,9 +657,12 @@ impl MetadataReidentifyService {
                 for (item_id, worker_permit) in item_ids.into_iter().zip(worker_permits) {
                     let service = self.clone();
                     let job_id = job_id.to_owned();
+                    let job_library_name = job_library_name.clone();
                     workers.spawn(async move {
                         let _worker_permit = worker_permit;
-                        service.process_item(&job_id, &item_id, mode).await;
+                        service
+                            .process_item(&job_id, &item_id, mode, job_library_name)
+                            .await;
                     });
                 }
             }
@@ -766,7 +781,13 @@ impl MetadataReidentifyService {
         self.publish_job_finished(job_id);
     }
 
-    async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
+    async fn process_item(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        mode: MetadataRefreshMode,
+        job_library_name: Option<Option<String>>,
+    ) {
         let item_started = Instant::now();
         let mut item_title = None;
         let result = match self.database.find_media_item_metadata(item_id).await {
@@ -854,10 +875,11 @@ impl MetadataReidentifyService {
                 self.publish_job_progress(job_id);
                 if !matches!(mode, MetadataRefreshMode::Reidentify) {
                     let (item_title, library_name) = if self.webhooks.is_some() {
-                        (
-                            item_title,
-                            self.notification_library_name_for_item(item_id).await,
-                        )
+                        let library_name = match job_library_name {
+                            Some(library_name) => library_name,
+                            None => self.notification_library_name_for_item(item_id).await,
+                        };
+                        (item_title, library_name)
                     } else {
                         (None, None)
                     };
@@ -944,6 +966,16 @@ impl MetadataReidentifyService {
             .flatten();
         self.notification_library_name_for_id(library_id.as_deref())
             .await
+    }
+
+    async fn notification_library_name_for_enabled_id(&self, library_id: &str) -> Option<String> {
+        self.database
+            .find_library(library_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|library| library.is_enabled)
+            .map(|library| bounded_display_text(&library.name))
     }
 
     async fn notification_library_name_for_id(&self, library_id: Option<&str>) -> Option<String> {

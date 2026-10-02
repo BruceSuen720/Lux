@@ -2145,7 +2145,7 @@ services:
 | LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
 | LUX-317 | docs/LUX-317-PLAN.md、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/login_background_assets.rs、src/api/、web/src/features/admin/、Lux-plugins/；统一登录背景插件与单张自定义上传图 |
 | LUX-318 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；TMDb 电影完整详情候选与 NFO 写回 |
-| LUX-319 | src/application/candidates.rs、src/application/nfo.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；电影 NFO 演员上限扩展到 100 并保持顺序 |
+| LUX-319 | src/application/candidates.rs、src/application/nfo.rs、src/application/people/service.rs、tests/metadata_selection.rs、tests/nfo_writer.rs、docs/；电影 NFO 与详情 API 演员上限扩展到 100 并保持顺序 |
 | LUX-320 | src/application/nfo.rs、src/application/probe.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
 | LUX-321 | src/application/nfo.rs、src/storage/media.rs、tests/nfo_writer.rs、docs/COMPATIBILITY.md、docs/；为电影 NFO 写入数据库时间/排序值并提供原子 probe-info 写回服务 |
 | LUX-322 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后调用 NFO 技术信息写回 |
@@ -8233,13 +8233,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-319：电影 NFO 演员上限扩展到 100
 
-范围：将 TMDb 电影候选与 Lux NFO 解析/写回的演员上限统一提高到 100，保留 provider 返回顺序、角色和排序。只写 provider 或已有关系明确提供的人物 ID；缺少 IMDb、TVDb 或 Douban ID 时不猜测，不为每个演员额外发起网络请求。
+范围：将 TMDb 电影候选、Lux NFO 解析/写回和条目详情 API 的演员上限统一提高到 100，保留 provider 返回顺序、角色和排序。只写 provider 或已有关系明确提供的人物 ID；缺少 IMDb、TVDb 或 Douban ID 时不猜测，不为每个演员额外发起网络请求。
 
 验收：
 
-- [ ] 100 位以内的演员按 TMDb 顺序完整进入 movie NFO，name、role、type、order 和可用 ID 保留。
-- [ ] 超过上限时稳定截断至 100，解析器与写入器使用同一上限。
-- [ ] 已有本地演员关系与 NFO 的 Fill Missing 合并语义不变，未知 XML 字段继续保留。
+- [x] 100 位以内的演员按 TMDb 顺序完整进入 movie NFO，name、role、type、order 和可用 ID 保留。
+- [x] 100 位以内的演员按来源顺序完整保留在详情 API，详情页不因显示上限丢失演员或角色。
+- [x] 可选人物资料补充仍限制为每条目最多 12 次请求，不随完整演员表扩大到 100 次。
+- [x] 超过上限时稳定截断至 100，解析器与写入器使用同一上限。
+- [x] 已有本地演员关系与 NFO 的 Fill Missing 合并语义不变，未知 XML 字段继续保留。
 
 明确不做：为取得 IMDb/TVDb/Douban 人物 ID 对演员逐条请求第三方 API；为缺失身份生成占位 ID。
 
