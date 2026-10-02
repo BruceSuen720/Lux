@@ -9513,8 +9513,8 @@ async fn plugin_installation_statuses_are_read_in_one_bounded_batch()
         .list_plugin_installation_statuses_by_ids(&plugin_ids)
         .await?;
     assert_eq!(statuses.len(), 2);
-    assert_eq!(statuses[&plugin_ids[0]], true);
-    assert_eq!(statuses[&plugin_ids[1]], false);
+    assert!(statuses[&plugin_ids[0]]);
+    assert!(!statuses[&plugin_ids[1]]);
     assert_eq!(database.query_count(), 1);
     Ok(())
 }
