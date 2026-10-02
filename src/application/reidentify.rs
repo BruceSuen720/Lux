@@ -445,22 +445,16 @@ impl MetadataReidentifyService {
         if unique_ids.is_empty() || unique_ids.len() > 100 {
             return Err(MetadataReidentifyError::InvalidItemCount);
         }
+        let metadata_by_item = self
+            .database
+            .list_media_item_metadata_by_ids(&unique_ids)
+            .await?;
         for item_id in &unique_ids {
-            if self
-                .database
-                .find_media_item_kind(item_id)
-                .await?
-                .is_some_and(|kind| kind.item_type == "VIDEO")
-            {
-                return Err(MetadataReidentifyError::InvalidItemCount);
-            }
-            if self
-                .database
-                .find_media_item_metadata(item_id)
-                .await?
-                .is_none()
-            {
+            let Some(item) = metadata_by_item.get(item_id) else {
                 return Err(MetadataReidentifyError::ItemNotFound(item_id.clone()));
+            };
+            if item.item_type == "VIDEO" {
+                return Err(MetadataReidentifyError::InvalidItemCount);
             }
         }
         let job_id = Uuid::now_v7().to_string();
@@ -1971,6 +1965,50 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         Ok((temp_dir, config, database, item_id))
+    }
+
+    #[tokio::test]
+    async fn metadata_job_creation_validates_items_with_one_batch_read()
+    -> Result<(), Box<dyn Error>> {
+        const ITEM_COUNT: usize = 100;
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Metadata jobs", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let item_ids = (0..ITEM_COUNT)
+            .map(|index| format!("metadata-job-item-{index:03}"))
+            .collect::<Vec<_>>();
+        for item_id in &item_ids {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            crate::application::scraper::ScraperProvider::unconfigured(),
+        );
+        database.reset_query_count();
+        let job = service.create_job(item_ids).await?;
+
+        assert_eq!(job.total_count, ITEM_COUNT as i64);
+        assert_eq!(database.query_count(), 6);
+        Ok(())
     }
 
     #[tokio::test]
