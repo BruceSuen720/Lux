@@ -7672,6 +7672,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：增量变更和多根刷新改为调用有界批量入队，单路径 API 继续委托同一存储操作。每 100 条唯一路径执行一条多行 upsert，并刷新一次 `total_count`；205 条路径相对基线 410 次 SQL 调用降为 6 次（减少约 98.5%）。回归验证重复路径最后的变更类型胜出、已处理路径被重新打开、任务计数与去重后的队列行数一致。SQLite 存储计数测试、`tests/scanning_jobs.rs` 81 项、`cargo build --locked`、`cargo test --locked --all-targets`（652 个库测试通过、10 个 PostgreSQL 专项忽略，其余集成目标通过）、`cargo fmt --all -- --check` 和全目标 Clippy 通过。性能记录见 `docs/PERFORMANCE.md`；本机 `uname -m=arm64`。PostgreSQL 专项因测试环境没有 PostgreSQL 运行实例而未执行，本次只报告共享 SQL 形状与占位符适配，不声称 PostgreSQL 实测或墙钟耗时收益。
 
+#### LUX-340：合并扫描文件状态与 inode 写入
+
+范围：扫描器更新已有文件时，先写入大小、修改时间、指纹和扫描代次，再单独更新 inode；未变化剧集回退路径也先标记已扫描、再单独更新 inode。这些连续写入使用同一份文件系统 metadata，增加额外 UPDATE 和事务。将 inode 并入已有 filesystem entry 更新和 mark-seen 语句，并在电影、剧集和 sidecar 扫描调用中传入当前可用 inode。identity-repair 的纯 inode 更新没有前序状态写入，不在本任务合并。
+
+验收：
+
+- [x] 已有条目扫描更新仍原子写入文件大小、修改时间、指纹、扫描代次、缺失状态与 inode，并保留媒体条目恢复逻辑。
+- [x] 扫描状态更新与 inode 不再拆成连续两次 filesystem entry UPDATE；存储查询计数证明每条相关路径至少减少一次 SQL 调用。
+- [x] 单测验证更新后的字段值和查询数；`scanner` 及相关扫描作业回归、全局 Rust 完成门、格式检查和 Clippy 通过。
+- [x] 性能记录只报告 SQL 调用计数，不据此推断墙钟、PostgreSQL 或 NAS 时延。
+
+依赖：LUX-339。预计文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。不修改 schema、扫描进度合同、媒体身份或恢复事务边界。
+
+结果（2026-10-02）：已有电影、剧集和 sidecar filesystem entry 更新现在在同一条状态 UPDATE 中写入 inode；指纹未变化路径也在 mark-seen UPDATE 中更新 inode。保留恢复缺失媒体条目的事务逻辑，identity-repair 的单独 inode 更新因没有前序状态写入而维持原样。SQLite 存储回归将有变化与 mark-seen 两种路径都从 3 条 SQL 调用降为 2 条，并核对状态字段。`scanner` 17 项、`scanning_jobs` 81 项通过；`cargo test --locked --all-targets` 的库测试为 653 passed / 10 ignored，集成目标全部通过；`cargo build --locked`、`cargo fmt --all -- --check` 和全目标 Clippy 通过。本机 `uname -m=arm64`。PostgreSQL 实例不可用，因此 PostgreSQL 专项按要求忽略；性能记录只报告 SQL 调用数，不推断墙钟或 NAS 收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

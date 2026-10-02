@@ -823,10 +823,7 @@ impl LibraryScanner {
                     .await?;
             }
             self.database
-                .mark_filesystem_entry_seen(&existing_entry.id, generation)
-                .await?;
-            self.database
-                .update_filesystem_entry_inode(&existing_entry.id, inode)
+                .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                 .await?;
             return Ok(ScanReport {
                 discovered_files: 1,
@@ -861,10 +858,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
-                    .await?;
-                self.database
-                    .update_filesystem_entry_inode(&existing_entry.id, inode)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
@@ -880,11 +874,9 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
-                .await?;
-            self.database
-                .update_filesystem_entry_inode(&existing_entry.id, inode)
                 .await?;
             self.database
                 .reset_media_probe_for_filesystem_entry(&existing_entry.id, size)
@@ -1015,6 +1007,7 @@ impl LibraryScanner {
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let inode = inode.and_then(|value| i64::try_from(value).ok());
         if let Some(existing_entry) = self
             .database
             .find_filesystem_entry(&root.id, &relative_path)
@@ -1046,7 +1039,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 return Ok(ScanReport {
                     discovered_files: 1,
@@ -1060,6 +1053,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
                 .await?;
@@ -1135,7 +1129,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
-                inode: inode.and_then(|value| i64::try_from(value).ok()),
+                inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })
@@ -2004,11 +1998,9 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
-                .await?;
-            self.database
-                .update_filesystem_entry_inode(&existing_entry.id, inode)
                 .await?;
             return Ok((existing_entry.id.clone(), true));
         }
@@ -2682,6 +2674,7 @@ impl LibraryScanner {
         let (device, inode) = file_identity(&metadata);
         let fingerprint =
             compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let inode = inode.and_then(|value| i64::try_from(value).ok());
         let mut report = ScanReport {
             discovered_files: 1,
             ..ScanReport::default()
@@ -2716,7 +2709,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 report.skipped_files = 1;
                 return Ok(report);
@@ -2727,6 +2720,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
                 .await?;
@@ -2803,7 +2797,7 @@ impl LibraryScanner {
                         .await?;
                 }
                 self.database
-                    .mark_filesystem_entry_seen(&existing_entry.id, generation)
+                    .mark_filesystem_entry_seen(&existing_entry.id, generation, inode)
                     .await?;
                 report.created_items = usize::from(created_item);
                 report.changed_files = usize::from(reassigned);
@@ -2816,6 +2810,7 @@ impl LibraryScanner {
                     size,
                     modified_at,
                     &fingerprint,
+                    inode,
                     generation,
                 )
                 .await?;
@@ -2845,7 +2840,7 @@ impl LibraryScanner {
                 entry_kind: "FILE",
                 size,
                 modified_at,
-                inode: inode.and_then(|value| i64::try_from(value).ok()),
+                inode,
                 fingerprint: &fingerprint,
                 last_seen_generation: generation,
             })

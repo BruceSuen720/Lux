@@ -8742,6 +8742,105 @@ async fn scan_job_status_counts_are_aggregated_in_storage() {
 }
 
 #[tokio::test]
+async fn filesystem_entry_scan_updates_include_inode_in_the_state_write() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Filesystem entry updates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root = temp_dir.path().join("filesystem-entry-updates");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    let root = LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().expect("UTF-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    database
+        .insert_filesystem_entry(NewFilesystemEntry {
+            id: "filesystem-entry-update",
+            library_root_id: &root_id,
+            relative_path: "movie.mkv",
+            entry_kind: "FILE",
+            size: 10,
+            modified_at: 20,
+            inode: Some(30),
+            fingerprint: b"old-fingerprint",
+            last_seen_generation: "old-generation",
+        })
+        .await
+        .expect("filesystem entry");
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'filesystem-entry-update'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("mark filesystem entry missing");
+
+    database.reset_query_count();
+    database
+        .update_filesystem_entry(
+            "filesystem-entry-update",
+            40,
+            50,
+            b"new-fingerprint",
+            Some(60),
+            "new-generation",
+        )
+        .await
+        .expect("filesystem entry update");
+    assert_eq!(database.query_count(), 2);
+
+    let updated: (i64, i64, Option<i64>, Vec<u8>, String, i64) = sqlx::query_as(
+        "SELECT size, modified_at, inode, fingerprint, last_seen_generation, is_missing
+         FROM filesystem_entries WHERE id = 'filesystem-entry-update'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("updated filesystem entry");
+    assert_eq!(
+        updated,
+        (
+            40,
+            50,
+            Some(60),
+            b"new-fingerprint".to_vec(),
+            "new-generation".to_owned(),
+            0,
+        )
+    );
+
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'filesystem-entry-update'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("mark filesystem entry missing again");
+    database.reset_query_count();
+    database
+        .mark_filesystem_entry_seen("filesystem-entry-update", "seen-generation", Some(70))
+        .await
+        .expect("mark filesystem entry seen");
+    assert_eq!(database.query_count(), 2);
+
+    let seen: (Option<i64>, String, i64) = sqlx::query_as(
+        "SELECT inode, last_seen_generation, is_missing
+         FROM filesystem_entries WHERE id = 'filesystem-entry-update'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("seen filesystem entry");
+    assert_eq!(seen, (Some(70), "seen-generation".to_owned(), 0));
+}
+
+#[tokio::test]
 async fn incremental_scan_paths_are_enqueued_with_bounded_sql_and_last_change_wins() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -10347,6 +10347,7 @@ impl Database {
         size: i64,
         modified_at: i64,
         fingerprint: &[u8],
+        inode: Option<i64>,
         last_seen_generation: &str,
     ) -> Result<(), StorageError> {
         let mut transaction = self
@@ -10359,13 +10360,14 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET size = ?, modified_at = ?, fingerprint = ?, last_seen_generation = ?,
+             SET size = ?, modified_at = ?, fingerprint = ?, inode = ?, last_seen_generation = ?,
                  is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(size)
         .bind(modified_at)
         .bind(fingerprint)
+        .bind(inode)
         .bind(last_seen_generation)
         .bind(id)
         .execute(&mut *transaction)
@@ -10389,6 +10391,7 @@ impl Database {
         &self,
         id: &str,
         last_seen_generation: &str,
+        inode: Option<i64>,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -10400,10 +10403,11 @@ impl Database {
             })?;
         self.query(
             "UPDATE filesystem_entries
-             SET last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
+             SET last_seen_generation = ?, inode = ?, is_missing = 0, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(last_seen_generation)
+        .bind(inode)
         .bind(id)
         .execute(&mut *transaction)
         .await

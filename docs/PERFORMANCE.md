@@ -1108,3 +1108,11 @@ light build 的 HLS chunk 减少 222.30 kB（约 37.4%），gzip 减少 67.67 kB
 2026-10-02 在 `uname -m=arm64` 的开发机上，以临时 SQLite 数据库向同一增量扫描任务加入 205 个唯一路径。改动前逐路径调用存储 upsert 与任务计数刷新，每条路径 2 次，共 410 次 SQL 查询调用。改动后按最多 100 条路径生成多行 upsert，并在每个批次后刷新一次任务计数：205 条路径分为 100、100、5 三批，共 3 条 upsert 和 3 条计数更新，即 6 次查询调用，减少 404 次（约 98.5%）。
 
 候选测试额外提交一个重复路径，并验证最后的 `MODIFY` 类型胜出、已处理项的 `processed_at` 被清空、`total_count` 与 205 个唯一队列项一致。每条路径绑定 4 个值，100 条每批最多 400 个参数。该计数来自 SQLite 存储查询计数器，只衡量 SQL 调用数量，不是网络往返采样或墙钟基准；未据此声称具体耗时或 PostgreSQL/NAS 性能提升。
+
+### LUX-340 扫描文件状态与 inode 写入计数
+
+2026-10-02 在 SQLite 临时库中复现已有文件更新：原路径先执行状态 UPDATE，再执行媒体条目恢复查询，随后单独执行 inode UPDATE，共 3 条存储 SQL 调用；合并 inode 后仍执行状态 UPDATE 和恢复查询，共 2 条，减少 1 条（约 33.3%）。存储回归测试在实现前直接观察到 3 条，合并实现后验证为 2 条，并检查 size、modified_at、fingerprint、inode、scan generation 与 missing 状态。
+
+未变化剧集回退路径的原 mark-seen 操作同样执行状态 UPDATE 与恢复查询，再单独更新 inode；现在 inode 随 mark-seen UPDATE 写入，计数从 3 降至 2。测试另验证 mark-seen 后 generation、inode 与 missing 状态。扫描器把当前 inode 一并传给电影、剧集和 sidecar 的已有条目更新。
+
+SQL 调用计数不等于墙钟耗时或磁盘写入量，也没有 PostgreSQL/NAS 实测；未据此推断时延收益。
