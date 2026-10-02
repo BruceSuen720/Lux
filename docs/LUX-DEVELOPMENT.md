@@ -7761,6 +7761,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-02）：将 build 脚本、全局/媒体库策略校验、用户 Emby 配置复制、Emby 人员/播放状态/同步字段/主图比例序列化中的 9 处条件按 let-chain 等价合并。带 `-W clippy::collapsible_if` 的全目标诊断确认这 4 个源码文件及 `build.rs` 不再产生该告警；其他模块仍有 35 处待后续任务处理。`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 及 `libraries_api`、`emby_auth`、`catalog`、`emby_counts` 集成目标（25 项）通过。本任务为条件表达式清理，不声称运行时性能提升。
 
+#### LUX-346：批量写入章节检测任务条目
+
+范围：章节检测任务按最多 500 个候选源分页，但存储层仍对每个条目单独执行 INSERT。将每批最多 100 个条目合并为一条多行 INSERT，减少大剧集库创建任务时的 SQL 执行次数；保留现有事务原子性、条目字段、PENDING 状态、页面顺序和空输入行为。每行绑定 7 个参数，100 行最多 700 个绑定值。
+
+验收：
+
+- [x] SQLite 存储回归验证 205 个条目持久化完整、状态/指纹/context 标记正确，SQL 调用从 205 次降至 3 次。
+- [x] 空输入不发 SQL；整页仍在单个事务内，任一批失败时整页回滚。
+- [x] 多行 VALUES 使用 SQLite/PostgreSQL 通用语法；不改 schema、任务分页或消费顺序。
+- [x] 性能记录仅报告固定条数的 SQL 调用数，不推断端到端时延、PostgreSQL 或 NAS 收益。
+
+依赖：无。预计文件：`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 SQLite 查询计数和持久化回归，运行定向 storage 测试确认旧实现失败，再实现批量 INSERT。
+
+结果（2026-10-02）：205 个候选条目从逐项 205 次 INSERT 改为最多 100 条一批的多行 INSERT，共 3 次 SQL 调用（约减少 98.5%）。回归在旧实现上先观察到 205 次并失败，再验证新实现的行数、PENDING 状态、source/input fingerprint 与 context 标记；空输入 0 次 SQL，第三批冲突会回滚整页。新语句每批最多 700 个绑定值。定向 storage 测试通过；`cargo build --locked`、`cargo test --locked --all-targets`、fmt、全目标/全 feature Clippy、脚本语法与 Python 工具测试通过；冻结 Web 安装、553 项 Web 测试和生产构建通过。本机 `uname -m=arm64`。性能记录只报告 SQLite 固定 fixture 的查询调用数；本任务未实测 PostgreSQL、墙钟时延或 NAS。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

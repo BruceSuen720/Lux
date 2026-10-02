@@ -9005,6 +9005,183 @@ async fn chapter_detection_job_creation_is_atomic_per_library() {
 }
 
 #[tokio::test]
+async fn chapter_detection_job_items_are_inserted_in_bounded_batches() {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Chapter batch", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('chapter-season-batch', ?, 'SEASON', 'Season 1', 'season-1', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("season item");
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < ?
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         )
+         SELECT 'chapter-item-' || value, ?, 'EPISODE', 'Episode ' || value,
+                'episode-' || value, 'LOCAL_CONFIRMED'
+         FROM sequence",
+    )
+    .bind(ITEM_COUNT as i64)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("episode items");
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < ?
+         )
+         INSERT INTO media_sources (id, item_id, source_kind, probe_status)
+         SELECT 'chapter-source-' || value, 'chapter-item-' || value, 'LOCAL_FILE', 'READY'
+         FROM sequence",
+    )
+    .bind(ITEM_COUNT as i64)
+    .execute(database.pool())
+    .await
+    .expect("media sources");
+
+    let source_ids = (1..=ITEM_COUNT)
+        .map(|index| format!("chapter-source-{index}"))
+        .collect::<Vec<_>>();
+    let item_ids = (1..=ITEM_COUNT)
+        .map(|index| format!("chapter-item-{index}"))
+        .collect::<Vec<_>>();
+    let job_id = "chapter-job-batch-insert";
+    let new_job = |id| NewChapterDetectionJob {
+        id,
+        library_id: &library_id,
+        plugin_id: "org.lux.intro-outro-detector",
+        concurrency: 1,
+        intro_window_seconds: 180,
+        credits_window_seconds: 180,
+        match_threshold: 0.8,
+        total_count: ITEM_COUNT as i64,
+    };
+    assert!(
+        database
+            .create_chapter_detection_job(new_job(job_id))
+            .await
+            .expect("create chapter job")
+    );
+
+    database.reset_query_count();
+    database
+        .insert_chapter_detection_job_items(&[])
+        .await
+        .expect("empty input should be a no-op");
+    assert_eq!(database.query_count(), 0);
+
+    let input_fingerprint = [0x24; 32];
+    let source_fingerprint = b"source-fingerprint";
+    let items = source_ids
+        .iter()
+        .zip(&item_ids)
+        .enumerate()
+        .map(|(index, (source_id, item_id))| NewChapterDetectionJobItem {
+            job_id,
+            source_id,
+            item_id,
+            season_id: "chapter-season-batch",
+            source_fingerprint,
+            input_fingerprint: &input_fingerprint,
+            is_context: index % 2 == 0,
+        })
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .insert_chapter_detection_job_items(&items)
+        .await
+        .expect("insert chapter job items");
+    assert_eq!(database.query_count(), 3);
+    let persisted_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_detection_job_items WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("persisted item count");
+    assert_eq!(persisted_count, ITEM_COUNT as i64);
+    let context_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chapter_detection_job_items
+         WHERE job_id = ? AND is_context = 1",
+    )
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("context item count");
+    assert_eq!(context_count, ITEM_COUNT.div_ceil(2) as i64);
+    let stored_item: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT status, source_fingerprint, input_fingerprint
+         FROM chapter_detection_job_items WHERE job_id = ? AND source_id = ?",
+    )
+    .bind(job_id)
+    .bind(&source_ids[0])
+    .fetch_one(database.pool())
+    .await
+    .expect("stored item fields");
+    assert_eq!(stored_item.0, "PENDING");
+    assert_eq!(stored_item.1, source_fingerprint);
+    assert_eq!(stored_item.2, input_fingerprint);
+
+    sqlx::query("UPDATE chapter_detection_jobs SET status = 'COMPLETED' WHERE id = ?")
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .expect("complete first job");
+    let rollback_job_id = "chapter-job-batch-rollback";
+    assert!(
+        database
+            .create_chapter_detection_job(new_job(rollback_job_id))
+            .await
+            .expect("create rollback job")
+    );
+    let mut invalid_items = source_ids
+        .iter()
+        .zip(&item_ids)
+        .map(|(source_id, item_id)| NewChapterDetectionJobItem {
+            job_id: rollback_job_id,
+            source_id,
+            item_id,
+            season_id: "chapter-season-batch",
+            source_fingerprint,
+            input_fingerprint: &input_fingerprint,
+            is_context: false,
+        })
+        .collect::<Vec<_>>();
+    invalid_items[ITEM_COUNT - 1].source_id = &source_ids[0];
+    assert!(
+        database
+            .insert_chapter_detection_job_items(&invalid_items)
+            .await
+            .is_err()
+    );
+    let rolled_back_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_detection_job_items WHERE job_id = ?")
+            .bind(rollback_job_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("rolled back item count");
+    assert_eq!(rolled_back_count, 0);
+    database.close().await;
+}
+
+#[tokio::test]
 async fn scan_job_status_counts_are_aggregated_in_storage() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

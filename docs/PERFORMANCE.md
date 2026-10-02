@@ -1134,3 +1134,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-02 使用 205 个启用 destination 的固定 fixture。原实现写入 1 条 event 后逐目标执行 205 条 delivery INSERT，共 206 次 SQL 调用；新实现每批最多 100 个目标，发出 1 条 event INSERT 与 3 条多行 delivery INSERT，共 4 次，减少 202 次（约 98.1%）。SQLite 与 PostgreSQL 17 均验证 205 条投递行、重复 dedupe key 不增加投递；SQLite 另验证空目标只入事件，以及第二批失败时 event 和前一批 delivery 一起回滚。
 
 每行绑定 3 个值，批次上限 100 使单条语句最多 300 个绑定参数，低于 SQLite 保守限制。计数来自 storage 查询计数器，只衡量 SQL 语句调用数，不是落盘行数或墙钟；未据此推断 NAS 或生产负载时延。
+
+### LUX-346 章节检测任务条目写入调用数
+
+2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中写入 205 个章节检测条目。旧实现逐项 INSERT，共 205 次存储 SQL 调用；新实现每批最多 100 条，多行 INSERT 共 3 次，减少 202 次（约 98.5%）。回归同时验证 205 行和 PENDING 状态、source/input fingerprint、context 标记；空输入为 0 次调用，第三批重复 source 触发约束错误后整页回滚。
+
+每行绑定 7 个参数，批次上限 100 使每条语句最多 700 个绑定值。该多行 VALUES 语法由 SQLite 验证，且不依赖数据库专有扩展；没有 PostgreSQL 实例复测。计数来自 SQLite storage 查询计数器，只表示 SQL 调用数量，不是事务数、磁盘写入量、墙钟基准或端到端任务时延；不据此推断 PostgreSQL、NAS 或 x86_64 性能。

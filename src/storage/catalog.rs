@@ -1,6 +1,7 @@
 use super::*;
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
+const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
 
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
@@ -4607,26 +4608,34 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for item in items {
-            self.query(
+        for batch in items.chunks(CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, 'PENDING')", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO chapter_detection_job_items (
                     job_id, source_id, item_id, season_id, source_fingerprint,
                     input_fingerprint, is_context, status
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
-            )
-            .bind(item.job_id)
-            .bind(item.source_id)
-            .bind(item.item_id)
-            .bind(item.season_id)
-            .bind(item.source_fingerprint)
-            .bind(item.input_fingerprint)
-            .bind(database_flag(item.is_context))
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item in batch {
+                statement = statement
+                    .bind(item.job_id)
+                    .bind(item.source_id)
+                    .bind(item.item_id)
+                    .bind(item.season_id)
+                    .bind(item.source_fingerprint)
+                    .bind(item.input_fingerprint)
+                    .bind(database_flag(item.is_context));
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()
