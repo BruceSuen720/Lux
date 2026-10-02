@@ -5724,6 +5724,120 @@ async fn collection_refresh_uses_provider_index_and_batch_insert() {
 }
 
 #[tokio::test]
+async fn emby_collection_member_mutations_use_bounded_batches() {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Manual collections", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let other_library = LibraryService::new(database.clone())
+        .create_library("Other manual collections", LibraryKind::Movie, false)
+        .await
+        .expect("other library");
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("manual-collection-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let foreign_item_id = "manual-collection-foreign";
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+    )
+    .bind(foreign_item_id)
+    .bind(other_library.id.to_string())
+    .bind(foreign_item_id)
+    .bind(foreign_item_id)
+    .execute(database.pool())
+    .await
+    .expect("foreign media item");
+    let removed_item_id = "manual-collection-removed";
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status, removed_at
+         ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', unixepoch())",
+    )
+    .bind(removed_item_id)
+    .bind(&library_id)
+    .bind(removed_item_id)
+    .bind(removed_item_id)
+    .execute(database.pool())
+    .await
+    .expect("removed media item");
+
+    let collection = database
+        .create_emby_collection("Manual batch", &[item_ids[0].clone()])
+        .await
+        .expect("create collection")
+        .expect("collection");
+    let mut requested_ids = item_ids.clone();
+    requested_ids.extend([foreign_item_id.to_owned(), removed_item_id.to_owned()]);
+
+    database.reset_query_count();
+    database
+        .add_emby_collection_items(&collection.collection_item_id, &requested_ids)
+        .await
+        .expect("add collection members")
+        .expect("collection exists");
+    assert_eq!(database.query_count(), 5);
+    let stored_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT mi.id
+         FROM collection_items ci
+         JOIN collections c ON c.id = ci.collection_id
+         JOIN media_items mi ON mi.id = ci.item_id
+         WHERE c.item_id = ?
+         ORDER BY ci.sort_order, mi.id",
+    )
+    .bind(&collection.collection_item_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("stored collection members");
+    assert_eq!(stored_ids, item_ids);
+
+    database.reset_query_count();
+    database
+        .remove_emby_collection_items(&collection.collection_item_id, &requested_ids)
+        .await
+        .expect("remove collection members")
+        .expect("collection exists");
+    assert_eq!(database.query_count(), 2);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM collection_items ci
+         JOIN collections c ON c.id = ci.collection_id
+         WHERE c.item_id = ?",
+    )
+    .bind(&collection.collection_item_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining collection members");
+    assert_eq!(remaining, 0);
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn favorite_catalog_filter_uses_favorite_state_index() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
