@@ -33,6 +33,7 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError, StoredItemImage,
+        StoredMediaWritebackContext,
     },
 };
 
@@ -856,7 +857,7 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, false, None)
+        self.local_image_types_impl(item_id, image_types, false, None, None)
             .await
     }
 
@@ -865,19 +866,26 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, true, None)
+        self.local_image_types_impl(item_id, image_types, true, None, None)
             .await
     }
 
-    pub(crate) async fn local_image_types_with_indexed_images(
+    pub(crate) async fn local_image_types_with_indexed_images_and_context(
         &self,
         item_id: &str,
         image_types: &[&str],
         include_fallback: bool,
         indexed_images: &[StoredItemImage],
+        writeback_context: &StoredMediaWritebackContext,
     ) -> Result<BTreeSet<String>, ImageWriteError> {
-        self.local_image_types_impl(item_id, image_types, include_fallback, Some(indexed_images))
-            .await
+        self.local_image_types_impl(
+            item_id,
+            image_types,
+            include_fallback,
+            Some(indexed_images),
+            Some(writeback_context),
+        )
+        .await
     }
 
     pub(crate) async fn fallback_image_types(
@@ -918,6 +926,7 @@ impl ImageWriteService {
         image_types: &[&str],
         include_fallback: bool,
         indexed_images: Option<&[StoredItemImage]>,
+        writeback_context: Option<&StoredMediaWritebackContext>,
     ) -> Result<BTreeSet<String>, ImageWriteError> {
         let image_types = image_types
             .iter()
@@ -933,6 +942,7 @@ impl ImageWriteService {
                     &image_types,
                     include_fallback,
                     indexed_images,
+                    writeback_context,
                 )
                 .await;
         }
@@ -942,6 +952,7 @@ impl ImageWriteService {
             &image_types,
             include_fallback,
             &indexed_images,
+            writeback_context,
         )
         .await
     }
@@ -952,6 +963,7 @@ impl ImageWriteService {
         image_types: &[&str],
         include_fallback: bool,
         indexed_images: &[StoredItemImage],
+        writeback_context: Option<&StoredMediaWritebackContext>,
     ) -> Result<BTreeSet<String>, ImageWriteError> {
         let mut found = BTreeSet::new();
 
@@ -1011,7 +1023,10 @@ impl ImageWriteService {
             }
         }
 
-        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let (_, directory, movie_stem, episode_stem) = match writeback_context {
+            Some(context) => self.writeback_paths_for_context(item_id, context).await?,
+            None => self.writeback_paths(item_id).await?,
+        };
         let paths = read_image_directory_entries(&directory).await?;
         for &image_type in image_types {
             if found.contains(image_type) {
@@ -1421,6 +1436,26 @@ impl ImageWriteService {
             }
         }
         .ok_or(ImageWriteError::ItemNotFound)?;
+        self.writeback_paths_for_context(
+            item_id,
+            &StoredMediaWritebackContext {
+                item_type,
+                source: Some(source),
+            },
+        )
+        .await
+    }
+
+    async fn writeback_paths_for_context(
+        &self,
+        item_id: &str,
+        context: &StoredMediaWritebackContext,
+    ) -> Result<(PathBuf, PathBuf, Option<String>, Option<String>), ImageWriteError> {
+        let item_type = context.item_type.as_str();
+        let source = context
+            .source
+            .as_ref()
+            .ok_or(ImageWriteError::ItemNotFound)?;
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| image_io_error(Path::new(&source.root_path), error))?;

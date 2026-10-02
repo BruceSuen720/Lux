@@ -3983,6 +3983,88 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_media_item_writeback_contexts_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredMediaWritebackContext>, StorageError> {
+        let mut contexts = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.item_type,
+                        ms.id AS source_id, ms.item_id AS source_item_id,
+                        ms.probe_status, lr.canonical_path AS root_path,
+                        fe.relative_path
+                 FROM media_items mi
+                 LEFT JOIN media_sources ms ON ms.id = CASE
+                     WHEN mi.item_type IN ('SERIES', 'SEASON') THEN (
+                         SELECT episode_source.id
+                         FROM media_items episode
+                         JOIN media_sources episode_source
+                           ON episode_source.item_id = episode.id
+                         JOIN filesystem_entries episode_fe
+                           ON episode_fe.id = episode_source.filesystem_entry_id
+                         WHERE episode.item_type = 'EPISODE'
+                           AND (episode.series_id = mi.id OR episode.parent_id = mi.id)
+                           AND episode_fe.is_missing = 0
+                         ORDER BY episode.id, episode_fe.relative_path
+                         LIMIT 1
+                     )
+                     ELSE (
+                         SELECT direct_source.id
+                         FROM media_sources direct_source
+                         JOIN filesystem_entries direct_fe
+                           ON direct_fe.id = direct_source.filesystem_entry_id
+                         WHERE direct_source.item_id = mi.id
+                           AND direct_source.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                           AND direct_fe.is_missing = 0
+                         ORDER BY direct_source.is_default DESC, direct_source.id
+                         LIMIT 1
+                     )
+                 END
+                 LEFT JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let source_id = row.try_get::<String, _>("source_id").ok();
+                let source = source_id.map(|source_id| StoredMediaSourcePath {
+                    source_id,
+                    item_id: row.get("source_item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                });
+                let item_id = row.get::<String, _>("item_id");
+                contexts.insert(
+                    item_id,
+                    StoredMediaWritebackContext {
+                        item_type: row.get("item_type"),
+                        source,
+                    },
+                );
+            }
+        }
+        Ok(contexts)
+    }
+
     pub(crate) async fn list_strm_source_paths_by_ids(
         &self,
         source_ids: &[String],

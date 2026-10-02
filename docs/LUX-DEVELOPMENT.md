@@ -8038,6 +8038,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：scanner 只对具备 requestable capability 且未关闭自动匹配的 item 发起一次批量 resolver 配置读取，之后按 item 复用客户端缓存并隔离插件错误；无 resolver、legacy fallback 和失败降级语义保持不变。scraper、reidentify、scanner 回归及全目标 Rust 门通过，本机 `uname -m=arm64`；未改变 schema、公共 API、插件协议或任务写入语义。
 
+#### LUX-364：批量预读本地完整性图片写回源上下文
+
+范围：本地完整性计划已批量读取策略、图片索引和 attempt 状态，但图片本地检查对每个 item 仍分别读取媒体类型与可写回源路径。增加有界批量读取的写回上下文，并将已读上下文传入图片路径检查；保留电影/视频直接源、剧集/季度首集源选择，canonicalize、library root containment、legacy 图片路径和缺失源错误语义。本任务不处理 NFO projection 或人物关系文件读取。
+
+验收：
+
+- [x] 205 个 item 的媒体类型与写回源读取由逐 item 的 410 次 SQL 调用降为 1 次有界查询。
+- [x] 直接媒体源、剧集/季度首集源、无源 item、输入重复和超过 500 个 ID 的批次边界保持原有结果语义。
+- [x] 本地图片存在性、fallback、legacy episode fanart、路径 canonicalize 与 root containment 行为保持不变。
+- [x] storage、metadata selection 回归通过；不改变 schema、公共 API、NFO projection 或人物文件读取边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 PostgreSQL、NAS 或生产墙钟收益。
+
+依赖：LUX-363。预计文件：`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`src/application/images.rs`、`src/application/candidates.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-03）：新增批量写回上下文读取，205 个 item 的类型与源预读由 410 次逐项查询降为 1 次；直接电影源和剧集首集源回归保持一致。完整性计划复用该上下文完成图片本地检查，未改变路径安全和缺失源语义。存储批量回归、metadata selection 图片/NFO 回归、本机 `uname -m=arm64` 与 library Clippy 通过；NFO projection、人物文件和端到端 worker 墙钟未纳入本任务性能数值。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

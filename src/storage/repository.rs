@@ -2999,6 +2999,12 @@ pub(crate) struct StoredMediaSourcePath {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredMediaWritebackContext {
+    pub(crate) item_type: String,
+    pub(crate) source: Option<StoredMediaSourcePath>,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredItemScanPath {
     pub(crate) library_id: String,
     pub(crate) library_root_id: String,

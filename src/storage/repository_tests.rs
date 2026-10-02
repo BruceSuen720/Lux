@@ -9536,6 +9536,160 @@ async fn active_media_metadata_with_libraries_uses_one_bounded_query()
 }
 
 #[tokio::test]
+async fn media_writeback_contexts_are_read_in_one_bounded_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Writeback contexts", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("writeback-context-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    for item_id in &item_ids {
+        assert_eq!(
+            database
+                .find_media_item_kind(item_id)
+                .await?
+                .as_ref()
+                .map(|kind| kind.item_type.as_str()),
+            Some("MOVIE")
+        );
+        assert!(
+            database
+                .find_metadata_writeback_source_path(item_id)
+                .await?
+                .is_none()
+        );
+    }
+    assert_eq!(database.query_count(), ITEM_COUNT * 2);
+
+    database.reset_query_count();
+    let contexts = database
+        .list_media_item_writeback_contexts_by_ids(&item_ids)
+        .await?;
+    assert_eq!(contexts.len(), ITEM_COUNT);
+    assert_eq!(contexts[&item_ids[0]].item_type, "MOVIE");
+    assert!(contexts[&item_ids[0]].source.is_none());
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_writeback_contexts_preserve_direct_and_episode_source_selection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Writeback source selection", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES
+            ('writeback-movie', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED'),
+            ('writeback-series', ?, 'SERIES', 'Series', 'series', 'LOCAL_CONFIRMED'),
+            ('writeback-episode', ?, 'EPISODE', 'Episode', 'episode', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET series_id = 'writeback-series'
+         WHERE id = 'writeback-episode'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('writeback-root', ?, ?, ?, 1, 1)",
+    )
+    .bind(&library_id)
+    .bind(temp_dir.path().to_string_lossy().as_ref())
+    .bind(temp_dir.path().to_string_lossy().as_ref())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation
+         ) VALUES
+            ('writeback-movie-file', 'writeback-root', 'movie.mkv', 'FILE', 10, 1, 'generation'),
+            ('writeback-episode-file', 'writeback-root', 'show/episode.mkv', 'FILE', 10, 1, 'generation')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+         ) VALUES
+            ('writeback-movie-source', 'writeback-movie', 'LOCAL_FILE',
+             'writeback-movie-file', 1, 'READY'),
+            ('writeback-episode-source', 'writeback-episode', 'LOCAL_FILE',
+             'writeback-episode-file', 1, 'READY')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    let contexts = database
+        .list_media_item_writeback_contexts_by_ids(&[
+            "writeback-movie".to_owned(),
+            "writeback-series".to_owned(),
+        ])
+        .await?;
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(contexts["writeback-movie"].item_type, "MOVIE");
+    assert_eq!(
+        contexts["writeback-movie"]
+            .source
+            .as_ref()
+            .map(|source| source.item_id.as_str()),
+        Some("writeback-movie")
+    );
+    assert_eq!(contexts["writeback-series"].item_type, "SERIES");
+    assert_eq!(
+        contexts["writeback-series"]
+            .source
+            .as_ref()
+            .map(|source| source.item_id.as_str()),
+        Some("writeback-episode")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_jobs_reconcile_items_left_running_by_workers() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()

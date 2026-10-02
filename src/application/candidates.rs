@@ -2292,6 +2292,10 @@ impl MetadataSelectionService {
             .list_item_media_strategy_settings_by_ids(&item_ids)
             .await?;
         let indexed_images = self.database.list_item_images_by_ids(&item_ids).await?;
+        let writeback_contexts = self
+            .database
+            .list_media_item_writeback_contexts_by_ids(&item_ids)
+            .await?;
 
         let mut actual_plans = Vec::with_capacity(supported_items.len());
         let mut attempt_item_ids = Vec::new();
@@ -2308,13 +2312,17 @@ impl MetadataSelectionService {
                 .get(*item_id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
+            let writeback_context = writeback_contexts
+                .get(*item_id)
+                .ok_or(MetadataSelectionError::ItemNotFound)?;
             let local_image_types = self
                 .images
-                .local_image_types_with_indexed_images(
+                .local_image_types_with_indexed_images_and_context(
                     item_id,
                     &image_types,
                     image_policy.thumbnail_scraping_mode.prefers_screenshots(),
                     indexed_images,
+                    writeback_context,
                 )
                 .await?;
             let actual_missing_image_mask = missing_image_mask(&image_types, &local_image_types);

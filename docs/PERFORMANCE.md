@@ -1240,3 +1240,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的 205 item fixture 上，scanner 只收集有 requestable capability 的 item，并通过 resolver 一次批量加载刮削器配置；配置 SQL 保持 1 次，随后逐 item 使用既有客户端缓存判断可用性。
 
 该记录只覆盖配置读取调用数，不把插件客户端解析、RPC、缓存命中和 scanner 墙钟混入 SQL 结果，也不推断 PostgreSQL、NAS 或生产收益。
+
+### LUX-364 本地完整性图片写回源上下文预读
+
+2026-10-03 在 `uname -m=arm64` 的临时 SQLite 库中准备 205 个 active movie item。旧路径在图片本地检查中对每个 item 分别读取媒体类型和可写回源路径，共 410 次 storage SQL 调用；新路径按最多 500 个 ID 批量读取写回上下文，共 1 次，减少 409 次（约 99.8%）。回归同时覆盖电影直接源和剧集首集源的选择。
+
+该计数只覆盖写回上下文的数据库预读；本地图片文件检查、NFO projection、人物关系文件、attempt 状态、完整性结果提交和在线补缺不在本次数值范围内。计数来自 SQLite storage 查询计数器，不代表数据库往返、墙钟、PostgreSQL、NAS 或生产收益。
