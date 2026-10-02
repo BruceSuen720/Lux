@@ -2893,11 +2893,11 @@ services:
 验收：
 
 - Lux Web 的推荐轮播通过 `/api/v1/home/carousel` 单独读取；服务端与 Web 会话缓存只保存轮播推荐条目。
-- Lux Web 的继续观看通过 `/api/v1/continue-watching` 读取，媒体库入口通过 `/api/v1/libraries` 读取，每库最新资源通过 `/api/v1/libraries/{id}/latest` 单独读取；该查询沿用有效入库时间，剧集按自身与最新可用分集加入时间的较大值排序。各区块分别加载与刷新，单个请求失败不得阻塞其余区块。
-- `home` SSE 事件会刷新轮播、继续观看、媒体库入口和已挂载的每库最新资源查询；封面刮削完成后，新的图像标签必须能随最新资源查询刷新。
+- Lux Web 的继续观看通过 `/api/v1/continue-watching` 读取，媒体库入口通过 `/api/v1/libraries` 读取，最新资源将所有当前可见媒体库 ID 传给 `/api/v1/home/libraries/latest` 一次批量读取，并按媒体库顺序分别显示 shelf；批量查询沿用有效入库时间，剧集按自身与最新可用分集加入时间的较大值排序。轮播、继续观看、媒体库入口和最新资源区块分别加载与刷新，单一区块失败不得阻塞其他区块。
+- `home` SSE 事件会刷新轮播、继续观看、媒体库入口和已挂载的多库最新资源查询；封面刮削完成后，新的图像标签必须能随最新资源查询刷新。
 - `GET /api/v1/home` 保留原完整响应供兼容调用；Lux Web 不再依赖该聚合接口。该接口的继续观看、可见库和最新资源均实时读取，只有推荐轮播使用缓存。
 - Emby Latest/Resume/Views 分别正确。
-- 每个单独的 Lux API 查询不产生 N+1；Lux Web 按媒体库分别请求最新资源。
+- 每个单独的 Lux API 查询不产生 N+1；Lux Web 最新资源区块每次使用一次多库批量 API，不按媒体库数量增加请求。
 
 验证：API 与 Web 回归测试；SQL 查询计数和性能测试。
 
@@ -7641,6 +7641,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`、`docs/LUX-DEVELOPMENT.md`。
 
 结果（2026-10-02）：新增 `HomeLatestLibrariesResponse` 与 `homeLibrariesLatest`，用 `URLSearchParams.append` 按输入顺序生成重复 `libraryId` 参数，并沿用首页 15 秒请求超时及调用方取消信号。新增测试覆盖批量响应解码、参数顺序、超时与主动取消；先确认旧客户端因方法不存在而失败，随后实现后定向 API client 测试 57 项通过。冻结依赖安装、Web 全量测试（Node 108 项、Vitest 76 个文件 / 550 项）和生产构建通过。本任务只增加客户端能力，首页尚未调用该方法，不据此声称运行时请求数或性能变化。
+
+#### LUX-338：首页使用多库最新资源批量查询
+
+范围：将首页每库一个 `homeLibraryLatest` 查询改为一个 `homeLibrariesLatest` 查询，传入当前可见媒体库 ID 并按输入顺序将结果映射到各媒体库 shelf。保持媒体库展示顺序、每库独立卡片、15 秒刷新与 `home` SSE 失效语义；空媒体库不发批量请求，最新资源错误不得阻塞轮播、媒体库入口或继续观看。查询 key 需包含有序媒体库 ID，以便库范围或顺序变化时刷新正确。兼容单库查询方法继续保留。
+
+验收：
+
+- [x] 有多个媒体库时每次只调用一次 `homeLibrariesLatest`，参数按媒体库顺序传入；不再逐库调用 `homeLibraryLatest`。
+- [x] 返回的最新资源分别显示在正确 shelf；空库列表不发请求，库的显示顺序保持不变。
+- [x] 首页事件刷新批量查询，15 秒轮询行为保留；最新资源请求失败不影响其他首页区块。
+- [x] 首页与 LuxShell 事件刷新回归通过，Web 全量测试和构建通过。
+
+预计文件：`web/src/features/home/HomePage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/home-page.test.tsx`、`web/tests/lux-shell.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-02）：首页以一次有序多库批量查询替代逐库请求，缓存键包含媒体库 ID 顺序；空库不请求，15 秒刷新和 `home` SSE 刷新保留，失败状态只显示在最新资源区块。定向首页与 LuxShell 测试 32 项通过，先确认旧实现下批量调用断言失败。检查并修正了缓存轮播测试仍 mock 旧单库 API 的遗漏。冻结依赖安装、Node 测试 108 项、标准并行 Vitest 全量 76 个文件 / 551 项及 TypeScript 检查、生产构建通过。两次早期并行全量运行曾有 5 个轮播用例因 1 秒等待超时，修正过期 mock 后标准全量通过。测试量化的是每次首页最新资源 HTTP 请求由每库一次降为一次，不代表实际延迟或 p95 已测量。
 
 #### 阶段 23 总体验收与阶段门
 

@@ -49,6 +49,23 @@ export function HomePage({ user }: { user: LuxUser }) {
     refetchIntervalInBackground: false,
   });
   const libraries = librariesQuery.data?.libraries ?? [];
+  const libraryIds = libraries.map((library) => library.id);
+  const latestLibrariesQuery = useQuery({
+    queryKey: queryKeys.homeLatestLibraries(libraryIds),
+    queryFn: ({ signal }) => api.homeLibrariesLatest(libraryIds, signal),
+    enabled: libraryIds.length > 0,
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) => homeRefetchInterval(query.state.data),
+    refetchIntervalInBackground: false,
+  });
+  const latestItemsByLibraryId = useMemo(() => {
+    const itemsByLibraryId = new Map<string, MediaItem[]>();
+    for (const latest of latestLibrariesQuery.data?.libraries ?? []) {
+      itemsByLibraryId.set(latest.libraryId, latest.items);
+    }
+    return itemsByLibraryId;
+  }, [latestLibrariesQuery.data]);
 
   useEffect(() => {
     if (carousel.data) writeHomeCarouselCache(user.id, carousel.data);
@@ -101,7 +118,16 @@ export function HomePage({ user }: { user: LuxUser }) {
             继续观看加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void continueWatchingQuery.refetch()}>重试</button>
           </div>
         ) : null}
-        {libraries.map((library) => <HomeLatestRail key={library.id} library={library} />)}
+        {libraries.map((library) => (
+          <HomeLatestRail
+            key={library.id}
+            library={library}
+            items={latestItemsByLibraryId.get(library.id)}
+            isPending={latestLibrariesQuery.isPending && !latestLibrariesQuery.data}
+            hasError={latestLibrariesQuery.error !== null && !latestLibrariesQuery.data}
+            onRetry={() => void latestLibrariesQuery.refetch()}
+          />
+        ))}
       </div>
     </div>
   );
@@ -111,18 +137,22 @@ export function homeRefetchInterval(data: unknown): number | false {
   return data === undefined ? false : queryRefreshIntervals.mediaSurface;
 }
 
-function HomeLatestRail({ library }: { library: Library }) {
-  const latest = useQuery({
-    queryKey: queryKeys.homeLatest(library.id),
-    queryFn: ({ signal }) => api.homeLibraryLatest(library.id, signal),
-    staleTime: 0,
-    retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data),
-    refetchIntervalInBackground: false,
-  });
+function HomeLatestRail({
+  library,
+  items,
+  isPending,
+  hasError,
+  onRetry,
+}: {
+  library: Library;
+  items?: MediaItem[];
+  isPending: boolean;
+  hasError: boolean;
+  onRetry: () => void;
+}) {
   const title = `最新${library.name}`;
 
-  if (latest.isPending && !latest.data) {
+  if (isPending) {
     return (
       <section className="lux-section" aria-label={title}>
         <div className="lux-section-heading"><h2>{title}</h2></div>
@@ -130,17 +160,17 @@ function HomeLatestRail({ library }: { library: Library }) {
       </section>
     );
   }
-  if (latest.error && !latest.data) {
+  if (hasError) {
     return (
       <section className="lux-section" aria-label={title}>
         <div className="lux-section-heading"><h2>{title}</h2></div>
         <div className="lux-editor-error" role="alert">
-          最新资源加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void latest.refetch()}>重试</button>
+          最新资源加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={onRetry}>重试</button>
         </div>
       </section>
     );
   }
-  return <MediaRail title={title} items={latest.data?.items ?? []} linkTo={`/libraries/${library.id}`} />;
+  return <MediaRail title={title} items={items ?? []} linkTo={`/libraries/${library.id}`} />;
 }
 
 function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continueWatching: MediaItem[] }) {
