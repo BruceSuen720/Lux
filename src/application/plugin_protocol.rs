@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -35,6 +35,7 @@ pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
 pub const LOGIN_BACKGROUND_GET_CAPABILITY: &str = "login_background.get";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
+pub const EMBY_ROUTE_CAPABILITY: &str = "emby.route";
 pub const METADATA_SEARCH_CAPABILITY: &str = "metadata.search";
 pub const METADATA_GET_CAPABILITY: &str = "metadata.get";
 pub const METADATA_BUNDLE_CAPABILITY: &str = "metadata.bundle";
@@ -88,6 +89,8 @@ pub struct PluginManifest {
     pub supported_media_source_kinds: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub emby_routes: Vec<PluginEmbyRoute>,
     #[serde(default)]
     pub config_fields: Vec<PluginConfigField>,
     #[serde(default)]
@@ -314,6 +317,31 @@ impl PluginManifest {
             }
         }
         self.runtime.validate()?;
+        if self.emby_routes.len() > 32 {
+            return Err(PluginManifestError::Invalid(
+                "manifest declares too many Emby routes".to_owned(),
+            ));
+        }
+        if !self.emby_routes.is_empty()
+            && !self
+                .capabilities
+                .iter()
+                .any(|capability| capability == EMBY_ROUTE_CAPABILITY)
+        {
+            return Err(PluginManifestError::Invalid(
+                "Emby routes require emby.route".to_owned(),
+            ));
+        }
+        let mut route_keys = std::collections::HashSet::new();
+        for route in &self.emby_routes {
+            route.validate()?;
+            if !route_keys.insert((route.method.as_str(), route.path.as_str())) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "duplicate Emby route: {} {}",
+                    route.method, route.path
+                )));
+            }
+        }
         if self.supported_item_types.len() > 32
             || self.supported_media_source_kinds.len() > 8
             || self.capabilities.len() > 64
@@ -494,6 +522,39 @@ fn default_plugin_category() -> String {
 pub struct PluginRuntime {
     pub kind: String,
     pub entrypoint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginEmbyRoute {
+    pub method: String,
+    pub path: String,
+    pub rpc_method: String,
+}
+
+impl PluginEmbyRoute {
+    fn validate(&self) -> Result<(), PluginManifestError> {
+        let method = self.method.to_ascii_uppercase();
+        if method != self.method
+            || !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD")
+        {
+            return Err(PluginManifestError::Invalid(
+                "Emby route method must be an uppercase HTTP method".to_owned(),
+            ));
+        }
+        if self.path.len() > 256
+            || !self.path.starts_with('/')
+            || self.path.contains('?')
+            || self.path.contains('#')
+            || self.path.contains('*')
+            || self.path.contains("..")
+        {
+            return Err(PluginManifestError::Invalid(
+                "Emby route path must be an exact safe path".to_owned(),
+            ));
+        }
+        validate_identifier("Emby route RPC method", &self.rpc_method, 128)
+    }
 }
 
 impl PluginRuntime {
@@ -817,6 +878,29 @@ impl PluginRequest {
             params,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginEmbyRouteRequest {
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body_base64: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginEmbyRouteResponse {
+    pub status_code: u16,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body_base64: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

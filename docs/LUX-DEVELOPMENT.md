@@ -8384,6 +8384,39 @@ MediaTidy 的神医验证请求为 `POST /emby/Items/SyncMediaInfo`，并记录�
 验证失败当作缓存命中证据。Rust 目标回归、fmt、Clippy 和 `git diff --check` 结果单独记录在
 本次任务结束报告中。
 
+#### LUX-384：插件注册 Emby 神医兼容路由
+
+范围：为 Plugin SDK 增加受限的 `embyRoutes` manifest 声明和 Emby 路由 RPC，使
+`org.lux.strm-media-info` 可以提供 StrmAssistant 的兼容探测接口。宿主负责路由匹配、Emby
+认证边界、请求/响应大小上限和头部脱敏；插件只收到方法、精确路径、原始 query、非认证头和
+有界 body。MediaTidy 对 `POST /Items/SyncMediaInfo` 的 HTTP 400 视为已安装神医接口；没有
+启用对应插件时必须返回 404。该兼容层不计算 SHA1、不读取远程媒体、不实现 FF 缓存或远程缓存。
+
+manifest 合同：
+
+```json
+{
+  "capabilities": ["media.probe", "emby.route"],
+  "embyRoutes": [{
+    "method": "POST",
+    "path": "/Items/SyncMediaInfo",
+    "rpcMethod": "emby.sync_media_info"
+  }]
+}
+```
+
+验收：
+
+- [ ] Plugin SDK 校验精确方法、路径和 RPC 方法，拒绝 query、通配符、路径穿越、重复路由和未声明能力。
+- [ ] `/Items/SyncMediaInfo` 根路径和 `/emby/Items/SyncMediaInfo` 都由已启用插件处理；插件缺失或禁用时返回 404。
+- [ ] 路由请求不把 `X-Emby-Token`、Authorization、Cookie 或完整 URL 传给插件；body 和响应有界。
+- [ ] `org.lux.strm-media-info` 返回 HTTP 400 的神医探测响应，不触发 `media.probe`、ffprobe、SHA1 或缓存操作。
+- [ ] MediaTidy 本机测试能从“未启用插件→404”变为“启用插件→检测到神医接口”，并保留现有 Emby/STRM 回归。
+
+依赖：LUX-383。预计文件：`src/application/plugin_protocol.rs`、`src/application/plugins.rs`、
+`src/api/emby.rs`、`src/api/emby_catalog.rs`、`tests/plugin_protocol.rs`、`tests/emby_auth.rs`、
+`docs/PLUGIN-SDK.md`、`docs/COMPATIBILITY.md`；插件实现同步在 Lux-plugins 仓库完成。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

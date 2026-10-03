@@ -8,10 +8,93 @@ use luxd::application::plugin_protocol::{
     PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
     PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR,
     PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginManifest,
-    PluginRequest, STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult,
-    StrmResolveStatus,
+    PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginRequest, STRM_RESOLVE_CAPABILITY,
+    StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
 };
-use serde_json::json;
+use serde_json::{Value, json};
+
+#[test]
+fn accepts_an_exact_emby_route_declared_by_a_plugin() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": 1,
+        "id": "org.lux.strm-media-info",
+        "name": "STRM media info",
+        "version": "1.0.0",
+        "apiVersion": 1,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "media_probe",
+        "category": "MEDIA",
+        "capabilities": ["media.probe", "emby.route"],
+        "embyRoutes": [{
+            "method": "POST",
+            "path": "/Items/SyncMediaInfo",
+            "rpcMethod": "emby.sync_media_info"
+        }]
+    }))
+    .expect("Emby route manifest should validate");
+
+    assert_eq!(manifest.emby_routes.len(), 1);
+    assert_eq!(manifest.emby_routes[0].method, "POST");
+    assert_eq!(manifest.emby_routes[0].path, "/Items/SyncMediaInfo");
+    assert_eq!(manifest.emby_routes[0].rpc_method, "emby.sync_media_info");
+}
+
+#[test]
+fn rejects_unsafe_or_undeclared_emby_routes() {
+    let without_capability = PluginManifest::from_value(json!({
+        "formatVersion": 1,
+        "id": "org.lux.route",
+        "name": "Route plugin",
+        "version": "1.0.0",
+        "apiVersion": 1,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "media_probe",
+        "category": "MEDIA",
+        "capabilities": ["media.probe"],
+        "embyRoutes": [{"method": "POST", "path": "/Items/SyncMediaInfo", "rpcMethod": "emby.route"}]
+    }));
+    assert!(without_capability.is_err());
+
+    let unsafe_path = PluginManifest::from_value(json!({
+        "formatVersion": 1,
+        "id": "org.lux.route",
+        "name": "Route plugin",
+        "version": "1.0.0",
+        "apiVersion": 1,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "media_probe",
+        "category": "MEDIA",
+        "capabilities": ["media.probe", "emby.route"],
+        "embyRoutes": [{"method": "post", "path": "/Items/../SyncMediaInfo", "rpcMethod": "emby.route"}]
+    }));
+    assert!(unsafe_path.is_err());
+}
+
+#[test]
+fn route_rpc_request_and_response_round_trip_with_bounded_fields() {
+    let request = PluginEmbyRouteRequest {
+        method: "POST".to_owned(),
+        path: "/Items/SyncMediaInfo".to_owned(),
+        query: Some("Path=%2Fprobe.strm".to_owned()),
+        headers: [("x-emby-client".to_owned(), "MediaTidy".to_owned())]
+            .into_iter()
+            .collect(),
+        body_base64: String::new(),
+    };
+    let encoded = serde_json::to_value(&request).expect("route request should serialize");
+    let decoded: PluginEmbyRouteRequest =
+        serde_json::from_value(encoded).expect("route request should deserialize");
+    assert_eq!(decoded.path, "/Items/SyncMediaInfo");
+    assert_eq!(decoded.query.as_deref(), Some("Path=%2Fprobe.strm"));
+
+    let response = PluginEmbyRouteResponse {
+        status_code: 400,
+        headers: Default::default(),
+        body_base64: String::new(),
+    };
+    let value = serde_json::to_value(response).expect("route response should serialize");
+    assert_eq!(value["statusCode"], Value::from(400));
+}
 
 #[test]
 fn accepts_a_versioned_process_plugin_manifest() {
