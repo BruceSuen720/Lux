@@ -2744,6 +2744,7 @@ where
         return Ok(write);
     }
     let temporary = parent.join(format!(".lux-{}.nfo.tmp", Uuid::now_v7()));
+    crate::application::internal_write::register(&temporary);
     let result = async {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2775,6 +2776,7 @@ where
         if !unchanged {
             return Err(NfoWriteError::ConcurrentModification(target.to_owned()));
         }
+        crate::application::internal_write::register(target);
         fs::rename(&temporary, target)
             .await
             .map_err(|source| io_error(target, source))?;
@@ -2785,6 +2787,13 @@ where
             .sync_all()
             .await
             .map_err(|source| io_error(parent, source))?;
+        crate::application::internal_write::finalize(
+            target,
+            crate::application::internal_write::file_stamp(target)
+                .await
+                .ok()
+                .flatten(),
+        );
         Ok(())
     }
     .await;

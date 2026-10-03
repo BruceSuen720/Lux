@@ -3,7 +3,7 @@ use std::{
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -45,15 +45,11 @@ const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
 const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
 const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
-const INTERNAL_IMAGE_WRITE_MARKER_TTL: Duration = Duration::from_secs(15);
 pub(crate) const MAX_IMAGE_VARIANTS: usize = 4;
 
 static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<ImagePermitPool>> = OnceLock::new();
 static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<ImagePermitPool>> = OnceLock::new();
 static IMAGE_ITEM_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
-static INTERNAL_IMAGE_WRITES: OnceLock<StdMutex<HashMap<PathBuf, InternalImageWriteMarker>>> =
-    OnceLock::new();
-
 struct ImagePermitPool {
     maximum: usize,
     active: std::sync::atomic::AtomicUsize,
@@ -129,73 +125,16 @@ impl Drop for ImagePermit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InternalImageWriteMarker {
-    expires_at: Instant,
-    expected_stamp: Option<ImageFileStamp>,
-}
-
-fn internal_image_write_registry() -> &'static StdMutex<HashMap<PathBuf, InternalImageWriteMarker>>
-{
-    INTERNAL_IMAGE_WRITES.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
 pub(crate) fn register_internal_image_write(path: &Path) {
-    let now = Instant::now();
-    let mut registry = match internal_image_write_registry().lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    registry.retain(|_, marker| marker.expires_at > now);
-    registry.insert(
-        path.to_owned(),
-        InternalImageWriteMarker {
-            expires_at: now + INTERNAL_IMAGE_WRITE_MARKER_TTL,
-            expected_stamp: None,
-        },
-    );
+    crate::application::internal_write::register(path);
 }
 
 fn finalize_internal_image_write(path: &Path, expected_stamp: Option<ImageFileStamp>) {
-    let now = Instant::now();
-    let mut registry = match internal_image_write_registry().lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    registry.retain(|_, marker| marker.expires_at > now);
-    if let Some(marker) = registry.get_mut(path) {
-        marker.expected_stamp = expected_stamp;
-    }
+    crate::application::internal_write::finalize(path, expected_stamp);
 }
 
 pub(crate) async fn should_suppress_internal_image_write(path: &Path) -> bool {
-    let now = Instant::now();
-    let marker = {
-        let mut registry = match internal_image_write_registry().lock() {
-            Ok(registry) => registry,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        registry.retain(|_, marker| marker.expires_at > now);
-        registry.get(path).copied()
-    };
-    let Some(marker) = marker else {
-        return false;
-    };
-    let Some(expected_stamp) = marker.expected_stamp else {
-        return true;
-    };
-    if image_file_stamp(path).await.ok().flatten() == Some(expected_stamp) {
-        return true;
-    }
-
-    let mut registry = match internal_image_write_registry().lock() {
-        Ok(registry) => registry,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if registry.get(path).copied() == Some(marker) {
-        registry.remove(path);
-    }
-    false
+    crate::application::internal_write::should_suppress(path).await
 }
 
 fn global_image_download_permits() -> Arc<ImagePermitPool> {
@@ -2282,30 +2221,17 @@ pub async fn write_image_atomically(target: &Path, bytes: &[u8]) -> Result<(), I
     result
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ImageFileStamp {
-    size: u64,
-    modified: Option<(u64, u32)>,
-}
+type ImageFileStamp = crate::application::internal_write::FileStamp;
 
 async fn image_file_stamp(path: &Path) -> Result<Option<ImageFileStamp>, ImageWriteError> {
-    let metadata = match fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(image_io_error(path, source)),
-    };
-    if metadata.file_type().is_symlink() {
+    if let Ok(metadata) = fs::symlink_metadata(path).await
+        && metadata.file_type().is_symlink()
+    {
         return Err(ImageWriteError::SymlinkTarget(path.to_owned()));
     }
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| (value.as_secs(), value.subsec_nanos()));
-    Ok(Some(ImageFileStamp {
-        size: metadata.len(),
-        modified,
-    }))
+    crate::application::internal_write::file_stamp(path)
+        .await
+        .map_err(|source| image_io_error(path, source))
 }
 
 async fn reject_metadata_symlinks(path: &Path) -> Result<(), ImageWriteError> {
