@@ -1325,6 +1325,66 @@ pub(super) async fn auth_update_settings(
     .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AuthPasswordPatch {
+    current_password: String,
+    new_password: String,
+}
+
+pub(super) async fn auth_update_password(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AuthPasswordPatch>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if request.current_password.is_empty() || request.new_password.is_empty() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "当前密码和新密码不能为空",
+        )
+        .into_response();
+    }
+    let Some(auth) = state.auth.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证服务尚未就绪",
+        )
+        .into_response();
+    };
+    match auth
+        .change_password(
+            &session.user.id,
+            &request.current_password,
+            &request.new_password,
+        )
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::InvalidCredentials,
+            "当前密码错误",
+        )
+        .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "密码修改暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
 fn user_library_order_response(library_order: Vec<String>) -> Response {
     Json(json!({ "libraryOrder": library_order })).into_response()
 }
@@ -1977,6 +2037,7 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/auth/settings",
             get(users::auth_settings).patch(users::auth_update_settings),
         )
+        .route("/api/v1/auth/password", patch(users::auth_update_password))
         .route(
             "/api/v1/auth/library-order",
             get(users::auth_library_order).patch(users::auth_update_library_order),

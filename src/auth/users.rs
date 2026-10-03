@@ -198,6 +198,43 @@ impl UserStore {
         updated.map(user_record).transpose()
     }
 
+    pub async fn change_password(
+        &self,
+        user_id: &UserId,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<bool, UserStoreError> {
+        let user_id = user_id.to_string();
+        let Some(stored) = self.database.find_user_by_id(&user_id).await? else {
+            return Ok(false);
+        };
+        let current_password_matches = self
+            .passwords
+            .verify_password(Some(stored.password_hash.as_str()), current_password)?;
+        if stored.is_disabled || !stored.has_password || !current_password_matches {
+            return Ok(false);
+        }
+
+        let password_hash = self.passwords.hash_password(new_password)?;
+        let updated = self
+            .database
+            .update_user(
+                &user_id,
+                UpdateUser {
+                    display_name: None,
+                    password_hash: Some(&password_hash),
+                    has_password: Some(true),
+                    is_disabled: None,
+                    is_admin: None,
+                    can_manage_server: None,
+                    can_remote_access: None,
+                    can_download: None,
+                },
+            )
+            .await?;
+        Ok(updated.is_some())
+    }
+
     pub async fn delete_user(&self, user_id: &str) -> Result<bool, UserStoreError> {
         if user_id.parse::<UserId>().is_err() {
             return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
