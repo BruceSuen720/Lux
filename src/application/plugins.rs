@@ -43,9 +43,9 @@ use crate::{
             PLUGIN_CATEGORY_SCRAPER, PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR,
             PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
             PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
-            PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
-            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
-            is_valid_login_background_asset_id,
+            PluginConfigField, PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
+            STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD, StrmResolveRpcRequest,
+            StrmResolveRpcResult, StrmResolveStatus, is_valid_login_background_asset_id,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
@@ -149,6 +149,12 @@ pub struct PluginService {
     login_background_refresh_worker_started: Arc<AtomicBool>,
     login_background_refresh_failures: Arc<Mutex<HashMap<String, LoginBackgroundRefreshFailure>>>,
     login_background_asset_upload_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginEmbyRouteTarget {
+    pub plugin_id: String,
+    pub rpc_method: String,
 }
 
 impl PluginService {
@@ -850,6 +856,67 @@ impl PluginService {
             .call(&plugin_id, method, params)
             .await
             .map_err(PluginServiceError::Runtime)
+    }
+
+    pub async fn emby_route_target(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Result<Option<PluginEmbyRouteTarget>, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let mut target = None;
+        for plugin in &catalog.plugins {
+            for route in &plugin.manifest.emby_routes {
+                if route.method != method || route.path != path {
+                    continue;
+                }
+                let (installed, enabled) = self.plugin_state(&plugin.manifest.id).await?;
+                if !installed || !enabled {
+                    continue;
+                }
+                let candidate = PluginEmbyRouteTarget {
+                    plugin_id: plugin.manifest.id.clone(),
+                    rpc_method: route.rpc_method.clone(),
+                };
+                if target.is_some() {
+                    return Err(PluginServiceError::InvalidConfig);
+                }
+                target = Some(candidate);
+            }
+        }
+        Ok(target)
+    }
+
+    pub async fn call_emby_route(
+        &self,
+        target: &PluginEmbyRouteTarget,
+        request: PluginEmbyRouteRequest,
+    ) -> Result<PluginEmbyRouteResponse, PluginServiceError> {
+        let value = self
+            .call(
+                &target.plugin_id,
+                &target.rpc_method,
+                serde_json::to_value(request).map_err(|_| PluginServiceError::InvalidResponse)?,
+            )
+            .await?;
+        let response: PluginEmbyRouteResponse =
+            serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
+        if !(100..=599).contains(&response.status_code)
+            || response.headers.len() > 16
+            || response
+                .headers
+                .iter()
+                .any(|(key, value)| key.len() > 128 || value.len() > 4096)
+        {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        let body = BASE64
+            .decode(&response.body_base64)
+            .map_err(|_| PluginServiceError::InvalidResponse)?;
+        if body.len() > 256 * 1024 {
+            return Err(PluginServiceError::InvalidResponse);
+        }
+        Ok(response)
     }
 
     pub async fn call_notification(

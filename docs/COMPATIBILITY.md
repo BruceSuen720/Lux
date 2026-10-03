@@ -14,6 +14,47 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（2026-10-03）
+
+Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有
+`org.lux.strm-media-info` 负责后台媒体探测和可选 `*-mediainfo.json` 写回；MediaTidy
+负责 SHA1、FF 缓存、远程缓存和同步。Lux 不向 STRM 写入 SHA1，也不新增 MediaTidy 专用
+缓存接口。
+
+LUX-382 已实现 sidecar 写回只更新 Lux 管理的 `MediaSourceInfo` 和当前媒体流字段，
+保留已有未知字段、章节和扩展字段；损坏 sidecar 不会被覆盖，新旁车包含兼容的空
+`Chapters` 数组。自动化回归证明 STRM 内容不变、Emby 条目/媒体源/播放合同保持不变。
+这只证明 Lux 侧兼容基线，不能宣称真实 MediaTidy 缓存命中；实际请求路径、payload 和
+远程缓存命中仍需在取得授权的可控实例后记录。
+
+## LUX-383 StrmAssistant 播放源旁车字段（2026-10-03）
+
+`org.lux.strm-media-info` 把已有 STRM 目标的 Emby 播放源语义投影到新生成的
+`MediaSourceInfo`，包括协议、远程标志和能力位。投影只使用已读取的 STRM 文本，不读取远程
+媒体、不生成 SHA1，不写入内部 ID、原始路径或认证信息。已有旁车的这些字段只在缺失时补齐，
+保留 StrmAssistant/MediaTidy 已经写入的值。
+
+单独运行的 `strm_probe` 回归证明 URL 型目标生成 HTTP/远程语义，File 型目标生成 File/本地
+语义，且既有字段、损坏文件保护和 STRM 字节不变。真实 MediaTidy 请求路径已在本机授权实例
+和隔离假 Emby 上记录；假 Emby 未实现神医插件专用响应，因此没有宣称真实缓存命中。
+
+## LUX-384 MediaTidy 神医探测路由（2026-10-03）
+
+Lux 不在主程序中实现神医、SHA1、FF 缓存或远程缓存。`org.lux.strm-media-info` 通过
+Plugin SDK 的 `embyRoutes` 注册精确的 `POST /Items/SyncMediaInfo`，宿主同时提供根路径和
+`/emby` 前缀。已安装且启用插件时，该探测 RPC 返回 HTTP 400；插件未安装或被禁用时返回
+404。路由请求只传递有界 body、脱敏后的非认证头和去除认证参数的 query，不把 Emby token、
+Authorization、Cookie 或完整 URL 交给插件。
+
+自动化证据：`tests/plugin_protocol.rs` 36 项、`tests/plugins.rs` 9 项和
+`tests/emby_auth.rs` 8 项通过；集成测试覆盖 404→400→404 状态变化和认证字段脱敏。
+Lux-plugins 的 STRM 插件库测试 43 项、构建和直接 `emby.sync_media_info` RPC 也通过。
+本机 `murongyun574/mediatidy:latest` 已完成真实 `testEmby` 验证：临时 Lux 实例未安装
+插件时返回 404；通过 Lux 插件安装接口启用真实 `org.lux.strm-media-info` 后，MediaTidy
+返回 `supported: true`、`statusCode: 400` 和“已检测到神医 SyncMediaInfo 接口”。
+测试使用的临时 Emby 实例、账号会话、插件安装状态和数据库备份均已清理/恢复。该证据证明
+神医探测兼容，不证明 FF 缓存已经命中或远程缓存已经上传。
+
 ## Emby 用户列表与登录兼容（2026-09-29）
 
 Lux 保持 Emby `UserDto.Name` 为账户显示名。`POST /Users/AuthenticateByName` 首先按规范登录用户名验证；若该用户名

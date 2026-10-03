@@ -8,7 +8,7 @@ use std::{
 };
 
 use quick_xml::{events::Event, reader::Reader};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -50,6 +50,13 @@ pub struct MediaProbeResult {
     pub duration_ticks: Option<i64>,
     pub bitrate: Option<i64>,
     pub streams: Vec<MediaStreamResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MediaInfoSidecarContext {
+    pub(crate) protocol: &'static str,
+    pub(crate) is_remote: bool,
+    pub(crate) supports_transcoding: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1289,24 +1296,170 @@ async fn read_media_info_sidecar(path: &Path) -> Option<MediaProbeResult> {
     parse_media_info_json(&bytes).ok()
 }
 
-pub(crate) fn serialize_media_info_sidecar(
+async fn read_existing_media_info_sidecar(target: &Path) -> Result<Option<Value>, ProbeError> {
+    let mut file = match fs::File::open(target).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ProbeError::Io(error)),
+    };
+    let bytes = read_limited(&mut file, MAX_OUTPUT_BYTES).await?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| ProbeError::InvalidOutput(error.to_string()))?;
+    parse_media_info_json(&bytes)?;
+    Ok(Some(document))
+}
+
+fn media_info_stream_value(stream: &MediaStreamResult) -> Value {
+    let mut value = Map::new();
+    value.insert("Index".to_owned(), Value::from(stream.stream_index));
+    value.insert("Type".to_owned(), Value::from(stream.stream_type.as_str()));
+    if let Some(codec) = &stream.codec {
+        value.insert("Codec".to_owned(), Value::from(codec.clone()));
+    }
+    if let Some(language) = &stream.language {
+        value.insert("Language".to_owned(), Value::from(language.clone()));
+    }
+    if let Some(title) = &stream.title {
+        value.insert("DisplayTitle".to_owned(), Value::from(title.clone()));
+    }
+    value.insert("IsDefault".to_owned(), Value::from(stream.is_default));
+    value.insert("IsForced".to_owned(), Value::from(stream.is_forced));
+    for (key, detail) in &stream.details {
+        value.insert(key.clone(), detail.clone());
+    }
+    Value::Object(value)
+}
+
+fn apply_media_info_source_context(
+    source: &mut Map<String, Value>,
+    context: MediaInfoSidecarContext,
+) {
+    source.insert("Protocol".to_owned(), Value::from(context.protocol));
+    source.insert("Type".to_owned(), Value::from("Default"));
+    source.insert("IsRemote".to_owned(), Value::from(context.is_remote));
+    source.insert("HasMixedProtocols".to_owned(), Value::from(false));
+    source.insert(
+        "SupportsTranscoding".to_owned(),
+        Value::from(context.supports_transcoding),
+    );
+    source.insert("SupportsDirectStream".to_owned(), Value::from(true));
+    source.insert("SupportsDirectPlay".to_owned(), Value::from(true));
+    source.insert("SupportsProbing".to_owned(), Value::from(true));
+    source.insert("IsInfiniteStream".to_owned(), Value::from(false));
+    source.insert("RequiresOpening".to_owned(), Value::from(false));
+    source.insert("RequiresClosing".to_owned(), Value::from(false));
+    source.insert("RequiresLooping".to_owned(), Value::from(false));
+    source.insert("ReadAtNativeFramerate".to_owned(), Value::from(false));
+    source.insert("RequiredHttpHeaders".to_owned(), Value::Object(Map::new()));
+    source.insert("AddApiKeyToDirectStreamUrl".to_owned(), Value::from(false));
+    source.insert("Formats".to_owned(), Value::Array(Vec::new()));
+}
+
+fn apply_missing_media_info_source_context(
+    source: &mut Map<String, Value>,
+    context: MediaInfoSidecarContext,
+) {
+    let mut context_fields = Map::new();
+    apply_media_info_source_context(&mut context_fields, context);
+    for (key, value) in context_fields {
+        source.entry(key).or_insert(value);
+    }
+}
+
+fn media_info_source_value(
     result: &MediaProbeResult,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let streams = result
-        .streams
+    context: Option<MediaInfoSidecarContext>,
+) -> Value {
+    let mut source = Map::new();
+    source.insert(
+        "Container".to_owned(),
+        result
+            .container
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    source.insert(
+        "Size".to_owned(),
+        result.source_size.map(Value::from).unwrap_or(Value::Null),
+    );
+    source.insert(
+        "RunTimeTicks".to_owned(),
+        result
+            .duration_ticks
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    source.insert(
+        "Bitrate".to_owned(),
+        result.bitrate.map(Value::from).unwrap_or(Value::Null),
+    );
+    source.insert(
+        "MediaStreams".to_owned(),
+        Value::Array(result.streams.iter().map(media_info_stream_value).collect()),
+    );
+    if let Some(context) = context {
+        apply_media_info_source_context(&mut source, context);
+    }
+    Value::Object(source)
+}
+
+fn media_info_document_value(
+    result: &MediaProbeResult,
+    context: Option<MediaInfoSidecarContext>,
+) -> Value {
+    Value::Array(vec![serde_json::json!({
+        "MediaSourceInfo": media_info_source_value(result, context),
+        "Chapters": [],
+    })])
+}
+
+fn merge_media_info_streams(existing: &[Value], streams: &[MediaStreamResult]) -> Vec<Value> {
+    let mut existing_by_index = HashMap::new();
+    for (ordinal, value) in existing.iter().enumerate() {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let index = object
+            .get("Index")
+            .and_then(Value::as_i64)
+            .or_else(|| i64::try_from(ordinal).ok());
+        if let Some(index) = index {
+            existing_by_index.insert(index, object.clone());
+        }
+    }
+
+    streams
         .iter()
         .map(|stream| {
-            let mut value = serde_json::Map::new();
+            let mut value = existing_by_index
+                .remove(&stream.stream_index)
+                .unwrap_or_default();
             value.insert("Index".to_owned(), Value::from(stream.stream_index));
             value.insert("Type".to_owned(), Value::from(stream.stream_type.as_str()));
-            if let Some(codec) = &stream.codec {
-                value.insert("Codec".to_owned(), Value::from(codec.clone()));
+            match &stream.codec {
+                Some(codec) => {
+                    value.insert("Codec".to_owned(), Value::from(codec.clone()));
+                }
+                None => {
+                    value.remove("Codec");
+                }
             }
-            if let Some(language) = &stream.language {
-                value.insert("Language".to_owned(), Value::from(language.clone()));
+            match &stream.language {
+                Some(language) => {
+                    value.insert("Language".to_owned(), Value::from(language.clone()));
+                }
+                None => {
+                    value.remove("Language");
+                }
             }
-            if let Some(title) = &stream.title {
-                value.insert("DisplayTitle".to_owned(), Value::from(title.clone()));
+            match &stream.title {
+                Some(title) => {
+                    value.insert("DisplayTitle".to_owned(), Value::from(title.clone()));
+                }
+                None => {
+                    value.remove("DisplayTitle");
+                }
             }
             value.insert("IsDefault".to_owned(), Value::from(stream.is_default));
             value.insert("IsForced".to_owned(), Value::from(stream.is_forced));
@@ -1315,21 +1468,102 @@ pub(crate) fn serialize_media_info_sidecar(
             }
             Value::Object(value)
         })
-        .collect::<Vec<_>>();
-    serde_json::to_vec_pretty(&serde_json::json!([{
-        "MediaSourceInfo": {
-            "Container": result.container,
-            "Size": result.source_size,
-            "RunTimeTicks": result.duration_ticks,
-            "Bitrate": result.bitrate,
-            "MediaStreams": streams,
-        }
-    }]))
+        .collect()
 }
 
-pub(crate) async fn write_media_info_sidecar(
+fn merge_media_info_source(
+    source: &mut Map<String, Value>,
+    result: &MediaProbeResult,
+    context: Option<MediaInfoSidecarContext>,
+) -> Result<(), ProbeError> {
+    source.insert(
+        "Container".to_owned(),
+        result
+            .container
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    source.insert(
+        "Size".to_owned(),
+        result.source_size.map(Value::from).unwrap_or(Value::Null),
+    );
+    source.insert(
+        "RunTimeTicks".to_owned(),
+        result
+            .duration_ticks
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    source.insert(
+        "Bitrate".to_owned(),
+        result.bitrate.map(Value::from).unwrap_or(Value::Null),
+    );
+    let existing_streams = source
+        .get("MediaStreams")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProbeError::InvalidOutput("MediaStreams is not an array".to_owned()))?;
+    let streams = merge_media_info_streams(existing_streams, &result.streams);
+    source.insert("MediaStreams".to_owned(), Value::Array(streams));
+    if let Some(context) = context {
+        apply_missing_media_info_source_context(source, context);
+    }
+    Ok(())
+}
+
+fn merge_media_info_document(
+    mut document: Value,
+    result: &MediaProbeResult,
+    context: Option<MediaInfoSidecarContext>,
+) -> Result<Value, ProbeError> {
+    match &mut document {
+        Value::Array(values) => {
+            let first = values.first_mut().ok_or_else(|| {
+                ProbeError::InvalidOutput("media info sidecar array is empty".to_owned())
+            })?;
+            let wrapper = first.as_object_mut().ok_or_else(|| {
+                ProbeError::InvalidOutput("media info sidecar entry is not an object".to_owned())
+            })?;
+            let source = wrapper
+                .get_mut("MediaSourceInfo")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    ProbeError::InvalidOutput(
+                        "media info sidecar source is not an object".to_owned(),
+                    )
+                })?;
+            merge_media_info_source(source, result, context)?;
+        }
+        Value::Object(object) => {
+            if let Some(source) = object
+                .get_mut("MediaSourceInfo")
+                .and_then(Value::as_object_mut)
+            {
+                merge_media_info_source(source, result, context)?;
+            } else {
+                merge_media_info_source(object, result, context)?;
+            }
+        }
+        _ => {
+            return Err(ProbeError::InvalidOutput(
+                "media info sidecar root is not an object or array".to_owned(),
+            ));
+        }
+    }
+    Ok(document)
+}
+
+pub(crate) fn serialize_media_info_sidecar_with_context(
+    result: &MediaProbeResult,
+    context: Option<MediaInfoSidecarContext>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec_pretty(&media_info_document_value(result, context))
+}
+
+pub(crate) async fn write_media_info_sidecar_with_context(
     path: &Path,
     result: &MediaProbeResult,
+    context: Option<MediaInfoSidecarContext>,
 ) -> Result<(), ProbeError> {
     let stem = path
         .file_stem()
@@ -1338,8 +1572,15 @@ pub(crate) async fn write_media_info_sidecar(
     let target = path.with_file_name(format!("{stem}-mediainfo.json"));
     let temporary =
         target.with_file_name(format!(".{stem}-mediainfo.{}.tmp", uuid::Uuid::now_v7()));
-    let contents = serialize_media_info_sidecar(result)
-        .map_err(|error| ProbeError::InvalidOutput(error.to_string()))?;
+    let contents = match read_existing_media_info_sidecar(&target).await? {
+        Some(document) => {
+            let document = merge_media_info_document(document, result, context)?;
+            serde_json::to_vec_pretty(&document)
+                .map_err(|error| ProbeError::InvalidOutput(error.to_string()))?
+        }
+        None => serialize_media_info_sidecar_with_context(result, context)
+            .map_err(|error| ProbeError::InvalidOutput(error.to_string()))?,
+    };
     let write_result = async {
         let mut file = fs::File::create(&temporary).await?;
         file.write_all(&contents).await?;
@@ -1535,7 +1776,15 @@ impl From<StorageError> for ProbeServiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::SubtitleDirectoryCache;
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::{
+        MediaInfoSidecarContext, MediaProbeResult, MediaStreamResult, ProbeError, StreamType,
+        SubtitleDirectoryCache, serialize_media_info_sidecar_with_context,
+        write_media_info_sidecar_with_context,
+    };
 
     #[tokio::test]
     async fn subtitle_directory_cache_reuses_one_listing_for_an_operation() {
@@ -1555,5 +1804,165 @@ mod tests {
 
         assert_eq!(initial, vec![first]);
         assert_eq!(reused, initial);
+    }
+
+    #[tokio::test]
+    async fn sidecar_write_preserves_external_fields_and_strm_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let strm = temporary.path().join("Movie.strm");
+        let original_strm = b"https://media.example.invalid/movie.mkv\n";
+        tokio::fs::write(&strm, original_strm)
+            .await
+            .expect("write strm");
+        let sidecar = temporary.path().join("Movie-mediainfo.json");
+        tokio::fs::write(
+            &sidecar,
+            serde_json::to_vec(&json!([{
+                "MediaSourceInfo": {
+                    "Container": "old",
+                    "Size": 9,
+                    "RunTimeTicks": 10,
+                    "Bitrate": 11,
+                    "Protocol": "File",
+                    "SupportsProbing": false,
+                    "Sha1": "external-sha1",
+                    "Name": "1080p",
+                    "ExternalSource": {"owner": "mediatidy"},
+                    "MediaStreams": [{
+                        "Index": 0,
+                        "Type": "Video",
+                        "Codec": "old-codec",
+                        "DisplayTitle": "old title",
+                        "IsDefault": false,
+                        "IsForced": false,
+                        "ExternalStreamField": "keep"
+                    }]
+                },
+                "Chapters": [{"StartPositionTicks": 1, "Name": "Intro"}],
+                "ExternalTopLevel": "keep"
+            }]))
+            .expect("serialize sidecar"),
+        )
+        .await
+        .expect("write sidecar");
+
+        let mut details = BTreeMap::new();
+        details.insert("Width".to_owned(), json!(1920));
+        write_media_info_sidecar_with_context(
+            &strm,
+            &MediaProbeResult {
+                container: Some("matroska".to_owned()),
+                source_size: Some(1234),
+                duration_ticks: Some(125_000_000),
+                bitrate: Some(500_000),
+                streams: vec![MediaStreamResult {
+                    stream_index: 0,
+                    stream_type: StreamType::Video,
+                    codec: Some("h264".to_owned()),
+                    language: None,
+                    title: Some("new title".to_owned()),
+                    is_default: true,
+                    is_forced: false,
+                    details,
+                }],
+            },
+            Some(MediaInfoSidecarContext {
+                protocol: "Http",
+                is_remote: true,
+                supports_transcoding: true,
+            }),
+        )
+        .await
+        .expect("merge sidecar");
+
+        let written: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&sidecar).await.expect("read sidecar"))
+                .expect("parse merged sidecar");
+        assert_eq!(written[0]["MediaSourceInfo"]["Container"], "matroska");
+        assert_eq!(written[0]["MediaSourceInfo"]["Protocol"], "File");
+        assert_eq!(written[0]["MediaSourceInfo"]["SupportsProbing"], false);
+        assert_eq!(written[0]["MediaSourceInfo"]["Sha1"], "external-sha1");
+        assert_eq!(written[0]["MediaSourceInfo"]["Name"], "1080p");
+        assert_eq!(
+            written[0]["MediaSourceInfo"]["ExternalSource"]["owner"],
+            "mediatidy"
+        );
+        assert_eq!(
+            written[0]["MediaSourceInfo"]["MediaStreams"][0]["Codec"],
+            "h264"
+        );
+        assert_eq!(
+            written[0]["MediaSourceInfo"]["MediaStreams"][0]["ExternalStreamField"],
+            "keep"
+        );
+        assert_eq!(written[0]["Chapters"][0]["Name"], "Intro");
+        assert_eq!(written[0]["ExternalTopLevel"], "keep");
+        assert_eq!(
+            tokio::fs::read(&strm).await.expect("read strm"),
+            original_strm
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_existing_sidecar_is_not_replaced() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let strm = temporary.path().join("Movie.strm");
+        tokio::fs::write(&strm, b"https://media.example.invalid/movie.mkv")
+            .await
+            .expect("write strm");
+        let sidecar = temporary.path().join("Movie-mediainfo.json");
+        let original_sidecar = b"{not-json";
+        tokio::fs::write(&sidecar, original_sidecar)
+            .await
+            .expect("write malformed sidecar");
+
+        let error = write_media_info_sidecar_with_context(
+            &strm,
+            &MediaProbeResult {
+                container: Some("matroska".to_owned()),
+                source_size: None,
+                duration_ticks: None,
+                bitrate: None,
+                streams: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect_err("malformed sidecar must be rejected");
+        assert!(matches!(error, ProbeError::InvalidOutput(_)));
+        assert_eq!(
+            tokio::fs::read(&sidecar).await.expect("read sidecar"),
+            original_sidecar
+        );
+    }
+
+    #[test]
+    fn sidecar_context_emits_file_source_contract_without_internal_ids() {
+        let bytes = serialize_media_info_sidecar_with_context(
+            &MediaProbeResult {
+                container: Some("matroska".to_owned()),
+                source_size: Some(1234),
+                duration_ticks: Some(125_000_000),
+                bitrate: Some(500_000),
+                streams: Vec::new(),
+            },
+            Some(MediaInfoSidecarContext {
+                protocol: "File",
+                is_remote: false,
+                supports_transcoding: true,
+            }),
+        )
+        .expect("serialize sidecar");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse sidecar");
+        let source = &value[0]["MediaSourceInfo"];
+        assert_eq!(source["Protocol"], "File");
+        assert_eq!(source["Type"], "Default");
+        assert_eq!(source["IsRemote"], false);
+        assert_eq!(source["SupportsDirectPlay"], true);
+        assert_eq!(source["SupportsDirectStream"], true);
+        assert_eq!(source["SupportsTranscoding"], true);
+        assert!(source.get("Id").is_none());
+        assert!(source.get("ItemId").is_none());
+        assert!(source.get("Path").is_none());
     }
 }
