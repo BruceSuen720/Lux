@@ -8206,6 +8206,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：旧迁移对包含两个可分配库、一个电影库、一个已有章节源库和一个重复 ID 的配置执行 10 次 SQL；新路径只执行一次插件状态读取和一次有界条件 UPDATE，共 2 次，减少 8 次（80%），且在同一插件内去重 ID、跨插件按既有排序保留先到先得。插件私有回归、章节检测/API、scheduled tasks、plugins、库级 Clippy 与格式检查通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-375：合并元数据写回策略读取
+
+范围：NFO 和图片写回共用的 `item_metadata_writeback_enabled` 先读取条目所属库 ID，再读取完整媒体库和 scraper 关联，最后读取全局媒体策略。改用已有的 item/library JOIN 读取一次本地策略与全局策略，保持启用库、未移除条目、库策略优先级和 JSON 容错语义，不改变写回目标或媒体元数据合同。
+
+验收：
+
+- [x] 单条写回策略判断由 4 次 storage SQL 调用降为 1 次。
+- [x] 库策略优先于全局策略；禁用库、已移除条目和无策略仍返回原有结果。
+- [x] NFO、图片和 metadata 回归通过；不改变数据库 schema、文件写回或公共 API。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断写回墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-364。预计文件：`src/application/metadata_writeback.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加策略判断查询计数回归，再复用已有的单条 JOIN 读取。
+
+结果（2026-10-03）：策略判断从条目库 ID、完整库（含 scraper 关联）和全局设置三段读取收敛为一次 `find_item_media_strategy_settings`；固定 fixture 从 4 次降为 1 次（75%）。写回、NFO、图片和 metadata 回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

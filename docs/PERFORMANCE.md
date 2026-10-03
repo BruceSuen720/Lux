@@ -1300,3 +1300,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个可分配剧集库、一个电影库、一个已有章节源库和一个重复 ID，并运行旧章节插件的 `libraryIds` 迁移。旧实现对每个配置 ID执行完整 `find_library`，再对两个可分配库执行 `update_library_settings`，共 10 次 storage SQL 调用；新实现先读取一次插件状态，再用一个有界条件 UPDATE 为两个未分配章节源的库写入，共 2 次，减少 8 次（80%）。
 
 条件更新只命中存在、非电影且 `chapter_source_id IS NULL` 的库；计数来自 SQLite storage 查询计数器，不代表迁移墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-375 元数据写回策略读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备一个启用媒体库和一条 active movie item，并检查写回策略。旧实现先读 item 的库 ID，再读完整库（含 scraper 关联）和全局策略，共 4 次 storage SQL 调用；新实现使用已有 item/library JOIN 一次取得本地及全局策略，共 1 次，减少 3 次（75%）。
+
+计数来自 SQLite storage 查询计数器，只衡量策略判断 SQL 调用数，不代表 NFO/图片写回墙钟、PostgreSQL、NAS 或生产收益。
