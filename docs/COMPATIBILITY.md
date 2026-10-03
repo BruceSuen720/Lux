@@ -49,8 +49,11 @@ Authorization、Cookie 或完整 URL 交给插件。
 自动化证据：`tests/plugin_protocol.rs` 36 项、`tests/plugins.rs` 9 项和
 `tests/emby_auth.rs` 8 项通过；集成测试覆盖 404→400→404 状态变化和认证字段脱敏。
 Lux-plugins 的 STRM 插件库测试 43 项、构建和直接 `emby.sync_media_info` RPC 也通过。
-截至本记录，尚未用已登录的本机 MediaTidy 调用其 `testEmby` 完成最终真机验证，不能据此
-宣称 MediaTidy 检测或 FF 缓存命中已完成。
+本机 `murongyun574/mediatidy:latest` 已完成真实 `testEmby` 验证：临时 Lux 实例未安装
+插件时返回 404；通过 Lux 插件安装接口启用真实 `org.lux.strm-media-info` 后，MediaTidy
+返回 `supported: true`、`statusCode: 400` 和“已检测到神医 SyncMediaInfo 接口”。
+测试使用的临时 Emby 实例、账号会话、插件安装状态和数据库备份均已清理/恢复。该证据证明
+神医探测兼容，不证明 FF 缓存已经命中或远程缓存已经上传。
 
 ## Emby 用户列表与登录兼容（2026-09-29）
 

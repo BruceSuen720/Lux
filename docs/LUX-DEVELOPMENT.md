@@ -8411,7 +8411,7 @@ manifest 合同：
 - [x] `/Items/SyncMediaInfo` 根路径和 `/emby/Items/SyncMediaInfo` 都由已启用插件处理；插件缺失或禁用时返回 404。
 - [x] 路由请求不把 `X-Emby-Token`、Authorization、Cookie 或完整 URL 传给插件；body 和响应有界。
 - [x] `org.lux.strm-media-info` 返回 HTTP 400 的神医探测响应，不触发 `media.probe`、ffprobe、SHA1 或缓存操作。
-- [ ] MediaTidy 本机测试能从“未启用插件→404”变为“启用插件→检测到神医接口”，并保留现有 Emby/STRM 回归。
+- [x] MediaTidy 本机测试能从“未启用插件→404”变为“启用插件→检测到神医接口”，并保留现有 Emby/STRM 回归。
 
 依赖：LUX-383。预计文件：`src/application/plugin_protocol.rs`、`src/application/plugins.rs`、
 `src/api/emby.rs`、`src/api/emby_catalog.rs`、`tests/plugin_protocol.rs`、`tests/emby_auth.rs`、
@@ -8422,7 +8422,10 @@ manifest 合同：
 `X-Emby-Token`、Authorization、Cookie 和 `api_key` 不进入插件请求；Plugin SDK 的 36 项
 协议测试、Emby 认证 8 项和插件管理 9 项通过。Lux-plugins 的 `org.lux.strm-media-info`
 已声明该路由并固定返回 400；插件库测试 43 项、插件构建和直接 RPC 试验通过。尚未以已登录
-的本机 MediaTidy UI/API 完成最终 `testEmby` 实测，因此未宣称 MediaTidy 真机检测完成。
+的本机 MediaTidy UI/API 完成最终 `testEmby` 实测。隔离 Lux 实例使用真实
+`org.lux.strm-media-info` 插件：安装前 MediaTidy 返回 404；通过 Lux 插件安装接口启用后，
+同一 `testEmby` 请求返回 `supported: true`、`statusCode: 400` 和“已检测到神医
+SyncMediaInfo 接口”。测试结束后删除了临时 MediaTidy 实例并恢复原始本地账号状态。
 
 #### 阶段 23 总体验收与阶段门
 
