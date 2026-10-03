@@ -1282,3 +1282,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 检查电影 probe NFO 写回的 SQL 路径。旧路径先读取 item kind、写回 source，再由通用 target 解析重复读取 kind 和 source；新路径一次读取 `StoredMediaWritebackContext`，并复用其中的电影 source 完成 target 路径检查。probe target 选择阶段由 4 次重复类型/源读取收敛为 1 次上下文查询；写回后的通用 auxiliary、fingerprint 和 invalidation SQL 不计入该边界。
 
 该记录是由固定调用路径得到的 SQL 边界，不是墙钟或磁盘基准；NFO writer、series metadata 和 metadata 回归通过，但未据此推断 PostgreSQL、NAS 或生产收益。
+
+### LUX-372 本地 NFO enrichment 元数据读取边界
+
+2026-10-03 检查单条 NFO enrichment 的媒体元数据读取路径。旧流程在身份冲突校验和最终写回之间分别执行两次完整 `find_media_item_metadata` 查询；新流程复用第一次结果，固定路径由 2 次完整读取降为 1 次。provider ID、NFO cache 和人物关系写入不修改媒体元数据列，因此没有引入额外刷新查询。
+
+该记录是 SQL 调用边界，不是墙钟或锁竞争基准；metadata、series metadata 和 NFO writer 回归通过，未据此推断 PostgreSQL、NAS 或生产收益。

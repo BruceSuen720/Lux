@@ -1607,7 +1607,8 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        if let Some(current) = self.database.find_media_item_metadata(item_id).await? {
+        let current = self.database.find_media_item_metadata(item_id).await?;
+        if let Some(current) = current.as_ref() {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {
                     title: Some(current.title.clone()),
@@ -1705,8 +1706,11 @@ impl MetadataEnricher {
                 }
             }
         }
+        // Provider IDs, the local NFO cache, and actor relations are stored separately from
+        // the metadata columns above, so this enrichment pass can reuse its initial snapshot
+        // instead of issuing the same full metadata read a second time.
         if let Some(fingerprint) = fingerprint.as_deref()
-            && let Some(current) = self.database.find_media_item_metadata(item_id).await?
+            && let Some(current) = current.as_ref()
         {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {

@@ -8161,6 +8161,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：probe 写回直接使用一次有界写回上下文读取，电影 target 复用该 source 完成 canonicalize 和 root containment；普通 NFO 写入继续独立解析 item 类型。`nfo_writer` 25 项、`series_metadata` 3 项、`metadata` 20 项通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-372：本地 NFO enrichment 复用元数据快照
+
+范围：`MetadataEnricher::enrich_nfo_item` 在同一条 NFO 处理流程中先读取媒体元数据做身份冲突校验，完成 provider ID、NFO 缓存和人物关系同步后又读取完整元数据构造最终写回。复用本次 enrichment 开始时的元数据快照；中间步骤不修改媒体元数据列，保持锁定字段、provenance、身份冲突和 NFO fingerprint 写回语义。
+
+验收：
+
+- [x] 单条 NFO enrichment 的完整媒体元数据读取由 2 次降为 1 次；provider ID、人物关系和 NFO cache 仍按原顺序执行。
+- [x] NFO 身份冲突、锁定字段、provenance、premiere/rating、坏 NFO 非阻塞和重复 enrichment 回归保持不变。
+- [x] metadata、series metadata、NFO writer 回归通过；不改变 schema、NFO/Emby 合同或在线刮削器协议。
+- [x] 性能记录只报告固定调用路径的 SQL 读取边界，不推断 worker 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-371、LUX-364。预计文件：`src/application/metadata.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定重复 `find_media_item_metadata` 基线，再复用同一处理快照。
+
+结果（2026-10-03）：NFO enrichment 保留一次初始 `find_media_item_metadata` 结果，在 provider ID、NFO cache 和 actor relation 处理后直接构造最终 `MediaMetadataUpdate`；metadata 20 项、series metadata 3 项和 NFO writer 25 项通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
