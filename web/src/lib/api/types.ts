@@ -44,6 +44,11 @@ export type UserLibraryOrder = {
   libraryOrder: string[];
 };
 
+export type UserPasswordChangeInput = {
+  currentPassword: string;
+  newPassword: string;
+};
+
 export type AuthSession = {
   user: LuxUser;
   serverName?: string | null;

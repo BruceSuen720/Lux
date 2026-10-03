@@ -17,6 +17,9 @@ use crate::{
     storage::{Database, MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE, StorageError},
 };
 
+// Keep the source IDs and at most three related item IDs below SQLite's bind limit.
+const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
+
 #[derive(Clone)]
 pub struct MediaDeleteService {
     database: Database,
