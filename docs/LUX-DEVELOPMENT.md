@@ -8331,19 +8331,26 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 探测任务前后 `.strm` 字节完全一致，任务不会创建或修改 `.strm`。
-- [ ] 既有 URL/路径型 `.strm` 的 Emby `Path`、`MediaSources[].Path`、`Protocol`、`IsRemote`、
+- [x] 探测任务前后 `.strm` 字节完全一致，任务不会创建或修改 `.strm`。
+- [x] 既有 URL/路径型 `.strm` 的 Emby `Path`、`MediaSources[].Path`、`Protocol`、`IsRemote`、
       `MediaStreams` 和标准 `PlaybackInfo` 合同保持不变。
-- [ ] 新 sidecar 与现有 StrmAssistant 兼容 JSON 结构一致；已有 sidecar 的未知顶层、
+- [x] 新 sidecar 与现有 StrmAssistant 兼容 JSON 结构一致；已有 sidecar 的未知顶层、
       `MediaSourceInfo` 和媒体流字段在写回后仍存在。
-- [ ] 已有 sidecar 损坏时原文件保持不变，任务返回有界的失败状态，不记录完整 URL 或文件内容。
-- [ ] 通过 STRM/探测/Emby 兼容回归；不改变 schema、插件 RPC 的已有必需字段或 MediaTidy 缓存边界。
-- [ ] 完成 `cargo test --locked --test probe --test strm_probe`、格式检查、相关 Clippy、
+- [x] 已有 sidecar 损坏时原文件保持不变，任务返回有界的失败状态，不记录完整 URL 或文件内容。
+- [x] 通过 STRM/探测/Emby 兼容回归；不改变 schema、插件 RPC 的已有必需字段或 MediaTidy 缓存边界。
+- [x] 完成 `cargo test --locked --test probe --test strm_probe`、格式检查、相关 Clippy、
       `git diff --check`，并更新 `docs/COMPATIBILITY.md`；本机架构记录为 ARM64，未推断 NAS 性能。
 
 依赖：LUX-381。预计文件：`src/application/probe.rs`、`tests/probe.rs`、`tests/strm_probe.rs`、
 `docs/PLUGIN-SDK.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。先增加 sidecar
 保留未知字段、损坏 sidecar 不覆盖和 STRM 字节不变的失败测试，再实现最小合并写回。
+
+结果（2026-10-03）：`writeSidecars` 现在对已有合法 sidecar 做字段级合并，保留 SHA1、章节和
+未知扩展；损坏 sidecar 会拒绝写回并保留原文件；新 sidecar 带有 StrmAssistant 兼容的空
+`Chapters` 数组。新增单元与 STRM 任务回归证明 `.strm` 字节不变、任务失败状态和 Emby
+STRM 合同不变。`cargo build --locked`、`cargo test --locked --all-targets -- --test-threads=1`
+（697 个库测试、全部可运行集成目标）、`cargo fmt --all -- --check`、全目标 Clippy 和
+`git diff --check` 通过；本机 `uname -m=arm64`。尚未以真实 MediaTidy 实例证明远程缓存命中。
 
 #### 阶段 23 总体验收与阶段门
 
