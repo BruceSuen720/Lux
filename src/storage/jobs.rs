@@ -8,6 +8,7 @@ const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+pub(crate) const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
 // Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
 const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
 const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
@@ -10858,6 +10859,11 @@ impl Database {
         if source_pairs.is_empty() {
             return Ok(true);
         }
+        if source_pairs.len() > MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE {
+            return Err(StorageError::Conflict(
+                "media source delete batch is too large".to_owned(),
+            ));
+        }
         let source_placeholders = std::iter::repeat_n("?", source_pairs.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -10909,19 +10915,25 @@ impl Database {
             }
         }
 
+        let delete_predicates = std::iter::repeat_n("(id = ? AND item_id = ?)", source_pairs.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
         let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM media_sources WHERE id IN ({source_placeholders})"
+            "DELETE FROM media_sources WHERE {delete_predicates}"
         )));
-        for (_, source_id) in source_pairs {
-            delete_query = delete_query.bind(source_id);
+        for (item_id, source_id) in source_pairs {
+            delete_query = delete_query.bind(source_id).bind(item_id);
         }
-        delete_query
+        let deleted = delete_query
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
+        if usize::try_from(deleted.rows_affected()).unwrap_or(usize::MAX) != source_pairs.len() {
+            return Ok(false);
+        }
         self.mark_media_items_removed_in_transaction(&mut transaction, &item_ids)
             .await?;
         self.mark_media_items_removed_in_transaction(&mut transaction, &parent_ids)
@@ -10979,8 +10991,9 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
+        Database, MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE, NewScanManifest, NewScanManifestDelta,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
+        prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
 
@@ -11511,6 +11524,14 @@ mod tests {
                 .fetch_one(database.pool())
                 .await?,
             2
+        );
+        database.reset_query_count();
+        let oversized = vec![("item", "source-a"); MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE + 1];
+        assert!(database.delete_media_sources(&oversized).await.is_err());
+        assert_eq!(
+            database.query_count(),
+            0,
+            "oversized batches fail before SQL"
         );
 
         database.reset_query_count();
