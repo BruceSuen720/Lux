@@ -8431,6 +8431,32 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_metadata_reidentify_jobs_for_activity(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
+        self.query(
+            "SELECT id, status, processed_count, total_count, error,
+                    created_at, updated_at, started_at, finished_at, mode,
+                    cancel_requested, library_id, job_scope, 0 AS pending_count
+             FROM metadata_reidentify_jobs
+             WHERE status IN ('QUEUED', 'RUNNING')
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(stored_metadata_reidentify_job)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_current_metadata_reidentify_items(
         &self,
         job_ids: &[String],
