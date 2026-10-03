@@ -93,15 +93,44 @@ fn sanitize_plugin_route_query(raw_query: &str) -> Option<String> {
     let query = raw_query
         .split('&')
         .filter(|part| {
-            let key = part.split('=').next().unwrap_or_default();
+            let key = url::form_urlencoded::parse(part.as_bytes())
+                .next()
+                .map(|(key, _)| key.to_ascii_lowercase())
+                .unwrap_or_else(|| {
+                    part.split('=')
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                });
             !matches!(
-                key.to_ascii_lowercase().as_str(),
-                "api_key" | "apikey" | "x-emby-token" | "x-mediabrowser-token" | "authorization"
+                key.as_str(),
+                "api_key"
+                    | "apikey"
+                    | "x-emby-token"
+                    | "x-mediabrowser-token"
+                    | "x-media-browser-token"
+                    | "x-emby-authorization"
+                    | "authorization"
             )
         })
         .collect::<Vec<_>>()
         .join("&");
     (!query.is_empty()).then_some(query)
+}
+
+#[cfg(test)]
+mod emby_route_tests {
+    use super::sanitize_plugin_route_query;
+
+    #[test]
+    fn removes_plain_and_percent_encoded_auth_query_keys() {
+        assert_eq!(
+            sanitize_plugin_route_query(
+                "Path=%2Fprobe.strm&api_key=secret&%61pi_key=encoded&Authorization=token"
+            ),
+            Some("Path=%2Fprobe.strm".to_owned())
+        );
+    }
 }
 
 #[derive(Deserialize, Default)]
