@@ -64,7 +64,8 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let movie_dir = media_root.join("Plugin Movie (2024)");
     tokio::fs::create_dir_all(&movie_dir).await?;
     let strm_path = movie_dir.join("Plugin.Movie.2024.strm");
-    tokio::fs::write(&strm_path, "https://media.example.invalid/video.mkv").await?;
+    let original_strm = b"https://media.example.invalid/video.mkv";
+    tokio::fs::write(&strm_path, original_strm).await?;
 
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -148,6 +149,7 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
             .map(Vec::len),
         Some(2)
     );
+    assert_eq!(tokio::fs::read(&strm_path).await?, original_strm);
 
     fs::write(
         &fake_ffmpeg,
@@ -355,6 +357,27 @@ printf '%s' '{"format":{"format_name":"matroska"},"streams":[{"index":0,"codec_t
     .fetch_one(database.pool())
     .await?;
     assert_eq!(overwritten_codec, "h264");
+
+    let sidecar_path = movie_dir.join("Plugin.Movie.2024-mediainfo.json");
+    let malformed_sidecar = b"{not-json";
+    tokio::fs::write(&sidecar_path, malformed_sidecar).await?;
+    let malformed_jobs = service
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: true,
+                write_sidecars: true,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 30,
+            },
+        )
+        .await?;
+    service.run(&malformed_jobs[0].id).await?;
+    assert_eq!(service.get(&malformed_jobs[0].id).await?.status, "FAILED");
+    assert_eq!(tokio::fs::read(&sidecar_path).await?, malformed_sidecar);
+    assert_eq!(tokio::fs::read(&strm_path).await?, original_strm);
     Ok(())
 }
 
