@@ -1,10 +1,108 @@
 use super::*;
 
+use crate::application::plugin_protocol::PluginEmbyRouteRequest;
 use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{Reader, escape::unescape, events::Event};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::domain::ids::UserId;
+
+pub(super) async fn emby_sync_media_info(
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if let Err(status) = require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        return status.into_response();
+    }
+    let Some(plugins) = state.plugins.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let path = "/Items/SyncMediaInfo";
+    let target = match plugins.emby_route_target("POST", path).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let route_request = PluginEmbyRouteRequest {
+        method: "POST".to_owned(),
+        path: path.to_owned(),
+        query: raw_query.as_deref().and_then(sanitize_plugin_route_query),
+        headers: filtered_plugin_route_headers(&headers),
+        body_base64: BASE64.encode(&body),
+    };
+    let route_response = match plugins.call_emby_route(&target, route_request).await {
+        Ok(response) => response,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let body = match BASE64.decode(route_response.body_base64) {
+        Ok(body) => body,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let status = match StatusCode::from_u16(route_response.status_code) {
+        Ok(status) => status,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut response = Response::builder().status(status);
+    for (name, value) in route_response.headers {
+        if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "cache-control" | "content-type" | "location"
+        ) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response = response.header(name, value);
+        }
+    }
+    response
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn filtered_plugin_route_headers(
+    headers: &HeaderMap,
+) -> std::collections::BTreeMap<String, String> {
+    const ALLOWED: &[&str] = &[
+        "accept",
+        "content-type",
+        "user-agent",
+        "x-emby-client",
+        "x-emby-device-id",
+        "x-emby-device-name",
+        "x-emby-version",
+    ];
+    ALLOWED
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ((*name).to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn sanitize_plugin_route_query(raw_query: &str) -> Option<String> {
+    let query = raw_query
+        .split('&')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or_default();
+            !matches!(
+                key.to_ascii_lowercase().as_str(),
+                "api_key" | "apikey" | "x-emby-token" | "x-mediabrowser-token" | "authorization"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    (!query.is_empty()).then_some(query)
+}
 
 #[derive(Deserialize, Default)]
 pub(super) struct DanmakuQuery {

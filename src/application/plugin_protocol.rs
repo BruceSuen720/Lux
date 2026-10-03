@@ -536,7 +536,10 @@ impl PluginEmbyRoute {
     fn validate(&self) -> Result<(), PluginManifestError> {
         let method = self.method.to_ascii_uppercase();
         if method != self.method
-            || !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD")
+            || !matches!(
+                method.as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"
+            )
         {
             return Err(PluginManifestError::Invalid(
                 "Emby route method must be an uppercase HTTP method".to_owned(),

@@ -7,9 +7,9 @@ use luxd::application::plugin_protocol::{
     LoginBackgroundRpcResult, LoginBackgroundRpcValidationError, MediaProbeRpcResult,
     PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
     PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR,
-    PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginManifest,
-    PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginRequest, STRM_RESOLVE_CAPABILITY,
-    StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+    PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER,
+    PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginManifest, PluginRequest,
+    STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
 };
 use serde_json::{Value, json};
 

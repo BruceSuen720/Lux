@@ -38,6 +38,20 @@ LUX-382 已实现 sidecar 写回只更新 Lux 管理的 `MediaSourceInfo` 和当
 语义，且既有字段、损坏文件保护和 STRM 字节不变。真实 MediaTidy 请求路径已在本机授权实例
 和隔离假 Emby 上记录；假 Emby 未实现神医插件专用响应，因此没有宣称真实缓存命中。
 
+## LUX-384 MediaTidy 神医探测路由（2026-10-03）
+
+Lux 不在主程序中实现神医、SHA1、FF 缓存或远程缓存。`org.lux.strm-media-info` 通过
+Plugin SDK 的 `embyRoutes` 注册精确的 `POST /Items/SyncMediaInfo`，宿主同时提供根路径和
+`/emby` 前缀。已安装且启用插件时，该探测 RPC 返回 HTTP 400；插件未安装或被禁用时返回
+404。路由请求只传递有界 body、脱敏后的非认证头和去除认证参数的 query，不把 Emby token、
+Authorization、Cookie 或完整 URL 交给插件。
+
+自动化证据：`tests/plugin_protocol.rs` 36 项、`tests/plugins.rs` 9 项和
+`tests/emby_auth.rs` 8 项通过；集成测试覆盖 404→400→404 状态变化和认证字段脱敏。
+Lux-plugins 的 STRM 插件库测试 43 项、构建和直接 `emby.sync_media_info` RPC 也通过。
+截至本记录，尚未用已登录的本机 MediaTidy 调用其 `testEmby` 完成最终真机验证，不能据此
+宣称 MediaTidy 检测或 FF 缓存命中已完成。
+
 ## Emby 用户列表与登录兼容（2026-09-29）
 
 Lux 保持 Emby `UserDto.Name` 为账户显示名。`POST /Users/AuthenticateByName` 首先按规范登录用户名验证；若该用户名
