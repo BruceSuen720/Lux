@@ -223,12 +223,12 @@ impl PeopleService {
             let Some(person) = enriched.person.clone() else {
                 continue;
             };
-            let merged = stored_actor
-                .person
-                .take()
+            let previous = stored_actor.person.clone();
+            let merged = previous
+                .clone()
                 .unwrap_or_default()
                 .supplement_missing_from(person);
-            if stored_actor.person.as_ref() != Some(&merged) {
+            if previous.as_ref() != Some(&merged) {
                 stored_actor.person = Some(merged);
                 changed_indices.push(index);
             }

@@ -52,6 +52,7 @@ const CAPABILITY_CREDITS: &str = "CREDITS";
 const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
+const COMPLETENESS_INPUT_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataRequestPlan {
@@ -166,8 +167,67 @@ fn metadata_completeness_fingerprint(
     actual_plan: MetadataRequestPlan,
     requestable_plan: MetadataRequestPlan,
 ) -> Vec<u8> {
-    let input = format!("{item_id}\n{current:?}\n{actual_plan:?}\n{requestable_plan:?}");
-    Sha256::digest(input.as_bytes()).to_vec()
+    let input = json!({
+        "version": COMPLETENESS_INPUT_VERSION,
+        "itemId": item_id,
+        "current": {
+            "itemType": current.item_type,
+            "title": current.title,
+            "originalTitle": current.original_title,
+            "overview": current.overview,
+            "productionYear": current.production_year,
+            "premiereDate": current.premiere_date,
+            "lastAirDate": current.last_air_date,
+            "status": current.status,
+            "originalLanguage": current.original_language,
+            "rating": current.rating,
+            "providerIds": normalized_json(current.provider_ids_json.as_deref()),
+            "metadataScraperId": current.metadata_scraper_id,
+            "scraperId": current.scraper_id,
+            "identificationStatus": current.identification_status,
+            "provenance": normalized_json(current.provenance_json.as_deref()),
+            "lockedFields": normalized_json(current.locked_fields_json.as_deref()),
+            "nfoMetadata": normalized_json(current.nfo_metadata_json.as_deref()),
+            "seriesItemId": current.series_item_id,
+            "seriesTitle": current.series_title,
+            "seriesProductionYear": current.series_production_year,
+            "seriesProviderName": current.series_provider_name,
+            "seriesProviderId": current.series_provider_id,
+            "seasonNumber": current.season_number,
+            "episodeNumber": current.episode_number,
+        },
+        "actualPlan": request_plan_json(actual_plan),
+        "requestablePlan": request_plan_json(requestable_plan),
+    });
+    let serialized = serde_json::to_vec(&input).unwrap_or_default();
+    Sha256::digest(&serialized).to_vec()
+}
+
+fn normalized_json(value: Option<&str>) -> Value {
+    value
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn request_plan_json(plan: MetadataRequestPlan) -> Value {
+    json!({
+        "needsMetadata": plan.needs_metadata,
+        "needsImages": plan.needs_images,
+        "needsCredits": plan.needs_credits,
+        "needsExternalIds": plan.needs_external_ids,
+        "needsTrailers": plan.needs_trailers,
+        "imagePolicy": plan.image_policy.map(|policy| json!({
+            "poster": policy.poster,
+            "artwork": policy.artwork,
+            "banner": policy.banner,
+            "logo": policy.logo,
+            "thumbnail": policy.thumbnail,
+            "disc": policy.disc,
+            "wallpaper": policy.wallpaper,
+            "thumbnailScrapingMode": format!("{:?}", policy.thumbnail_scraping_mode),
+        })),
+        "missingImageMask": plan.missing_image_mask,
+    })
 }
 
 fn metadata_request_plan_has_work(plan: MetadataRequestPlan) -> bool {
