@@ -1294,3 +1294,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个已安装的 STRM resolver 插件，并检查 resolver 可用性。旧实现对每个 resolver 分别读取 `installed_plugins`，共 2 次 storage SQL 调用；新实现收集 resolver ID 后执行 1 次有界批量查询，减少 1 次（50%）。动态插件视图、可用性过滤和 resolver 顺序保持不变。
 
 计数来自 SQLite storage 查询计数器，只衡量安装状态读取的 SQL 调用数，不代表插件配置文件解析、resolver RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-374 旧章节插件库选择迁移调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个可分配剧集库、一个电影库、一个已有章节源库和一个重复 ID，并运行旧章节插件的 `libraryIds` 迁移。旧实现对每个配置 ID执行完整 `find_library`，再对两个可分配库执行 `update_library_settings`，共 10 次 storage SQL 调用；新实现先读取一次插件状态，再用一个有界条件 UPDATE 为两个未分配章节源的库写入，共 2 次，减少 8 次（80%）。
+
+条件更新只命中存在、非电影且 `chapter_source_id IS NULL` 的库；计数来自 SQLite storage 查询计数器，不代表迁移墙钟、PostgreSQL、NAS 或生产收益。

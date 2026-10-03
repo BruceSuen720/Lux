@@ -1759,34 +1759,17 @@ impl PluginService {
             let Some(library_ids) = values.get("libraryIds").and_then(Value::as_array) else {
                 continue;
             };
-            for library_id in library_ids.iter().filter_map(Value::as_str) {
-                let Some(library) = self.database.find_library(library_id).await? else {
-                    continue;
-                };
-                if library.kind == "MOVIE" || library.chapter_source_id.is_some() {
-                    continue;
-                }
-                self.database
-                    .update_library_settings(
-                        library_id,
-                        crate::storage::LibrarySettingsUpdate {
-                            name: None,
-                            kind: None,
-                            is_enabled: None,
-                            realtime_watch_enabled: None,
-                            realtime_metadata_auto_match_enabled: None,
-                            reconciliation_schedule: None,
-                            metadata_schedule: None,
-                            scan_concurrency: None,
-                            probe_concurrency: None,
-                            scraper_id: None,
-                            scrapers: None,
-                            chapter_source_id: Some(Some(&plugin.manifest.id)),
-                            media_strategy_json: None,
-                        },
-                    )
-                    .await?;
-            }
+            let mut library_ids = library_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|library_id| !library_id.trim().is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            library_ids.sort_unstable();
+            library_ids.dedup();
+            self.database
+                .assign_chapter_source_to_unassigned_libraries(&plugin.manifest.id, &library_ids)
+                .await?;
         }
         Ok(())
     }
@@ -3859,6 +3842,106 @@ mod plugin_discovery_tests {
             1,
             "resolver availability should batch installation status reads"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_chapter_selection_migration_batches_library_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-chapter-detector";
+
+        let root = tempdir()?;
+        let config_dir = root.path().join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
+        tokio::fs::create_dir_all(&plugin_dir).await?;
+        tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+        tokio::fs::write(
+            config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": PLUGIN_ID,
+                "name": "Test chapter detector",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "chapter_detector",
+                "category": "MEDIA",
+                "supportedMediaSourceKinds": ["LOCAL_FILE"],
+                "capabilities": ["chapters.detect"],
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let first = libraries
+            .create_library("Series one", LibraryKind::Series, false)
+            .await?;
+        let second = libraries
+            .create_library("Series two", LibraryKind::Series, false)
+            .await?;
+        let movie = libraries
+            .create_library("Movie", LibraryKind::Movie, false)
+            .await?;
+        let assigned = libraries
+            .create_library("Already assigned", LibraryKind::Series, false)
+            .await?;
+        sqlx::query("UPDATE libraries SET chapter_source_id = ? WHERE id = ?")
+            .bind("existing-source")
+            .bind(assigned.id.to_string())
+            .execute(database.pool())
+            .await?;
+        tokio::fs::create_dir_all(config_dir.join("plugin-config")).await?;
+        tokio::fs::write(
+            config_dir.join(format!("plugin-config/{PLUGIN_ID}.json")),
+            serde_json::to_vec(&json!({
+                "libraryIds": [
+                    first.id.to_string(),
+                    second.id.to_string(),
+                    movie.id.to_string(),
+                    assigned.id.to_string(),
+                    first.id.to_string()
+                ]
+            }))?,
+        )
+        .await?;
+
+        let service = PluginService::new(database.clone(), config_dir);
+        service.install(PLUGIN_ID).await?;
+
+        database.reset_query_count();
+        service.migrate_legacy_chapter_source_selections().await?;
+        assert_eq!(
+            database.query_count(),
+            2,
+            "legacy chapter migration should batch library source updates"
+        );
+        for library_id in [first.id, second.id] {
+            let source: Option<String> =
+                sqlx::query_scalar("SELECT chapter_source_id FROM libraries WHERE id = ?")
+                    .bind(library_id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            assert_eq!(source.as_deref(), Some(PLUGIN_ID));
+        }
+        let movie_source: Option<String> =
+            sqlx::query_scalar("SELECT chapter_source_id FROM libraries WHERE id = ?")
+                .bind(movie.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert!(movie_source.is_none());
+        let assigned_source: Option<String> =
+            sqlx::query_scalar("SELECT chapter_source_id FROM libraries WHERE id = ?")
+                .bind(assigned.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(assigned_source.as_deref(), Some("existing-source"));
         Ok(())
     }
 }

@@ -8191,6 +8191,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：两个已安装 STRM resolver 的可用性检查由 2 次逐插件 `installed_plugins` 查询降为 1 次批量查询；动态视图与 resolver 返回顺序保持不变。`application::plugins::plugin_discovery_tests::strm_resolver_availability_reads_installation_statuses_once` 与 STRM resolver 集成回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-374：批量迁移旧章节插件媒体库选择
+
+范围：旧章节插件配置迁移对每个 `libraryIds` 分别读取完整媒体库（连同 scraper 关联），再逐库开启事务写入 `chapter_source_id`。将同一插件的库 ID 去重后按最多 100 个一批，在一个有界事务中只为存在、非电影且尚未分配章节源的库写入当前插件；保留插件优先级、无效/重复 ID、电影库和已有章节源的跳过语义，不改变章节任务或公共 API 合同。
+
+验收：
+
+- [x] 一个配置包含两个可分配库、一个电影库、一个已有章节源库和一个重复 ID 时，旧迁移路径的 10 次 storage SQL 调用降为 2 次（插件状态读取和一次批量条件更新）。
+- [x] 不存在库、电影库、已有章节源、重复 ID 和多个插件的优先级语义保持不变。
+- [x] 章节检测、计划任务、插件服务和存储回归通过；不改变 schema、插件协议或章节任务状态机。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断迁移墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-373。预计文件：`src/storage/library.rs`、`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加旧配置迁移的查询计数回归，再替换逐库读取和写入。
+
+结果（2026-10-03）：旧迁移对包含两个可分配库、一个电影库、一个已有章节源库和一个重复 ID 的配置执行 10 次 SQL；新路径只执行一次插件状态读取和一次有界条件 UPDATE，共 2 次，减少 8 次（80%），且在同一插件内去重 ID、跨插件按既有排序保留先到先得。插件私有回归、章节检测/API、scheduled tasks、plugins、库级 Clippy 与格式检查通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

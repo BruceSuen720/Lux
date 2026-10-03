@@ -687,6 +687,54 @@ impl Database {
         }))
     }
 
+    pub(crate) async fn assign_chapter_source_to_unassigned_libraries(
+        &self,
+        plugin_id: &str,
+        library_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if library_ids.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for chunk in library_ids.chunks(100) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE libraries
+                 SET chapter_source_id = ?, updated_at = unixepoch()
+                 WHERE kind <> 'MOVIE'
+                   AND chapter_source_id IS NULL
+                   AND id IN ({placeholders})"
+            )));
+            query = query.bind(plugin_id);
+            for library_id in chunk {
+                query = query.bind(library_id);
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn register_auto_library_cover_task(
         &self,
         library_id: &str,
