@@ -1283,7 +1283,114 @@ fn rewrite_rich_nfo(
         }
         buffer.clear();
     }
-    Ok(writer.into_inner())
+    let rewritten = writer.into_inner();
+    if !original.is_empty()
+        && nfo_semantic_fingerprint(original)? == nfo_semantic_fingerprint(&rewritten)?
+    {
+        return Ok(original.to_vec());
+    }
+    Ok(rewritten)
+}
+
+fn nfo_semantic_fingerprint(bytes: &[u8]) -> Result<Vec<u8>, NfoWriteError> {
+    let projection = parse_local_nfo_projection(bytes)
+        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+    let root = nfo_root_tag(bytes)?;
+    let images = nfo_image_projection(bytes)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-NFO-SEMANTIC-1\0");
+    hasher.update(format!("{root:?}|{projection:?}|{images:?}").as_bytes());
+    Ok(hasher.finalize().to_vec())
+}
+
+fn nfo_root_tag(bytes: &[u8]) -> Result<String, NfoWriteError> {
+    let mut reader = Reader::from_reader(bytes);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event)) => {
+                return String::from_utf8(event.name().as_ref().to_vec())
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()));
+            }
+            Ok(Event::Eof) => {
+                return Err(NfoWriteError::InvalidXml(
+                    "NFO document does not contain a root element".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+}
+
+fn nfo_image_projection(bytes: &[u8]) -> Result<Vec<(String, String, String)>, NfoWriteError> {
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut active: Option<(usize, String, String, String)> = None;
+    let mut images = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                depth = depth.saturating_add(1);
+                let tag = event.name();
+                let tag = tag.as_ref();
+                if (depth == 2 && tag == b"thumb") || (depth == 3 && tag == b"thumb") {
+                    let kind = if depth == 3 { "fanart" } else { "thumb" };
+                    let aspect = attribute_value_bytes(&event, b"aspect")?.unwrap_or_default();
+                    active = Some((depth, kind.to_owned(), aspect, String::new()));
+                }
+            }
+            Ok(Event::Text(event)) if active.as_ref().is_some_and(|item| item.0 == depth) => {
+                if let Some(item) = active.as_mut() {
+                    let decoded = event
+                        .decode()
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    item.3.push_str(
+                        &unescape(decoded.as_ref())
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?,
+                    );
+                }
+            }
+            Ok(Event::End(_event)) => {
+                if active.as_ref().is_some_and(|item| item.0 == depth) {
+                    if let Some((_, kind, aspect, value)) = active.take() {
+                        if !value.trim().is_empty() {
+                            images.push((kind, aspect, value.trim().to_owned()));
+                        }
+                    }
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+    images.sort();
+    Ok(images)
+}
+
+fn attribute_value_bytes(
+    event: &BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<String>, NfoWriteError> {
+    for attribute in event.attributes().with_checks(false) {
+        let attribute = attribute.map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+        if attribute.key.as_ref() == name {
+            return attribute
+                .unescape_value()
+                .map(|value| Some(value.into_owned()))
+                .map_err(|error| NfoWriteError::InvalidXml(error.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn rich_root_tag(tag: &[u8]) -> bool {
