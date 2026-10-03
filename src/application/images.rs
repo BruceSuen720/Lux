@@ -129,8 +129,12 @@ pub(crate) fn register_internal_image_write(path: &Path) {
     crate::application::internal_write::register(path);
 }
 
-fn finalize_internal_image_write(path: &Path, expected_stamp: Option<ImageFileStamp>) {
-    crate::application::internal_write::finalize(path, expected_stamp);
+fn finalize_internal_image_write(
+    path: &Path,
+    expected_stamp: Option<ImageFileStamp>,
+    content: &[u8],
+) {
+    crate::application::internal_write::finalize(path, expected_stamp, content);
 }
 
 pub(crate) async fn should_suppress_internal_image_write(path: &Path) -> bool {
@@ -2211,7 +2215,7 @@ pub async fn write_image_atomically(target: &Path, bytes: &[u8]) -> Result<(), I
             .sync_all()
             .await
             .map_err(|source| image_io_error(parent, source))?;
-        finalize_internal_image_write(target, image_file_stamp(target).await.ok().flatten());
+        finalize_internal_image_write(target, image_file_stamp(target).await.ok().flatten(), bytes);
         Ok(())
     }
     .await;

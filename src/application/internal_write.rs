@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
+
 const INTERNAL_WRITE_MARKER_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,6 +19,7 @@ pub(crate) struct FileStamp {
 struct Marker {
     expires_at: Instant,
     expected_stamp: Option<FileStamp>,
+    expected_content: Option<[u8; 32]>,
 }
 
 static MARKERS: OnceLock<StdMutex<HashMap<PathBuf, Marker>>> = OnceLock::new();
@@ -36,11 +39,12 @@ pub(crate) fn register(path: &Path) {
         Marker {
             expires_at: now + INTERNAL_WRITE_MARKER_TTL,
             expected_stamp: None,
+            expected_content: None,
         },
     );
 }
 
-pub(crate) fn finalize(path: &Path, expected_stamp: Option<FileStamp>) {
+pub(crate) fn finalize(path: &Path, expected_stamp: Option<FileStamp>, content: &[u8]) {
     let now = Instant::now();
     let mut markers = registry()
         .lock()
@@ -48,6 +52,7 @@ pub(crate) fn finalize(path: &Path, expected_stamp: Option<FileStamp>) {
     markers.retain(|_, marker| marker.expires_at > now);
     if let Some(marker) = markers.get_mut(path) {
         marker.expected_stamp = expected_stamp;
+        marker.expected_content = Some(content_fingerprint(content));
     }
 }
 
@@ -66,7 +71,9 @@ pub(crate) async fn should_suppress(path: &Path) -> bool {
     let Some(expected_stamp) = marker.expected_stamp else {
         return true;
     };
-    if file_stamp(path).await.ok().flatten() == Some(expected_stamp) {
+    if file_stamp(path).await.ok().flatten() == Some(expected_stamp)
+        && marker.expected_content == read_content_fingerprint(path).await.ok().flatten()
+    {
         return true;
     }
 
@@ -77,6 +84,18 @@ pub(crate) async fn should_suppress(path: &Path) -> bool {
         markers.remove(path);
     }
     false
+}
+
+fn content_fingerprint(content: &[u8]) -> [u8; 32] {
+    Sha256::digest(content).into()
+}
+
+async fn read_content_fingerprint(path: &Path) -> std::io::Result<Option<[u8; 32]>> {
+    match tokio::fs::read(path).await {
+        Ok(content) => Ok(Some(content_fingerprint(&content))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) async fn file_stamp(path: &Path) -> std::io::Result<Option<FileStamp>> {
@@ -104,6 +123,34 @@ mod tests {
     use super::{finalize, register, should_suppress};
 
     #[tokio::test]
+    async fn external_content_with_restored_stamp_is_not_suppressed() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let target = root.path().join("movie.nfo");
+        tokio::fs::write(&target, b"internal").await.expect("write");
+        let modified = std::fs::metadata(&target)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        register(&target);
+        finalize(
+            &target,
+            super::file_stamp(&target).await.expect("stamp"),
+            b"internal",
+        );
+        assert!(should_suppress(&target).await);
+        tokio::fs::write(&target, b"external")
+            .await
+            .expect("external write");
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .expect("open")
+            .set_modified(modified)
+            .expect("restore mtime");
+        assert!(!should_suppress(&target).await);
+    }
+
+    #[tokio::test]
     async fn temporary_marker_is_suppressed_and_external_update_invalidates_target() {
         let root = tempfile::tempdir().expect("temporary root");
         let temporary = root.path().join(".lux-write.tmp");
@@ -122,6 +169,7 @@ mod tests {
                 .expect("stamp")
                 .as_ref()
                 .copied(),
+            b"internal",
         );
         assert!(should_suppress(&target).await);
         tokio::fs::write(&target, b"external change")
