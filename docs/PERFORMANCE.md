@@ -1312,3 +1312,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中注册 205 个唯一 `LIBRARY` task owner，并额外传入 1 个重复 owner。旧实现逐 owner upsert，共 206 次 storage SQL 调用；新实现先去重，再按 100/100/5 三批多行 upsert，共 3 次，减少 203 次（约 98.5%）。
 
 计数来自 SQLite storage 查询计数器，只衡量 owner 配置写入 SQL 调用数，不代表 Manifest 同步墙钟、GLOBAL 计划镜像、PostgreSQL、NAS 或生产收益。
+
+### LUX-377 弹幕多媒体库任务创建调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中配置两个媒体库并创建弹幕匹配任务。旧实现每个库重复读取弹幕配置、媒体库选项、插件状态和动态可用性，共 26 次 storage SQL 调用；新实现复用一次设置读取和一次可用性检查，共 19 次，减少 7 次（约 26.9%）。每库任务仍独立写入并回读。
+
+计数来自 SQLite storage 查询计数器，只衡量任务创建路径的 SQL 调用数，不代表配置文件解析、插件 RPC、PostgreSQL、NAS 或生产收益。
