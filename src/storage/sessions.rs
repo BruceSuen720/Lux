@@ -690,29 +690,9 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let mut expired = Vec::with_capacity(rows.len());
-        for row in rows {
-            let session = stored_web_playback_session(row);
-            let updated = self
-                .query(
-                    "UPDATE web_playback_sessions
-                     SET state = 'STOPPED', updated_at = ?
-                     WHERE id = ? AND state = 'ACTIVE' AND expires_at < ?",
-                )
-                .bind(now)
-                .bind(&session.id)
-                .bind(now)
-                .execute(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            if updated.rows_affected() == 1 {
-                expired.push(session);
-            }
-        }
-        Ok(expired)
+        let sessions = rows.into_iter().map(stored_web_playback_session).collect();
+        self.stop_web_playback_sessions(sessions, now, "expires_at < ?", now)
+            .await
     }
 
     pub(crate) async fn take_inactive_web_playback_sessions(
@@ -739,30 +719,54 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let mut inactive = Vec::with_capacity(rows.len());
-        for row in rows {
-            let session = stored_web_playback_session(row);
-            let updated = self
-                .query(
-                    "UPDATE web_playback_sessions
-                     SET state = 'STOPPED', updated_at = ?
-                     WHERE id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'
-                       AND last_heartbeat_at < ?",
-                )
-                .bind(now)
-                .bind(&session.id)
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            if updated.rows_affected() == 1 {
-                inactive.push(session);
-            }
+        let sessions = rows.into_iter().map(stored_web_playback_session).collect();
+        self.stop_web_playback_sessions(
+            sessions,
+            now,
+            "plan = 'SERVER_HLS' AND last_heartbeat_at < ?",
+            cutoff,
+        )
+        .await
+    }
+
+    async fn stop_web_playback_sessions(
+        &self,
+        sessions: Vec<StoredWebPlaybackSession>,
+        now: i64,
+        predicate: &str,
+        predicate_value: i64,
+    ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(inactive)
+        let placeholders = std::iter::repeat_n("?", sessions.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut update = self.query(sqlx::AssertSqlSafe(format!(
+            "UPDATE web_playback_sessions
+             SET state = 'STOPPED', updated_at = ?
+             WHERE id IN ({placeholders}) AND state = 'ACTIVE' AND {predicate}
+             RETURNING id"
+        )));
+        update = update.bind(now);
+        for session in &sessions {
+            update = update.bind(&session.id);
+        }
+        let stopped_ids = update
+            .bind(predicate_value)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect::<HashSet<_>>();
+        Ok(sessions
+            .into_iter()
+            .filter(|session| stopped_ids.contains(&session.id))
+            .collect())
     }
 
     pub(crate) async fn set_web_playback_temp_dir(

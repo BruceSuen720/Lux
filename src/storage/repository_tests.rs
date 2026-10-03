@@ -11776,6 +11776,86 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
 }
 
 #[tokio::test]
+async fn web_playback_cleanup_updates_each_kind_in_one_statement() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let setup = SetupService::new(database.clone()).expect("setup service");
+    setup
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("user");
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback cleanup batch", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback cleanup batch',
+                       'playback cleanup batch', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    for prefix in ["expired", "inactive"] {
+        for index in 0..3 {
+            let id = format!("{prefix}-session-{index}");
+            database
+                .insert_web_playback_session(NewWebPlaybackSession {
+                    id: &id,
+                    user_id: &user_id,
+                    item_id: &item_id,
+                    media_source_id: None,
+                    play_session_id: &format!("lux-web:{id}"),
+                    tier: 1,
+                    plan: "SERVER_HLS",
+                    temp_dir: None,
+                    is_admin: true,
+                    expires_at: if prefix == "expired" { 99 } else { 10_000 },
+                    now: 1_000,
+                })
+                .await
+                .expect("web playback session");
+        }
+    }
+    sqlx::query(
+        "UPDATE web_playback_sessions
+         SET last_heartbeat_at = 900
+         WHERE id LIKE 'inactive-session-%'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("inactive heartbeat");
+
+    database.reset_query_count();
+    let expired = database
+        .take_expired_web_playback_sessions(1_000)
+        .await
+        .expect("expired sessions");
+    assert_eq!(expired.len(), 3);
+    assert_eq!(database.query_count(), 2);
+
+    database.reset_query_count();
+    let inactive = database
+        .take_inactive_web_playback_sessions(1_000, 90)
+        .await
+        .expect("inactive sessions");
+    assert_eq!(inactive.len(), 3);
+    assert_eq!(database.query_count(), 2);
+}
+
+#[tokio::test]
 async fn user_updates_wait_for_a_concurrent_sqlite_writer() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
