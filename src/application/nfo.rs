@@ -2394,13 +2394,7 @@ impl NfoWriteService {
             .await
             .map_err(|error| io_error(&target, error))?;
         self.database
-            .invalidate_media_item_nfo_metadata_if_source_changed(
-                item_id,
-                &write.content_fingerprint,
-            )
-            .await?;
-        self.database
-            .mark_media_item_metadata_checked(item_id, &fingerprint)
+            .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
             .await?;
         Ok(NfoWriteReport {
             path: target,
