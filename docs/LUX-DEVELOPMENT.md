@@ -8352,6 +8352,30 @@ STRM 合同不变。`cargo build --locked`、`cargo test --locked --all-targets 
 （697 个库测试、全部可运行集成目标）、`cargo fmt --all -- --check`、全目标 Clippy 和
 `git diff --check` 通过；本机 `uname -m=arm64`。尚未以真实 MediaTidy 实例证明远程缓存命中。
 
+#### LUX-383：StrmAssistant 播放源字段旁车投影
+
+范围：在已有 LUX-382 sidecar 合并策略上，为新生成的 `MediaSourceInfo` 补齐
+StrmAssistant/Emby 使用的播放源字段：`Protocol`、`Type`、`IsRemote`、直放/转码能力、
+`Formats`、`RequiredHttpHeaders`、`IsInfiniteStream`、`Requires*`、`SupportsProbing`、
+`ReadAtNativeFramerate` 和 `AddApiKeyToDirectStreamUrl`。字段只根据已经读取的 STRM 目标
+进行词法分类，不访问目标、不计算 SHA1、不写入 STRM，不写入 `Id`、`ItemId` 或 `Path`。
+
+URL 型目标使用 HTTP/远程语义，路径型目标使用 File/本地语义；现有 sidecar 的未知字段、
+章节、SHA1 和扩展字段继续保留。MediaTidy 的缓存查询、上传和同步不属于本任务。
+
+验收：
+
+- [ ] 新 sidecar 的 `MediaSourceInfo` 具备 StrmAssistant 播放源字段，字段类型与 Emby DTO 一致。
+- [ ] URL/路径型目标的 `Protocol`、`IsRemote` 和能力位与 Lux Emby `MediaSources[]` 保持一致。
+- [ ] sidecar 不出现内部条目 ID、媒体源 ID、原始 `Path` 或认证信息。
+- [ ] 既有 sidecar 合并、损坏文件保护、STRM 字节不变和现有 Emby 回归不变。
+- [ ] 完成 `cargo test --locked --test strm_probe --test strm --test probe`、全目标 Clippy、
+      格式检查和 `git diff --check`；本机架构记录为 ARM64。
+
+依赖：LUX-382。预计文件：`src/application/probe.rs`、`src/application/strm_probe.rs`、
+`tests/strm_probe.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。先增加 URL 型
+旁车字段失败测试，再实现目标分类到旁车字段的最小投影。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

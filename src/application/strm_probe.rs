@@ -16,6 +16,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    application::strm_target::{StrmTargetKind, classify_strm_target},
     application::{
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
@@ -26,7 +27,7 @@ use crate::{
             MAX_STRM_THUMBNAIL_POSITION_PERCENT, MIN_STRM_THUMBNAIL_POSITION_PERCENT,
             MediaProbeOutput, PluginService, PluginServiceError,
         },
-        probe::{safe_media_path, write_media_info_sidecar},
+        probe::{MediaInfoSidecarContext, safe_media_path, write_media_info_sidecar_with_context},
         strm_probe_policy::validate_remote_media_url,
         thumbnail_policy::ThumbnailScrapingMode,
     },
@@ -602,6 +603,7 @@ impl StrmProbeService {
                 source.item_id,
                 source.root_path,
                 path,
+                Some(sidecar_context_for_target(&url)),
                 result,
                 media_info_needed,
                 thumbnail_needed,
@@ -672,9 +674,13 @@ impl StrmProbeService {
                 })
                 .await?;
             if job.write_sidecars
-                && write_media_info_sidecar(&outcome.path, &result.media)
-                    .await
-                    .is_err()
+                && write_media_info_sidecar_with_context(
+                    &outcome.path,
+                    &result.media,
+                    outcome.sidecar_context,
+                )
+                .await
+                .is_err()
             {
                 self.database
                     .mark_media_probe_failed(
@@ -1212,6 +1218,7 @@ struct SourceOutcome {
     item_id: String,
     root_path: String,
     path: PathBuf,
+    sidecar_context: Option<MediaInfoSidecarContext>,
     result: Option<MediaProbeOutput>,
     media_info_needed: bool,
     thumbnail_needed: bool,
@@ -1226,6 +1233,7 @@ impl SourceOutcome {
         item_id: String,
         root_path: String,
         path: PathBuf,
+        sidecar_context: Option<MediaInfoSidecarContext>,
         result: MediaProbeOutput,
         media_info_needed: bool,
         thumbnail_needed: bool,
@@ -1235,6 +1243,7 @@ impl SourceOutcome {
             item_id,
             root_path,
             path,
+            sidecar_context,
             result: Some(result),
             skipped: false,
             media_info_needed,
@@ -1250,6 +1259,7 @@ impl SourceOutcome {
             item_id: String::new(),
             root_path: String::new(),
             path: PathBuf::new(),
+            sidecar_context: None,
             result: None,
             skipped: true,
             media_info_needed: false,
@@ -1265,6 +1275,7 @@ impl SourceOutcome {
             item_id: String::new(),
             root_path: String::new(),
             path: PathBuf::new(),
+            sidecar_context: None,
             result: None,
             skipped: false,
             media_info_needed: false,
@@ -1287,6 +1298,26 @@ fn failure_status(error: &PluginServiceError) -> &'static str {
             "TIMEOUT"
         }
         _ => "FAILED",
+    }
+}
+
+fn sidecar_context_for_target(target: &str) -> MediaInfoSidecarContext {
+    match classify_strm_target(target).kind {
+        StrmTargetKind::Url => MediaInfoSidecarContext {
+            protocol: "Http",
+            is_remote: true,
+            supports_transcoding: true,
+        },
+        StrmTargetKind::Path => MediaInfoSidecarContext {
+            protocol: "File",
+            is_remote: false,
+            supports_transcoding: true,
+        },
+        _ => MediaInfoSidecarContext {
+            protocol: "File",
+            is_remote: false,
+            supports_transcoding: false,
+        },
     }
 }
 

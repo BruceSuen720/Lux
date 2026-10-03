@@ -143,6 +143,15 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     let sidecar = tokio::fs::read(movie_dir.join("Plugin.Movie.2024-mediainfo.json")).await?;
     let sidecar: serde_json::Value = serde_json::from_slice(&sidecar)?;
     assert_eq!(sidecar[0]["MediaSourceInfo"]["Container"], "matroska");
+    assert_eq!(sidecar[0]["MediaSourceInfo"]["Protocol"], "Http");
+    assert_eq!(sidecar[0]["MediaSourceInfo"]["Type"], "Default");
+    assert_eq!(sidecar[0]["MediaSourceInfo"]["IsRemote"], true);
+    assert_eq!(sidecar[0]["MediaSourceInfo"]["SupportsDirectPlay"], true);
+    assert_eq!(sidecar[0]["MediaSourceInfo"]["SupportsDirectStream"], true);
+    assert_eq!(sidecar[0]["MediaSourceInfo"]["SupportsTranscoding"], true);
+    assert!(sidecar[0]["MediaSourceInfo"].get("Id").is_none());
+    assert!(sidecar[0]["MediaSourceInfo"].get("ItemId").is_none());
+    assert!(sidecar[0]["MediaSourceInfo"].get("Path").is_none());
     assert_eq!(
         sidecar[0]["MediaSourceInfo"]["MediaStreams"]
             .as_array()
