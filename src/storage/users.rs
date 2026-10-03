@@ -1517,7 +1517,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for (key, value) in [
+        let settings = [
             ("resume_played_percent", percent.to_string()),
             ("resume_min_ticks", min_ticks.to_string()),
             ("media_strategy", media_strategy.to_owned()),
@@ -1529,21 +1529,25 @@ impl Database {
                 "login_background_source",
                 login_background_source.to_owned(),
             ),
-        ] {
-            self.query(
-                "INSERT INTO server_settings (key, value)
-                 VALUES (?, ?)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
-            )
-            .bind(key)
-            .bind(value)
+        ];
+        let values = std::iter::repeat_n("(?, ?)", settings.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO server_settings (key, value)
+             VALUES {values}
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()"
+        )));
+        for (key, value) in settings {
+            statement = statement.bind(key).bind(value);
+        }
+        statement
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        }
         transaction
             .commit()
             .await

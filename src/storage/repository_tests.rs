@@ -9159,6 +9159,53 @@ async fn postgres_metadata_claim_uses_materialized_priorities_and_preserves_grou
 }
 
 #[tokio::test]
+async fn server_settings_are_written_with_one_upsert() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    database.reset_query_count();
+    database
+        .set_server_settings(
+            95,
+            300_000_000,
+            r#"{"thumbnailScrapingMode":"SCRAPER_FIRST"}"#,
+            true,
+            "PLUGIN",
+        )
+        .await?;
+
+    assert_eq!(database.query_count(), 1);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM server_settings
+         WHERE key IN (
+             'resume_played_percent', 'resume_min_ticks', 'media_strategy',
+             'force_admin_library_order', 'login_background_source'
+         )
+         ORDER BY key",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            ("force_admin_library_order".to_owned(), "1".to_owned()),
+            ("login_background_source".to_owned(), "PLUGIN".to_owned()),
+            (
+                "media_strategy".to_owned(),
+                r#"{"thumbnailScrapingMode":"SCRAPER_FIRST"}"#.to_owned()
+            ),
+            ("resume_min_ticks".to_owned(), "300000000".to_owned()),
+            ("resume_played_percent".to_owned(), "95".to_owned()),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()

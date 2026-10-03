@@ -8358,6 +8358,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：无计划任务分页得到的 `StoredScheduledTaskConfig` 直接传入执行分发，移除了每个任务再次 `find_scheduled_task_config` 的重复读取；新增无计划扫描任务回归与 scheduled tasks 5 项回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-385：批量写入服务器设置
+
+范围：管理员保存服务器设置时，当前在同一个事务中对固定的五个 `server_settings` 键逐条执行 UPSERT。改为一次有界的五行参数化 UPSERT，保留键名、值转换、冲突更新、事务边界和管理设置 API 合同，不引入 schema 变化。
+
+验收：
+
+- [x] 一次服务器设置保存由五条逐键 UPSERT 降为一条多行 UPSERT；五个键的值和冲突更新语义保持不变。
+- [x] 单条 SQL 只绑定固定五组值，兼容 SQLite/PostgreSQL，不把外部设置值拼入 SQL 文本。
+- [x] storage 查询计数回归锁定写入调用数；管理设置、登录背景、首页/播放阈值相关回归保持通过。
+- [x] 不改变事务边界、更新时间字段、服务器设置读取接口或公共 API。
+
+依赖：无。预计文件：`src/storage/users.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加固定五键写入计数回归，再收敛为单条多行 UPSERT。
+
+结果（2026-10-03）：服务器设置保存由五条逐键 UPSERT 收敛为一条固定五行参数化 UPSERT，事务和读取语义保持不变。storage 回归验证查询调用从 5 次降为 1 次，并校验五个键的最终值；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
