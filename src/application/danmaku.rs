@@ -34,6 +34,7 @@ const MAX_PROVIDER_BASE_URL_CHARS: usize = 4096;
 const MAX_CONCURRENCY: i64 = 64;
 const MAX_EFFECTIVE_CONCURRENCY: usize = 4;
 const WORK_PAGE_SIZE: i64 = 100;
+const DANMAKU_CANCEL_CHECK_INTERVAL: usize = 8;
 pub const DEFAULT_DANMAKU_CONCURRENCY: i64 = 2;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -652,6 +653,7 @@ impl DanmakuService {
             .await;
         let mut workers: JoinSet<Result<Option<WorkerResult>, StorageError>> = JoinSet::new();
         let mut cancelled = false;
+        let mut items_since_cancel_check = DANMAKU_CANCEL_CHECK_INTERVAL;
 
         loop {
             let items = self
@@ -662,13 +664,16 @@ impl DanmakuService {
                 break;
             }
             for item in items {
-                if self
-                    .database
-                    .danmaku_match_job_cancel_requested(&job.id)
-                    .await?
-                {
-                    cancelled = true;
-                    break;
+                if danmaku_cancel_check_due(items_since_cancel_check) {
+                    if self
+                        .database
+                        .danmaku_match_job_cancel_requested(&job.id)
+                        .await?
+                    {
+                        cancelled = true;
+                        break;
+                    }
+                    items_since_cancel_check = 0;
                 }
                 while workers.len() >= concurrency {
                     self.finish_worker(&job.id, workers.join_next().await)
@@ -710,6 +715,7 @@ impl DanmakuService {
                     .await;
                     Ok(Some(result))
                 });
+                items_since_cancel_check = items_since_cancel_check.saturating_add(1);
             }
             while !workers.is_empty() {
                 self.finish_worker(&job.id, workers.join_next().await)
@@ -894,6 +900,15 @@ fn effective_danmaku_concurrency(configured: i64) -> usize {
     usize::try_from(configured)
         .unwrap_or(1)
         .clamp(1, MAX_EFFECTIVE_CONCURRENCY)
+}
+
+fn danmaku_cancel_check_due(items_since_last_check: usize) -> bool {
+    items_since_last_check >= DANMAKU_CANCEL_CHECK_INTERVAL
+}
+
+#[cfg(test)]
+fn danmaku_cancel_check_count(item_count: usize) -> usize {
+    item_count.div_ceil(DANMAKU_CANCEL_CHECK_INTERVAL)
 }
 
 struct TrackWrite {
@@ -1217,7 +1232,9 @@ fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_danmaku_concurrency, match_file_name_candidates};
+    use super::{
+        danmaku_cancel_check_count, effective_danmaku_concurrency, match_file_name_candidates,
+    };
     use crate::application::{
         libraries::LibraryService,
         plugins::{DANMAKU_PLUGIN_ID, DanmakuSettings},
@@ -1235,6 +1252,15 @@ mod tests {
         assert_eq!(effective_danmaku_concurrency(1), 1);
         assert_eq!(effective_danmaku_concurrency(2), 2);
         assert_eq!(effective_danmaku_concurrency(64), 4);
+    }
+
+    #[test]
+    fn cancellation_checks_start_immediately_and_repeat_every_eight_items() {
+        assert_eq!(danmaku_cancel_check_count(0), 0);
+        assert_eq!(danmaku_cancel_check_count(1), 1);
+        assert_eq!(danmaku_cancel_check_count(8), 1);
+        assert_eq!(danmaku_cancel_check_count(9), 2);
+        assert_eq!(danmaku_cancel_check_count(100), 13);
     }
 
     #[test]
