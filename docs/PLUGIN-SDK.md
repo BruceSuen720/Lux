@@ -462,7 +462,9 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 `MEDIA_PROBE_INVALID_OUTPUT`；错误消息不能包含完整 URL 或 stderr。
 
 媒体探测调用只能由后台 STRM 探测任务触发，不得从播放、PlaybackInfo 或普通用户请求路径触发。Lux 宿主负责并发、超时、取消、重启恢复、任务状态、数据库写入和可选的
-`*-mediainfo.json` 原子写入。`permissions.network` 是能力声明，不替代宿主的出站 URL 安全策略。
+`*-mediainfo.json` 原子写入。写入已有 sidecar 时只更新宿主管理的媒体信息字段，并保留未知字段、章节及外部扩展；`existingInfoPolicy=OVERWRITE`
+表示重新探测并更新这些宿主字段，不表示删除未知字段。已有 sidecar 无法解析时不得覆盖原文件。Lux 不生成或修改 `.strm` 内容，也不在该 RPC 中计算 SHA1。
+`permissions.network` 是能力声明，不替代宿主的出站 URL 安全策略。
 
 ### 通知器调用约定
 

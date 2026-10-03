@@ -14,6 +14,17 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-382 已有 STRM 的 MediaTidy/StrmAssistant 兼容边界（实施中）
+
+Lux 不生成 `.strm`，只读取外部已有文件并把首个非空目标映射到 Emby 媒体源。现有
+`org.lux.strm-media-info` 负责后台媒体探测和可选 `*-mediainfo.json` 写回；MediaTidy
+负责 SHA1、FF 缓存、远程缓存和同步。Lux 不向 STRM 写入 SHA1，也不新增 MediaTidy 专用
+缓存接口。
+
+LUX-382 的实现要求 sidecar 写回只更新 Lux 管理的 `MediaSourceInfo` 和当前媒体流字段，
+保留已有未知字段、章节和扩展字段；损坏 sidecar 不得被覆盖。完成前不能宣称真实
+MediaTidy 缓存命中，仍需在取得授权的可控实例后记录实际请求路径和 payload。
+
 ## Emby 用户列表与登录兼容（2026-09-29）
 
 Lux 保持 Emby `UserDto.Name` 为账户显示名。`POST /Users/AuthenticateByName` 首先按规范登录用户名验证；若该用户名

@@ -8313,6 +8313,38 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：STRM 截图登记从两次逐条 `item_images` upsert 加一次 fallback UPDATE，改为已有批量图片写入中的一条多行 UPSERT 加一次 fallback UPDATE，共 2 次 SQL、1 个事务；storage 回归锁定该边界。`POSTER`、`THUMB` 的路径、尺寸、标签、来源和 fallback 语义保持不变，STRM、scanner 和相关任务回归通过。本机 `uname -m=arm64`，未实测插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
 
+#### LUX-382：已有 STRM 的 MediaTidy/StrmAssistant 媒体信息兼容基线
+
+范围：Lux 只读取外部已经存在的 `.strm`，不生成、重写或向其中注入 SHA1。继续由
+`org.lux.strm-media-info` 通过现有 `media.probe` RPC 提取媒体信息，并通过已有 Emby
+兼容层公开条目 `Path`、`MediaSources[].Path`、`MediaStreams`、`PlaybackInfo` 和可选的
+`*-mediainfo.json`。MediaTidy 的 SHA1 获取、FF 缓存、远程缓存和同步协议不进入 Lux 核心。
+
+当 `writeSidecars` 开启时，宿主只更新自己拥有的兼容字段（`MediaSourceInfo` 的容器、大小、
+时长、码率和当前媒体流），保留已有 sidecar 中未由 Lux 管理的字段、章节和扩展字段；因此
+外部工具或 MediaTidy 写入的 SHA1/缓存标记不会因 Lux 探测而丢失。`SKIP` 继续跳过已有媒体
+信息，`OVERWRITE` 只表示重新探测并更新 Lux 管理字段，不表示删除未知字段。已有 sidecar
+无法解析时不得直接覆盖原文件，任务应报告失败并保留原内容。
+
+本任务不新增数据库字段、迁移、SHA1 计算、MediaTidy 专用 HTTP 路由或媒体字节代理；若后续
+经授权的 MediaTidy 请求记录证明它需要独立的身份/哈希 RPC，再另立任务设计通用插件能力。
+
+验收：
+
+- [ ] 探测任务前后 `.strm` 字节完全一致，任务不会创建或修改 `.strm`。
+- [ ] 既有 URL/路径型 `.strm` 的 Emby `Path`、`MediaSources[].Path`、`Protocol`、`IsRemote`、
+      `MediaStreams` 和标准 `PlaybackInfo` 合同保持不变。
+- [ ] 新 sidecar 与现有 StrmAssistant 兼容 JSON 结构一致；已有 sidecar 的未知顶层、
+      `MediaSourceInfo` 和媒体流字段在写回后仍存在。
+- [ ] 已有 sidecar 损坏时原文件保持不变，任务返回有界的失败状态，不记录完整 URL 或文件内容。
+- [ ] 通过 STRM/探测/Emby 兼容回归；不改变 schema、插件 RPC 的已有必需字段或 MediaTidy 缓存边界。
+- [ ] 完成 `cargo test --locked --test probe --test strm_probe`、格式检查、相关 Clippy、
+      `git diff --check`，并更新 `docs/COMPATIBILITY.md`；本机架构记录为 ARM64，未推断 NAS 性能。
+
+依赖：LUX-381。预计文件：`src/application/probe.rs`、`tests/probe.rs`、`tests/strm_probe.rs`、
+`docs/PLUGIN-SDK.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。先增加 sidecar
+保留未知字段、损坏 sidecar 不覆盖和 STRM 字节不变的失败测试，再实现最小合并写回。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
