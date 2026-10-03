@@ -1288,3 +1288,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 检查单条 NFO enrichment 的媒体元数据读取路径。旧流程在身份冲突校验和最终写回之间分别执行两次完整 `find_media_item_metadata` 查询；新流程复用第一次结果，固定路径由 2 次完整读取降为 1 次。provider ID、NFO cache 和人物关系写入不修改媒体元数据列，因此没有引入额外刷新查询。
 
 该记录是 SQL 调用边界，不是墙钟或锁竞争基准；metadata、series metadata 和 NFO writer 回归通过，未据此推断 PostgreSQL、NAS 或生产收益。
+
+### LUX-373 STRM resolver 安装状态读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个已安装的 STRM resolver 插件，并检查 resolver 可用性。旧实现对每个 resolver 分别读取 `installed_plugins`，共 2 次 storage SQL 调用；新实现收集 resolver ID 后执行 1 次有界批量查询，减少 1 次（50%）。动态插件视图、可用性过滤和 resolver 顺序保持不变。
+
+计数来自 SQLite storage 查询计数器，只衡量安装状态读取的 SQL 调用数，不代表插件配置文件解析、resolver RPC 墙钟、PostgreSQL、NAS 或生产收益。

@@ -1285,13 +1285,21 @@ impl PluginService {
     async fn available_strm_resolver_ids(&self) -> Result<Vec<String>, PluginServiceError> {
         let mut plugin_ids = Vec::new();
         let catalog = self.catalog_snapshot().await;
-        for plugin in &catalog.plugins {
-            if !is_strm_resolver_plugin(plugin)
-                || !self
-                    .database
-                    .is_plugin_installed(&plugin.manifest.id)
-                    .await?
-            {
+        let resolver_plugins = catalog
+            .plugins
+            .iter()
+            .filter(|plugin| is_strm_resolver_plugin(plugin))
+            .collect::<Vec<_>>();
+        let resolver_ids = resolver_plugins
+            .iter()
+            .map(|plugin| plugin.manifest.id.clone())
+            .collect::<Vec<_>>();
+        let installation_statuses = self
+            .database
+            .list_plugin_installation_statuses_by_ids(&resolver_ids)
+            .await?;
+        for plugin in resolver_plugins {
+            if installation_statuses.get(&plugin.manifest.id) != Some(&true) {
                 continue;
             }
             let view = self.dynamic_view(plugin, true, true).await?;
@@ -3794,6 +3802,62 @@ mod plugin_discovery_tests {
             database.query_count(),
             3,
             "the library list and scraper associations should be loaded once per page"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strm_resolver_availability_reads_installation_statuses_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FIRST_PLUGIN_ID: &str = "org.lux.test-strm-resolver-one";
+        const SECOND_PLUGIN_ID: &str = "org.lux.test-strm-resolver-two";
+
+        let root = tempdir()?;
+        let config_dir = root.path().join("config");
+        for (plugin_id, name) in [
+            (FIRST_PLUGIN_ID, "STRM resolver one"),
+            (SECOND_PLUGIN_ID, "STRM resolver two"),
+        ] {
+            let plugin_dir = config_dir.join(format!("plugins/{plugin_id}/binaries"));
+            tokio::fs::create_dir_all(&plugin_dir).await?;
+            tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+            tokio::fs::write(
+                config_dir.join(format!("plugins/{plugin_id}/manifest.json")),
+                serde_json::to_vec_pretty(&json!({
+                    "formatVersion": 1,
+                    "id": plugin_id,
+                    "name": name,
+                    "version": "1.0.0",
+                    "apiVersion": 1,
+                    "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                    "type": "strm_resolver",
+                    "category": "MEDIA",
+                    "capabilities": ["strm.resolve"],
+                    "permissions": {"network": [], "filesystem": []},
+                    "files": []
+                }))?,
+            )
+            .await?;
+        }
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new(database.clone(), config_dir);
+        service.install(FIRST_PLUGIN_ID).await?;
+        service.install(SECOND_PLUGIN_ID).await?;
+
+        database.reset_query_count();
+        assert_eq!(
+            service.available_strm_resolver_ids().await?,
+            vec![FIRST_PLUGIN_ID, SECOND_PLUGIN_ID]
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "resolver availability should batch installation status reads"
         );
         Ok(())
     }

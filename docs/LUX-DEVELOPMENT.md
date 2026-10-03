@@ -8176,6 +8176,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：NFO enrichment 保留一次初始 `find_media_item_metadata` 结果，在 provider ID、NFO cache 和 actor relation 处理后直接构造最终 `MediaMetadataUpdate`；metadata 20 项、series metadata 3 项和 NFO writer 25 项通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-373：批量读取 STRM resolver 安装状态
+
+范围：STRM resolver 可用性检查在遍历插件目录时逐个读取 `installed_plugins`。先收集当前 catalog 中声明 `strm.resolve` 的 resolver 插件 ID，再按有界批量查询一次安装状态，随后复用状态生成可用插件列表；保留插件目录顺序、未安装/禁用过滤、动态配置校验和 resolver RPC 顺序，不改变插件协议或数据库 schema。
+
+验收：
+
+- [x] 同一可用性请求包含多个 STRM resolver 时，安装状态读取由每插件一次降为一次批量查询。
+- [x] 未安装、已禁用和已启用插件的过滤、动态配置可用性判断及返回顺序保持不变。
+- [x] STRM resolver 播放与插件服务回归通过；不改变插件协议、配置文件或 RPC 边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 resolver RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-368。预计文件：`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多个 resolver 的安装状态查询计数回归，再复用已有批量安装状态读取。
+
+结果（2026-10-03）：两个已安装 STRM resolver 的可用性检查由 2 次逐插件 `installed_plugins` 查询降为 1 次批量查询；动态视图与 resolver 返回顺序保持不变。`application::plugins::plugin_discovery_tests::strm_resolver_availability_reads_installation_statuses_once` 与 STRM resolver 集成回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
