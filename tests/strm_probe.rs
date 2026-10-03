@@ -149,6 +149,7 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
             .map(Vec::len),
         Some(2)
     );
+    assert_eq!(sidecar[0]["Chapters"].as_array().map(Vec::len), Some(0));
     assert_eq!(tokio::fs::read(&strm_path).await?, original_strm);
 
     fs::write(

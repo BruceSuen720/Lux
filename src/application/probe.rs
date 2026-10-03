@@ -1357,7 +1357,8 @@ fn media_info_source_value(result: &MediaProbeResult) -> Value {
 
 fn media_info_document_value(result: &MediaProbeResult) -> Value {
     Value::Array(vec![serde_json::json!({
-        "MediaSourceInfo": media_info_source_value(result)
+        "MediaSourceInfo": media_info_source_value(result),
+        "Chapters": [],
     })])
 }
 
