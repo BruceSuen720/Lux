@@ -1876,11 +1876,10 @@ impl PluginService {
                         .unwrap_or_default(),
                     _ => Vec::new(),
                 };
-                for owner_id in owner_ids {
+                if task.owner_type == "LIBRARY" {
                     self.database
-                        .register_plugin_scheduled_task(
-                            &task.owner_type,
-                            &owner_id,
+                        .register_plugin_library_scheduled_tasks(
+                            &owner_ids,
                             &task.task_type,
                             &task.name,
                             &task.description,
@@ -1890,6 +1889,22 @@ impl PluginService {
                             &resource_limit_json,
                         )
                         .await?;
+                } else {
+                    for owner_id in owner_ids {
+                        self.database
+                            .register_plugin_scheduled_task(
+                                &task.owner_type,
+                                &owner_id,
+                                &task.task_type,
+                                &task.name,
+                                &task.description,
+                                plugin_id,
+                                schedule,
+                                task_enabled,
+                                &resource_limit_json,
+                            )
+                            .await?;
+                    }
                 }
             }
         }

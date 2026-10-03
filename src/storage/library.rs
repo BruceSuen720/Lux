@@ -2617,6 +2617,84 @@ impl Database {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_plugin_library_scheduled_tasks(
+        &self,
+        owner_ids: &[String],
+        task_type: &str,
+        task_name: &str,
+        task_description: &str,
+        plugin_id: &str,
+        schedule: &str,
+        is_enabled: bool,
+        resource_limit_json: &str,
+    ) -> Result<(), StorageError> {
+        let mut unique_owner_ids = Vec::with_capacity(owner_ids.len());
+        let mut seen_owner_ids = HashSet::with_capacity(owner_ids.len());
+        for owner_id in owner_ids {
+            if seen_owner_ids.insert(owner_id) {
+                unique_owner_ids.push(owner_id);
+            }
+        }
+        if unique_owner_ids.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for chunk in unique_owner_ids.chunks(100) {
+            let rows =
+                std::iter::repeat_n("('LIBRARY', ?, ?, ?, ?, 'PLUGIN', ?, ?, ?, ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+                 ) VALUES {rows}
+                 ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                    task_name = excluded.task_name,
+                    task_description = excluded.task_description,
+                    source_type = excluded.source_type,
+                    plugin_id = excluded.plugin_id,
+                    cron_or_interval = excluded.cron_or_interval,
+                    is_enabled = excluded.is_enabled,
+                    resource_limit_json = excluded.resource_limit_json,
+                    updated_at = unixepoch()"
+            )));
+            for owner_id in chunk {
+                query = query
+                    .bind(*owner_id)
+                    .bind(task_type)
+                    .bind(task_name)
+                    .bind(task_description)
+                    .bind(plugin_id)
+                    .bind(schedule)
+                    .bind(database_flag(is_enabled))
+                    .bind(resource_limit_json);
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn disable_plugin_scheduled_tasks(
         &self,
         plugin_id: &str,
@@ -3564,6 +3642,46 @@ mod scheduled_task_plan_mirror_tests {
             2,
             "both task types should share the two mirror updates"
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_library_task_registration_uses_bounded_batches() {
+        const OWNER_COUNT: usize = 205;
+        let (_temp_dir, database) = test_database().await;
+        let owner_ids = (0..OWNER_COUNT)
+            .map(|index| format!("plugin-library-owner-{index:03}"))
+            .collect::<Vec<_>>();
+        let mut owner_ids = owner_ids;
+        owner_ids.push(owner_ids[0].clone());
+
+        database.reset_query_count();
+        database
+            .register_plugin_library_scheduled_tasks(
+                &owner_ids,
+                "PLUGIN_LIBRARY_BATCH",
+                "Plugin library task",
+                "Plugin library task",
+                "org.lux.test-plugin",
+                "0 2 * * *",
+                true,
+                "{}",
+            )
+            .await
+            .expect("library plugin tasks should register");
+
+        assert_eq!(
+            database.query_count(),
+            3,
+            "library plugin task registration should use bounded multi-row upserts"
+        );
+        let registered_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_configs
+             WHERE task_type = 'PLUGIN_LIBRARY_BATCH'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("library plugin task count should be queryable");
+        assert_eq!(registered_count, OWNER_COUNT as i64);
     }
 
     #[tokio::test]

@@ -8221,6 +8221,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：策略判断从条目库 ID、完整库（含 scraper 关联）和全局设置三段读取收敛为一次 `find_item_media_strategy_settings`；固定 fixture 从 4 次降为 1 次（75%）。写回、NFO、图片和 metadata 回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-376：批量注册 Manifest 媒体库任务 owner
+
+范围：Manifest `LIBRARY` scheduled task 当前为每个 `ownerConfigKey` 值单独 upsert `scheduled_task_configs`。新增有界多行 upsert，按最多 100 个 owner 一批，在一次事务中写入；同一请求内重复 owner 去重。`GLOBAL` task 继续使用现有计划镜像注册路径，不改变 owner 类型、任务字段、启用状态或调度语义。
+
+验收：
+
+- [x] 205 个唯一媒体库 owner 加 1 个重复值由 206 次 SQL 写入降为 3 次有界批量 upsert。
+- [x] owner 任务行数量、重复 owner 幂等、任务字段和启用状态保持不变。
+- [x] Manifest、插件、计划任务和存储回归通过；不改变 schema、插件协议或 GLOBAL 计划镜像合同。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断插件同步墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-375。预计文件：`src/storage/library.rs`、`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加媒体库 owner 的逐条注册计数回归，再接入有界多行 upsert。
+
+结果（2026-10-03）：`LIBRARY` owner 注册由逐条 upsert 改为 100/100/5 三批多行 upsert，并在输入内去重；205 个唯一 owner 加 1 个重复值由 206 次降为 3 次。GLOBAL task 的计划镜像路径保持原样；插件、Manifest、scheduled task、存储定向回归和库级 Clippy 通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

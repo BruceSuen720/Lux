@@ -1306,3 +1306,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备一个启用媒体库和一条 active movie item，并检查写回策略。旧实现先读 item 的库 ID，再读完整库（含 scraper 关联）和全局策略，共 4 次 storage SQL 调用；新实现使用已有 item/library JOIN 一次取得本地及全局策略，共 1 次，减少 3 次（75%）。
 
 计数来自 SQLite storage 查询计数器，只衡量策略判断 SQL 调用数，不代表 NFO/图片写回墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-376 Manifest 媒体库 owner 注册调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中注册 205 个唯一 `LIBRARY` task owner，并额外传入 1 个重复 owner。旧实现逐 owner upsert，共 206 次 storage SQL 调用；新实现先去重，再按 100/100/5 三批多行 upsert，共 3 次，减少 203 次（约 98.5%）。
+
+计数来自 SQLite storage 查询计数器，只衡量 owner 配置写入 SQL 调用数，不代表 Manifest 同步墙钟、GLOBAL 计划镜像、PostgreSQL、NAS 或生产收益。
