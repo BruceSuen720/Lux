@@ -1324,3 +1324,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中安装两个带媒体库选项和 GLOBAL task 的插件，再同步 Manifest task。旧实现每插件各读一次媒体库和 scraper 关联，共 15 次 storage SQL 调用；新实现复用一次懒加载快照，共 13 次，减少 2 次（约 13.3%）。GLOBAL 计划和 task 写入次数未改变。
 
 计数来自 SQLite storage 查询计数器，只衡量同步路径 SQL 调用数，不代表配置文件解析、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-379 缩略图 scraper 重试首轮读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备一个带 scraper 的本地电影条目并检查 scraper-first 重试状态。旧实现先读取本地缩略图源和全局策略，再在图片缺失判断中重复读取本地源并读取图片索引，共 4 次 storage SQL；新实现复用同一源读取并在状态判断中读取一次全局策略和图片索引，共 3 次，减少 1 次（25%）。
+
+元数据刷新完成后的最终图片检查仍独立重新读取最新源和图片索引，避免缓存刷新前状态。计数来自 SQLite storage 查询计数器，只衡量首轮状态读取，不代表刷新墙钟、文件检查、PostgreSQL、NAS 或生产收益。

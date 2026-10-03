@@ -8266,6 +8266,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：Manifest 同步在首次需要媒体库选项时加载一次媒体库/关联快照，随后各插件复用；两插件 GLOBAL task fixture 从 15 次降为 13 次，减少 2 次（约 13.3%）。插件、弹幕配置、scheduled tasks 和库级 Clippy 通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-379：缩略图 scraper 重试复用首轮源读取
+
+范围：缩略图 scraper-first 重试在同一轮中先判断策略是否适用，再判断 poster/thumbnail 是否缺失；两个判断分别读取同一条本地缩略图源。将首轮检查合并为一次源读取并复用其媒体库策略字段，保留无源、STRM、无 scraper、策略不适用和图片路径安全检查语义。元数据刷新完成后的最终图片检查必须重新读取源和图片索引，以反映本轮写回结果。
+
+验收：
+
+- [x] scraper-first 重试首轮检查对带 scraper 的本地媒体由 4 次 SQL 调用降为 3 次：本地源、全局策略和图片索引各读取一次。
+- [x] 无源、STRM、无 scraper、非 `SCRAPER_FIRST` 策略和 poster/thumbnail 缺失、fallback、路径越界行为保持不变。
+- [x] 元数据刷新后的最终图片重新检查仍读取最新源和图片索引；三次失败后的截图回退、重试时间和状态写回保持不变。
+- [x] 缩略图、scheduled tasks 和相关 scanner/metadata 回归通过；不改变 schema、任务状态机、图片文件合同或插件协议。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用边界，不推断刷新墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-378。预计文件：`src/application/thumbnails.rs`、`src/application/scheduled_tasks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加首轮检查的查询计数回归，再复用同一源读取；刷新后的最终检查保留独立读取。
+
+结果（2026-10-03）：scraper-first 重试首轮对带 scraper 的本地媒体由源/策略判断 2 次读取加图片缺失判断 2 次读取，共 4 次 SQL，收敛为一次状态读取中的本地源、全局策略和图片索引，共 3 次，减少 1 次（25%）。元数据刷新完成后的最终 `scraper_first_images_missing` 仍独立重新读取源和图片索引；缩略图回退、scanner/metadata 和计划任务回归通过。本机 `uname -m=arm64`，未实测刷新墙钟、PostgreSQL、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

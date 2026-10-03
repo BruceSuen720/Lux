@@ -625,28 +625,20 @@ async fn run_thumbnail_scraper_retry(
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
-    let applicable = match thumbnails.scraper_first_retry_is_applicable(&item_id).await {
-        Ok(applicable) => applicable,
+    let retry_state = match thumbnails.scraper_first_retry_state(&item_id).await {
+        Ok(retry_state) => retry_state,
         Err(error) => {
             release_thumbnail_scraper_retry(&database, &retry, now).await;
-            tracing::warn!(item_id, %error, "thumbnail scraper retry policy could not be checked");
+            tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be checked");
             return;
         }
     };
-    if !applicable {
+    if !retry_state.applicable {
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
 
-    let images_missing = match thumbnails.scraper_first_images_missing(&item_id).await {
-        Ok(images_missing) => images_missing,
-        Err(error) => {
-            release_thumbnail_scraper_retry(&database, &retry, now).await;
-            tracing::warn!(item_id, %error, "thumbnail scraper retry images could not be checked");
-            return;
-        }
-    };
-    if !images_missing {
+    if !retry_state.images_missing {
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
