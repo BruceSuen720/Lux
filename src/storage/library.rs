@@ -1,5 +1,7 @@
 use super::*;
 
+const SCHEDULED_TASK_CONFIG_OWNER_BATCH_SIZE: usize = 500;
+
 struct LibraryTaskPlanAssignment {
     id: String,
     task_name: String,
@@ -3045,6 +3047,58 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_scheduled_task_configs_by_owner_ids(
+        &self,
+        owner_type: &str,
+        owner_ids: &[String],
+        task_type: &str,
+    ) -> Result<HashMap<String, StoredScheduledTaskConfig>, StorageError> {
+        let mut unique_owner_ids = Vec::with_capacity(owner_ids.len());
+        let mut seen_owner_ids = HashSet::with_capacity(owner_ids.len());
+        for owner_id in owner_ids {
+            if seen_owner_ids.insert(owner_id.clone()) {
+                unique_owner_ids.push(owner_id.clone());
+            }
+        }
+        let mut configs = HashMap::with_capacity(unique_owner_ids.len());
+        for chunk in unique_owner_ids.chunks(SCHEDULED_TASK_CONFIG_OWNER_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT s.owner_type, s.owner_id, s.task_type, s.plan_id, s.task_name,
+                        s.task_description, s.source_type, s.plugin_id,
+                        s.cron_or_interval, s.is_enabled, s.resource_limit_json,
+                        s.created_at, s.updated_at,
+                        l.name AS library_name
+                 FROM scheduled_task_configs s
+                 LEFT JOIN libraries l
+                   ON s.owner_type = 'LIBRARY' AND l.id = s.owner_id
+                 WHERE s.owner_type = ? AND s.task_type = ?
+                   AND s.owner_id IN ({placeholders})"
+            )));
+            query = query.bind(owner_type).bind(task_type);
+            for owner_id in chunk {
+                query = query.bind(owner_id);
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                let config = stored_scheduled_task(row);
+                configs.insert(config.owner_id.clone(), config);
+            }
+        }
+        Ok(configs)
+    }
+
     pub(crate) async fn library_exists(&self, library_id: &str) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(SELECT 1 FROM libraries WHERE id = ?) THEN 1 ELSE 0 END",
@@ -3896,5 +3950,33 @@ mod scheduled_task_plan_mirror_tests {
         assert_eq!(mirror.1, default_schedule_and_enabled.0);
         assert_eq!(mirror.2, default_schedule_and_enabled.1);
         assert_eq!(mirror.3, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_configs_for_libraries_are_loaded_in_one_query() {
+        let (_temp_dir, database) = test_database().await;
+        let libraries = LibraryService::new(database.clone());
+        let first = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("first library should be created");
+        let second = libraries
+            .create_library("More Movies", LibraryKind::Movie, false)
+            .await
+            .expect("second library should be created");
+        let library_ids = vec![first.id.to_string(), second.id.to_string()];
+
+        database.reset_query_count();
+        let configs = database
+            .list_scheduled_task_configs_by_owner_ids(
+                "LIBRARY",
+                &library_ids,
+                "RECONCILIATION_SCAN",
+            )
+            .await
+            .expect("scheduled task configs should load");
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(database.query_count(), 1);
     }
 }

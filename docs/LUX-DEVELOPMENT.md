@@ -8329,6 +8329,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：两个同一电影条目的源由旧路径的 6 次逐源 SELECT/DELETE/UPDATE 降为 3 次批量 SQL；不匹配或缺失源只执行一次校验查询且不写入。剧集删除保留 item、parent、series 三层顺序更新，避免同一 UPDATE 中父级看不到刚删除的子级；删除媒体源和整剧集 API 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
 
+#### LUX-383：计划任务媒体库配置批量读取
+
+范围：执行包含多个媒体库的任务计划时，调度器当前对每个媒体库单独读取 `scheduled_task_configs`，然后再创建各自的运行任务。新增每批最多 500 个 owner ID 的配置读取，并在计划派发期间复用结果；保留每库独立运行、失败隔离、未注册任务错误、章节插件 ID 传递、全局任务路径和调度游标语义。
+
+验收：
+
+- [x] 两个媒体库的计划配置读取由两次逐库查询降为一次有界批量查询；两个独立运行任务仍各自创建。
+- [x] 缺失配置的媒体库仍单独记录 `NotRegistered` 并继续派发其他媒体库；章节检测继续使用对应配置的 `plugin_id`。
+- [x] 输入 owner ID 去重并按最多 500 个值分批，使用 SQLite/PostgreSQL 通用参数化查询，不改变任务表、计划镜像或公共 API。
+- [x] scheduled tasks 4 项、计划镜像 storage 12 项、fmt 和 Clippy 回归通过；性能记录只报告 SQL 调用边界。
+
+依赖：LUX-244。预计文件：`src/application/scheduled_tasks.rs`、`src/storage/library.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多个 owner 的批量配置读取计数回归，再接入计划派发。
+
+结果（2026-10-03）：计划派发先按最多 500 个媒体库 owner 批量读取任务配置，再按媒体库复用配置创建独立运行任务；两库配置读取固定为 1 次，原有每库独立运行与失败隔离合同保持不变。scheduled tasks 4 项、计划镜像 storage 12 项和相关格式/Clippy 定向验证通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
