@@ -1355,6 +1355,17 @@ fn apply_media_info_source_context(
     source.insert("Formats".to_owned(), Value::Array(Vec::new()));
 }
 
+fn apply_missing_media_info_source_context(
+    source: &mut Map<String, Value>,
+    context: MediaInfoSidecarContext,
+) {
+    let mut context_fields = Map::new();
+    apply_media_info_source_context(&mut context_fields, context);
+    for (key, value) in context_fields {
+        source.entry(key).or_insert(value);
+    }
+}
+
 fn media_info_source_value(
     result: &MediaProbeResult,
     context: Option<MediaInfoSidecarContext>,
@@ -1495,7 +1506,7 @@ fn merge_media_info_source(
     let streams = merge_media_info_streams(existing_streams, &result.streams);
     source.insert("MediaStreams".to_owned(), Value::Array(streams));
     if let Some(context) = context {
-        apply_media_info_source_context(source, context);
+        apply_missing_media_info_source_context(source, context);
     }
     Ok(())
 }
@@ -1812,6 +1823,8 @@ mod tests {
                     "Size": 9,
                     "RunTimeTicks": 10,
                     "Bitrate": 11,
+                    "Protocol": "File",
+                    "SupportsProbing": false,
                     "Sha1": "external-sha1",
                     "Name": "1080p",
                     "ExternalSource": {"owner": "mediatidy"},
@@ -1853,7 +1866,11 @@ mod tests {
                     details,
                 }],
             },
-            None,
+            Some(MediaInfoSidecarContext {
+                protocol: "Http",
+                is_remote: true,
+                supports_transcoding: true,
+            }),
         )
         .await
         .expect("merge sidecar");
@@ -1862,6 +1879,8 @@ mod tests {
             serde_json::from_slice(&tokio::fs::read(&sidecar).await.expect("read sidecar"))
                 .expect("parse merged sidecar");
         assert_eq!(written[0]["MediaSourceInfo"]["Container"], "matroska");
+        assert_eq!(written[0]["MediaSourceInfo"]["Protocol"], "File");
+        assert_eq!(written[0]["MediaSourceInfo"]["SupportsProbing"], false);
         assert_eq!(written[0]["MediaSourceInfo"]["Sha1"], "external-sha1");
         assert_eq!(written[0]["MediaSourceInfo"]["Name"], "1080p");
         assert_eq!(

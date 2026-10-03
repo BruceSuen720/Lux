@@ -27,11 +27,16 @@ LUX-382 已实现 sidecar 写回只更新 Lux 管理的 `MediaSourceInfo` 和当
 这只证明 Lux 侧兼容基线，不能宣称真实 MediaTidy 缓存命中；实际请求路径、payload 和
 远程缓存命中仍需在取得授权的可控实例后记录。
 
-## LUX-383 StrmAssistant 播放源旁车字段（计划）
+## LUX-383 StrmAssistant 播放源旁车字段（2026-10-03）
 
-下一阶段将把已有 STRM 目标的 Emby 播放源语义投影到新生成的 `MediaSourceInfo`，包括协议、
-远程标志和能力位。投影只使用已读取的 STRM 文本，不读取远程媒体、不生成 SHA1，不写入
-内部 ID、原始路径或认证信息；真实 MediaTidy 请求和缓存命中仍需独立运行证据。
+`org.lux.strm-media-info` 把已有 STRM 目标的 Emby 播放源语义投影到新生成的
+`MediaSourceInfo`，包括协议、远程标志和能力位。投影只使用已读取的 STRM 文本，不读取远程
+媒体、不生成 SHA1，不写入内部 ID、原始路径或认证信息。已有旁车的这些字段只在缺失时补齐，
+保留 StrmAssistant/MediaTidy 已经写入的值。
+
+单独运行的 `strm_probe` 回归证明 URL 型目标生成 HTTP/远程语义，File 型目标生成 File/本地
+语义，且既有字段、损坏文件保护和 STRM 字节不变。真实 MediaTidy 请求路径已在本机授权实例
+和隔离假 Emby 上记录；假 Emby 未实现神医插件专用响应，因此没有宣称真实缓存命中。
 
 ## Emby 用户列表与登录兼容（2026-09-29）
 

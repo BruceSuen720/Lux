@@ -8365,16 +8365,24 @@ URL 型目标使用 HTTP/远程语义，路径型目标使用 File/本地语义�
 
 验收：
 
-- [ ] 新 sidecar 的 `MediaSourceInfo` 具备 StrmAssistant 播放源字段，字段类型与 Emby DTO 一致。
-- [ ] URL/路径型目标的 `Protocol`、`IsRemote` 和能力位与 Lux Emby `MediaSources[]` 保持一致。
-- [ ] sidecar 不出现内部条目 ID、媒体源 ID、原始 `Path` 或认证信息。
-- [ ] 既有 sidecar 合并、损坏文件保护、STRM 字节不变和现有 Emby 回归不变。
-- [ ] 完成 `cargo test --locked --test strm_probe --test strm --test probe`、全目标 Clippy、
+- [x] 新 sidecar 的 `MediaSourceInfo` 具备 StrmAssistant 播放源字段，字段类型与 Emby DTO 一致。
+- [x] URL/路径型目标的 `Protocol`、`IsRemote` 和能力位与 Lux Emby `MediaSources[]` 保持一致。
+- [x] sidecar 不出现内部条目 ID、媒体源 ID、原始 `Path` 或认证信息。
+- [x] 既有 sidecar 合并、损坏文件保护、STRM 字节不变和现有 Emby 回归不变；外部已经写入的
+      播放源字段只在缺失时补齐。
+- [x] 完成 `cargo test --locked --test strm_probe --test strm --test probe`、全目标 Clippy、
       格式检查和 `git diff --check`；本机架构记录为 ARM64。
 
 依赖：LUX-382。预计文件：`src/application/probe.rs`、`src/application/strm_probe.rs`、
 `tests/strm_probe.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/COMPATIBILITY.md`。先增加 URL 型
 旁车字段失败测试，再实现目标分类到旁车字段的最小投影。
+
+结果（2026-10-03）：URL 型和 File 型旁车均投影了 StrmAssistant 播放源字段；已有旁车的
+`Protocol`、`SupportsProbing` 等外部值不会被覆盖，缺失字段才补齐。隔离假 Emby 捕获到
+MediaTidy 的神医验证请求为 `POST /emby/Items/SyncMediaInfo`，并记录了
+`POST /api/strm-assistant-ff/run` 的目标选择 payload；该假 Emby 没有神医插件响应，未将
+验证失败当作缓存命中证据。Rust 目标回归、fmt、Clippy 和 `git diff --check` 结果单独记录在
+本次任务结束报告中。
 
 #### 阶段 23 总体验收与阶段门
 
