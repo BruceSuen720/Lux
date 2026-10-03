@@ -8421,7 +8421,7 @@ manifest 合同：
 声明 `emby.route` 的插件转发。集成回归覆盖未安装/禁用返回 404、启用后返回 400，以及
 `X-Emby-Token`、Authorization、Cookie 和 `api_key` 不进入插件请求；Plugin SDK 的 36 项
 协议测试、Emby 认证 8 项和插件管理 9 项通过。Lux-plugins 的 `org.lux.strm-media-info`
-已声明该路由并固定返回 400；插件库测试 43 项、插件构建和直接 RPC 试验通过。尚未以已登录
+已声明该路由并固定返回 400；插件库测试 43 项、插件构建和直接 RPC 试验通过。已使用已登录
 的本机 MediaTidy UI/API 完成最终 `testEmby` 实测。隔离 Lux 实例使用真实
 `org.lux.strm-media-info` 插件：安装前 MediaTidy 返回 404；通过 Lux 插件安装接口启用后，
 同一 `testEmby` 请求返回 `supported: true`、`statusCode: 400` 和“已检测到神医
