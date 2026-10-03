@@ -596,7 +596,8 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(identity).toContain("原始片名本地电影原名");
     expect(identity).toContain("年份2026");
     expect(identity).toContain("原始语言中文");
-    expect(identity).toContain("添加于");
+    expect(identity).not.toContain("添加于");
+    expect(container.querySelector(".lux-media-file-summary")?.textContent).toContain("2026");
     expect(container.querySelector(".lux-media-nfo-taxonomy")?.textContent).toContain("ID 77");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("首播日期2026-02-17");
     expect(container.querySelector(".lux-media-nfo")?.textContent).toContain("发行日期2026-02-20");
@@ -606,9 +607,14 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("https://example.com/movie");
     expect(container.querySelector("a[aria-label=\"预告片 1\"]")?.getAttribute("href"))
       .toBe("https://example.com/trailer");
+    expect(container.querySelector(".lux-media-nfo-links-label")?.textContent).toBe("更多来源");
+    expect(container.querySelector(".lux-media-nfo-links-list")?.querySelectorAll("a")).toHaveLength(2);
     expect(container.querySelectorAll(".lux-media-nfo")).toHaveLength(1);
-    expect(container.querySelector(".lux-media-nfo-media-heading")?.textContent).toContain("本地媒体文件");
+    expect(container.querySelector(".lux-media-nfo-media-heading")?.textContent).toBe("媒体文件");
+    expect(container.querySelector(".lux-media-file-summary")?.textContent).toContain("本地媒体文件");
     expect(container.querySelector(".lux-media-file-summary")?.textContent).not.toContain("来源");
+    expect(container.querySelector(".lux-media-file-summary")?.textContent).not.toContain("类型");
+    expect(container.querySelector(".lux-media-file-summary")?.textContent).not.toContain("版本");
     expect(container.querySelector(".lux-media-info")).toBeNull();
   });
 
@@ -1204,8 +1210,9 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(details?.textContent).toContain("stereo");
     expect(details?.textContent).toContain("中文字幕");
     expect(details?.querySelector(".lux-media-nfo-media-heading")?.textContent).toContain("媒体文件");
-    expect(details?.querySelector<HTMLDetailsElement>(".lux-media-info-address")?.open).toBe(false);
-    expect(details?.querySelector<HTMLDetailsElement>(".lux-media-stream-disclosure")?.open).toBe(false);
+    expect(details?.querySelector("details.lux-media-info-address")).toBeNull();
+    expect(details?.querySelector(".lux-media-info-address")).not.toBeNull();
+    expect(details?.querySelector(".lux-media-stream-disclosure")).toBeNull();
     expect(details?.querySelector(".lux-horizontal-scroll-viewport")).not.toBeNull();
     expect(container.querySelector(".lux-detail-source")?.textContent).toContain("mkv");
     expect(container.textContent).not.toContain("暂无可播放版本");
