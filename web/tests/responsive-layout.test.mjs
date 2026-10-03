@@ -109,3 +109,18 @@ test("mobile navigation stays attached below the fixed header", () => {
   assert.match(fixedMobileNavRule, /position:\s*fixed/);
   assert.match(fixedMobileNavRule, /top:\s*var\(--lux-header-height\)/);
 });
+
+test("mobile task activity popover stays inside the viewport and wraps its content", () => {
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const popoverRule = mobileStyles.match(/\.lux-scan-activity-popover\s*\{([^}]*)\}/)?.[1] ?? "";
+  const headingRule = mobileStyles.match(/\.lux-scan-activity-row-heading\s*\{([^}]*)\}/)?.[1] ?? "";
+  const actionRule = mobileStyles.match(/\.lux-scan-activity-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(popoverRule, /position:\s*fixed/);
+  assert.match(popoverRule, /left:\s*12px/);
+  assert.match(popoverRule, /right:\s*12px/);
+  assert.match(popoverRule, /width:\s*auto/);
+  assert.match(popoverRule, /overflow-y:\s*auto/);
+  assert.match(headingRule, /flex-direction:\s*column/);
+  assert.match(actionRule, /flex-wrap:\s*wrap/);
+});

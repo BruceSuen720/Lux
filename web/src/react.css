@@ -1848,7 +1848,21 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-icon-button, .lux-user-button { min-width: 46px; height: 46px; }
   .lux-registered-task-edit { min-width: var(--lux-button-height-compact); width: var(--lux-button-height-compact); min-height: var(--lux-button-height-compact); height: var(--lux-button-height-compact); }
   .lux-scan-activity-trigger { width: 46px; height: 46px; }
-  .lux-scan-activity-popover { right: -61px; }
+  .lux-scan-activity-popover {
+    position: fixed;
+    z-index: 30;
+    top: calc(var(--lux-header-height) + 8px);
+    right: 12px;
+    left: 12px;
+    width: auto;
+    max-height: calc(100dvh - var(--lux-header-height) - 24px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .lux-scan-activity-row-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .lux-scan-activity-row p { white-space: normal; overflow-wrap: anywhere; }
+  .lux-scan-activity-actions { flex-wrap: wrap; }
+  .lux-scan-activity-actions a, .lux-scan-activity-actions button { flex: 1 1 120px; justify-content: center; }
   .lux-avatar { width: 36px; height: 36px; }
   .lux-hero { min-height: 620px; }
   .lux-hero-copy { width: calc(100% - 32px); margin: 0 16px 58px; }
