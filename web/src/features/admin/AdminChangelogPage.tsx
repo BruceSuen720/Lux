@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.14",
+    date: "2026-10-03",
+    sections: [
+      { kind: "added", items: [
+        "账户设置支持用户验证当前密码后自行修改密码。",
+        "增加 MediaTidy/StrmAssistant 的 STRM 兼容支持：保留外部旁车信息和扩展字段，补齐播放源字段，并通过受限插件路由提供 SyncMediaInfo 兼容探测。",
+      ] },
+      { kind: "changed", items: [
+        "扩大批量处理范围，优化扫描、元数据、插件、计划任务、图片、弹幕、媒体合并、媒体源删除和 Web 播放会话清理，减少重复数据库读写。",
+      ] },
+      { kind: "fixed", items: [
+        "加强 Emby 兼容请求的认证参数过滤和媒体源归属校验，避免编码后的认证参数进入插件请求或删除错误媒体源。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.13",
     date: "2026-10-02",
     sections: [
