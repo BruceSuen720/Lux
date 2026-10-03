@@ -102,22 +102,21 @@ impl Database {
             .map(|root| root.id.clone())
             .collect::<Vec<_>>();
 
-        let primary_has_default =
-            self.query_scalar::<i64>(
-                "SELECT EXISTS (
-                     SELECT 1 FROM media_sources
-                     WHERE item_id = ? AND is_default = 1
-                 )",
-            )
-            .bind(primary_item_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })? != 0;
-
         if primary.item_type == "MOVIE" {
+            let primary_has_default =
+                self.query_scalar::<i64>(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM media_sources
+                         WHERE item_id = ? AND is_default = 1
+                     )",
+                )
+                .bind(primary_item_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })? != 0;
             self.merge_movie_sources_in_transaction(
                 &mut transaction,
                 &merged_item_ids,
@@ -716,7 +715,7 @@ mod tests {
 
         assert_eq!(
             database.query_count(),
-            20,
+            19,
             "expected batched root and episode reads instead of one read per item/season"
         );
         Ok(())
