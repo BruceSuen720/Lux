@@ -372,6 +372,7 @@ impl Database {
                 .get(&target_season_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
+            let mut matched_episode_mappings = Vec::new();
             let mut unmatched_episode_ids = Vec::new();
             for source_episode in source_episodes {
                 let target_episode = source_episode
@@ -383,34 +384,36 @@ impl Database {
                     })
                     .map(|episode| episode.id.clone());
                 if let Some(target_episode_id) = target_episode {
-                    self.merge_sources_in_transaction(
-                        transaction,
-                        &source_episode.id,
-                        &target_episode_id,
-                        false,
-                    )
-                    .await?;
-                    self.merge_user_item_state_in_transaction(
-                        transaction,
-                        &source_episode.id,
-                        &target_episode_id,
-                    )
-                    .await?;
-                    self.query(
-                        "UPDATE media_items
-                         SET merged_into_item_id = ?, updated_at = unixepoch()
-                         WHERE id = ?",
-                    )
-                    .bind(&target_episode_id)
-                    .bind(&source_episode.id)
-                    .execute(&mut **transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    matched_episode_mappings.push((source_episode.id.clone(), target_episode_id));
                 } else {
                     unmatched_episode_ids.push(source_episode.id.clone());
+                }
+            }
+            let unique_targets = matched_episode_mappings
+                .iter()
+                .map(|(_, target_id)| target_id)
+                .collect::<HashSet<_>>();
+            if unique_targets.len() == matched_episode_mappings.len() {
+                self.merge_episode_sources_in_transaction(transaction, &matched_episode_mappings)
+                    .await?;
+                self.merge_mapped_user_item_states_in_transaction(
+                    transaction,
+                    &matched_episode_mappings,
+                )
+                .await?;
+                self.mark_mapped_items_merged_in_transaction(
+                    transaction,
+                    &matched_episode_mappings,
+                )
+                .await?;
+            } else {
+                for (source_episode_id, target_episode_id) in matched_episode_mappings {
+                    self.merge_matched_episode_in_transaction(
+                        transaction,
+                        &source_episode_id,
+                        &target_episode_id,
+                    )
+                    .await?;
                 }
             }
             self.move_series_episodes_in_transaction(
@@ -420,6 +423,216 @@ impl Database {
                 target_series_id,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn merge_matched_episode_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_episode_id: &str,
+        target_episode_id: &str,
+    ) -> Result<(), StorageError> {
+        self.merge_sources_in_transaction(transaction, source_episode_id, target_episode_id, false)
+            .await?;
+        self.merge_user_item_state_in_transaction(
+            transaction,
+            source_episode_id,
+            target_episode_id,
+        )
+        .await?;
+        self.mark_items_merged_in_transaction(
+            transaction,
+            &[source_episode_id.to_owned()],
+            target_episode_id,
+        )
+        .await
+    }
+
+    async fn merge_episode_sources_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        mappings: &[(String, String)],
+    ) -> Result<(), StorageError> {
+        let mut target_ids = Vec::new();
+        let mut seen_targets = HashSet::new();
+        for (_, target_id) in mappings {
+            if seen_targets.insert(target_id) {
+                target_ids.push(target_id.clone());
+            }
+        }
+        for chunk in mappings.chunks(MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source_placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH merge_map(source_id, target_id) AS (VALUES {values})
+                 UPDATE media_sources
+                 SET item_id = (
+                         SELECT target_id FROM merge_map
+                         WHERE source_id = media_sources.item_id
+                     ),
+                     updated_at = unixepoch()
+                 WHERE item_id IN ({source_placeholders})"
+            )));
+            for (source_id, target_id) in chunk {
+                query = query.bind(source_id).bind(target_id);
+            }
+            for (source_id, _) in chunk {
+                query = query.bind(source_id);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        self.normalize_default_sources_in_transaction(transaction, &target_ids)
+            .await
+    }
+
+    async fn normalize_default_sources_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        for chunk in item_ids.chunks(MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE media_sources
+                 SET is_default = CASE WHEN id = (
+                     SELECT id FROM media_sources selected
+                     WHERE selected.item_id = media_sources.item_id
+                     ORDER BY selected.is_default DESC, selected.id
+                     LIMIT 1
+                 ) THEN 1 ELSE 0 END,
+                     updated_at = unixepoch()
+                 WHERE item_id IN ({placeholders})"
+            )));
+            for item_id in chunk {
+                query = query.bind(item_id);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn merge_mapped_user_item_states_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        mappings: &[(String, String)],
+    ) -> Result<(), StorageError> {
+        let max_function = self.scalar_max_function();
+        for chunk in mappings.chunks(MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source_placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH merge_map(source_id, target_id) AS (VALUES {values})
+                 INSERT INTO user_item_state (
+                     user_id, item_id, position_ticks, is_played, is_favorite,
+                     play_count, last_played_at, version
+                 )
+                 SELECT state.user_id, merge_map.target_id,
+                        MAX(state.position_ticks), MAX(state.is_played),
+                        MAX(state.is_favorite), MAX(state.play_count),
+                        MAX(state.last_played_at), MAX(state.version)
+                 FROM user_item_state state
+                 JOIN merge_map ON merge_map.source_id = state.item_id
+                 GROUP BY state.user_id, merge_map.target_id
+                 ON CONFLICT(user_id, item_id) DO UPDATE SET
+                     position_ticks = {max_function}(user_item_state.position_ticks, excluded.position_ticks),
+                     is_played = {max_function}(user_item_state.is_played, excluded.is_played),
+                     is_favorite = {max_function}(user_item_state.is_favorite, excluded.is_favorite),
+                     play_count = {max_function}(user_item_state.play_count, excluded.play_count),
+                     last_played_at = CASE
+                         WHEN user_item_state.last_played_at IS NULL THEN excluded.last_played_at
+                         WHEN excluded.last_played_at IS NULL THEN user_item_state.last_played_at
+                         WHEN excluded.last_played_at > user_item_state.last_played_at THEN excluded.last_played_at
+                         ELSE user_item_state.last_played_at
+                     END,
+                     version = user_item_state.version + 1"
+            )));
+            for (source_id, target_id) in chunk {
+                query = query.bind(source_id).bind(target_id);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let mut delete = self.query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM user_item_state WHERE item_id IN ({source_placeholders})"
+            )));
+            for (source_id, _) in chunk {
+                delete = delete.bind(source_id);
+            }
+            delete
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn mark_mapped_items_merged_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        mappings: &[(String, String)],
+    ) -> Result<(), StorageError> {
+        for chunk in mappings.chunks(MAX_MERGE_EPISODE_UPDATE_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source_placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH merge_map(source_id, target_id) AS (VALUES {values})
+                 UPDATE media_items
+                 SET merged_into_item_id = (
+                         SELECT target_id FROM merge_map
+                         WHERE source_id = media_items.id
+                     ),
+                     updated_at = unixepoch()
+                 WHERE id IN ({source_placeholders})
+                   AND merged_into_item_id IS NULL"
+            )));
+            for (source_id, target_id) in chunk {
+                query = query.bind(source_id).bind(target_id);
+            }
+            for (source_id, _) in chunk {
+                query = query.bind(source_id);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -850,6 +1063,98 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(moved_episode_count, EPISODE_COUNT as i64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_merge_batches_matched_episode_writes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const EPISODE_COUNT: usize = 20;
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Mixed, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let target_series_id = "merge-matched-target-series";
+        let source_series_id = "merge-matched-source-series";
+        let target_season_id = "merge-matched-target-season";
+        let source_season_id = "merge-matched-source-season";
+        for (series_id, item_type) in [
+            (target_series_id, "SERIES"),
+            (source_series_id, "SERIES"),
+            (target_season_id, "SEASON"),
+            (source_season_id, "SEASON"),
+        ] {
+            insert_merge_item(
+                &database,
+                &library_id,
+                MergeTestItem {
+                    id: series_id,
+                    item_type,
+                    parent_id: (item_type == "SEASON").then_some(
+                        if series_id == target_season_id {
+                            target_series_id
+                        } else {
+                            source_series_id
+                        },
+                    ),
+                    series_id: (item_type == "SEASON").then_some(
+                        if series_id == target_season_id {
+                            target_series_id
+                        } else {
+                            source_series_id
+                        },
+                    ),
+                    season_number: (item_type == "SEASON").then_some(1),
+                    episode_number: None,
+                },
+            )
+            .await?;
+        }
+        for episode_number in 1..=EPISODE_COUNT {
+            let target_episode_id = format!("merge-matched-target-episode-{episode_number:02}");
+            let source_episode_id = format!("merge-matched-source-episode-{episode_number:02}");
+            for (episode_id, series_id, parent_id) in [
+                (&target_episode_id, target_series_id, target_season_id),
+                (&source_episode_id, source_series_id, source_season_id),
+            ] {
+                insert_merge_item(
+                    &database,
+                    &library_id,
+                    MergeTestItem {
+                        id: episode_id,
+                        item_type: "EPISODE",
+                        parent_id: Some(parent_id),
+                        series_id: Some(series_id),
+                        season_number: Some(1),
+                        episode_number: Some(episode_number as i64),
+                    },
+                )
+                .await?;
+            }
+        }
+
+        database.reset_query_count();
+        database
+            .merge_media_items(
+                target_series_id,
+                &[target_series_id.to_owned(), source_series_id.to_owned()],
+            )
+            .await?;
+
+        assert_eq!(database.query_count(), 15);
+        let merged_episode_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE item_type = 'EPISODE' AND merged_into_item_id LIKE 'merge-matched-target-episode-%'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(merged_episode_count, EPISODE_COUNT as i64);
         Ok(())
     }
 
