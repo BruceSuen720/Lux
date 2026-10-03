@@ -8298,6 +8298,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：弹幕匹配每页最多 100 条时，取消状态读取从逐条检查加页面结束检查的 101 次静态上界，降为首项及每 8 条一次的 13 次间隔检查加 1 次最终检查，共 14 次，减少 87 次（约 86.1%）。检查点后最多再领取 8 条，已领取 worker、pending 取消、进度和插件调用语义保持不变；弹幕、配置、API 和 scheduled tasks 回归通过。本机 `uname -m=arm64`，未实测插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
 
+#### LUX-381：批量写入 STRM 缩略图图片记录
+
+范围：STRM 探测成功生成缩略图后，当前对同一个文件分别写入 `POSTER`、`THUMB` 两条 `item_images`，再单独清除媒体条目的 `poster_fallback_required`，形成 3 次写入和 3 个短事务。复用已有有界图片批量写入，将两条图片记录和 fallback 清除放入同一个事务；保留同一路径、尺寸、标签、来源、图片类型、失败状态和 fallback 语义。
+
+验收：
+
+- [x] STRM 缩略图成功登记由 2 次逐条图片 upsert 加 1 次 fallback UPDATE，降为 1 次批量图片 INSERT/UPSERT 加 1 次 fallback UPDATE。
+- [x] `POSTER`、`THUMB` 两条记录的路径、尺寸、内容标签和 `STRM_FFMPEG` 来源保持一致；批量写入失败时不清除 fallback，任务仍按原失败语义结束。
+- [x] 截图优先、已有图片跳过、NONE 策略、媒体信息和增量 STRM 探测回归保持不变；不改变 schema、插件协议或图片 API 合同。
+- [x] STRM、storage、scheduled tasks 和相关 scanner 回归通过；性能记录只报告固定 fixture 的 SQL/事务边界，不推断插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-380。预计文件：`src/application/strm_probe.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加批量图片事务的查询计数回归，再接入 STRM 探测写回。
+
+结果（2026-10-03）：STRM 截图登记从两次逐条 `item_images` upsert 加一次 fallback UPDATE，改为已有批量图片写入中的一条多行 UPSERT 加一次 fallback UPDATE，共 2 次 SQL、1 个事务；storage 回归锁定该边界。`POSTER`、`THUMB` 的路径、尺寸、标签、来源和 fallback 语义保持不变，STRM、scanner 和相关任务回归通过。本机 `uname -m=arm64`，未实测插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

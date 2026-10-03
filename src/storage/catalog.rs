@@ -6097,17 +6097,6 @@ impl Database {
             })
     }
 
-    pub(crate) async fn upsert_item_image(
-        &self,
-        item_id: &str,
-        image_type: &str,
-        local_path: &std::path::Path,
-        metadata: ItemImageMetadata<'_>,
-    ) -> Result<String, StorageError> {
-        self.upsert_item_image_at_index(item_id, image_type, 0, local_path, metadata)
-            .await
-    }
-
     pub(crate) async fn upsert_item_image_at_index(
         &self,
         item_id: &str,

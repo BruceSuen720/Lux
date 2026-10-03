@@ -2907,12 +2907,18 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
             clear_poster_fallback: true,
         },
     ];
+    database.reset_query_count();
     assert_eq!(
         database
             .insert_item_images_batch_at_indices(&batch)
             .await
             .expect("insert images for both items"),
         4
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "image rows and fallback clear share one transaction"
     );
     assert_eq!(
         database

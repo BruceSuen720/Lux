@@ -33,8 +33,8 @@ use crate::{
     domain::ids::LibraryId,
     observability::resources::ResourceMetrics,
     storage::{
-        Database, ItemImageMetadata, MediaProbeUpdate, MediaStreamUpdate, StorageError,
-        StoredStrmMediaSource, StoredStrmProbeJob,
+        Database, ItemImageBatchInsert, ItemImageInsert, MediaProbeUpdate, MediaStreamUpdate,
+        StorageError, StoredStrmMediaSource, StoredStrmProbeJob,
     },
 };
 
@@ -734,39 +734,29 @@ impl StrmProbeService {
                 i64::try_from(thumbnail.len()).map_err(|_| StrmProbeError::WorkerFailed)?;
             let content_tag = hex_sha256(thumbnail);
             let dimensions = read_image_dimensions_from_bytes(thumbnail).await;
-            for image_type in ["POSTER", "THUMB"] {
-                if self
-                    .database
-                    .upsert_item_image(
-                        &outcome.item_id,
-                        image_type,
-                        &target,
-                        ItemImageMetadata {
-                            file_size,
-                            width: dimensions.map(|(width, _)| width),
-                            height: dimensions.map(|(_, height)| height),
-                            content_tag: &content_tag,
-                            source: "STRM_FFMPEG",
-                            source_url: None,
-                        },
-                    )
-                    .await
-                    .is_err()
-                {
-                    self.database
-                        .mark_media_probe_failed(
-                            &outcome.source_id,
-                            "FAILED",
-                            "thumbnail registration failed",
-                        )
-                        .await?;
-                    return Ok(1);
-                }
-            }
-            self.database
-                .set_poster_fallback_required(&outcome.item_id, false)
+            let image_batch = strm_thumbnail_image_batch(
+                &outcome.item_id,
+                &target,
+                file_size,
+                dimensions.map(|(width, _)| width),
+                dimensions.map(|(_, height)| height),
+                &content_tag,
+            );
+            if self
+                .database
+                .insert_item_images_batch_at_indices(&[image_batch])
                 .await
-                .map_err(StrmProbeError::Storage)?;
+                .is_err()
+            {
+                self.database
+                    .mark_media_probe_failed(
+                        &outcome.source_id,
+                        "FAILED",
+                        "thumbnail registration failed",
+                    )
+                    .await?;
+                return Ok(1);
+            }
         }
         Ok(0)
     }
@@ -873,6 +863,36 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 fn strm_thumbnail_path(path: &Path) -> Option<PathBuf> {
     canonical_thumbnail_path(path)
+}
+
+fn strm_thumbnail_image_batch(
+    item_id: &str,
+    target: &Path,
+    file_size: i64,
+    width: Option<i32>,
+    height: Option<i32>,
+    content_tag: &str,
+) -> ItemImageBatchInsert {
+    let local_path = target.to_string_lossy().into_owned();
+    let images = ["POSTER", "THUMB"]
+        .into_iter()
+        .map(|image_type| ItemImageInsert {
+            image_type: image_type.to_owned(),
+            image_index: 0,
+            local_path: local_path.clone(),
+            file_size,
+            width,
+            height,
+            content_tag: content_tag.to_owned(),
+            source: "STRM_FFMPEG".to_owned(),
+            source_url: None,
+        })
+        .collect();
+    ItemImageBatchInsert {
+        item_id: item_id.to_owned(),
+        images,
+        clear_poster_fallback: true,
+    }
 }
 
 async fn safe_strm_thumbnail_target(media_path: &Path, root_path: &str) -> Option<PathBuf> {
@@ -1154,6 +1174,35 @@ mod tests {
         assert_eq!(
             strm_thumbnail_path(Path::new("/library/Example.S01E01.strm")),
             Some(PathBuf::from("/library/Example.S01E01-thumbnail.jpg"))
+        );
+    }
+
+    #[test]
+    fn strm_thumbnail_image_batch_registers_both_types_and_clears_fallback() {
+        let batch = strm_thumbnail_image_batch(
+            "item-1",
+            Path::new("/library/Example-thumbnail.jpg"),
+            128,
+            Some(1280),
+            Some(720),
+            "sha256",
+        );
+
+        assert_eq!(batch.item_id, "item-1");
+        assert!(batch.clear_poster_fallback);
+        assert_eq!(
+            batch
+                .images
+                .iter()
+                .map(|image| image.image_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["POSTER", "THUMB"]
+        );
+        assert!(
+            batch
+                .images
+                .iter()
+                .all(|image| image.local_path == "/library/Example-thumbnail.jpg")
         );
     }
 }
