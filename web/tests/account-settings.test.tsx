@@ -152,6 +152,53 @@ describe("account settings", () => {
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
   });
 
+  it("submits the self-service password change and clears the form after success", async () => {
+    const updatePassword = vi.spyOn(api, "updatePassword").mockResolvedValue();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const currentPassword = container.querySelector<HTMLInputElement>('input[autocomplete="current-password"]');
+    const newPassword = container.querySelectorAll<HTMLInputElement>('input[autocomplete="new-password"]');
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    await act(async () => {
+      setValue?.call(currentPassword, "old password");
+      currentPassword?.dispatchEvent(new Event("input", { bubbles: true }));
+      currentPassword?.dispatchEvent(new Event("change", { bubbles: true }));
+      setValue?.call(newPassword[0], "new password");
+      newPassword[0]?.dispatchEvent(new Event("input", { bubbles: true }));
+      newPassword[0]?.dispatchEvent(new Event("change", { bubbles: true }));
+      setValue?.call(newPassword[1], "new password");
+      newPassword[1]?.dispatchEvent(new Event("input", { bubbles: true }));
+      newPassword[1]?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".lux-password-panel button[type='submit']")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(updatePassword).toHaveBeenCalledWith({
+      currentPassword: "old password",
+      newPassword: "new password",
+    });
+    expect(currentPassword?.value).toBe("");
+    expect(newPassword[0]?.value).toBe("");
+    expect(newPassword[1]?.value).toBe("");
+    expect(container.textContent).toContain("密码已修改");
+  });
+
   it("defaults to the administrator library order and lets a user turn it off", async () => {
     const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({
       playedPercent: 95,
