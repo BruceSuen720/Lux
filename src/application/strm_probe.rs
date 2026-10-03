@@ -598,16 +598,19 @@ impl StrmProbeService {
             .await;
         drop(permit);
         match result {
-            Ok(result) => SourceOutcome::ready(
-                source.source_id,
-                source.item_id,
-                source.root_path,
-                path,
-                Some(sidecar_context_for_target(&url)),
-                result,
-                media_info_needed,
-                thumbnail_needed,
-            ),
+            Ok(result) => {
+                let mut outcome = SourceOutcome::ready(
+                    source.source_id,
+                    source.item_id,
+                    source.root_path,
+                    path,
+                    result,
+                    media_info_needed,
+                    thumbnail_needed,
+                );
+                outcome.sidecar_context = Some(sidecar_context_for_target(&url));
+                outcome
+            }
             Err(error) => {
                 SourceOutcome::failed(&source.source_id, failure_status(&error), error.to_string())
             }
@@ -1233,7 +1236,6 @@ impl SourceOutcome {
         item_id: String,
         root_path: String,
         path: PathBuf,
-        sidecar_context: Option<MediaInfoSidecarContext>,
         result: MediaProbeOutput,
         media_info_needed: bool,
         thumbnail_needed: bool,
@@ -1243,7 +1245,7 @@ impl SourceOutcome {
             item_id,
             root_path,
             path,
-            sidecar_context,
+            sidecar_context: None,
             result: Some(result),
             skipped: false,
             media_info_needed,
