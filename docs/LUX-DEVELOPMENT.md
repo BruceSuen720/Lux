@@ -8344,6 +8344,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：计划派发先按最多 500 个媒体库 owner 批量读取任务配置，再按媒体库复用配置创建独立运行任务；两库配置读取固定为 1 次，原有每库独立运行与失败隔离合同保持不变。scheduled tasks 4 项、计划镜像 storage 12 项和相关格式/Clippy 定向验证通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-384：复用无计划任务配置读取
+
+范围：调度器分页读取没有执行计划的 `scheduled_task_configs` 后，当前仍调用通用 `run_task` 再次按 owner 查询同一配置。直接复用已分页读取的配置行，保留 owner/task 校验、插件 ID、未注册错误、独立运行任务和计划任务路径语义，不改变任务表或公共 API。
+
+验收：
+
+- [x] 无计划任务执行不再重复查询当前已加载的配置行；任务仍按原配置创建运行任务。
+- [x] 非法 owner、unsupported task、缺失配置和章节插件 `plugin_id` 语义保持不变；执行计划任务仍使用 LUX-383 的批量读取路径。
+- [x] 无计划任务调度回归、scheduled tasks、fmt 和 Clippy 通过；性能记录只报告重复读取边界。
+
+依赖：LUX-383。预计文件：`src/application/scheduled_tasks.rs`、`tests/scheduled_tasks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加无计划任务执行回归，再复用当前分页配置。
+
+结果（2026-10-03）：无计划任务分页得到的 `StoredScheduledTaskConfig` 直接传入执行分发，移除了每个任务再次 `find_scheduled_task_config` 的重复读取；新增无计划扫描任务回归与 scheduled tasks 5 项回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

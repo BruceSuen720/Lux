@@ -281,10 +281,18 @@ impl ScheduledTaskService {
                 {
                     continue;
                 }
-                if let Err(error) = self
-                    .run_task(&task.owner_type, &task.owner_id, &task.task_type)
-                    .await
-                {
+                let result = match normalize_scheduled_task_request(
+                    &task.owner_type,
+                    &task.owner_id,
+                    &task.task_type,
+                ) {
+                    Ok((owner_type, owner_id, task_type)) => {
+                        self.run_task_with_config(&owner_type, &owner_id, &task_type, &task)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
                     match error {
                         ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
                         | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive) => {}

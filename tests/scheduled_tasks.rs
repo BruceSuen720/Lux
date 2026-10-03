@@ -278,3 +278,47 @@ async fn scheduled_plan_dispatches_each_library_once_per_cron_minute()
     assert_eq!(job_count, 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn unplanned_task_dispatch_reuses_the_loaded_task_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    })
+    .await?;
+    let library = luxd::application::libraries::LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "UPDATE scheduled_task_configs
+         SET plan_id = NULL, cron_or_interval = '* * * * *', is_enabled = 1
+         WHERE owner_type = 'LIBRARY' AND owner_id = ?
+           AND task_type = 'RECONCILIATION_SCAN'",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let plugins = PluginService::new(database.clone(), config_dir);
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database.clone(), plugins),
+        None,
+    )
+    .with_library_services(ScanJobService::new(database.clone()), None, None, None);
+
+    scheduler.run_once().await;
+
+    let job_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_jobs
+         WHERE library_id = ? AND job_type = 'RECONCILE_LIBRARY'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(job_count, 1);
+    Ok(())
+}
