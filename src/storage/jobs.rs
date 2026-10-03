@@ -10851,29 +10851,16 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) async fn delete_media_source(
+    pub(crate) async fn delete_media_sources(
         &self,
-        item_id: &str,
-        source_id: &str,
+        source_pairs: &[(&str, &str)],
     ) -> Result<bool, StorageError> {
-        let Some((old_item_id, parent_id, series_id)) = self
-            .query_as::<(String, Option<String>, Option<String>)>(
-                "SELECT ms.item_id, old_item.parent_id, old_item.series_id
-                 FROM media_sources ms
-                 JOIN media_items old_item ON old_item.id = ms.item_id
-                 WHERE ms.id = ? AND ms.item_id = ?",
-            )
-            .bind(source_id)
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-        else {
-            return Ok(false);
-        };
+        if source_pairs.is_empty() {
+            return Ok(true);
+        }
+        let source_placeholders = std::iter::repeat_n("?", source_pairs.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut transaction = self
             .pool
             .begin()
@@ -10882,40 +10869,65 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
-            .bind(source_id)
-            .bind(&old_item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        for related_item_id in [Some(old_item_id), parent_id, series_id]
-            .into_iter()
-            .flatten()
-        {
-            self.query(
-                "UPDATE media_items
-                 SET removed_at = unixepoch(), updated_at = unixepoch()
-                 WHERE id = ? AND removed_at IS NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM media_sources WHERE item_id = media_items.id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM media_items child
-                       WHERE child.parent_id = media_items.id
-                         AND child.removed_at IS NULL
-                   )",
-            )
-            .bind(related_item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut lookup = self.query_as::<(String, String, Option<String>, Option<String>)>(
+            sqlx::AssertSqlSafe(format!(
+                "SELECT ms.id, ms.item_id, old_item.parent_id, old_item.series_id
+                 FROM media_sources ms
+                 JOIN media_items old_item ON old_item.id = ms.item_id
+                 WHERE ms.id IN ({source_placeholders})"
+            )),
+        );
+        for (_, source_id) in source_pairs {
+            lookup = lookup.bind(source_id);
         }
+        let rows = lookup
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let requested_pairs = source_pairs.iter().copied().collect::<HashSet<_>>();
+        if rows.len() != source_pairs.len()
+            || rows.iter().any(|(stored_source_id, stored_item_id, _, _)| {
+                !requested_pairs.contains(&(stored_item_id.as_str(), stored_source_id.as_str()))
+            })
+        {
+            return Ok(false);
+        }
+
+        let mut item_ids = HashSet::with_capacity(rows.len());
+        let mut parent_ids = HashSet::with_capacity(rows.len());
+        let mut series_ids = HashSet::with_capacity(rows.len());
+        for (_, old_item_id, parent_id, series_id) in rows {
+            item_ids.insert(old_item_id);
+            if let Some(parent_id) = parent_id {
+                parent_ids.insert(parent_id);
+            }
+            if let Some(series_id) = series_id {
+                series_ids.insert(series_id);
+            }
+        }
+
+        let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM media_sources WHERE id IN ({source_placeholders})"
+        )));
+        for (_, source_id) in source_pairs {
+            delete_query = delete_query.bind(source_id);
+        }
+        delete_query
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.mark_media_items_removed_in_transaction(&mut transaction, &item_ids)
+            .await?;
+        self.mark_media_items_removed_in_transaction(&mut transaction, &parent_ids)
+            .await?;
+        self.mark_media_items_removed_in_transaction(&mut transaction, &series_ids)
+            .await?;
         transaction
             .commit()
             .await
@@ -10924,6 +10936,43 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+
+    async fn mark_media_items_removed_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_ids: &HashSet<String>,
+    ) -> Result<(), StorageError> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut update_query = self.query(sqlx::AssertSqlSafe(format!(
+            "UPDATE media_items
+             SET removed_at = unixepoch(), updated_at = unixepoch()
+             WHERE id IN ({placeholders}) AND removed_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_sources WHERE item_id = media_items.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_items child
+                   WHERE child.parent_id = media_items.id
+                     AND child.removed_at IS NULL
+               )"
+        )));
+        for item_id in item_ids {
+            update_query = update_query.bind(item_id);
+        }
+        update_query
+            .execute(&mut **transaction)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 }
 
@@ -11411,5 +11460,81 @@ mod tests {
             prune_sidecar_directories(vec!["Show/Season 01".to_owned(), ".".to_owned()]),
             vec![".".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_media_sources_batches_item_cleanup_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('item', 'lib', 'MOVIE', 'Item', 'item', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        for source_id in ["source-a", "source-b"] {
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, 'item', 'LOCAL_FILE', 1, 'PENDING')",
+                )
+                .bind(source_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        database.reset_query_count();
+        assert!(
+            !database
+                .delete_media_sources(&[("wrong-item", "source-a"), ("item", "missing")])
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "invalid pairs stop before writes"
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            2
+        );
+
+        database.reset_query_count();
+        let sources = [("item", "source-a"), ("item", "source-b")];
+        assert!(database.delete_media_sources(&sources).await?);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "two source rows should share one lookup, delete, and hierarchy cleanup"
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert!(
+            database
+                .query_scalar::<Option<i64>>("SELECT removed_at FROM media_items WHERE id = 'item'")
+                .fetch_one(database.pool())
+                .await?
+                .is_some()
+        );
+        Ok(())
     }
 }

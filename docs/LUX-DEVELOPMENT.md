@@ -8313,6 +8313,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：STRM 截图登记从两次逐条 `item_images` upsert 加一次 fallback UPDATE，改为已有批量图片写入中的一条多行 UPSERT 加一次 fallback UPDATE，共 2 次 SQL、1 个事务；storage 回归锁定该边界。`POSTER`、`THUMB` 的路径、尺寸、标签、来源和 fallback 语义保持不变，STRM、scanner 和相关任务回归通过。本机 `uname -m=arm64`，未实测插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
 
+#### LUX-382：批量删除媒体源与层级清理
+
+范围：删除媒体条目或剧集时，应用层当前对每个媒体源分别查询存在性、开启事务删除并更新条目/父级/剧集层级。将源校验、删除和层级清理改为每批最多 250 个源的一组参数化 SQL；保留文件与旁车删除顺序、显式源删除、缺失源错误、item/parent/series 的移除条件、事务边界和每源 webhook 语义。
+
+验收：
+
+- [x] 两个同一电影条目的源从逐源 6 次 SQL 调用降为一次批量查询、删除和层级更新共 3 次。
+- [x] 剧集删除按 item、parent、series 顺序批量更新，系列、季度和分集最终移除语义与原实现一致。
+- [x] 源 ID 与 item ID 不匹配或批次中有缺失源时在写入前返回失败，不部分删除；显式单源和整条目删除 API 回归保持通过。
+- [x] 每批最多 250 个源，层级更新最多绑定 750 个条目 ID，使用 SQLite/PostgreSQL 通用参数化查询，不改变 schema、文件删除或 webhook 合同。
+- [x] 性能记录只报告固定 SQLite SQL 调用数，不推断端到端时延、PostgreSQL、NAS 或生产收益。
+
+依赖：无。预计文件：`src/application/deletion.rs`、`src/storage/jobs.rs`、`docs/PERFORMANCE.md`。先增加多源删除的查询计数回归，确认逐源基线，再实现有界批量删除。
+
+结果（2026-10-03）：两个同一电影条目的源由旧路径的 6 次逐源 SELECT/DELETE/UPDATE 降为 3 次批量 SQL；不匹配或缺失源只执行一次校验查询且不写入。剧集删除保留 item、parent、series 三层顺序更新，避免同一 UPDATE 中父级看不到刚删除的子级；删除媒体源和整剧集 API 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

@@ -17,6 +17,9 @@ use crate::{
     storage::{Database, StorageError},
 };
 
+// Keep the source IDs and at most three related item IDs below SQLite's bind limit.
+const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
+
 #[derive(Clone)]
 pub struct MediaDeleteService {
     database: Database,
@@ -156,12 +159,12 @@ impl MediaDeleteService {
         for path in &paths {
             fs::remove_file(path).await?;
         }
-        for source in &sources {
-            if !self
-                .database
-                .delete_media_source(&source.item_id, &source.source_id)
-                .await?
-            {
+        for source_batch in sources.chunks(MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE) {
+            let source_pairs = source_batch
+                .iter()
+                .map(|source| (source.item_id.as_str(), source.source_id.as_str()))
+                .collect::<Vec<_>>();
+            if !self.database.delete_media_sources(&source_pairs).await? {
                 return Err(MediaDeleteError::ItemNotFound);
             }
         }
