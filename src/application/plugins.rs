@@ -1828,15 +1828,19 @@ impl PluginService {
             .await?;
         for plugin in scheduled_plugins {
             let plugin_id = &plugin.manifest.id;
+            let task_types = plugin
+                .manifest
+                .scheduled_tasks
+                .iter()
+                .map(|task| task.task_type.clone())
+                .collect::<Vec<_>>();
             let status = installation_statuses.get(plugin_id).copied();
             let installed = status.is_some();
             let enabled = status == Some(true);
             if !installed {
-                for task in &plugin.manifest.scheduled_tasks {
-                    self.database
-                        .disable_plugin_scheduled_task(plugin_id, &task.task_type)
-                        .await?;
-                }
+                self.database
+                    .disable_plugin_scheduled_tasks(plugin_id, &task_types)
+                    .await?;
                 continue;
             }
             let fields = self.config_fields_for_plugin(plugin).await?;
@@ -1846,10 +1850,10 @@ impl PluginService {
             );
             let config_valid = validate_config_values(&fields, &values).is_ok()
                 && validate_dynamic_plugin_config(plugin_id, &values).is_ok();
+            self.database
+                .disable_plugin_scheduled_tasks(plugin_id, &task_types)
+                .await?;
             for task in &plugin.manifest.scheduled_tasks {
-                self.database
-                    .disable_plugin_scheduled_task(plugin_id, &task.task_type)
-                    .await?;
                 let schedule = values
                     .get(&task.schedule_config_key)
                     .and_then(Value::as_str)

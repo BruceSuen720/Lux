@@ -8131,6 +8131,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：动态插件列表按请求懒加载一次 `list_libraries` 结果，并在普通、已安装、通知和章节源列表中复用；单插件路径保持独立读取。两个媒体库选项插件的固定 SQLite 查询由 5 次降至 3 次，选项过滤与插件配置回归通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-370：Manifest 任务禁用镜像批量更新
+
+范围：Manifest scheduled task 同步在同一插件声明多个任务时，对每个 task 分别开启事务并更新配置、计划两张表。将同一插件的 task 类型收集后在一个事务中用有界 `IN` 更新两张镜像表，保留未安装插件停用、计划镜像同步和后续 owner 注册语义；本任务不改变 owner 注册的任务字段或批量写入合同。
+
+验收：
+
+- [x] 同一插件两个 task 的禁用镜像更新由 4 次 SQL 调用、两次事务降至 2 次 SQL 调用、一次事务。
+- [x] 配置表和计划表的启用状态、task 类型过滤、单 task 兼容路径和空 task 输入保持不变。
+- [x] Manifest、弹幕配置和存储计划镜像回归通过；不改变 schema、插件协议、owner 注册字段或调度语义。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断任务同步墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-369。预计文件：`src/application/plugins.rs`、`src/storage/library.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加两个 task 的逐项禁用查询计数基线，再接入同插件有界批量禁用。
+
+结果（2026-10-03）：Manifest 同步先按插件收集 task 类型，再一次事务更新 `scheduled_task_configs` 与 `scheduled_task_plans`；owner 注册循环保持原字段和顺序。两个 task 的固定 SQLite 镜像更新由 4 次降至 2 次，存储计划镜像、弹幕配置和 Manifest 注册回归通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

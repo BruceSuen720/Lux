@@ -2569,11 +2569,17 @@ impl Database {
         })
     }
 
-    pub(crate) async fn disable_plugin_scheduled_task(
+    pub(crate) async fn disable_plugin_scheduled_tasks(
         &self,
         plugin_id: &str,
-        task_type: &str,
+        task_types: &[String],
     ) -> Result<(), StorageError> {
+        if task_types.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", task_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut transaction = self
             .pool
             .begin()
@@ -2582,32 +2588,40 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query(
+        let mut config_update = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_configs
              SET is_enabled = 0, updated_at = unixepoch()
-             WHERE source_type = 'PLUGIN' AND plugin_id = ? AND task_type = ?",
-        )
-        .bind(plugin_id)
-        .bind(task_type)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
+             WHERE source_type = 'PLUGIN' AND plugin_id = ?
+               AND task_type IN ({placeholders})"
+        )));
+        config_update = config_update.bind(plugin_id);
+        for task_type in task_types {
+            config_update = config_update.bind(task_type);
+        }
+        config_update
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut plan_update = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_plans
              SET is_enabled = 0, updated_at = unixepoch()
-             WHERE source_type = 'PLUGIN' AND plugin_id = ? AND task_type = ?",
-        )
-        .bind(plugin_id)
-        .bind(task_type)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+             WHERE source_type = 'PLUGIN' AND plugin_id = ?
+               AND task_type IN ({placeholders})"
+        )));
+        plan_update = plan_update.bind(plugin_id);
+        for task_type in task_types {
+            plan_update = plan_update.bind(task_type);
+        }
+        plan_update
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         transaction
             .commit()
             .await
@@ -3432,7 +3446,7 @@ mod scheduled_task_plan_mirror_tests {
         .expect("plugin config should be inserted");
 
         database
-            .disable_plugin_scheduled_task("org.lux.danmaku", "DANMAKU_MATCH")
+            .disable_plugin_scheduled_tasks("org.lux.danmaku", &["DANMAKU_MATCH".to_owned()])
             .await
             .expect("plugin task should be disabled");
 
@@ -3450,6 +3464,58 @@ mod scheduled_task_plan_mirror_tests {
         .expect("plugin plan should remain available");
         assert_eq!(config_enabled, 0);
         assert_eq!(plan_enabled, 0);
+    }
+
+    #[tokio::test]
+    async fn disabling_multiple_plugin_tasks_batches_the_same_updates() {
+        let (_temp_dir, database) = test_database().await;
+        for (task_type, plan_id) in [
+            ("PLUGIN_TASK_ONE", "plugin-plan-one"),
+            ("PLUGIN_TASK_TWO", "plugin-plan-two"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_task_plans (
+                    id, task_type, plan_name, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, scope_type, is_default
+                 ) VALUES (?, ?, 'Plugin plan', 'Plugin task', 'Plugin task',
+                           'PLUGIN', 'org.lux.test-plugin', '0 2 * * *', 1,
+                           '{}', 'GLOBAL', 1)",
+            )
+            .bind(plan_id)
+            .bind(task_type)
+            .execute(database.pool())
+            .await
+            .expect("plugin plan should be inserted");
+            sqlx::query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, plan_id
+                 ) VALUES ('GLOBAL', 'global', ?, 'Plugin task', 'Plugin task',
+                           'PLUGIN', 'org.lux.test-plugin', '0 2 * * *', 1, '{}', ?)",
+            )
+            .bind(task_type)
+            .bind(plan_id)
+            .execute(database.pool())
+            .await
+            .expect("plugin task config should be inserted");
+        }
+
+        database.reset_query_count();
+        database
+            .disable_plugin_scheduled_tasks(
+                "org.lux.test-plugin",
+                &["PLUGIN_TASK_ONE".to_owned(), "PLUGIN_TASK_TWO".to_owned()],
+            )
+            .await
+            .expect("plugin tasks should be disabled");
+
+        assert_eq!(
+            database.query_count(),
+            2,
+            "both task types should share the two mirror updates"
+        );
     }
 
     #[tokio::test]
