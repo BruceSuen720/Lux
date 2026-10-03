@@ -1318,3 +1318,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中配置两个媒体库并创建弹幕匹配任务。旧实现每个库重复读取弹幕配置、媒体库选项、插件状态和动态可用性，共 26 次 storage SQL 调用；新实现复用一次设置读取和一次可用性检查，共 19 次，减少 7 次（约 26.9%）。每库任务仍独立写入并回读。
 
 计数来自 SQLite storage 查询计数器，只衡量任务创建路径的 SQL 调用数，不代表配置文件解析、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-378 Manifest 同步媒体库选项调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中安装两个带媒体库选项和 GLOBAL task 的插件，再同步 Manifest task。旧实现每插件各读一次媒体库和 scraper 关联，共 15 次 storage SQL 调用；新实现复用一次懒加载快照，共 13 次，减少 2 次（约 13.3%）。GLOBAL 计划和 task 写入次数未改变。
+
+计数来自 SQLite storage 查询计数器，只衡量同步路径 SQL 调用数，不代表配置文件解析、插件 RPC、PostgreSQL、NAS 或生产收益。

@@ -1817,6 +1817,7 @@ impl PluginService {
             .database
             .list_plugin_installation_statuses_by_ids(&scheduled_plugin_ids)
             .await?;
+        let mut library_options = None;
         for plugin in scheduled_plugins {
             let plugin_id = &plugin.manifest.id;
             let task_types = plugin
@@ -1834,7 +1835,15 @@ impl PluginService {
                     .await?;
                 continue;
             }
-            let fields = self.config_fields_for_plugin(plugin).await?;
+            let fields = if plugin_uses_library_options(plugin) {
+                if library_options.is_none() {
+                    library_options = Some(self.database.list_libraries().await?);
+                }
+                self.config_fields_for_plugin_with_libraries(plugin, library_options.as_deref())
+                    .await?
+            } else {
+                self.config_fields_for_plugin(plugin).await?
+            };
             let values = merge_default_config_values(
                 &fields,
                 normalize_plugin_config(plugin_id, self.read_plugin_config(plugin_id).await?),
@@ -3753,6 +3762,7 @@ mod plugin_discovery_tests {
             let plugin_dir = config_dir.join(format!("plugins/{plugin_id}/binaries"));
             tokio::fs::create_dir_all(&plugin_dir).await?;
             tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+            let task_type = format!("LIBRARY_OPTIONS_TASK_{}", plugin_id.replace('.', "_"));
             tokio::fs::write(
                 config_dir.join(format!("plugins/{plugin_id}/manifest.json")),
                 serde_json::to_vec_pretty(&json!({
@@ -3772,6 +3782,21 @@ mod plugin_discovery_tests {
                         "type": "select",
                         "multiple": true,
                         "optionsSource": "media-libraries"
+                    }, {
+                        "key": "schedule",
+                        "label": "Schedule",
+                        "type": "text",
+                        "defaultValue": "0 2 * * *"
+                    }],
+                    "scheduledTasks": [{
+                        "taskType": task_type,
+                        "ownerType": "GLOBAL",
+                        "name": "Library options task",
+                        "description": "Library options task",
+                        "scheduleConfigKey": "schedule",
+                        "defaultSchedule": "0 2 * * *",
+                        "requiredConfigKeys": [],
+                        "resourceLimit": {}
                     }],
                     "permissions": {"network": [], "filesystem": []},
                     "files": []
@@ -3800,6 +3825,13 @@ mod plugin_discovery_tests {
             database.query_count(),
             3,
             "the library list and scraper associations should be loaded once per page"
+        );
+        database.reset_query_count();
+        service.sync_manifest_scheduled_tasks().await?;
+        assert_eq!(
+            database.query_count(),
+            13,
+            "scheduled task sync should reuse one library options snapshot"
         );
         Ok(())
     }

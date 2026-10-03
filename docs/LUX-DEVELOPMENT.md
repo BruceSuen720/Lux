@@ -8251,6 +8251,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：两个媒体库的配置任务创建从每库重复读取设置/可用性改为设置读取一次、可用性检查一次；固定 fixture 从 26 次 SQL 降为 19 次，减少 7 次（约 26.9%）。弹幕、配置、配置 API 和插件回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-378：Manifest 任务同步复用媒体库选项
+
+范围：同一次 Manifest task 同步遍历多个带 `media-libraries` 配置字段的插件时，动态字段解析重复读取媒体库及 scraper 关联。把选项快照限制为当前同步调用内懒加载一次并复用；没有媒体库选项或未安装的插件不触发读取，单插件配置接口仍读取当前数据，不改变任务注册、启用状态或调度合同。
+
+验收：
+
+- [x] 两个带媒体库选项的 GLOBAL task 插件同步，由 15 次 storage SQL 调用降为 13 次。
+- [x] 插件字段选项、过滤、配置校验、任务 schedule 和 GLOBAL 计划镜像保持不变。
+- [x] 插件列表/Manifest 同步、弹幕配置和计划任务回归通过；不改变 schema 或插件协议。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断同步墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-376、LUX-369。预计文件：`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先扩展多插件选项 fixture 覆盖同步调用，再复用同步内快照。
+
+结果（2026-10-03）：Manifest 同步在首次需要媒体库选项时加载一次媒体库/关联快照，随后各插件复用；两插件 GLOBAL task fixture 从 15 次降为 13 次，减少 2 次（约 13.3%）。插件、弹幕配置、scheduled tasks 和库级 Clippy 通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
