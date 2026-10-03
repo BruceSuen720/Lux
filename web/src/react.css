@@ -504,7 +504,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-person-works-grid { margin-top: 20px; }
 .lux-person-works-actions { display: flex; justify-content: center; margin-top: 28px; }
 @media (max-width: 700px) {
-  .lux-person-detail-page { padding-top: 0; }
+  .lux-person-detail-page { width: 92%; box-sizing: border-box; padding-top: 0; }
   .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
   .lux-person-detail-copy h1 { font-size: 2.2rem; }
@@ -1937,7 +1937,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-source { grid-column: 1 / -1; justify-content: center; width: 100%; }
   .lux-detail-copy h1 { font-size: 28px; }
   .lux-detail-source { width: 100%; }
-  .lux-detail-sections { display: flex; flex-direction: column; }
+  .lux-detail-sections { display: flex; flex-direction: column; width: 92%; margin-inline: auto; }
   .lux-detail-hierarchy { order: 1; }
   .lux-detail-hierarchy > .lux-series-children, .lux-detail-hierarchy > .lux-season-episodes, .lux-detail-hierarchy > .lux-episode-rail { margin-top: 0; padding-top: 0; }
   .lux-detail-cast { order: 2; }
@@ -1949,6 +1949,10 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-media-info-summary { grid-template-columns: 1fr; }
   .lux-media-info-address { align-items: flex-start; flex-direction: column; gap: 5px; }
   .lux-media-nfo { margin-top: 32px; padding-top: 12px; }
+  .lux-media-nfo-heading h2 { font-size: 1.18rem; font-weight: 650; }
+  .lux-media-nfo-heading > span { font-size: .72rem; }
+  .lux-media-nfo-media-heading h3 { font-size: 1rem; }
+  .lux-media-nfo-media-heading > span { font-size: .72rem; }
   .lux-media-nfo-summary { grid-template-columns: 1fr; }
   .lux-media-nfo-taxonomy { align-items: flex-start; flex-direction: column; gap: 10px; }
   .lux-media-nfo-overview.has-rating { grid-template-columns: minmax(0, 1fr); gap: 14px; }

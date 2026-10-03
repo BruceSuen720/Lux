@@ -124,3 +124,11 @@ test("mobile task activity popover stays inside the viewport and wraps its conte
   assert.match(headingRule, /flex-direction:\s*column/);
   assert.match(actionRule, /flex-wrap:\s*wrap/);
 });
+
+test("mobile person details use the same horizontal page gutter", () => {
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 700px)"));
+  const personRule = mobileStyles.match(/\.lux-person-detail-page\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(personRule, /width:\s*92%/);
+  assert.match(personRule, /box-sizing:\s*border-box/);
+});
