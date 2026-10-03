@@ -9206,6 +9206,134 @@ async fn server_settings_are_written_with_one_upsert() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn uninstalling_a_plugin_batches_library_scraper_rewrites()
+-> Result<(), Box<dyn std::error::Error>> {
+    const REMOVED_PLUGIN: &str = "org.lux.removed-scraper";
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let first = libraries
+        .create_library("First", LibraryKind::Movie, false)
+        .await?;
+    let second = libraries
+        .create_library("Second", LibraryKind::Movie, false)
+        .await?;
+    let first_id = first.id.to_string();
+    let second_id = second.id.to_string();
+
+    sqlx::query(
+        "INSERT INTO installed_plugins (plugin_id, is_enabled)
+         VALUES (?, 1)",
+    )
+    .bind(REMOVED_PLUGIN)
+    .execute(database.pool())
+    .await?;
+    for (library_id, scrapers) in [
+        (
+            first_id.as_str(),
+            [
+                (REMOVED_PLUGIN, 0_i64, "PRIMARY"),
+                ("backup-one", 1, "BACKUP"),
+            ]
+            .as_slice(),
+        ),
+        (
+            second_id.as_str(),
+            [
+                (REMOVED_PLUGIN, 0_i64, "PRIMARY"),
+                ("backup-two", 1, "BACKUP"),
+                ("supplement-two", 2, "SUPPLEMENT"),
+            ]
+            .as_slice(),
+        ),
+    ] {
+        for (scraper_id, position, role) in scrapers {
+            sqlx::query(
+                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(library_id)
+            .bind(scraper_id)
+            .bind(position)
+            .bind(role)
+            .execute(database.pool())
+            .await?;
+        }
+    }
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = ?, chapter_source_id = ?
+         WHERE id = ?",
+    )
+    .bind(REMOVED_PLUGIN)
+    .bind(REMOVED_PLUGIN)
+    .bind(&first_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE libraries SET scraper_id = ? WHERE id = ?")
+        .bind(REMOVED_PLUGIN)
+        .bind(&second_id)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    database.uninstall_plugin(REMOVED_PLUGIN).await?;
+    assert_eq!(database.query_count(), 8);
+
+    let first_scrapers: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT scraper_id, position, role FROM library_scrapers
+         WHERE library_id = ? ORDER BY position",
+    )
+    .bind(&first_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        first_scrapers,
+        vec![("backup-one".to_owned(), 0, "PRIMARY".to_owned())]
+    );
+    let second_scrapers: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT scraper_id, position, role FROM library_scrapers
+         WHERE library_id = ? ORDER BY position",
+    )
+    .bind(&second_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        second_scrapers,
+        vec![
+            ("backup-two".to_owned(), 0, "PRIMARY".to_owned()),
+            ("supplement-two".to_owned(), 1, "SUPPLEMENT".to_owned()),
+        ]
+    );
+    let library_values: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, scraper_id, chapter_source_id FROM libraries
+         WHERE id IN (?, ?) ORDER BY id",
+    )
+    .bind(&first_id)
+    .bind(&second_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        library_values,
+        vec![
+            (first_id.clone(), Some("backup-one".to_owned()), None),
+            (second_id.clone(), Some("backup-two".to_owned()), None),
+        ]
+    );
+    let installed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM installed_plugins WHERE plugin_id = ?")
+            .bind(REMOVED_PLUGIN)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(installed, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()

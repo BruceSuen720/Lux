@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
+const UNINSTALL_PLUGIN_LIBRARY_BATCH_SIZE: usize = 100;
+const UNINSTALL_PLUGIN_SCRAPER_INSERT_BATCH_SIZE: usize = 100;
 
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -1585,77 +1587,118 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for library_id in library_ids {
-            let rows = self
-                .query(
-                    "SELECT scraper_id, role FROM library_scrapers
-                     WHERE library_id = ? ORDER BY position, scraper_id",
-                )
-                .bind(&library_id)
+        for library_chunk in library_ids.chunks(UNINSTALL_PLUGIN_LIBRARY_BATCH_SIZE) {
+            let placeholders = std::iter::repeat_n("?", library_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut select = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT library_id, scraper_id, role
+                 FROM library_scrapers
+                 WHERE library_id IN ({placeholders})
+                 ORDER BY library_id, position, scraper_id"
+            )));
+            for library_id in library_chunk {
+                select = select.bind(library_id);
+            }
+            let rows = select
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            self.query("DELETE FROM library_scrapers WHERE library_id = ?")
-                .bind(&library_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            for (position, row) in rows.into_iter().enumerate() {
-                let stored_role: String = row.get("role");
-                let role = if position == 0 {
-                    "PRIMARY"
-                } else if stored_role.as_str() == "PRIMARY" {
-                    "BACKUP"
-                } else {
-                    stored_role.as_str()
-                };
-                let position = i64::try_from(position)
-                    .map_err(|_| StorageError::Serialization("刮削器位置超出范围".to_owned()))?;
-                self.query(
-                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(&library_id)
-                .bind(row.get::<String, _>("scraper_id"))
-                .bind(position)
-                .bind(role)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let mut scrapers_by_library = HashMap::<String, Vec<(String, String)>>::new();
+            for row in rows {
+                scrapers_by_library
+                    .entry(row.get("library_id"))
+                    .or_default()
+                    .push((row.get("scraper_id"), row.get("role")));
             }
-            let primary = self
-                .query_scalar::<String>(
-                    "SELECT scraper_id FROM library_scrapers
-                     WHERE library_id = ? AND position = 0",
-                )
-                .bind(&library_id)
-                .fetch_optional(&mut *transaction)
+
+            let mut delete = self.query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM library_scrapers WHERE library_id IN ({placeholders})"
+            )));
+            for library_id in library_chunk {
+                delete = delete.bind(library_id);
+            }
+            delete
+                .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            self.query(
-                "UPDATE libraries SET scraper_id = ?, updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(primary)
-            .bind(&library_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+
+            let mut insert_rows = Vec::<(String, String, i64, String)>::new();
+            let mut primary_by_library = Vec::<(String, Option<String>)>::new();
+            for library_id in library_chunk {
+                let rows = scrapers_by_library.remove(library_id).unwrap_or_default();
+                let mut primary = None;
+                for (position, (scraper_id, stored_role)) in rows.into_iter().enumerate() {
+                    let role = if position == 0 {
+                        "PRIMARY"
+                    } else if stored_role == "PRIMARY" {
+                        "BACKUP"
+                    } else {
+                        stored_role.as_str()
+                    };
+                    let position = i64::try_from(position).map_err(|_| {
+                        StorageError::Serialization("刮削器位置超出范围".to_owned())
+                    })?;
+                    if position == 0 {
+                        primary = Some(scraper_id.clone());
+                    }
+                    insert_rows.push((library_id.clone(), scraper_id, position, role.to_owned()));
+                }
+                primary_by_library.push((library_id.clone(), primary));
+            }
+
+            for insert_chunk in insert_rows.chunks(UNINSTALL_PLUGIN_SCRAPER_INSERT_BATCH_SIZE) {
+                let values = std::iter::repeat_n("(?, ?, ?, ?)", insert_chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut insert = self.query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                     VALUES {values}"
+                )));
+                for (library_id, scraper_id, position, role) in insert_chunk {
+                    insert = insert
+                        .bind(library_id)
+                        .bind(scraper_id)
+                        .bind(*position)
+                        .bind(role);
+                }
+                insert
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            }
+
+            let case_clauses = std::iter::repeat_n("WHEN ? THEN ?", library_chunk.len())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut update = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE libraries
+                 SET scraper_id = CASE id {case_clauses} ELSE NULL END,
+                     updated_at = unixepoch()
+                 WHERE id IN ({placeholders})"
+            )));
+            for (library_id, primary) in &primary_by_library {
+                update = update.bind(library_id).bind(primary.as_deref());
+            }
+            for library_id in library_chunk {
+                update = update.bind(library_id);
+            }
+            update
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         self.query(
             "UPDATE libraries
