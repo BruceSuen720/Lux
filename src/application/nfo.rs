@@ -3098,8 +3098,8 @@ mod tests {
         );
         assert_eq!(
             database.query_count(),
-            4,
-            "context, auxiliary, invalidation and fingerprint"
+            3,
+            "context, auxiliary, combined state sync and fingerprint"
         );
         let content = fs::read_to_string(&target).await?;
         assert!(content.contains("<custom>keep</custom>"));
