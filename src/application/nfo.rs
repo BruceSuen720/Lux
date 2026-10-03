@@ -29,7 +29,7 @@ use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
-use crate::storage::{Database, MediaMetadataUpdate, StorageError};
+use crate::storage::{Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalNfoCredit {
@@ -2203,17 +2203,17 @@ impl NfoWriteService {
         source_id: &str,
         probe: &MediaProbeResult,
     ) -> Result<bool, NfoWriteError> {
-        let Some(kind) = self.database.find_media_item_kind(item_id).await? else {
+        let mut contexts = self
+            .database
+            .list_media_item_writeback_contexts_by_ids(&[item_id.to_owned()])
+            .await?;
+        let Some(context) = contexts.remove(item_id) else {
             return Ok(false);
         };
-        if kind.item_type != "MOVIE" {
+        if context.item_type != "MOVIE" {
             return Ok(false);
         }
-        let Some(writeback_source) = self
-            .database
-            .find_metadata_writeback_source_path(item_id)
-            .await?
-        else {
+        let Some(writeback_source) = context.source else {
             return Ok(false);
         };
         let is_strm = Path::new(&writeback_source.relative_path)
@@ -2223,7 +2223,9 @@ impl NfoWriteService {
         if writeback_source.source_id != source_id || is_strm {
             return Ok(false);
         }
-        let target = self.item_nfo_target(item_id).await?;
+        let target = self
+            .item_nfo_target_from_source("MOVIE", None, &writeback_source)
+            .await?;
         let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
         let write = write_nfo_atomically_with_rewriter(
             &target,
@@ -2360,6 +2362,16 @@ impl NfoWriteService {
             _ => None,
         }
         .ok_or(NfoWriteError::ItemNotFound)?;
+        self.item_nfo_target_from_source(&kind.item_type, kind.season_number, &source)
+            .await
+    }
+
+    async fn item_nfo_target_from_source(
+        &self,
+        item_type: &str,
+        season_number: Option<i64>,
+        source: &StoredMediaSourcePath,
+    ) -> Result<PathBuf, NfoWriteError> {
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| io_error(Path::new(&source.root_path), error))?;
@@ -2379,7 +2391,7 @@ impl NfoWriteService {
         if !directory.starts_with(&root) {
             return Err(NfoWriteError::PathOutsideRoot(directory));
         }
-        let target = match kind.item_type.as_str() {
+        let target = match item_type {
             "MOVIE" => find_nfo_path(&media_path)
                 .await
                 .unwrap_or_else(|| directory.join("movie.nfo")),
@@ -2396,7 +2408,7 @@ impl NfoWriteService {
                 }
                 series_dir.join("tvshow.nfo")
             }
-            "SEASON" => find_season_nfo_target(&directory, kind.season_number).await,
+            "SEASON" => find_season_nfo_target(&directory, season_number).await,
             _ => return Err(NfoWriteError::ItemNotFound),
         };
         let target_parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -2921,6 +2933,114 @@ struct ActiveField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        application::{libraries::LibraryService, scanner::LibraryScanner},
+        config::Config,
+        library::LibraryKind,
+    };
+
+    #[tokio::test]
+    async fn probe_nfo_write_reuses_context_and_preserves_source_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("Movies");
+        fs::create_dir_all(&root).await?;
+        fs::write(root.join("Example.Movie.2020.mkv"), b"fixture").await?;
+        let target = root.join("movie.nfo");
+        fs::write(
+            &target,
+            b"<movie><title>Example</title><custom>keep</custom></movie>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let (item_id, source_id): (String, String) =
+            sqlx::query_as("SELECT item_id, id FROM media_sources LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        let probe = MediaProbeResult {
+            container: Some("mkv".to_owned()),
+            source_size: Some(100),
+            duration_ticks: Some(600_000_000),
+            bitrate: Some(500_000),
+            streams: vec![],
+        };
+        let writer = NfoWriteService::new(database.clone());
+        database.reset_query_count();
+        assert!(
+            writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            4,
+            "context, auxiliary, invalidation and fingerprint"
+        );
+        let content = fs::read_to_string(&target).await?;
+        assert!(content.contains("<custom>keep</custom>"));
+        assert!(root.join("movie.nfo").exists());
+
+        database.reset_query_count();
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, "wrong-source", &probe)
+                .await?
+        );
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(fs::read_to_string(&target).await?, content);
+
+        sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert!(
+            !writer
+                .write_item_probe_details("missing-item", &source_id, &probe)
+                .await?
+        );
+
+        sqlx::query("UPDATE media_items SET item_type = 'MOVIE' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE filesystem_entries SET relative_path = 'Example.strm' WHERE id = (SELECT filesystem_entry_id FROM media_sources WHERE id = ?)")
+            .bind(&source_id).execute(database.pool()).await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        sqlx::query("DELETE FROM media_sources WHERE id = ?")
+            .bind(&source_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(fs::read_to_string(&target).await?, content);
+        Ok(())
+    }
 
     fn mutate_target(path: &Path) -> std::io::Result<()> {
         std::fs::write(path, b"<movie><title>external</title></movie>")

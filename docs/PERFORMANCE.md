@@ -1276,3 +1276,9 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备同一插件的两个 Manifest task，并更新其配置/计划镜像。旧路径对每个 task 分别开启事务，分别 UPDATE 两张表，共 4 次 storage SQL 调用；新路径在一个事务中按 task 类型 `IN` 更新两张表，共 2 次，减少 2 次（50%）。回归验证两个 task 的配置表和计划表均被停用。
 
 该优化只合并禁用镜像更新；后续 owner 注册仍按现有字段和顺序执行。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是事务墙钟、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-371 NFO probe 写回上下文读取边界
+
+2026-10-03 检查电影 probe NFO 写回的 SQL 路径。旧路径先读取 item kind、写回 source，再由通用 target 解析重复读取 kind 和 source；新路径一次读取 `StoredMediaWritebackContext`，并复用其中的电影 source 完成 target 路径检查。probe target 选择阶段由 4 次重复类型/源读取收敛为 1 次上下文查询；写回后的通用 auxiliary、fingerprint 和 invalidation SQL 不计入该边界。
+
+该记录是由固定调用路径得到的 SQL 边界，不是墙钟或磁盘基准；NFO writer、series metadata 和 metadata 回归通过，但未据此推断 PostgreSQL、NAS 或生产收益。

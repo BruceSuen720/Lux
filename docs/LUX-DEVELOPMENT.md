@@ -8146,6 +8146,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：Manifest 同步先按插件收集 task 类型，再一次事务更新 `scheduled_task_configs` 与 `scheduled_task_plans`；owner 注册循环保持原字段和顺序。两个 task 的固定 SQLite 镜像更新由 4 次降至 2 次，存储计划镜像、弹幕配置和 Manifest 注册回归通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
+#### LUX-371：NFO probe 写回复用媒体写回上下文
+
+范围：`write_item_probe_details` 先分别读取媒体条目类型和写回源，随后调用通用 NFO target 解析再次读取同一类型和源。复用已有的 `list_media_item_writeback_contexts_by_ids` 单条上下文查询，并把电影 target 路径安全检查提取为纯路径阶段；保留 MOVIE/STRM/source ID 过滤、canonicalize、library root containment、既有 NFO 命名和写回后 fingerprint 处理。
+
+验收：
+
+- [x] 电影 probe 写回的类型/源预检由 2 次独立读取加 target 阶段重复 2 次，收敛为 1 次上下文查询；通用系列、季度、分集 NFO target 路径保持原读取合同。
+- [x] 错误 source、STRM 源、无源条目、非电影条目、非标准 movie.nfo 和路径越界行为保持不变。
+- [x] NFO writer、series metadata、metadata 回归通过；不改变数据库 schema、NFO/Emby 合同或 probe 状态。
+- [x] 性能记录只报告固定路径上的 SQL 调用边界，不推断 NFO 写回墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-370、LUX-364。预计文件：`src/application/nfo.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先覆盖 probe 写回的现有路径回归，再复用已存在的写回上下文查询。
+
+结果（2026-10-03）：probe 写回直接使用一次有界写回上下文读取，电影 target 复用该 source 完成 canonicalize 和 root containment；普通 NFO 写入继续独立解析 item 类型。`nfo_writer` 25 项、`series_metadata` 3 项、`metadata` 20 项通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
