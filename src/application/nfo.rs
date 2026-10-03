@@ -2793,6 +2793,7 @@ where
                 .await
                 .ok()
                 .flatten(),
+            &rewritten,
         );
         Ok(())
     }
