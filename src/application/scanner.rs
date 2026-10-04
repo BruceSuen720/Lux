@@ -2879,6 +2879,7 @@ pub struct ScanJobService {
     admin_events: AdminEventHub,
     user_events: UserEventHub,
     scan_lock: Arc<Semaphore>,
+    full_scan_queue: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
@@ -3647,6 +3648,7 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             user_events: UserEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
+            full_scan_queue: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
             people: None,
@@ -9510,6 +9512,16 @@ impl ScanJobService {
         let Some(_run_guard) = self.track_scan_job_run(job_id, &job.library_id) else {
             self.cancel_running_job(job_id).await?;
             return Ok(());
+        };
+        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
+            Some(
+                Arc::clone(&self.full_scan_queue)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ScanJobError::ScanLockClosed)?,
+            )
+        } else {
+            None
         };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(

@@ -414,7 +414,9 @@ impl Database {
                      FROM metadata_reidentify_job_items job_items
                      JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
                      WHERE jobs.mode = 'FILL_MISSING'
-                       AND jobs.status IN ('QUEUED', 'RUNNING')
+                       AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
+                       AND (jobs.status <> 'DEFERRED'
+                            OR jobs.updated_at >= unixepoch() - 3600)
                        AND jobs.cancel_requested = 0
                        AND job_items.status IN ('PENDING', 'RUNNING')
                        AND job_items.item_id IN ({placeholders})"
