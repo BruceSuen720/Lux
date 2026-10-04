@@ -1562,9 +1562,14 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let library_ids = self
-            .query_scalar::<String>(
-                "SELECT DISTINCT library_id FROM library_scrapers WHERE scraper_id = ?",
+        let rows: Vec<(String, String, i64, String)> = self
+            .query_as(
+                "SELECT library_id, scraper_id, position, role
+                 FROM library_scrapers
+                 WHERE library_id IN (
+                     SELECT DISTINCT library_id FROM library_scrapers WHERE scraper_id = ?
+                 )
+                 ORDER BY library_id, position, scraper_id",
             )
             .bind(plugin_id)
             .fetch_all(&mut *transaction)
@@ -1573,85 +1578,109 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query("DELETE FROM library_scrapers WHERE scraper_id = ?")
-            .bind(plugin_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        for library_id in library_ids {
-            let rows = self
-                .query(
-                    "SELECT scraper_id, role FROM library_scrapers
-                     WHERE library_id = ? ORDER BY position, scraper_id",
-                )
-                .bind(&library_id)
-                .fetch_all(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            self.query("DELETE FROM library_scrapers WHERE library_id = ?")
-                .bind(&library_id)
+        let mut scrapers_by_library = BTreeMap::<String, Vec<(String, String)>>::new();
+        for (library_id, scraper_id, _position, role) in rows {
+            if scraper_id != plugin_id {
+                scrapers_by_library
+                    .entry(library_id)
+                    .or_default()
+                    .push((scraper_id, role));
+            } else {
+                scrapers_by_library.entry(library_id).or_default();
+            }
+        }
+        let library_ids = scrapers_by_library.keys().cloned().collect::<Vec<_>>();
+
+        const LIBRARY_ID_QUERY_CHUNK_SIZE: usize = 500;
+        for library_id_chunk in library_ids.chunks(LIBRARY_ID_QUERY_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", library_id_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM library_scrapers WHERE library_id IN ({placeholders})"
+            )));
+            for library_id in library_id_chunk {
+                query = query.bind(library_id);
+            }
+            query
                 .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            for (position, row) in rows.into_iter().enumerate() {
-                let stored_role: String = row.get("role");
+        }
+
+        let mut rebuilt_rows = Vec::new();
+        let mut primary_by_library = Vec::with_capacity(scrapers_by_library.len());
+        for (library_id, scrapers) in scrapers_by_library {
+            let primary = scrapers.first().map(|(scraper_id, _)| scraper_id.clone());
+            primary_by_library.push((library_id.clone(), primary));
+            for (position, (scraper_id, stored_role)) in scrapers.into_iter().enumerate() {
                 let role = if position == 0 {
                     "PRIMARY"
-                } else if stored_role.as_str() == "PRIMARY" {
+                } else if stored_role == "PRIMARY" {
                     "BACKUP"
                 } else {
                     stored_role.as_str()
                 };
                 let position = i64::try_from(position)
                     .map_err(|_| StorageError::Serialization("刮削器位置超出范围".to_owned()))?;
-                self.query(
-                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(&library_id)
-                .bind(row.get::<String, _>("scraper_id"))
-                .bind(position)
-                .bind(role)
+                rebuilt_rows.push((library_id.clone(), scraper_id, position, role.to_owned()));
+            }
+        }
+
+        const SCRAPER_ROW_INSERT_CHUNK_SIZE: usize = 100;
+        for row_chunk in rebuilt_rows.chunks(SCRAPER_ROW_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", row_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                 VALUES {values}"
+            )));
+            for (library_id, scraper_id, position, role) in row_chunk {
+                query = query
+                    .bind(library_id)
+                    .bind(scraper_id)
+                    .bind(*position)
+                    .bind(role);
+            }
+            query
                 .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
+        }
+
+        const LIBRARY_UPDATE_CHUNK_SIZE: usize = 100;
+        for library_chunk in primary_by_library.chunks(LIBRARY_UPDATE_CHUNK_SIZE) {
+            let cases = std::iter::repeat_n("WHEN ? THEN ?", library_chunk.len())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let placeholders = std::iter::repeat_n("?", library_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE libraries
+                 SET scraper_id = CASE id {cases} END, updated_at = unixepoch()
+                 WHERE id IN ({placeholders})"
+            )));
+            for (library_id, primary) in library_chunk {
+                query = query.bind(library_id).bind(primary);
             }
-            let primary = self
-                .query_scalar::<String>(
-                    "SELECT scraper_id FROM library_scrapers
-                     WHERE library_id = ? AND position = 0",
-                )
-                .bind(&library_id)
-                .fetch_optional(&mut *transaction)
+            for (library_id, _) in library_chunk {
+                query = query.bind(library_id);
+            }
+            query
+                .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            self.query(
-                "UPDATE libraries SET scraper_id = ?, updated_at = unixepoch()
-                 WHERE id = ?",
-            )
-            .bind(primary)
-            .bind(&library_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         }
         self.query(
             "UPDATE libraries
@@ -1943,6 +1972,80 @@ mod tests {
                 .has_user_library_access(&user_id, &second_library_id)
                 .await?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uninstall_plugin_rebuilds_affected_library_scrapers_in_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const LIBRARY_COUNT: usize = 205;
+        let (_temp_dir, database) = test_database().await?;
+        database.install_plugin("org.lux.batch-uninstall").await?;
+
+        for index in 0..LIBRARY_COUNT {
+            let library_id = format!("batch-uninstall-library-{index:03}");
+            sqlx::query(
+                "INSERT INTO libraries (id, name, kind, scraper_id)
+                 VALUES (?, ?, 'MOVIE', 'org.lux.batch-uninstall')",
+            )
+            .bind(&library_id)
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+            for (position, (scraper_id, role)) in [
+                ("org.lux.batch-uninstall", "PRIMARY"),
+                ("org.lux.secondary", "SUPPLEMENT"),
+                ("org.lux.backup", "BACKUP"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                sqlx::query(
+                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(&library_id)
+                .bind(scraper_id)
+                .bind(position as i64)
+                .bind(role)
+                .execute(database.pool())
+                .await?;
+            }
+        }
+
+        database.reset_query_count();
+        database.uninstall_plugin("org.lux.batch-uninstall").await?;
+        assert_eq!(database.query_count(), 12);
+
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT scraper_id, position, role
+             FROM library_scrapers
+             WHERE library_id = 'batch-uninstall-library-000'
+             ORDER BY position",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            rows,
+            vec![
+                ("org.lux.secondary".to_owned(), 0, "PRIMARY".to_owned()),
+                ("org.lux.backup".to_owned(), 1, "BACKUP".to_owned()),
+            ]
+        );
+        let primary: Option<String> = sqlx::query_scalar(
+            "SELECT scraper_id FROM libraries
+             WHERE id = 'batch-uninstall-library-000'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(primary.as_deref(), Some("org.lux.secondary"));
+        let installed: Option<String> = sqlx::query_scalar(
+            "SELECT plugin_id FROM installed_plugins
+             WHERE plugin_id = 'org.lux.batch-uninstall'",
+        )
+        .fetch_optional(database.pool())
+        .await?;
+        assert_eq!(installed, None);
         Ok(())
     }
 
