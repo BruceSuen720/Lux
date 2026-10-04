@@ -192,6 +192,8 @@ impl PeopleService {
         } else {
             legacy_path
         };
+        let relation_guard = self.relation_lock_for(&relation_path).await;
+        let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
         acquire_exclusive_file_lock(&lock_path).await?;
         let result = self
@@ -294,6 +296,8 @@ impl PeopleService {
             PeopleError::Serialization("people relation path has no parent".to_owned())
         })?;
         create_private_dir(relation_dir).await?;
+        let relation_guard = self.relation_lock_for(&relation_path).await;
+        let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
         acquire_exclusive_file_lock(&lock_path).await?;
         let result = self
