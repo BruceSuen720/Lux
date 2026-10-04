@@ -11512,12 +11512,34 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
         .await
         .expect("web playback session");
 
+    for index in 0..129 {
+        let id = format!("expired-session-{index:03}");
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: &id,
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: &format!("lux-web:{id}"),
+                tier: 1,
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: 99,
+                now: 1,
+            })
+            .await
+            .expect("additional web playback session");
+    }
+
+    database.reset_query_count();
     let expired = database
         .take_expired_web_playback_sessions(100)
         .await
         .expect("expired sessions");
 
-    assert_eq!(expired.len(), 1);
+    assert_eq!(expired.len(), 128);
+    assert_eq!(database.query_count(), 2);
     assert_eq!(expired[0].id, "expired-session");
     let state: String =
         sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'expired-session'")
@@ -11525,6 +11547,14 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
             .await
             .expect("session state");
     assert_eq!(state, "STOPPED");
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_playback_sessions
+         WHERE state = 'ACTIVE' AND expires_at < 100",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining expired sessions");
+    assert_eq!(active_count, 2);
 }
 
 #[tokio::test]
@@ -11575,6 +11605,35 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
         })
         .await
         .expect("web playback session");
+
+    for index in 0..129 {
+        let id = format!("inactive-session-{index:03}");
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: &id,
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: &format!("lux-web:{id}"),
+                tier: 4,
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: 10_000,
+                now: 1_000,
+            })
+            .await
+            .expect("additional inactive web playback session");
+        sqlx::query(
+            "UPDATE web_playback_sessions
+             SET last_heartbeat_at = 900
+             WHERE id = ?",
+        )
+        .bind(&id)
+        .execute(database.pool())
+        .await
+        .expect("stale additional heartbeat");
+    }
     assert_eq!(
         database
             .accept_web_playback_event(NewWebPlaybackEvent {
@@ -11607,12 +11666,14 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
     .await
     .expect("stale heartbeat");
 
+    database.reset_query_count();
     let inactive = database
         .take_inactive_web_playback_sessions(1_000, 90)
         .await
         .expect("inactive sessions");
 
-    assert_eq!(inactive.len(), 1);
+    assert_eq!(inactive.len(), 128);
+    assert_eq!(database.query_count(), 2);
     assert_eq!(inactive[0].id, "inactive-session");
     let state: String =
         sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'inactive-session'")
@@ -11620,6 +11681,14 @@ async fn inactive_server_hls_sessions_are_stopped_in_a_bounded_batch() {
             .await
             .expect("session state");
     assert_eq!(state, "STOPPED");
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_playback_sessions
+         WHERE state = 'ACTIVE' AND plan = 'SERVER_HLS' AND last_heartbeat_at < 910",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining inactive sessions");
+    assert_eq!(active_count, 2);
 }
 
 #[tokio::test]

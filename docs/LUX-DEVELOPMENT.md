@@ -8329,6 +8329,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：两个同一电影条目的源由旧路径的 6 次逐源 SELECT/DELETE/UPDATE 降为 3 次批量 SQL；不匹配或缺失源只执行一次校验查询且不写入。剧集删除保留 item、parent、series 三层顺序更新，避免同一 UPDATE 中父级看不到刚删除的子级；删除媒体源和整剧集 API 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
 
+#### LUX-383：批量清理 Web HLS 播放会话
+
+范围：Web HLS 会话清理当前先取最多 128 个过期或无心跳会话，再逐会话执行条件 UPDATE，单次清理最多产生 129 次 SQL。改为保留有界候选读取后，用一次参数化 `UPDATE ... RETURNING` 批量停止仍满足条件的会话；保留并发条件复核、按候选顺序返回成功停止的会话、最多 128 条上限和 HLS 目录清理语义。不改变播放会话表结构或 API 合同。
+
+验收：
+
+- [x] 130 个过期会话和 130 个无心跳会话各只停止前 128 个，剩余 2 个保持 active；两条路径的 storage SQL 调用均由 129 次降为 2 次。
+- [x] 条件 UPDATE 只返回仍为 active 且满足过期/无心跳条件的会话；返回顺序保持候选读取顺序，清理任务继续只处理实际停止的 HLS 目录。
+- [x] 播放会话、Web 播放和存储回归通过；不改变状态机、会话上限、并发竞态保护或 PostgreSQL/SQLite 通用 SQL 边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 HLS 文件清理墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：无。预计文件：`src/storage/sessions.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先以 130 会话回归锁定逐会话 UPDATE 基线，再接入有界批量停止。
+
+结果（2026-10-05）：过期与无心跳清理均由候选 SELECT 加逐会话 UPDATE 收敛为候选 SELECT 加一次 `UPDATE ... RETURNING id`，固定 130 会话 fixture 从 129 次降为 2 次 SQL；只返回仍满足条件的会话并按原候选顺序交给 HLS 目录清理。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
