@@ -510,6 +510,7 @@ pub struct PeopleService {
     database: Option<Database>,
     rebuild_lock: Arc<AsyncMutex<()>>,
     person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    relation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     rebuild_coordinator: PersonIndexRebuildCoordinator,
 }
 
@@ -571,6 +572,15 @@ impl PeopleService {
         Ok(())
     }
 
+    pub(super) async fn relation_lock_for(&self, relation_path: &Path) -> Arc<AsyncMutex<()>> {
+        let key = relation_path.to_string_lossy().into_owned();
+        let mut locks = self.relation_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
         let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
             Ok(builder) => match builder.build() {
@@ -585,6 +595,7 @@ impl PeopleService {
             database: None,
             rebuild_lock: Arc::new(AsyncMutex::new(())),
             person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            relation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
