@@ -2893,40 +2893,39 @@ impl Database {
             })
     }
 
-    pub(crate) async fn movie_metadata_identity_conflicts(
+    pub(crate) async fn movie_metadata_identity_conflict(
         &self,
         item_id: &str,
         sort_title: &str,
         production_year: i64,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar::<i64>(
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                 FROM media_items current_item
-                 JOIN media_items conflicting_item
-                   ON conflicting_item.library_id = current_item.library_id
-                  AND conflicting_item.id <> current_item.id
-                  AND conflicting_item.item_type = 'MOVIE'
-                  AND conflicting_item.sort_title = ?
-                  AND conflicting_item.production_year = ?
-                  AND conflicting_item.removed_at IS NULL
-                  AND conflicting_item.has_available_source = 1
-                  AND (
-                      current_item.parent_id IS NULL
-                      OR conflicting_item.parent_id IS NULL
-                      OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
-                  )
-                 WHERE current_item.id = ?
-                   AND current_item.item_type = 'MOVIE'
-                   AND current_item.removed_at IS NULL
-             ) THEN 1 ELSE 0 END",
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar::<String>(
+            "SELECT conflicting_item.id
+             FROM media_items current_item
+             JOIN media_items conflicting_item
+               ON conflicting_item.library_id = current_item.library_id
+              AND conflicting_item.id <> current_item.id
+              AND conflicting_item.item_type = 'MOVIE'
+              AND conflicting_item.sort_title = ?
+              AND conflicting_item.production_year = ?
+              AND conflicting_item.removed_at IS NULL
+              AND conflicting_item.has_available_source = 1
+              AND (
+                  current_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+              )
+             WHERE current_item.id = ?
+               AND current_item.item_type = 'MOVIE'
+               AND current_item.removed_at IS NULL
+             ORDER BY conflicting_item.id
+             LIMIT 1",
         )
         .bind(sort_title)
         .bind(production_year)
         .bind(item_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map(|value| value != 0)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

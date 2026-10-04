@@ -333,6 +333,229 @@ async fn local_metadata_backfill_retries_nfo_failure_without_advancing_its_curso
     Ok(())
 }
 
+#[tokio::test]
+async fn local_metadata_backfill_conflict_advances_without_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    for (stem, content) in [
+        ("Backfill.Target.Movie.1987", "movie-a"),
+        ("Backfill.Different.Movie.2018", "movie-b"),
+    ] {
+        tokio::fs::write(media_root.join(format!("{stem}.mkv")), content).await?;
+        tokio::fs::write(
+            media_root.join(format!("{stem}.nfo")),
+            "<movie><title>Backfill Target Movie</title><year>1987</year></movie>",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, status, attempts)
+         VALUES (?, 'RUNNING', 1)",
+    )
+    .bind(root.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+    let backfill: (String, i64, Option<String>) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let row: (String, i64, Option<String>) = sqlx::query_as(
+                    "SELECT status, attempts, error
+                     FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+                )
+                .bind(root.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+                if !matches!(row.0.as_str(), "PENDING" | "RUNNING") {
+                    return Ok::<_, sqlx::Error>(row);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    assert_eq!(backfill.0, "COMPLETED");
+    assert_eq!(backfill.1, 2);
+    assert!(
+        backfill
+            .2
+            .as_deref()
+            .is_some_and(|error| error.contains("non-retryable"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_metadata_backfill_retry_keeps_conflicted_item_excluded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for (directory, file, nfo) in [
+        (
+            "00 Backfill Primary (1987)",
+            "Backfill.Primary.1987.mkv",
+            "<movie><title>Shared Backfill Conflict</title><year>1987</year></movie>",
+        ),
+        (
+            "01 Backfill Duplicate (2018)",
+            "Backfill.Duplicate.2018.mkv",
+            "<movie><title>Shared Backfill Conflict</title><year>1987</year></movie>",
+        ),
+        (
+            "02 Backfill Retry Target (2024)",
+            "Backfill.Retry.Target.2024.mkv",
+            "<movie><title>Backfill Retry Target From NFO</title><year>2024</year></movie>",
+        ),
+    ] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(file), b"movie").await?;
+        tokio::fs::write(movie_dir.join("movie.nfo"), nfo).await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let retry_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND production_year = 2024",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_backfill_retry_target_nfo_update
+         BEFORE UPDATE OF title ON media_items
+         WHEN OLD.item_type = 'MOVIE' AND OLD.production_year = 2024
+         BEGIN SELECT RAISE(ABORT, 'injected transient backfill NFO failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, status, attempts)
+         VALUES (?, 'RUNNING', 1)",
+    )
+    .bind(root.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+    let failed_page: (i64, Option<String>, String) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let page: (String, i64, Option<String>, String) = sqlx::query_as(
+                    "SELECT status, attempts, error, non_retryable_item_ids_json
+                     FROM scan_local_metadata_backfills WHERE library_root_id = ?",
+                )
+                .bind(root.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+                if page.0 == "FAILED" {
+                    return Ok::<_, sqlx::Error>((page.1, page.2, page.3));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    assert_eq!(failed_page.0, 2);
+    let conflict_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE'
+           AND title <> 'Shared Backfill Conflict' AND production_year IN (1987, 2018)",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let excluded_item_ids: Vec<String> = serde_json::from_str(&failed_page.2)?;
+    assert!(
+        excluded_item_ids.contains(&conflict_item_id),
+        "the conflicted item must be persisted as excluded before retrying the page"
+    );
+
+    sqlx::query("DROP TRIGGER fail_backfill_retry_target_nfo_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_backfills SET next_attempt_at = 0
+         WHERE library_root_id = ?",
+    )
+    .bind(root.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let completed_page: (String, i64, Option<String>) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let page: (String, i64, Option<String>) = sqlx::query_as(
+                    "SELECT status, attempts, error FROM scan_local_metadata_backfills
+                     WHERE library_root_id = ?",
+                )
+                .bind(root.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+                if page.0 == "COMPLETED" {
+                    return Ok::<_, sqlx::Error>(page);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    assert_eq!(completed_page.1, 3);
+    assert!(
+        completed_page
+            .2
+            .as_deref()
+            .is_some_and(|error| error.contains("non-retryable"))
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT title FROM media_items WHERE id = ?")
+            .bind(&retry_item_id)
+            .fetch_one(database.pool())
+            .await?,
+        "Backfill Retry Target From NFO"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
@@ -549,6 +772,208 @@ async fn completed_movie_scan_indexes_local_nfo_and_images()
     assert_eq!(images[0].0, "FANART");
     assert_eq!(images[1].0, "POSTER");
     assert!(images.iter().all(|(_, path)| path.ends_with(".jpg")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_nfo_identity_conflict_completes_batch_without_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+
+    tokio::fs::write(media_root.join("Target.Movie.1987.mkv"), b"movie-a").await?;
+    tokio::fs::write(
+        media_root.join("Target.Movie.1987.nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+    tokio::fs::write(media_root.join("Different.Movie.2018.mkv"), b"movie-b").await?;
+    tokio::fs::write(
+        media_root.join("Different.Movie.2018.nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let batch: (String, i64, Option<String>) = sqlx::query_as(
+                "SELECT status, attempts, error
+                 FROM scan_local_metadata_batches WHERE job_id = ?",
+            )
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+            if !matches!(batch.0.as_str(), "PENDING" | "RUNNING") {
+                return Ok::<_, sqlx::Error>(batch);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(batch.0, "COMPLETED");
+    assert_eq!(batch.1, 1);
+    assert!(
+        batch
+            .2
+            .as_deref()
+            .is_some_and(|error| error.contains("non-retryable"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_nfo_retry_excludes_non_retryable_conflict_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    for (directory, file, nfo) in [
+        (
+            "00 Conflict Primary (1987)",
+            "Conflict.Primary.1987.mkv",
+            "<movie><title>Shared Conflict Movie</title><year>1987</year></movie>",
+        ),
+        (
+            "01 Conflict Duplicate (2018)",
+            "Conflict.Duplicate.2018.mkv",
+            "<movie><title>Shared Conflict Movie</title><year>1987</year></movie>",
+        ),
+        (
+            "02 Retry Target (2024)",
+            "Retry.Target.2024.mkv",
+            "<movie><title>Retry Target From NFO</title><year>2024</year></movie>",
+        ),
+    ] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(file), b"movie").await?;
+        tokio::fs::write(movie_dir.join("movie.nfo"), nfo).await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_retry_target_nfo_update
+         BEFORE UPDATE OF title ON media_items
+         WHEN OLD.item_type = 'MOVIE' AND OLD.production_year = 2024
+         BEGIN SELECT RAISE(ABORT, 'injected transient NFO failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let batch: (String, i64, String, String) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let batch: (String, i64, String, String) = sqlx::query_as(
+                    "SELECT status, attempts, source_refs_json, non_retryable_item_ids_json
+                     FROM scan_local_metadata_batches WHERE job_id = ?",
+                )
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+                if batch.0 == "FAILED" {
+                    return Ok::<_, sqlx::Error>(batch);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    assert_eq!(batch.1, 1);
+
+    let conflicting_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE'
+           AND title <> 'Shared Conflict Movie' AND production_year IN (1987, 2018)",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let retry_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND production_year = 2024",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let retry_entry_id: String = sqlx::query_scalar(
+        "SELECT entry.id FROM filesystem_entries entry
+         JOIN media_sources source ON source.filesystem_entry_id = entry.id
+         WHERE source.item_id = ?",
+    )
+    .bind(&retry_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    let retry_source_ids: Vec<String> = serde_json::from_str(&batch.2)?;
+    let excluded_item_ids: Vec<String> = serde_json::from_str(&batch.3)?;
+    assert!(
+        excluded_item_ids.contains(&conflicting_item_id),
+        "a permanent NFO identity conflict must be persisted as excluded before retrying the batch"
+    );
+    assert!(
+        retry_source_ids.contains(&retry_entry_id),
+        "the transiently failing item must remain in the retry batch"
+    );
+
+    sqlx::query("DROP TRIGGER fail_retry_target_nfo_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE scan_local_metadata_batches SET next_attempt_at = 0 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ?",
+            )
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
     Ok(())
 }
 

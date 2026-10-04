@@ -2987,7 +2987,7 @@ async fn process_scan_local_metadata_batch(
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     batch: StoredScanLocalMetadataBatch,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<(String, String, Vec<String>, Vec<String>)> {
     let batch_id = batch.id.clone();
     let scan_job_id = batch.job_id.clone();
     let source_ids = match serde_json::from_str::<Vec<String>>(&batch.source_refs_json) {
@@ -3008,6 +3008,21 @@ async fn process_scan_local_metadata_batch(
             return None;
         }
     };
+    let non_retryable_item_ids =
+        match serde_json::from_str::<Vec<String>>(&batch.non_retryable_item_ids_json) {
+            Ok(item_ids)
+                if item_ids.len() <= MAX_SCAN_LOCAL_METADATA_SOURCE_IDS
+                    && item_ids.iter().all(|item_id| !item_id.trim().is_empty())
+                    && item_ids.iter().collect::<HashSet<_>>().len() == item_ids.len() =>
+            {
+                item_ids
+            }
+            _ => {
+                fail_scan_local_metadata_batch(database, &batch_id, "invalid NFO exclusion list")
+                    .await;
+                return None;
+            }
+        };
 
     let result = match enricher
         .index_scan_local_metadata_batch_images(&source_ids)
@@ -3033,7 +3048,7 @@ async fn process_scan_local_metadata_batch(
     user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => Some((batch_id, scan_job_id, source_ids)),
+        Ok(()) => Some((batch_id, scan_job_id, source_ids, non_retryable_item_ids)),
         Err(error) => {
             tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
             fail_scan_local_metadata_batch(database, &batch_id, &error).await;
@@ -3049,34 +3064,45 @@ async fn finish_scan_local_metadata_batch(
     batch_id: &str,
     scan_job_id: &str,
     source_ids: &[String],
+    existing_non_retryable_item_ids: &[String],
 ) {
-    let result = enricher
-        .enrich_scan_local_metadata_batch_nfo(source_ids)
+    let mut non_retryable_item_ids = existing_non_retryable_item_ids.to_vec();
+    let result = match enricher
+        .enrich_scan_local_metadata_batch_nfo(source_ids, &non_retryable_item_ids)
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|report| {
-            if report.failed_item_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} local NFO item(s) failed",
-                    report.failed_item_ids.len()
-                ))
+    {
+        Ok(report) => {
+            for item_id in &report.non_retryable_failed_item_ids {
+                if !non_retryable_item_ids.contains(item_id) {
+                    non_retryable_item_ids.push(item_id.clone());
+                }
             }
-        });
-    let result = match result {
-        Ok(()) => {
-            complete_local_metadata_completeness(
-                database,
-                context.metadata_selection,
-                context.metadata_reidentify,
-                Some(scan_job_id),
-                source_ids,
-                context.user_events,
-            )
-            .await
+            let retryable_failed_item_count = report.retryable_failed_item_count();
+            if retryable_failed_item_count > 0 {
+                Err(format!(
+                    "{retryable_failed_item_count} local NFO item(s) failed"
+                ))
+            } else {
+                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
+                    format!(
+                        "{} non-retryable local NFO item(s) failed",
+                        non_retryable_item_ids.len()
+                    )
+                });
+                complete_local_metadata_completeness(
+                    database,
+                    context.metadata_selection,
+                    context.metadata_reidentify,
+                    Some(scan_job_id),
+                    source_ids,
+                    &non_retryable_item_ids,
+                    context.user_events,
+                )
+                .await
+                .map(|()| issue)
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
         home.invalidate();
@@ -3084,22 +3110,36 @@ async fn finish_scan_local_metadata_batch(
     context.user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => match database.complete_scan_local_metadata_batch(batch_id).await {
+        Ok(issue) => match database
+            .complete_scan_local_metadata_batch_with_outcome(
+                batch_id,
+                issue.as_deref(),
+                &non_retryable_item_ids,
+            )
+            .await
+        {
             Ok(true) => {}
             Ok(false) => tracing::debug!(batch_id, "local metadata batch was already terminal"),
             Err(error) => {
                 tracing::warn!(batch_id, %error, "local metadata batch completion could not be saved");
-                fail_scan_local_metadata_batch(
+                fail_scan_local_metadata_batch_with_non_retryable_item_ids(
                     database,
                     batch_id,
                     "local metadata completion failed",
+                    &non_retryable_item_ids,
                 )
                 .await;
             }
         },
         Err(error) => {
             tracing::warn!(batch_id, %error, "local NFO batch failed and will be retried");
-            fail_scan_local_metadata_batch(database, batch_id, &error).await;
+            fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+                database,
+                batch_id,
+                &error,
+                &non_retryable_item_ids,
+            )
+            .await;
         }
     }
 }
@@ -3114,6 +3154,32 @@ async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, err
         .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
         .fail_scan_local_metadata_batch(batch_id, error, Some(retry_at))
+        .await
+    {
+        tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
+    }
+}
+
+async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+    database: &Database,
+    batch_id: &str,
+    error: &str,
+    non_retryable_item_ids: &[String],
+) {
+    let retry_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
+        .unwrap_or(i64::MAX);
+    if let Err(storage_error) = database
+        .fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+            batch_id,
+            error,
+            non_retryable_item_ids,
+            Some(retry_at),
+        )
         .await
     {
         tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
@@ -3149,33 +3215,43 @@ async fn finish_scan_local_metadata_backfill_page(
     context: LocalMetadataCompletionContext<'_>,
     page: StoredScanLocalMetadataBackfillPage,
 ) {
-    let result = enricher
-        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids)
+    let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
+    let result = match enricher
+        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids, &page.non_retryable_item_ids)
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|report| {
-            if report.failed_item_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} local NFO item(s) failed",
-                    report.failed_item_ids.len()
-                ))
+    {
+        Ok(report) => {
+            for item_id in &report.non_retryable_failed_item_ids {
+                if !non_retryable_item_ids.contains(item_id) {
+                    non_retryable_item_ids.push(item_id.clone());
+                }
             }
-        });
-    let result = match result {
-        Ok(()) => {
-            complete_local_metadata_completeness(
-                database,
-                context.metadata_selection,
-                context.metadata_reidentify,
-                None,
-                &page.entry_ids,
-                context.user_events,
-            )
-            .await
+            let retryable_failed_item_count = report.retryable_failed_item_count();
+            if retryable_failed_item_count > 0 {
+                Err(format!(
+                    "{retryable_failed_item_count} local NFO item(s) failed"
+                ))
+            } else {
+                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
+                    format!(
+                        "{} non-retryable local NFO item(s) failed",
+                        non_retryable_item_ids.len()
+                    )
+                });
+                complete_local_metadata_completeness(
+                    database,
+                    context.metadata_selection,
+                    context.metadata_reidentify,
+                    None,
+                    &page.entry_ids,
+                    &non_retryable_item_ids,
+                    context.user_events,
+                )
+                .await
+                .map(|()| issue)
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
         home.invalidate();
@@ -3183,8 +3259,8 @@ async fn finish_scan_local_metadata_backfill_page(
     context.user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => match database
-            .complete_scan_local_metadata_backfill_page(&page)
+        Ok(issue) => match database
+            .complete_scan_local_metadata_backfill_page_with_optional_issue(&page, issue.as_deref())
             .await
         {
             Ok(true) => {}
@@ -3202,6 +3278,7 @@ async fn finish_scan_local_metadata_backfill_page(
                     database,
                     &page,
                     "local metadata backfill completion failed",
+                    &non_retryable_item_ids,
                 )
                 .await;
             }
@@ -3212,7 +3289,13 @@ async fn finish_scan_local_metadata_backfill_page(
                 %error,
                 "local metadata backfill NFO failed and will be retried"
             );
-            fail_scan_local_metadata_backfill_page(database, &page, &error).await;
+            fail_scan_local_metadata_backfill_page(
+                database,
+                &page,
+                &error,
+                &non_retryable_item_ids,
+            )
+            .await;
         }
     }
 }
@@ -3221,6 +3304,7 @@ async fn fail_scan_local_metadata_backfill_page(
     database: &Database,
     page: &StoredScanLocalMetadataBackfillPage,
     error: &str,
+    non_retryable_item_ids: &[String],
 ) {
     let retry_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3230,7 +3314,12 @@ async fn fail_scan_local_metadata_backfill_page(
         .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
         .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
-        .fail_scan_local_metadata_backfill_page(page, error, Some(retry_at))
+        .fail_scan_local_metadata_backfill_page_with_exclusions(
+            page,
+            error,
+            non_retryable_item_ids,
+            Some(retry_at),
+        )
         .await
     {
         tracing::warn!(
@@ -3295,6 +3384,7 @@ async fn complete_local_metadata_completeness(
     metadata_reidentify: Option<&MetadataReidentifyService>,
     scan_job_id: Option<&str>,
     filesystem_entry_ids: &[String],
+    excluded_item_ids: &[String],
     user_events: &UserEventHub,
 ) -> Result<(), String> {
     if selection.is_none() {
@@ -3306,6 +3396,11 @@ async fn complete_local_metadata_completeness(
         .map_err(|error| error.to_string())?;
     let mut item_ids = sources
         .into_iter()
+        .filter(|source| {
+            !excluded_item_ids
+                .iter()
+                .any(|excluded| excluded == &source.item_id)
+        })
         .map(|source| source.item_id)
         .collect::<Vec<_>>();
     item_ids.sort_unstable();
@@ -8970,7 +9065,7 @@ impl ScanJobService {
                 }
                 match database.claim_next_scan_local_metadata_batch().await {
                     Ok(Some(batch)) => {
-                        if let Some((batch_id, scan_job_id, source_ids)) =
+                        if let Some((batch_id, scan_job_id, source_ids, non_retryable_item_ids)) =
                             process_scan_local_metadata_batch(
                                 &database,
                                 &enricher,
@@ -9000,6 +9095,7 @@ impl ScanJobService {
                                     &batch_id,
                                     &scan_job_id,
                                     &source_ids,
+                                    &non_retryable_item_ids,
                                 )
                                 .await;
                                 batch_id
@@ -9051,7 +9147,10 @@ impl ScanJobService {
                                             "local metadata backfill image stage failed and will be retried"
                                         );
                                         fail_scan_local_metadata_backfill_page(
-                                            &database, &page, &error,
+                                            &database,
+                                            &page,
+                                            &error,
+                                            &[],
                                         )
                                         .await;
                                     }

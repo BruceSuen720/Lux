@@ -952,11 +952,13 @@ impl MetadataEnricher {
     pub(crate) async fn enrich_scan_local_metadata_batch_nfo(
         &self,
         filesystem_entry_ids: &[String],
+        excluded_item_ids: &[String],
     ) -> Result<MetadataReport, MetadataError> {
-        let sources = self
+        let mut sources = self
             .database
             .list_scan_local_metadata_sources(filesystem_entry_ids)
             .await?;
+        sources.retain(|source| !excluded_item_ids.contains(&source.item_id));
         let (movies, home_videos, episodes) = split_scan_local_metadata_sources(sources);
         let mut report = MetadataReport::default();
         for source in movies {
@@ -971,9 +973,22 @@ impl MetadataEnricher {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(item_id = %source.item_id, %error, "local movie NFO failed");
+                    if let MetadataError::ConflictingMovieIdentity {
+                        conflicting_item_id,
+                        ..
+                    } = &error
+                    {
+                        tracing::warn!(
+                            item_id = %source.item_id,
+                            conflicting_item_id = %conflicting_item_id,
+                            %error,
+                            "local movie NFO failed"
+                        );
+                    } else {
+                        tracing::warn!(item_id = %source.item_id, %error, "local movie NFO failed");
+                    }
                     report.nfo_failed += 1;
-                    report.mark_item_failed(&source.item_id);
+                    report.mark_item_error(&source.item_id, &error);
                 }
             }
         }
@@ -1148,7 +1163,7 @@ impl MetadataEnricher {
                     %error,
                     "local series metadata failed; continuing with remaining targets"
                 );
-                item_report.mark_item_failed(&item_id);
+                item_report.mark_item_error(&item_id, &error);
             }
             report.merge(item_report);
         }
@@ -1204,7 +1219,7 @@ impl MetadataEnricher {
                         "local movie NFO failed; continuing with images and remaining items"
                     );
                     report.nfo_failed += 1;
-                    report.mark_item_failed(&source.item_id);
+                    report.mark_item_error(&source.item_id, &error);
                 }
             }
 
@@ -1251,7 +1266,7 @@ impl MetadataEnricher {
                         "local home video NFO failed; continuing with remaining items"
                     );
                     report.nfo_failed += 1;
-                    report.mark_item_failed(&source.item_id);
+                    report.mark_item_error(&source.item_id, &error);
                 }
             }
         }
@@ -1523,7 +1538,7 @@ impl MetadataEnricher {
                     "local NFO enrichment failed; continuing with remaining metadata"
                 );
                 report.nfo_failed += 1;
-                report.mark_item_failed(item_id);
+                report.mark_item_error(item_id, &error);
             }
         }
     }
@@ -1630,9 +1645,9 @@ impl MetadataEnricher {
                 state.metadata.production_year.map(i64::from) != current.production_year;
             if (title_changed || year_changed)
                 && let Some(production_year) = state.metadata.production_year
-                && self
+                && let Some(conflicting_item_id) = self
                     .database
-                    .movie_metadata_identity_conflicts(
+                    .movie_metadata_identity_conflict(
                         item_id,
                         &state
                             .metadata
@@ -1646,6 +1661,7 @@ impl MetadataEnricher {
             {
                 return Err(MetadataError::ConflictingMovieIdentity {
                     item_id: item_id.to_owned(),
+                    conflicting_item_id,
                 });
             }
         }
@@ -1990,6 +2006,7 @@ pub struct MetadataReport {
     pub items_processed: usize,
     pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
+    pub(crate) non_retryable_failed_item_ids: Vec<String>,
 }
 
 impl MetadataReport {
@@ -2004,12 +2021,46 @@ impl MetadataReport {
         for item_id in other.failed_item_ids {
             self.mark_item_failed(&item_id);
         }
+        for item_id in other.non_retryable_failed_item_ids {
+            self.mark_item_non_retryable_failed(&item_id);
+        }
     }
 
     fn mark_item_failed(&mut self, item_id: &str) {
         if !self.failed_item_ids.iter().any(|failed| failed == item_id) {
             self.failed_item_ids.push(item_id.to_owned());
         }
+    }
+
+    fn mark_item_non_retryable_failed(&mut self, item_id: &str) {
+        self.mark_item_failed(item_id);
+        if !self
+            .non_retryable_failed_item_ids
+            .iter()
+            .any(|failed| failed == item_id)
+        {
+            self.non_retryable_failed_item_ids.push(item_id.to_owned());
+        }
+    }
+
+    fn mark_item_error(&mut self, item_id: &str, error: &MetadataError) {
+        if error.is_retryable() {
+            self.mark_item_failed(item_id);
+        } else {
+            self.mark_item_non_retryable_failed(item_id);
+        }
+    }
+
+    pub(crate) fn retryable_failed_item_count(&self) -> usize {
+        self.failed_item_ids
+            .iter()
+            .filter(|item_id| {
+                !self
+                    .non_retryable_failed_item_ids
+                    .iter()
+                    .any(|failed| failed == *item_id)
+            })
+            .count()
     }
 }
 
@@ -2052,6 +2103,18 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(cached, initial);
         Ok(())
+    }
+
+    #[test]
+    fn conflicting_movie_identity_error_is_non_retryable_and_names_both_items() {
+        let error = MetadataError::ConflictingMovieIdentity {
+            item_id: "current-item".to_owned(),
+            conflicting_item_id: "conflicting-item".to_owned(),
+        };
+        let message = error.to_string();
+        assert!(!error.is_retryable());
+        assert!(message.contains("current_item_id=current-item"));
+        assert!(message.contains("conflicting_item_id=conflicting-item"));
     }
 }
 
@@ -2417,7 +2480,14 @@ pub enum MetadataError {
     NfoCache(LocalNfoMetadataStoreError),
     ConflictingMovieIdentity {
         item_id: String,
+        conflicting_item_id: String,
     },
+}
+
+impl MetadataError {
+    fn is_retryable(&self) -> bool {
+        !matches!(self, Self::ConflictingMovieIdentity { .. })
+    }
 }
 
 impl fmt::Display for MetadataError {
@@ -2433,9 +2503,12 @@ impl fmt::Display for MetadataError {
             ),
             Self::Storage(error) => error.fmt(formatter),
             Self::NfoCache(error) => error.fmt(formatter),
-            Self::ConflictingMovieIdentity { item_id } => write!(
+            Self::ConflictingMovieIdentity {
+                item_id,
+                conflicting_item_id,
+            } => write!(
                 formatter,
-                "local movie NFO conflicts with another movie identity: {item_id}"
+                "local movie NFO conflicts with another movie identity: current_item_id={item_id}, conflicting_item_id={conflicting_item_id}"
             ),
         }
     }

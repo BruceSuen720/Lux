@@ -5596,38 +5596,6 @@ impl Database {
             })
     }
 
-    pub(crate) async fn invalidate_media_item_nfo_metadata_if_source_changed(
-        &self,
-        item_id: &str,
-        source_fingerprint: &[u8],
-    ) -> Result<(), StorageError> {
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE media_items
-             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
-                 updated_at = unixepoch()
-             WHERE id = ?
-               AND (nfo_metadata_fingerprint IS NULL OR nfo_metadata_fingerprint <> ?)",
-        )
-        .bind(item_id)
-        .bind(source_fingerprint)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
     pub(crate) async fn mark_media_item_metadata_checked(
         &self,
         item_id: &str,
@@ -5645,6 +5613,57 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn sync_media_item_nfo_state(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+        metadata_fingerprint: &[u8],
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE media_items
+             SET nfo_metadata_json = CASE
+                     WHEN nfo_metadata_fingerprint IS NULL
+                       OR nfo_metadata_fingerprint <> ? THEN NULL
+                     ELSE nfo_metadata_json
+                 END,
+                 nfo_metadata_fingerprint = CASE
+                     WHEN nfo_metadata_fingerprint IS NULL
+                       OR nfo_metadata_fingerprint <> ? THEN NULL
+                     ELSE nfo_metadata_fingerprint
+                 END,
+                 metadata_fingerprint = ?,
+                 updated_at = CASE
+                     WHEN nfo_metadata_fingerprint IS NULL
+                       OR nfo_metadata_fingerprint <> ?
+                       OR metadata_fingerprint IS NULL
+                       OR metadata_fingerprint <> ? THEN unixepoch()
+                     ELSE updated_at
+                 END
+             WHERE id = ?",
+        )
+        .bind(source_fingerprint)
+        .bind(source_fingerprint)
+        .bind(metadata_fingerprint)
+        .bind(source_fingerprint)
+        .bind(metadata_fingerprint)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

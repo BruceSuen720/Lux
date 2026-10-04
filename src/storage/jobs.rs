@@ -11,6 +11,48 @@ const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
 pub(crate) const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
 // Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
 const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
+
+fn parse_scan_local_metadata_non_retryable_item_ids(
+    value: &str,
+    max_count: usize,
+) -> Result<Vec<String>, StorageError> {
+    let item_ids = serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+        StorageError::Conflict(format!("invalid scan metadata exclusions: {error}"))
+    })?;
+    if item_ids.len() > max_count
+        || item_ids.iter().any(|item_id| item_id.trim().is_empty())
+        || item_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != item_ids.len()
+    {
+        return Err(StorageError::Conflict(
+            "scan metadata exclusions are invalid".into(),
+        ));
+    }
+    Ok(item_ids)
+}
+
+fn serialize_scan_local_metadata_non_retryable_item_ids(
+    item_ids: &[String],
+    max_count: usize,
+) -> Result<String, StorageError> {
+    if item_ids.len() > max_count
+        || item_ids.iter().any(|item_id| item_id.trim().is_empty())
+        || item_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != item_ids.len()
+    {
+        return Err(StorageError::Conflict(
+            "scan metadata exclusions are invalid".into(),
+        ));
+    }
+    serde_json::to_string(item_ids).map_err(|error| StorageError::Serialization(error.to_string()))
+}
+
 const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
     WHEN item_type IN ('MOVIE', 'SERIES') THEN 0
     WHEN item_type = 'SEASON' THEN 1
@@ -24,6 +66,7 @@ pub(crate) struct StoredScanLocalMetadataBackfillPage {
     pub(crate) library_root_id: String,
     pub(crate) cursor_entry_id: Option<String>,
     pub(crate) entry_ids: Vec<String>,
+    pub(crate) non_retryable_item_ids: Vec<String>,
     pub(crate) next_cursor_entry_id: String,
     pub(crate) has_more: bool,
     pub(crate) attempts: i64,
@@ -192,14 +235,14 @@ impl Database {
                     })?;
                 return Ok(None);
             };
-            let claimed: Option<(Option<String>, i64)> = self
+            let claimed: Option<(Option<String>, i64, String)> = self
                 .query_as(
                     "UPDATE scan_local_metadata_backfills
                      SET status = 'RUNNING', attempts = attempts + 1,
                          next_attempt_at = NULL, error = NULL, updated_at = unixepoch()
                      WHERE library_root_id = ? AND status IN ('PENDING', 'FAILED')
                        AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
-                     RETURNING cursor_entry_id, attempts",
+                     RETURNING cursor_entry_id, attempts, non_retryable_item_ids_json",
                 )
                 .bind(&library_root_id)
                 .fetch_optional(&mut *transaction)
@@ -208,7 +251,7 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            let Some((cursor_entry_id, attempts)) = claimed else {
+            let Some((cursor_entry_id, attempts, non_retryable_item_ids_json)) = claimed else {
                 transaction
                     .commit()
                     .await
@@ -218,6 +261,10 @@ impl Database {
                     })?;
                 continue;
             };
+            let non_retryable_item_ids = parse_scan_local_metadata_non_retryable_item_ids(
+                &non_retryable_item_ids_json,
+                MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
+            )?;
             let mut entry_ids = self
                 .query_scalar::<String>(
                     "SELECT DISTINCT entry.id
@@ -246,6 +293,7 @@ impl Database {
                 self.query(
                     "UPDATE scan_local_metadata_backfills
                      SET status = 'COMPLETED', next_attempt_at = NULL, error = NULL,
+                         non_retryable_item_ids_json = '[]',
                          updated_at = unixepoch()
                      WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
                        AND cursor_entry_id IS NOT DISTINCT FROM ?",
@@ -287,6 +335,7 @@ impl Database {
                 library_root_id,
                 cursor_entry_id,
                 entry_ids,
+                non_retryable_item_ids,
                 next_cursor_entry_id,
                 has_more,
                 attempts,
@@ -298,6 +347,20 @@ impl Database {
         &self,
         page: &StoredScanLocalMetadataBackfillPage,
     ) -> Result<bool, StorageError> {
+        self.complete_scan_local_metadata_backfill_page_with_optional_issue(page, None)
+            .await
+    }
+
+    pub(crate) async fn complete_scan_local_metadata_backfill_page_with_optional_issue(
+        &self,
+        page: &StoredScanLocalMetadataBackfillPage,
+        issue: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if issue.is_some_and(|issue| issue.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES) {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill issue exceeds the storage limit".into(),
+            ));
+        }
         let status = if page.has_more {
             "PENDING"
         } else {
@@ -307,13 +370,15 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_local_metadata_backfills
-                 SET cursor_entry_id = ?, status = ?, next_attempt_at = NULL, error = NULL,
+                 SET cursor_entry_id = ?, status = ?, next_attempt_at = NULL, error = ?,
+                     non_retryable_item_ids_json = '[]',
                      updated_at = unixepoch()
                  WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
                    AND cursor_entry_id IS NOT DISTINCT FROM ?",
             )
             .bind(&page.next_cursor_entry_id)
             .bind(status)
+            .bind(issue)
             .bind(&page.library_root_id)
             .bind(page.attempts)
             .bind(page.cursor_entry_id.as_deref())
@@ -332,22 +397,64 @@ impl Database {
         error: &str,
         next_attempt_at: Option<i64>,
     ) -> Result<bool, StorageError> {
+        self.fail_scan_local_metadata_backfill_page_with_exclusions(
+            page,
+            error,
+            &[],
+            next_attempt_at,
+        )
+        .await
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_backfill_page_with_exclusions(
+        &self,
+        page: &StoredScanLocalMetadataBackfillPage,
+        error: &str,
+        newly_non_retryable_item_ids: &[String],
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
         if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
             return Err(StorageError::Conflict(
                 "scan metadata backfill error exceeds the storage limit".into(),
             ));
         }
+        let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
+        let mut unique_item_ids = non_retryable_item_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for item_id in newly_non_retryable_item_ids {
+            if item_id.trim().is_empty() {
+                return Err(StorageError::Conflict(
+                    "scan metadata backfill exclusion item id is empty".into(),
+                ));
+            }
+            if unique_item_ids.insert(item_id.clone()) {
+                non_retryable_item_ids.push(item_id.clone());
+            }
+        }
+        if non_retryable_item_ids.len() > MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill exclusion count exceeds the page limit".into(),
+            ));
+        }
+        let non_retryable_item_ids_json = serialize_scan_local_metadata_non_retryable_item_ids(
+            &non_retryable_item_ids,
+            MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
+        )?;
         let _write_guard = self.acquire_metadata_write_lock().await;
         let result = self
             .query(
                 "UPDATE scan_local_metadata_backfills
                  SET status = 'FAILED', next_attempt_at = ?, error = ?,
+                     non_retryable_item_ids_json = ?,
                      updated_at = unixepoch()
                  WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
                    AND cursor_entry_id IS NOT DISTINCT FROM ?",
             )
             .bind(next_attempt_at)
             .bind(error)
+            .bind(non_retryable_item_ids_json)
             .bind(&page.library_root_id)
             .bind(page.attempts)
             .bind(page.cursor_entry_id.as_deref())
@@ -898,6 +1005,41 @@ impl Database {
             .await
     }
 
+    pub(crate) async fn complete_scan_local_metadata_batch_with_outcome(
+        &self,
+        batch_id: &str,
+        issue: Option<&str>,
+        non_retryable_item_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        if issue.is_some_and(|issue| issue.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES) {
+            return Err(StorageError::Conflict(
+                "scan local metadata issue exceeds the storage limit".into(),
+            ));
+        }
+        let non_retryable_item_ids_json = serialize_scan_local_metadata_non_retryable_item_ids(
+            non_retryable_item_ids,
+            MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES,
+        )?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'COMPLETED', next_attempt_at = NULL, error = ?,
+                     non_retryable_item_ids_json = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(issue)
+            .bind(non_retryable_item_ids_json)
+            .bind(batch_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn fail_scan_local_metadata_batch(
         &self,
         batch_id: &str,
@@ -911,6 +1053,43 @@ impl Database {
         }
         self.transition_scan_local_metadata_batch(batch_id, next_attempt_at, Some(error))
             .await
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+        &self,
+        batch_id: &str,
+        error: &str,
+        non_retryable_item_ids: &[String],
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
+            return Err(StorageError::Conflict(
+                "scan local metadata error exceeds the storage limit".into(),
+            ));
+        }
+        let non_retryable_item_ids_json = serialize_scan_local_metadata_non_retryable_item_ids(
+            non_retryable_item_ids,
+            MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES,
+        )?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'FAILED', next_attempt_at = ?, error = ?,
+                     non_retryable_item_ids_json = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(next_attempt_at)
+            .bind(error)
+            .bind(non_retryable_item_ids_json)
+            .bind(batch_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn transition_scan_local_metadata_batch(
@@ -8422,6 +8601,32 @@ impl Database {
             .await
         };
         rows.map(|rows| {
+            rows.into_iter()
+                .map(stored_metadata_reidentify_job)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_metadata_reidentify_jobs_for_activity(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
+        self.query(
+            "SELECT id, status, processed_count, total_count, error,
+                    created_at, updated_at, started_at, finished_at, mode,
+                    cancel_requested, library_id, job_scope, 0 AS pending_count
+             FROM metadata_reidentify_jobs
+             WHERE status IN ('QUEUED', 'RUNNING')
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
             rows.into_iter()
                 .map(stored_metadata_reidentify_job)
                 .collect()
