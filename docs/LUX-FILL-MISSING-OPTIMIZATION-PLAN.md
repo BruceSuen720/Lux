@@ -2,7 +2,7 @@
 
 ## 当前实现状态
 
-以下第一阶段修复已经落地，生产环境仍需单独构建、发布和验证：
+以下修复已经落地并部署到 FNOS `192.168.10.50`：
 
 - 只有本轮新确认的 missing claim 才会触发自动 `FILL_MISSING`。
 - 近期 `DEFERRED` job 参与去重，避免 provider 暂不可用时立即重复建任务。
@@ -10,8 +10,12 @@
 - completeness 失败记录在 `retry_after` 到期前不会重新领取。
 - 同一媒体库的自动补全优先并入已有 `QUEUED` job，单个 job 仍限制为 100 条。
 - 默认扫描并发为 2，全量 `RECONCILE_LIBRARY` 使用全局串行队列。
+- 自动 `FILL_MISSING` worker 默认并发限制为 2，避免多个 job 各自启动 8 个 worker 放大 CPU。
+- person manifest 与 item people relation 写入按 key 分片串行，避免同一文件锁竞争导致反复重试。
 
-对应提交：`cea0c50d`、`8389bc0e`、`a2272b2b`、`086c8769`。
+对应提交：`cea0c50d`、`8389bc0e`、`a2272b2b`、`086c8769`、`efc5e323`、`e9185dcb`、`48d6357f`。
+
+FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 outbox 已清空，最近采样 Lux/PostgreSQL CPU 约为 2.9%/2.4%。
 
 日期：2026-10-05
 
