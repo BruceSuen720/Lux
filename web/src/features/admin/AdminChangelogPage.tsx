@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.15",
+    date: "2026-10-04",
+    sections: [
+      { kind: "added", items: [
+        "本地元数据回填增加不可重试项记录和任务活动索引，便于识别 NFO 身份冲突并查看后台处理状态。",
+      ] },
+      { kind: "changed", items: [
+        "NFO 写入增加内部内容指纹与稳定性保护：等效内容不重复改写，内部写入不会反复触发扫描事件，并减少元数据和人物关系的重复写入。",
+        "管理台活动刷新改用轻量查询并合并失效通知，媒体详情元信息布局进一步调整。",
+      ] },
+      { kind: "fixed", items: [
+        "本地 NFO 身份冲突不再无限重试；检测到文件已被外部修改时保留外部内容，避免覆盖新的本地数据。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.14",
     date: "2026-10-03",
     sections: [
