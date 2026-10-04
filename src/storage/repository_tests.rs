@@ -410,6 +410,108 @@ async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users
 }
 
 #[tokio::test]
+async fn played_container_state_sync_batches_parent_queries_and_preserves_state() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let admin = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Shows", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let user_id = admin.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, title, sort_title,
+             identification_status, has_available_source
+         ) VALUES
+            ('played-parent-series', ?, 'SERIES', NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 1),
+            ('played-parent-season', ?, 'SEASON', 'played-parent-series', 'played-parent-series', 'Season', 'season', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-1', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-2', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media hierarchy");
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, play_count)
+         VALUES (?, 'played-episode-1', 1, 1), (?, 'played-episode-2', 1, 1)",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("episode states");
+
+    database.reset_query_count();
+    database
+        .sync_played_container_states(&user_id, "played-episode-1")
+        .await
+        .expect("played parent states");
+    assert_eq!(database.query_count(), 3);
+
+    let played_states: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT item_id, is_played, play_count FROM user_item_state
+         WHERE user_id = ? AND item_id IN ('played-parent-season', 'played-parent-series')
+         ORDER BY item_id",
+    )
+    .bind(&user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("played parent state rows");
+    assert_eq!(
+        played_states,
+        vec![
+            ("played-parent-season".to_owned(), 1, 1),
+            ("played-parent-series".to_owned(), 1, 1),
+        ]
+    );
+
+    sqlx::query(
+        "UPDATE user_item_state SET is_played = 0 WHERE user_id = ? AND item_id = 'played-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("unmark episode");
+    database.reset_query_count();
+    database
+        .sync_played_container_states(&user_id, "played-episode-2")
+        .await
+        .expect("unplayed parent states");
+    assert_eq!(database.query_count(), 3);
+
+    let unplayed_states: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT item_id, is_played, version FROM user_item_state
+         WHERE user_id = ? AND item_id IN ('played-parent-season', 'played-parent-series')
+         ORDER BY item_id",
+    )
+    .bind(&user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("unplayed parent state rows");
+    assert_eq!(
+        unplayed_states,
+        vec![
+            ("played-parent-season".to_owned(), 0, 1),
+            ("played-parent-series".to_owned(), 0, 1),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn home_resume_page_returns_items_and_total_with_one_query() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

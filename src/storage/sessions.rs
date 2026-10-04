@@ -234,6 +234,9 @@ impl Database {
             return Ok(());
         }
 
+        let parent_placeholders = std::iter::repeat_n("?", parent_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut transaction = self
             .pool
             .begin()
@@ -242,64 +245,85 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for parent_id in parent_ids {
-            let is_played: i64 = self
-                .query_scalar(
-                    "WITH eligible AS (
-                         SELECT episode.id
-                         FROM media_items episode
-                         JOIN media_items parent ON parent.id = ?
-                         WHERE episode.item_type = 'EPISODE'
-                           AND episode.removed_at IS NULL
-                           AND episode.has_available_source = 1
-                           AND ((parent.item_type = 'SEASON' AND episode.parent_id = parent.id)
-                             OR (parent.item_type = 'SERIES' AND episode.series_id = parent.id))
-                     )
-                     SELECT CASE WHEN EXISTS (SELECT 1 FROM eligible)
-                                      AND NOT EXISTS (
-                                          SELECT 1
-                                          FROM eligible
-                                          LEFT JOIN user_item_state state
-                                            ON state.user_id = ? AND state.item_id = eligible.id
-                                          WHERE COALESCE(state.is_played, 0) = 0
-                                      )
-                                 THEN 1 ELSE 0 END",
+        let mut parent_state_query = self.query(sqlx::AssertSqlSafe(format!(
+            "WITH parent_scope AS (
+                 SELECT id, item_type FROM media_items WHERE id IN ({parent_placeholders})
+             ), eligible AS (
+                 SELECT parent_scope.id AS parent_id, episode.id AS episode_id
+                 FROM parent_scope
+                 JOIN media_items episode
+                   ON episode.item_type = 'EPISODE'
+                  AND episode.removed_at IS NULL
+                  AND episode.has_available_source = 1
+                  AND ((parent_scope.item_type = 'SEASON' AND episode.parent_id = parent_scope.id)
+                    OR (parent_scope.item_type = 'SERIES' AND episode.series_id = parent_scope.id))
+             ), parent_states AS (
+                 SELECT eligible.parent_id,
+                        CASE WHEN COUNT(*) > 0
+                                  AND SUM(CASE WHEN COALESCE(state.is_played, 0) = 0 THEN 1 ELSE 0 END) = 0
+                             THEN 1 ELSE 0 END AS is_played
+                 FROM eligible
+                 LEFT JOIN user_item_state state
+                   ON state.user_id = ? AND state.item_id = eligible.episode_id
+                 GROUP BY eligible.parent_id
+             )
+             SELECT parent_scope.id AS parent_id,
+                    COALESCE(parent_states.is_played, 0) AS is_played
+             FROM parent_scope
+             LEFT JOIN parent_states ON parent_states.parent_id = parent_scope.id"
+        )));
+        for parent_id in &parent_ids {
+            parent_state_query = parent_state_query.bind(parent_id);
+        }
+        parent_state_query = parent_state_query.bind(user_id);
+        let parent_states = parent_state_query
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("parent_id"),
+                    row.get::<i64, _>("is_played"),
                 )
-                .bind(&parent_id)
+            })
+            .collect::<Vec<_>>();
+
+        let values = std::iter::repeat_n("(?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END, CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)", parent_states.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut state_write = self.query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+             VALUES {values}
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                 is_played = excluded.is_played,
+                 play_count = CASE
+                     WHEN excluded.is_played = 1 AND user_item_state.is_played = 0
+                     THEN user_item_state.play_count + 1 ELSE user_item_state.play_count END,
+                 last_played_at = CASE
+                     WHEN excluded.is_played = 1 THEN unixepoch()
+                     ELSE user_item_state.last_played_at END,
+                 version = user_item_state.version + CASE
+                     WHEN excluded.is_played != user_item_state.is_played THEN 1 ELSE 0 END"
+        )));
+        for (parent_id, is_played) in parent_states {
+            state_write = state_write
                 .bind(user_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            self.query(
-                "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
-                 VALUES (?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END,
-                         CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)
-                 ON CONFLICT(user_id, item_id) DO UPDATE SET
-                     is_played = excluded.is_played,
-                     play_count = CASE
-                         WHEN excluded.is_played = 1 AND user_item_state.is_played = 0
-                         THEN user_item_state.play_count + 1 ELSE user_item_state.play_count END,
-                     last_played_at = CASE
-                         WHEN excluded.is_played = 1 THEN unixepoch()
-                         ELSE user_item_state.last_played_at END,
-                     version = user_item_state.version + CASE
-                         WHEN excluded.is_played != user_item_state.is_played THEN 1 ELSE 0 END",
-            )
-            .bind(user_id)
-            .bind(&parent_id)
-            .bind(is_played)
-            .bind(is_played)
-            .bind(is_played)
+                .bind(parent_id)
+                .bind(is_played)
+                .bind(is_played)
+                .bind(is_played);
+        }
+        state_write
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        }
         transaction
             .commit()
             .await
