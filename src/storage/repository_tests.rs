@@ -10320,10 +10320,11 @@ async fn media_probe_streams_are_replaced_in_bounded_batches() {
             duration_ticks: Some(456),
             bitrate: Some(789),
             streams: &streams,
+            chapters: &[],
         })
         .await
         .expect("save probe result");
-    assert_eq!(database.query_count(), 5);
+    assert_eq!(database.query_count(), 6);
 
     let stored_indices: Vec<i64> = sqlx::query_scalar(
         "SELECT stream_index FROM media_streams
@@ -10386,6 +10387,7 @@ async fn media_probe_streams_are_replaced_in_bounded_batches() {
                 duration_ticks: Some(200),
                 bitrate: Some(300),
                 streams: &invalid_streams,
+                chapters: &[],
             })
             .await
             .is_err()
@@ -10431,10 +10433,11 @@ async fn media_probe_streams_are_replaced_in_bounded_batches() {
             duration_ticks: None,
             bitrate: None,
             streams: &[],
+            chapters: &[],
         })
         .await
         .expect("save probe result with no streams");
-    assert_eq!(database.query_count(), 2);
+    assert_eq!(database.query_count(), 3);
     let empty_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_streams WHERE media_source_id = 'probe-batch-source'",
     )

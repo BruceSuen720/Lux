@@ -38,22 +38,21 @@ LUX-382 已实现 sidecar 写回只更新 Lux 管理的 `MediaSourceInfo` 和当
 语义，且既有字段、损坏文件保护和 STRM 字节不变。真实 MediaTidy 请求路径已在本机授权实例
 和隔离假 Emby 上记录；假 Emby 未实现神医插件专用响应，因此没有宣称真实缓存命中。
 
-## LUX-384 MediaTidy 神医探测路由（2026-10-03）
+## LUX-384 MediaTidy 神医探测路由（2026-10-04）
 
 Lux 不在主程序中实现神医、SHA1、FF 缓存或远程缓存。`org.lux.strm-media-info` 通过
 Plugin SDK 的 `embyRoutes` 注册精确的 `POST /Items/SyncMediaInfo`，宿主同时提供根路径和
-`/emby` 前缀。已安装且启用插件时，该探测 RPC 返回 HTTP 400；插件未安装或被禁用时返回
-404。路由请求只传递有界 body、脱敏后的非认证头和去除认证参数的 query，不把 Emby token、
-Authorization、Cookie 或完整 URL 交给插件。
+`/emby` 前缀。宿主向插件声明 `media.info.import` 后，插件可以返回受限的
+`mediaInfoImport` Bundle；Lux 会按 `itemId`、`mediaSourceId` 或 STRM 绝对路径定位已索引媒体源，
+并在事务中写入格式、大小、时长、码率、媒体流和普通章节。插件未安装或被禁用时返回 404；
+没有导入能力或 Bundle 校验失败时拒绝请求。路由请求只传递有界 body、脱敏后的非认证头和去除认证参数的
+query，不把 Emby token、Authorization、Cookie 或完整 URL 交给插件。
 
-自动化证据：`tests/plugin_protocol.rs` 36 项、`tests/plugins.rs` 9 项和
-`tests/emby_auth.rs` 8 项通过；集成测试覆盖 404→400→404 状态变化和认证字段脱敏。
+自动化证据：`tests/plugin_protocol.rs` 38 项、`tests/plugins.rs` 9 项和
+`tests/storage.rs` 45 项通过；协议测试覆盖双向能力声明、Bundle 大小/路径/字段校验和认证字段脱敏。
 Lux-plugins 的 STRM 插件库测试 43 项、构建和直接 `emby.sync_media_info` RPC 也通过。
-本机 `murongyun574/mediatidy:latest` 已完成真实 `testEmby` 验证：临时 Lux 实例未安装
-插件时返回 404；通过 Lux 插件安装接口启用真实 `org.lux.strm-media-info` 后，MediaTidy
-返回 `supported: true`、`statusCode: 400` 和“已检测到神医 SyncMediaInfo 接口”。
-测试使用的临时 Emby 实例、账号会话、插件安装状态和数据库备份均已清理/恢复。该证据证明
-神医探测兼容，不证明 FF 缓存已经命中或远程缓存已经上传。
+当前本地源码已实现 Bundle 导入；FNOS 镜像重新构建和 MediaTidy 真实恢复仍需部署后验证。
+该兼容层不计算 SHA1、不读取远程视频、不实现 FF 缓存或远程缓存上传，这些仍由 MediaTidy 负责。
 
 ## Emby 用户列表与登录兼容（2026-09-29）
 

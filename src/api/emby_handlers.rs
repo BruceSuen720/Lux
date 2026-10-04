@@ -1,7 +1,11 @@
 use super::*;
 
-use crate::application::plugin_protocol::PluginEmbyRouteRequest;
 use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
+use crate::application::{
+    plugin_protocol::{PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginMediaInfoTarget},
+    probe::{media_probe_result_from_rpc, parse_media_info_json},
+};
+use crate::storage::MediaInfoChapterUpdate;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{Reader, escape::unescape, events::Event};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -15,8 +19,12 @@ pub(super) async fn emby_sync_media_info(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
-    if let Err(status) = require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        return status.into_response();
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !body.is_empty() && !user.is_admin {
+        return StatusCode::FORBIDDEN.into_response();
     }
     let Some(plugins) = state.plugins.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -27,27 +35,114 @@ pub(super) async fn emby_sync_media_info(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let host_capabilities = vec!["media.info.import".to_owned()];
     let route_request = PluginEmbyRouteRequest {
         method: "POST".to_owned(),
         path: path.to_owned(),
         query: raw_query.as_deref().and_then(sanitize_plugin_route_query),
         headers: filtered_plugin_route_headers(&headers),
         body_base64: BASE64.encode(&body),
+        host_capabilities: host_capabilities.clone(),
     };
     let route_response = match plugins.call_emby_route(&target, route_request).await {
         Ok(response) => response,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let body = match BASE64.decode(route_response.body_base64) {
+    let PluginEmbyRouteResponse {
+        status_code,
+        headers,
+        body_base64,
+        media_info_import,
+    } = route_response;
+    let body = match BASE64.decode(body_base64) {
         Ok(body) => body,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let status = match StatusCode::from_u16(route_response.status_code) {
+    let status = match StatusCode::from_u16(status_code) {
         Ok(status) => status,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if status == StatusCode::OK {
+        let route_response = PluginEmbyRouteResponse {
+            status_code,
+            headers: headers.clone(),
+            body_base64: String::new(),
+            media_info_import: media_info_import.clone(),
+        };
+        if !route_response.validate_media_info_import(&host_capabilities, &target.capabilities) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let (path, probe, chapters) = if let Some(operation) = media_info_import {
+            let path = match resolve_media_info_target(&state, &operation.target).await {
+                Ok(Some(path)) => path,
+                Ok(None) | Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let probe = media_probe_result_from_rpc(operation.media);
+            let chapters = operation
+                .chapters
+                .into_iter()
+                .map(|chapter| MediaInfoChapterUpdate {
+                    start_position_ticks: chapter.start_position_ticks,
+                    name: chapter.name,
+                    chapter_index: chapter.chapter_index,
+                })
+                .collect();
+            (path, probe, chapters)
+        } else if !body.is_empty() {
+            let path = raw_query.as_deref().and_then(|query| {
+                url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+                    key.eq_ignore_ascii_case("path").then(|| value.into_owned())
+                })
+            });
+            let path = if let Some(path) = path {
+                path
+            } else {
+                let Some(id) = raw_query.as_deref().and_then(|query| {
+                    url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+                        key.eq_ignore_ascii_case("id").then(|| value.into_owned())
+                    })
+                }) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                let id = emby_internal_id(&id);
+                let Some(database) = state.database.as_ref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let Some(source) = database
+                    .find_strm_source_by_emby_id(&id)
+                    .await
+                    .ok()
+                    .flatten()
+                else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                format!("{}/{}", source.root_path, source.relative_path)
+            };
+            let probe = match parse_media_info_json(&body) {
+                Ok(probe) => probe,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let chapters = match parse_media_info_chapters(&body) {
+                Ok(chapters) => chapters,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            (path, probe, chapters)
+        } else {
+            return StatusCode::OK.into_response();
+        };
+        let Some(service) = state.probe.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        if service
+            .import_media_info_for_absolute_path(&path, &probe, &chapters)
+            .await
+            .is_err()
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
     let mut response = Response::builder().status(status);
-    for (name, value) in route_response.headers {
+    for (name, value) in headers {
         if !matches!(
             name.to_ascii_lowercase().as_str(),
             "cache-control" | "content-type" | "location"
@@ -64,6 +159,76 @@ pub(super) async fn emby_sync_media_info(
     response
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn resolve_media_info_target(
+    state: &AppState,
+    target: &PluginMediaInfoTarget,
+) -> Result<Option<String>, ()> {
+    let Some(database) = state.database.as_ref() else {
+        return Err(());
+    };
+    let source = if let Some(path) = target.path.as_deref() {
+        database
+            .find_strm_source_by_absolute_path(path)
+            .await
+            .map_err(|_| ())?
+            .or(database
+                .find_strm_source_by_path_suffix(path)
+                .await
+                .map_err(|_| ())?)
+    } else if let Some(id) = target
+        .media_source_id
+        .as_deref()
+        .or(target.item_id.as_deref())
+    {
+        database
+            .find_strm_source_by_emby_id(&emby_internal_id(id))
+            .await
+            .map_err(|_| ())?
+    } else {
+        return Ok(None);
+    };
+    Ok(source.map(|source| format!("{}/{}", source.root_path, source.relative_path)))
+}
+
+fn parse_media_info_chapters(bytes: &[u8]) -> Result<Vec<MediaInfoChapterUpdate>, ()> {
+    let document: Value = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let bundle = document
+        .as_array()
+        .and_then(|bundles| bundles.first())
+        .and_then(Value::as_object)
+        .ok_or(())?;
+    let values = bundle.get("Chapters").and_then(Value::as_array).ok_or(())?;
+    if values.len() > 512 {
+        return Err(());
+    }
+    let mut chapters = Vec::with_capacity(values.len());
+    let mut indexes = std::collections::HashSet::new();
+    for value in values {
+        let object = value.as_object().ok_or(())?;
+        let start = object
+            .get("StartPositionTicks")
+            .and_then(|value| value.as_i64())
+            .ok_or(())?;
+        let index = object
+            .get("ChapterIndex")
+            .and_then(|value| value.as_i64())
+            .ok_or(())?;
+        if start < 0 || index < 0 || !indexes.insert(index) {
+            return Err(());
+        }
+        let name = object
+            .get("Name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        chapters.push(MediaInfoChapterUpdate {
+            start_position_ticks: start,
+            name,
+            chapter_index: index,
+        });
+    }
+    Ok(chapters)
 }
 
 fn filtered_plugin_route_headers(

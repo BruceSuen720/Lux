@@ -80,6 +80,7 @@ fn route_rpc_request_and_response_round_trip_with_bounded_fields() {
             .into_iter()
             .collect(),
         body_base64: String::new(),
+        host_capabilities: vec!["media.info.import".to_owned()],
     };
     let encoded = serde_json::to_value(&request).expect("route request should serialize");
     let decoded: PluginEmbyRouteRequest =
@@ -91,9 +92,113 @@ fn route_rpc_request_and_response_round_trip_with_bounded_fields() {
         status_code: 400,
         headers: Default::default(),
         body_base64: String::new(),
+        media_info_import: None,
     };
     let value = serde_json::to_value(response).expect("route response should serialize");
     assert_eq!(value["statusCode"], Value::from(400));
+}
+
+fn import_response() -> Value {
+    json!({"statusCode": 200, "bodyBase64": "", "mediaInfoImport": {
+        "target": {"path": "/library/Movie.strm"},
+        "media": {"container": "mkv", "sourceSize": 100, "durationTicks": 10000000,
+            "bitrate": 800, "streams": [{"streamIndex": 0, "streamType": "VIDEO",
+                "codec": "hevc", "isDefault": true, "isForced": false,
+                "details": {"Width": 1920, "Height": 1080}}]},
+        "chapters": [{"startPositionTicks": 0, "chapterIndex": 0, "name": "Chapter 1"}]
+    }})
+}
+
+#[test]
+fn media_info_import_is_optional_and_requires_both_capability_declarations() {
+    let old: PluginEmbyRouteResponse = serde_json::from_value(json!({"statusCode": 400})).unwrap();
+    assert!(old.media_info_import.is_none());
+    assert!(old.validate_media_info_import(&[], &[]));
+    let response: PluginEmbyRouteResponse = serde_json::from_value(import_response()).unwrap();
+    let caps = vec!["media.info.import".to_owned()];
+    assert!(response.validate_media_info_import(&caps, &caps));
+    assert!(!response.validate_media_info_import(&[], &caps));
+    assert!(!response.validate_media_info_import(&caps, &[]));
+}
+
+#[test]
+fn media_info_import_rejects_unsafe_or_unbounded_operations() {
+    let caps = vec!["media.info.import".to_owned()];
+    let mut cases = Vec::new();
+    for (pointer, replacement) in [
+        ("/statusCode", json!(400)),
+        (
+            "/mediaInfoImport/target/path",
+            json!("https://example.invalid/movie.mkv"),
+        ),
+        (
+            "/mediaInfoImport/target/path",
+            json!("/library/../other/Movie.strm"),
+        ),
+        (
+            "/mediaInfoImport/target/path",
+            json!("/library/Movie.strm\u{0}"),
+        ),
+        ("/mediaInfoImport/target", json!({})),
+        (
+            "/mediaInfoImport/target",
+            json!({"path": "/library/Movie.strm", "itemId": "123"}),
+        ),
+        ("/mediaInfoImport/target", json!({"itemId": "123\u{0}"})),
+        ("/mediaInfoImport/media/sourceSize", json!(-1)),
+        ("/mediaInfoImport/media/streams", json!([])),
+        ("/mediaInfoImport/media/streams/0/streamIndex", json!(-1)),
+        (
+            "/mediaInfoImport/media/streams/0/details",
+            json!({"Path": "/external/subtitle.srt"}),
+        ),
+        (
+            "/mediaInfoImport/media/streams/0/details/Width",
+            json!("bad"),
+        ),
+        (
+            "/mediaInfoImport/chapters/0/startPositionTicks",
+            json!(10000001),
+        ),
+        ("/mediaInfoImport/chapters/0/name", json!("x".repeat(513))),
+    ] {
+        let mut value = import_response();
+        *value.pointer_mut(pointer).unwrap() = replacement;
+        cases.push(value);
+    }
+    let mut duplicate = import_response();
+    let stream = duplicate["mediaInfoImport"]["media"]["streams"][0].clone();
+    duplicate["mediaInfoImport"]["media"]["streams"]
+        .as_array_mut()
+        .unwrap()
+        .push(stream);
+    cases.push(duplicate);
+    let mut duplicate_chapter = import_response();
+    let chapter = duplicate_chapter["mediaInfoImport"]["chapters"][0].clone();
+    duplicate_chapter["mediaInfoImport"]["chapters"]
+        .as_array_mut()
+        .unwrap()
+        .push(chapter);
+    cases.push(duplicate_chapter);
+    let mut thumbnail = import_response();
+    thumbnail["mediaInfoImport"]["media"]["thumbnailJpegBase64"] = json!("abcd");
+    cases.push(thumbnail);
+    let mut excessive = import_response();
+    excessive["mediaInfoImport"]["chapters"] = json!(
+        (0..513)
+            .map(|i| json!({
+                "startPositionTicks": 0, "chapterIndex": i, "name": "Chapter"
+            }))
+            .collect::<Vec<_>>()
+    );
+    cases.push(excessive);
+    for value in cases {
+        let response: PluginEmbyRouteResponse = serde_json::from_value(value).unwrap();
+        assert!(!response.validate_media_info_import(&caps, &caps));
+    }
+    let mut injected = import_response();
+    injected["mediaInfoImport"]["target"]["url"] = json!("https://example.invalid/");
+    assert!(serde_json::from_value::<PluginEmbyRouteResponse>(injected).is_err());
 }
 
 #[test]

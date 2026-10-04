@@ -674,6 +674,7 @@ impl StrmProbeService {
                     duration_ticks: result.media.duration_ticks,
                     bitrate: result.media.bitrate,
                     streams: &streams,
+                    chapters: &[],
                 })
                 .await?;
             if job.write_sidecars

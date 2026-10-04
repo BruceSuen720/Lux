@@ -20,6 +20,7 @@ use tokio::{
 
 use crate::{
     application::nfo::{NfoWriteError, NfoWriteService},
+    application::plugin_protocol::{MediaProbeRpcResult, MediaProbeRpcStreamType},
     config::{MAX_PROBE_CONCURRENCY, probe_concurrency_override_from_env},
     domain::{ids::LibraryId, time::duration_to_ticks},
     observability::resources::ResourceMetrics,
@@ -69,6 +70,33 @@ pub struct MediaStreamResult {
     pub is_default: bool,
     pub is_forced: bool,
     pub details: BTreeMap<String, Value>,
+}
+
+pub fn media_probe_result_from_rpc(response: MediaProbeRpcResult) -> MediaProbeResult {
+    MediaProbeResult {
+        container: response.container,
+        source_size: response.source_size,
+        duration_ticks: response.duration_ticks,
+        bitrate: response.bitrate,
+        streams: response
+            .streams
+            .into_iter()
+            .map(|stream| MediaStreamResult {
+                stream_index: stream.stream_index,
+                stream_type: match stream.stream_type {
+                    MediaProbeRpcStreamType::Video => StreamType::Video,
+                    MediaProbeRpcStreamType::Audio => StreamType::Audio,
+                    MediaProbeRpcStreamType::Subtitle => StreamType::Subtitle,
+                },
+                codec: stream.codec,
+                language: stream.language,
+                title: stream.title,
+                is_default: stream.is_default,
+                is_forced: stream.is_forced,
+                details: stream.details,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -970,6 +998,59 @@ impl MediaProbeService {
         self
     }
 
+    pub(crate) async fn import_media_info_for_absolute_path(
+        &self,
+        absolute_path: &str,
+        result: &MediaProbeResult,
+        chapters: &[crate::storage::MediaInfoChapterUpdate],
+    ) -> Result<(), ProbeServiceError> {
+        let source = self
+            .database
+            .find_strm_source_by_absolute_path(absolute_path)
+            .await?
+            .ok_or_else(|| ProbeServiceError::Worker("STRM source was not indexed".to_owned()))?;
+        let details = result
+            .streams
+            .iter()
+            .map(|stream| {
+                if stream.details.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&stream.details).ok()
+                }
+            })
+            .collect::<Vec<_>>();
+        let streams = result
+            .streams
+            .iter()
+            .zip(details.iter())
+            .map(|(stream, details)| MediaStreamUpdate {
+                stream_index: stream.stream_index,
+                stream_type: stream.stream_type.as_str(),
+                codec: stream.codec.as_deref(),
+                language: stream.language.as_deref(),
+                title: stream.title.as_deref(),
+                details_json: details.as_deref(),
+                external_path: None,
+                is_external: false,
+                is_default: stream.is_default,
+                is_forced: stream.is_forced,
+            })
+            .collect::<Vec<_>>();
+        self.database
+            .save_media_probe(MediaProbeUpdate {
+                source_id: &source.source_id,
+                container: result.container.as_deref(),
+                source_size: result.source_size,
+                duration_ticks: result.duration_ticks,
+                bitrate: result.bitrate,
+                streams: &streams,
+                chapters,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn probe_movie_library(
         &self,
         library_id: LibraryId,
@@ -1211,6 +1292,7 @@ impl MediaProbeService {
                         duration_ticks: result.duration_ticks,
                         bitrate: result.bitrate,
                         streams: &streams,
+                        chapters: &[],
                     })
                     .await?;
                 if let Some(nfo_writer) = &self.nfo_writer

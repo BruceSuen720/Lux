@@ -3602,6 +3602,7 @@ pub(crate) struct MediaProbeUpdate<'a> {
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) bitrate: Option<i64>,
     pub(crate) streams: &'a [MediaStreamUpdate<'a>],
+    pub(crate) chapters: &'a [MediaInfoChapterUpdate],
 }
 
 pub(crate) struct MediaStreamUpdate<'a> {
@@ -3615,6 +3616,12 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) is_external: bool,
     pub(crate) is_default: bool,
     pub(crate) is_forced: bool,
+}
+
+pub(crate) struct MediaInfoChapterUpdate {
+    pub(crate) start_position_ticks: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) chapter_index: i64,
 }
 
 #[derive(Debug)]

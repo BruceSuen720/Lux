@@ -2371,6 +2371,44 @@ impl Database {
                     });
             }
         }
+        for source_ids in source_ids.chunks(500) {
+            if source_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", source_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT media_source_id, start_position_ticks, name, chapter_index
+                 FROM media_info_chapters WHERE media_source_id IN ({placeholders})
+                 ORDER BY media_source_id, start_position_ticks, chapter_index, id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for source_id in source_ids {
+                statement = statement.bind(source_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let source_id: String = row.get("media_source_id");
+                chapters
+                    .entry(source_id.clone())
+                    .or_default()
+                    .push(StoredMediaChapter {
+                        source_id,
+                        start_position_ticks: row.get("start_position_ticks"),
+                        name: row.get("name"),
+                        marker_type: "CHAPTER".to_owned(),
+                        chapter_index: row.get("chapter_index"),
+                    });
+            }
+        }
         Ok(chapters)
     }
 
@@ -2711,6 +2749,127 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
+        })
+    }
+
+    pub(crate) async fn find_strm_source_by_absolute_path(
+        &self,
+        absolute_path: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND ? = lr.canonical_path || '/' || fe.relative_path
+             LIMIT 2",
+        )
+        .bind(absolute_path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .and_then(|rows| {
+            if rows.len() > 1 {
+                return Err(StorageError::Conflict(
+                    "multiple STRM sources match the absolute path".to_owned(),
+                ));
+            }
+            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            }))
+        })
+    }
+
+    pub(crate) async fn find_strm_source_by_path_suffix(
+        &self,
+        external_path: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND ? LIKE '%/' || fe.relative_path
+             LIMIT 2",
+        )
+        .bind(external_path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .and_then(|rows| {
+            if rows.len() > 1 {
+                return Err(StorageError::Conflict(
+                    "multiple STRM sources match the external path suffix".to_owned(),
+                ));
+            }
+            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            }))
+        })
+    }
+
+    pub(crate) async fn find_strm_source_by_emby_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND (ms.id = ? OR ms.item_id = ?)
+             LIMIT 2",
+        )
+        .bind(id)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .and_then(|rows| {
+            if rows.len() > 1 {
+                return Err(StorageError::Conflict(
+                    "multiple STRM sources match the Emby id".to_owned(),
+                ));
+            }
+            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            }))
         })
     }
 
@@ -4414,6 +4573,32 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
+        }
+        self.query("DELETE FROM media_info_chapters WHERE media_source_id = ?")
+            .bind(update.source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for chapter in update.chapters {
+            self.query(
+                "INSERT INTO media_info_chapters (
+                    id, media_source_id, start_position_ticks, name, chapter_index
+                 ) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(update.source_id)
+            .bind(chapter.start_position_ticks)
+            .bind(&chapter.name)
+            .bind(chapter.chapter_index)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         }
         transaction
             .commit()

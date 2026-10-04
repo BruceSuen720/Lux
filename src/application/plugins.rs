@@ -155,6 +155,7 @@ pub struct PluginService {
 pub struct PluginEmbyRouteTarget {
     pub plugin_id: String,
     pub rpc_method: String,
+    pub capabilities: Vec<String>,
 }
 
 impl PluginService {
@@ -877,6 +878,7 @@ impl PluginService {
                 let candidate = PluginEmbyRouteTarget {
                     plugin_id: plugin.manifest.id.clone(),
                     rpc_method: route.rpc_method.clone(),
+                    capabilities: plugin.manifest.capabilities.clone(),
                 };
                 if target.is_some() {
                     return Err(PluginServiceError::InvalidConfig);

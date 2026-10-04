@@ -894,6 +894,8 @@ pub struct PluginEmbyRouteRequest {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub body_base64: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -904,6 +906,171 @@ pub struct PluginEmbyRouteResponse {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub body_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_info_import: Option<PluginMediaInfoImport>,
+}
+
+pub const MEDIA_INFO_IMPORT_CAPABILITY: &str = "media.info.import";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMediaInfoImport {
+    pub target: PluginMediaInfoTarget,
+    pub media: MediaProbeRpcResult,
+    #[serde(default)]
+    pub chapters: Vec<PluginMediaInfoChapter>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMediaInfoTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMediaInfoChapter {
+    pub start_position_ticks: i64,
+    pub chapter_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl PluginEmbyRouteResponse {
+    /// Validates the operation contract. Authorization and target resolution remain host duties.
+    pub fn validate_media_info_import(
+        &self,
+        host_capabilities: &[String],
+        plugin_capabilities: &[String],
+    ) -> bool {
+        let Some(operation) = &self.media_info_import else {
+            return true;
+        };
+        (200..300).contains(&self.status_code)
+            && [host_capabilities, plugin_capabilities]
+                .iter()
+                .all(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability == MEDIA_INFO_IMPORT_CAPABILITY)
+                })
+            && operation.is_valid()
+    }
+}
+
+impl PluginMediaInfoImport {
+    pub fn is_valid(&self) -> bool {
+        let target = &self.target;
+        let selectors = [&target.item_id, &target.media_source_id, &target.path];
+        if selectors
+            .iter()
+            .filter(|selector| selector.is_some())
+            .count()
+            != 1
+            || [&target.item_id, &target.media_source_id].iter().any(|id| {
+                id.as_ref().is_some_and(|id| {
+                    id.is_empty()
+                        || id.len() > 128
+                        || !id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            })
+            || target.path.as_ref().is_some_and(|path| {
+                path.len() > 8192
+                    || path.chars().any(char::is_control)
+                    || !Path::new(path).is_absolute()
+                    || path
+                        .split(['/', '\\'])
+                        .any(|component| matches!(component, "." | ".."))
+            })
+            || serde_json::to_vec(self)
+                .ok()
+                .is_none_or(|bytes| bytes.len() > 256 * 1024)
+        {
+            return false;
+        }
+        let media = &self.media;
+        if !bounded_import_text(&media.container, 128)
+            || [media.source_size, media.duration_ticks, media.bitrate]
+                .iter()
+                .flatten()
+                .any(|value| *value < 0)
+            || media.thumbnail_jpeg_base64.is_some()
+            || media.streams.is_empty()
+            || media.streams.len() > 128
+            || self.chapters.len() > 512
+        {
+            return false;
+        }
+        let mut indexes = std::collections::HashSet::new();
+        if media.streams.iter().any(|stream| {
+            stream.stream_index < 0
+                || !indexes.insert(stream.stream_index)
+                || !bounded_import_text(&stream.codec, 256)
+                || !bounded_import_text(&stream.language, 256)
+                || !bounded_import_text(&stream.title, 512)
+                || stream
+                    .details
+                    .iter()
+                    .any(|(key, value)| !valid_import_detail(key, value))
+        }) {
+            return false;
+        }
+        indexes.clear();
+        self.chapters.iter().all(|chapter| {
+            chapter.start_position_ticks >= 0
+                && chapter.chapter_index >= 0
+                && indexes.insert(chapter.chapter_index)
+                && bounded_import_text(&chapter.name, 512)
+                && media
+                    .duration_ticks
+                    .is_none_or(|duration| chapter.start_position_ticks <= duration)
+        })
+    }
+}
+
+fn bounded_import_text(text: &Option<String>, limit: usize) -> bool {
+    text.as_ref()
+        .is_none_or(|text| text.len() <= limit && !text.chars().any(char::is_control))
+}
+
+fn valid_import_detail(key: &str, value: &Value) -> bool {
+    match key {
+        "IsInterlaced" | "IsHearingImpaired" | "IsTextSubtitleStream" => value.is_boolean(),
+        "BitRate" | "BitDepth" | "RefFrames" | "Height" | "Width" | "Level" | "Channels" => {
+            value.as_i64().is_some_and(|number| number >= 0)
+        }
+        "AverageFrameRate" | "RealFrameRate" => value.as_f64().is_some_and(|number| number >= 0.0),
+        "SampleRate" => {
+            value.as_i64().is_some_and(|number| number >= 0)
+                || value
+                    .as_str()
+                    .is_some_and(|text| text.len() <= 32 && text.parse::<u32>().is_ok())
+        }
+        "DisplayLanguage"
+        | "TimeBase"
+        | "VideoRange"
+        | "VideoRangeType"
+        | "Profile"
+        | "AspectRatio"
+        | "PixelFormat"
+        | "ChannelLayout"
+        | "ColorSpace"
+        | "ColorTransfer"
+        | "ColorPrimaries"
+        | "ExtendedVideoType"
+        | "ExtendedVideoSubType"
+        | "ExtendedVideoSubTypeDescription" => value
+            .as_str()
+            .is_some_and(|text| text.len() <= 512 && !text.chars().any(char::is_control)),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
