@@ -1042,17 +1042,14 @@ fn bounded_import_text(text: &Option<String>, limit: usize) -> bool {
 
 fn valid_import_detail(key: &str, value: &Value) -> bool {
     match key {
-        "IsInterlaced" | "IsHearingImpaired" | "IsTextSubtitleStream" => value.is_boolean(),
+        "IsInterlaced" | "IsHearingImpaired" | "IsTextSubtitleStream" => {
+            valid_import_boolean(value)
+        }
         "BitRate" | "BitDepth" | "RefFrames" | "Height" | "Width" | "Level" | "Channels" => {
-            value.as_i64().is_some_and(|number| number >= 0)
+            valid_nonnegative_integer(value)
         }
-        "AverageFrameRate" | "RealFrameRate" => value.as_f64().is_some_and(|number| number >= 0.0),
-        "SampleRate" => {
-            value.as_i64().is_some_and(|number| number >= 0)
-                || value
-                    .as_str()
-                    .is_some_and(|text| text.len() <= 32 && text.parse::<u32>().is_ok())
-        }
+        "AverageFrameRate" | "RealFrameRate" => valid_frame_rate(value),
+        "SampleRate" => valid_nonnegative_integer(value),
         "DisplayLanguage"
         | "TimeBase"
         | "VideoRange"
@@ -1071,6 +1068,46 @@ fn valid_import_detail(key: &str, value: &Value) -> bool {
             .is_some_and(|text| text.len() <= 512 && !text.chars().any(char::is_control)),
         _ => false,
     }
+}
+
+fn valid_import_boolean(value: &Value) -> bool {
+    value.is_boolean()
+        || value.as_i64().is_some()
+        || value.as_str().is_some_and(|text| {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "true" | "false" | "1" | "0" | "yes" | "no"
+            )
+        })
+}
+
+fn valid_nonnegative_integer(value: &Value) -> bool {
+    value.as_i64().is_some_and(|number| number >= 0)
+        || value.as_str().is_some_and(|text| {
+            text.len() <= 32
+                && !text.is_empty()
+                && text.parse::<i64>().is_ok_and(|number| number >= 0)
+        })
+}
+
+fn valid_frame_rate(value: &Value) -> bool {
+    if value
+        .as_f64()
+        .is_some_and(|number| number.is_finite() && number >= 0.0)
+    {
+        return true;
+    }
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let Some((numerator, denominator)) = text.split_once('/') else {
+        return false;
+    };
+    text.len() <= 32
+        && !numerator.is_empty()
+        && !denominator.is_empty()
+        && numerator.parse::<u64>().is_ok()
+        && denominator.parse::<u64>().is_ok()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

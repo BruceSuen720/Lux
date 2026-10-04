@@ -122,6 +122,44 @@ fn media_info_import_is_optional_and_requires_both_capability_declarations() {
 }
 
 #[test]
+fn media_info_import_accepts_cached_audio_bitrate_strings() {
+    let caps = vec!["media.info.import".to_owned()];
+    let mut value = import_response();
+    value["mediaInfoImport"]["media"]["streams"][0]["details"] = json!({
+        "AverageFrameRate": "0/0", "RealFrameRate": "0/0",
+        "BitRate": "768000", "SampleRate": "48000", "Channels": 6
+    });
+    let response: PluginEmbyRouteResponse = serde_json::from_value(value).unwrap();
+    assert!(response.validate_media_info_import(&caps, &caps));
+}
+
+#[test]
+fn media_info_import_rejects_invalid_bitrate_strings() {
+    let caps = vec!["media.info.import".to_owned()];
+    for bitrate in ["-1", "1.5", "NaN", "", "768000\n", "9223372036854775808"] {
+        let mut value = import_response();
+        value["mediaInfoImport"]["media"]["streams"][0]["details"]["BitRate"] = json!(bitrate);
+        let response: PluginEmbyRouteResponse = serde_json::from_value(value).unwrap();
+        assert!(
+            !response.validate_media_info_import(&caps, &caps),
+            "{bitrate:?}"
+        );
+    }
+}
+
+#[test]
+fn media_info_import_accepts_emby_rational_frame_rates() {
+    let caps = vec!["media.info.import".to_owned()];
+    let mut value = import_response();
+    value["mediaInfoImport"]["media"]["streams"][0]["details"] = json!({
+        "AverageFrameRate": "60/1",
+        "RealFrameRate": "0/0"
+    });
+    let response: PluginEmbyRouteResponse = serde_json::from_value(value).unwrap();
+    assert!(response.validate_media_info_import(&caps, &caps));
+}
+
+#[test]
 fn media_info_import_rejects_unsafe_or_unbounded_operations() {
     let caps = vec!["media.info.import".to_owned()];
     let mut cases = Vec::new();
