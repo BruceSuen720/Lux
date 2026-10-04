@@ -15,6 +15,21 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.16",
+    date: "2026-10-04",
+    sections: [
+      { kind: "added", items: [
+        "MediaTidy/StrmAssistant 兼容路由支持导入受限的 mediaInfoImport Bundle，将已校验的格式、大小、时长、码率、媒体流和普通章节写入已索引的 STRM 媒体源。",
+      ] },
+      { kind: "changed", items: [
+        "Web 播放容器状态同步改为批量读取和写入多个剧集/季度父条目，减少播放进度更新产生的数据库往返。",
+      ] },
+      { kind: "fixed", items: [
+        "加强媒体信息 Bundle 的目标匹配、字段范围、路径和认证参数校验，拒绝超界或不属于当前媒体源的导入数据。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.15",
     date: "2026-10-04",
     sections: [
