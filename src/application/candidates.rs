@@ -172,25 +172,13 @@ fn metadata_completeness_fingerprint(
         "itemId": item_id,
         "current": {
             "itemType": current.item_type,
-            "title": current.title,
-            "originalTitle": current.original_title,
-            "overview": current.overview,
-            "productionYear": current.production_year,
-            "premiereDate": current.premiere_date,
-            "lastAirDate": current.last_air_date,
-            "status": current.status,
-            "originalLanguage": current.original_language,
-            "rating": current.rating,
             "providerIds": normalized_json(current.provider_ids_json.as_deref()),
             "metadataScraperId": current.metadata_scraper_id,
             "scraperId": current.scraper_id,
             "identificationStatus": current.identification_status,
             "provenance": normalized_json(current.provenance_json.as_deref()),
             "lockedFields": normalized_json(current.locked_fields_json.as_deref()),
-            "nfoMetadata": normalized_json(current.nfo_metadata_json.as_deref()),
             "seriesItemId": current.series_item_id,
-            "seriesTitle": current.series_title,
-            "seriesProductionYear": current.series_production_year,
             "seriesProviderName": current.series_provider_name,
             "seriesProviderId": current.series_provider_id,
             "seasonNumber": current.season_number,
@@ -4632,10 +4620,16 @@ mod tests {
 
         let first_fingerprint = completeness.input_fingerprint;
         current.overview = Some("Updated local overview".to_owned());
+        assert_eq!(
+            first_fingerprint,
+            metadata_completeness_fingerprint("movie-1", &current, actual_plan, requestable_plan,),
+            "unrelated metadata changes must not requeue every missing capability"
+        );
+        current.provider_ids_json = Some(serde_json::json!({"tmdb": "changed"}).to_string());
         assert_ne!(
             first_fingerprint,
             metadata_completeness_fingerprint("movie-1", &current, actual_plan, requestable_plan,),
-            "current local metadata changes the input fingerprint"
+            "provider identity changes must update the input fingerprint"
         );
         current.item_type = "VIDEO".to_owned();
         assert!(
