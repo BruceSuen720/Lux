@@ -122,8 +122,8 @@ export function MediaSubtitleEditor({ item, sourceId, onClose, onSaved }: MediaS
               <footer className="lux-media-editor-footer">
                 <span>{saving ? "正在保存…" : "外挂字幕来自媒体文件同目录"}</span>
                 <div>
-                  <button className="lux-button lux-button-secondary" type="button" onClick={onClose}>取消</button>
-                  <button className="lux-button lux-button-primary" type="submit" disabled={saving}><Save size={16} /> {saving ? "保存中…" : "保存"}</button>
+                  <button className="lux-button lux-button-touch lux-button-secondary" type="button" onClick={onClose}>取消</button>
+                  <button className="lux-button lux-button-touch lux-button-primary" type="submit" disabled={saving}><Save size={16} /> {saving ? "保存中…" : "保存"}</button>
                 </div>
               </footer>
             </form>
