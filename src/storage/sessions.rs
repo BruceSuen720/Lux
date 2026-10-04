@@ -715,7 +715,7 @@ impl Database {
                 source,
             })?;
         let sessions = rows.into_iter().map(stored_web_playback_session).collect();
-        self.stop_web_playback_sessions(sessions, now, "expires_at < ?", now)
+        self.stop_selected_web_playback_sessions(sessions, now, "expires_at < ?", now)
             .await
     }
 
@@ -744,7 +744,7 @@ impl Database {
                 source,
             })?;
         let sessions = rows.into_iter().map(stored_web_playback_session).collect();
-        self.stop_web_playback_sessions(
+        self.stop_selected_web_playback_sessions(
             sessions,
             now,
             "plan = 'SERVER_HLS' AND last_heartbeat_at < ?",
@@ -753,12 +753,12 @@ impl Database {
         .await
     }
 
-    async fn stop_web_playback_sessions(
+    async fn stop_selected_web_playback_sessions(
         &self,
         sessions: Vec<StoredWebPlaybackSession>,
         now: i64,
-        predicate: &str,
-        predicate_value: i64,
+        eligibility: &str,
+        eligibility_value: i64,
     ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
         if sessions.is_empty() {
             return Ok(Vec::new());
@@ -766,18 +766,19 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", sessions.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut update = self.query(sqlx::AssertSqlSafe(format!(
+        let sql = format!(
             "UPDATE web_playback_sessions
              SET state = 'STOPPED', updated_at = ?
-             WHERE id IN ({placeholders}) AND state = 'ACTIVE' AND {predicate}
+             WHERE id IN ({placeholders}) AND state = 'ACTIVE' AND {eligibility}
              RETURNING id"
-        )));
-        update = update.bind(now);
+        );
+        let mut query = self.query_scalar::<String>(sqlx::AssertSqlSafe(sql));
+        query = query.bind(now);
         for session in &sessions {
-            update = update.bind(&session.id);
+            query = query.bind(&session.id);
         }
-        let stopped_ids = update
-            .bind(predicate_value)
+        let stopped_ids = query
+            .bind(eligibility_value)
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -785,7 +786,6 @@ impl Database {
                 source,
             })?
             .into_iter()
-            .map(|row| row.get::<String, _>("id"))
             .collect::<HashSet<_>>();
         Ok(sessions
             .into_iter()
