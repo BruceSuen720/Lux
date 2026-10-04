@@ -297,6 +297,38 @@ impl Database {
         Ok(id)
     }
 
+    async fn insert_library_scrapers_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        scrapers: &[crate::library::LibraryScraper],
+    ) -> Result<(), StorageError> {
+        for chunk in scrapers.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+                 VALUES {values}"
+            )));
+            for scraper in chunk {
+                query = query
+                    .bind(library_id)
+                    .bind(&scraper.scraper_id)
+                    .bind(scraper.position)
+                    .bind(scraper.role.as_str());
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -332,22 +364,8 @@ impl Database {
             source,
         })?;
 
-        for scraper in library.scrapers {
-            self.query(
-                "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(library.id)
-            .bind(&scraper.scraper_id)
-            .bind(scraper.position)
-            .bind(scraper.role.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        self.insert_library_scrapers_in_transaction(&mut transaction, library.id, library.scrapers)
+            .await?;
 
         let registrations = [
             (
@@ -1212,22 +1230,8 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            for scraper in scrapers {
-                self.query(
-                    "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(library_id)
-                .bind(&scraper.scraper_id)
-                .bind(scraper.position)
-                .bind(scraper.role.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            }
+            self.insert_library_scrapers_in_transaction(&mut transaction, library_id, scrapers)
+                .await?;
             let primary_scraper = scrapers.first().map(|scraper| scraper.scraper_id.as_str());
             self.query(
                 "UPDATE libraries
@@ -3978,5 +3982,142 @@ mod scheduled_task_plan_mirror_tests {
 
         assert_eq!(configs.len(), 2);
         assert_eq!(database.query_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod library_scraper_batch_tests {
+    use super::*;
+    use crate::{
+        application::libraries::LibraryService,
+        config::Config,
+        library::{LibraryKind, LibraryScraper, LibraryScraperRole},
+    };
+
+    #[tokio::test]
+    async fn library_scraper_rows_insert_in_one_bounded_statement() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let scrapers = (0..5)
+            .map(|position| LibraryScraper {
+                scraper_id: format!("scraper-{position}"),
+                position,
+                role: if position == 0 {
+                    LibraryScraperRole::Primary
+                } else {
+                    LibraryScraperRole::Supplement
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut transaction = database.pool.begin().await.expect("transaction");
+
+        database.reset_query_count();
+        database
+            .insert_library_scrapers_in_transaction(
+                &mut transaction,
+                &library.id.to_string(),
+                &scrapers,
+            )
+            .await
+            .expect("scraper rows");
+        transaction.commit().await.expect("commit");
+
+        assert_eq!(database.query_count(), 1);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM library_scrapers WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("scraper count");
+        assert_eq!(count, scrapers.len() as i64);
+
+        let stored: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT scraper_id, position, role FROM library_scrapers
+             WHERE library_id = ? ORDER BY position",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("ordered scraper rows");
+        let expected = scrapers
+            .iter()
+            .map(|scraper| {
+                (
+                    scraper.scraper_id.clone(),
+                    scraper.position,
+                    scraper.role.as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stored, expected);
+
+        let mut transaction = database.pool.begin().await.expect("empty transaction");
+        database.reset_query_count();
+        database
+            .insert_library_scrapers_in_transaction(&mut transaction, &library.id.to_string(), &[])
+            .await
+            .expect("empty input");
+        assert_eq!(database.query_count(), 0);
+        transaction.rollback().await.expect("empty rollback");
+
+        // Exercise the storage boundary beyond the API's 16-scraper limit.
+        let mut batch_scrapers = (0..205)
+            .map(|position| LibraryScraper {
+                scraper_id: format!("batch-scraper-{position}"),
+                position: position + 5,
+                role: LibraryScraperRole::Backup,
+            })
+            .collect::<Vec<_>>();
+        let mut transaction = database.pool.begin().await.expect("batch transaction");
+        database.reset_query_count();
+        database
+            .insert_library_scrapers_in_transaction(
+                &mut transaction,
+                &library.id.to_string(),
+                &batch_scrapers,
+            )
+            .await
+            .expect("bounded inserts");
+        assert_eq!(database.query_count(), 3);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM library_scrapers WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("batch row count");
+        assert_eq!(count, 210);
+        transaction.rollback().await.expect("batch rollback");
+
+        batch_scrapers[200].scraper_id = batch_scrapers[0].scraper_id.clone();
+        let mut transaction = database.pool.begin().await.expect("conflicting batch");
+        assert!(
+            database
+                .insert_library_scrapers_in_transaction(
+                    &mut transaction,
+                    &library.id.to_string(),
+                    &batch_scrapers
+                )
+                .await
+                .is_err()
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("conflicting batch rollback");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM library_scrapers WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("rows after failed batch");
+        assert_eq!(count, 5);
     }
 }

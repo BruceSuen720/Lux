@@ -8448,6 +8448,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 实施记录（2026-10-04）：旧实现查询计数回归先失败，实测为 5 次；新实现固定为 3 次，减少 2 次（约 40%）。父级状态、播放次数、版本、取消已看、重复同步和空容器回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。本任务为新一轮的单独增量，上一轮截至 LUX-389 的收口记录保持不变。
 
+#### LUX-391：批量写入媒体库刮削器配置
+
+范围：媒体库创建和编辑刮削器配置时，原实现对每个有序 scraper 单独执行 `library_scrapers` INSERT。改为复用一个有界多行 INSERT helper；保留最多 16 项校验、位置/角色顺序、主刮削器兼容字段、事务边界和单个 legacy `scraper_id` 更新语义。不改变读取 API 或数据库模型。
+
+验收：
+
+- [x] 5 个 scraper 行由 5 次 INSERT 降为 1 次；批次上限 100，超过上限仍分批写入。
+- [x] 创建和编辑路径复用同一 helper；位置、角色、主刮削器字段和空列表行为保持不变。
+- [x] storage 查询计数回归、library 集成回归和现有计划任务/插件 scraper 回归通过。
+- [x] Rust build、全目标测试、fmt、全目标全 feature Clippy 和差异检查通过；记录 ARM64 与后端验证边界。
+
+文件：`src/storage/library.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。测试与私有 helper 位于同一模块，因此未修改 `repository_tests.rs`。实现前 helper 回归因方法不存在而编译失败；旧创建/编辑循环每项执行一条 INSERT 属于源码计数，新 helper 的 SQL 调用数通过测试实测。补充空输入、205 行分批、位置/角色与后续批次失败回滚覆盖。
+
+最终门禁（2026-10-05）：本机 `uname -m=arm64`，Toshiba target 已挂载。`cargo build --locked`、`cargo test --locked --all-targets`（711 passed、0 failed、11 ignored；其中 PostgreSQL 专项 15 项因无本地 PostgreSQL 而 ignored）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 均通过。未进行 PostgreSQL、NAS 或生产环境性能验证。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
