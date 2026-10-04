@@ -23,6 +23,6 @@
 @media (max-width: 560px) {
   .lux-identifier-search { grid-template-columns: minmax(0, 1fr); gap: 14px; padding: 16px; }
   .lux-identifier-search .lux-button { justify-self: stretch; min-height: var(--lux-button-height-touch); }
-  .lux-identifier-results { max-height: calc(100vh - 330px); max-height: calc(100dvh - 330px); padding: 16px; }
+  .lux-identifier-results { max-height: min(590px, calc(100vh - 180px)); max-height: min(590px, calc(100dvh - 180px)); padding: 16px; }
   .lux-identifier-actions .lux-button { min-height: var(--lux-button-height-touch); }
 }

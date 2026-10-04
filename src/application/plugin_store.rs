@@ -678,6 +678,11 @@ mod tests {
     #[test]
     fn selects_the_package_for_the_running_platform_and_architecture() {
         let (platform, arch) = current_platform_and_arch();
+        let non_matching_arch = if arch == "x86_64" {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
         let entry = PluginStoreEntry {
             id: "org.lux.example".to_owned(),
             name: "Example".to_owned(),
@@ -691,7 +696,7 @@ mod tests {
             packages: vec![
                 PluginStorePackage {
                     platform: "linux".to_owned(),
-                    arch: "x86_64".to_owned(),
+                    arch: non_matching_arch.to_owned(),
                     package_url: "https://example.com/x86.zip".to_owned(),
                     sha256: "a".repeat(64),
                 },
