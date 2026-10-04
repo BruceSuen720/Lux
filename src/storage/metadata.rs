@@ -84,7 +84,10 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')"
+                    OR item_metadata_completeness.local_state = 'CANCELLED'
+                    OR (item_metadata_completeness.local_state = 'FAILED'
+                        AND (item_metadata_completeness.retry_after IS NULL
+                             OR item_metadata_completeness.retry_after <= unixepoch()))"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for check in batch {
@@ -478,7 +481,10 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')
+                    OR item_metadata_completeness.local_state = 'CANCELLED'
+                    OR (item_metadata_completeness.local_state = 'FAILED'
+                        AND (item_metadata_completeness.retry_after IS NULL
+                             OR item_metadata_completeness.retry_after <= unixepoch()))
                  RETURNING item_id",
             )
             .bind(item_id)

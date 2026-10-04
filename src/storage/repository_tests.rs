@@ -2146,11 +2146,33 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
                 &item_id,
                 "POSTER",
                 failed_fingerprint,
-                Some(2_000),
+                Some(4_000_000_000),
                 "local read failed",
             )
             .await
             .expect("record local read failure")
+    );
+    assert!(
+        !database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", failed_fingerprint,)
+            .await
+            .expect("respect completeness retry backoff")
+    );
+    database
+        .query(
+            "UPDATE item_metadata_completeness
+             SET retry_after = 0
+             WHERE item_id = ? AND capability = 'POSTER'",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await
+        .expect("expire completeness retry backoff");
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", failed_fingerprint,)
+            .await
+            .expect("claim completeness after retry backoff")
     );
     assert!(
         database
@@ -3684,8 +3706,11 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
 
     sqlx::query(
         "CREATE TRIGGER reject_fill_missing_job
-         BEFORE INSERT ON metadata_reidentify_jobs
-         WHEN NEW.mode = 'FILL_MISSING'
+         BEFORE INSERT ON metadata_reidentify_job_items
+         WHEN EXISTS (
+             SELECT 1 FROM metadata_reidentify_jobs
+             WHERE id = NEW.job_id AND mode = 'FILL_MISSING'
+         )
          BEGIN SELECT RAISE(ABORT, 'injected fill-missing job failure'); END",
     )
     .execute(database.pool())
@@ -3749,6 +3774,53 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .await
         .expect("scheduled item page");
     assert_eq!(scheduled_items, vec![item_ids[1].clone()]);
+
+    let queued_merge_fingerprint = b"queued-merge-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_ids[0],
+                "STILL",
+                queued_merge_fingerprint,
+            )
+            .await
+            .expect("prepare queued merge check")
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_ids[0],
+                "STILL",
+                queued_merge_fingerprint,
+            )
+            .await
+            .expect("claim queued merge check")
+    );
+    let queued_merge_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_ids[0],
+        capability: "STILL",
+        input_fingerprint: queued_merge_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let merged = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &queued_merge_result,
+            &[item_ids[0].clone()],
+        )
+        .await
+        .expect("merge into queued fill-missing job");
+    assert_eq!(merged.scheduled_job_ids, vec![scheduled_job_id.clone()]);
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT total_count FROM metadata_reidentify_jobs WHERE id = ?",)
+            .bind(scheduled_job_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read merged queued job count"),
+        2
+    );
 
     let replayed = database
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &backdrop_results, &item_ids)
