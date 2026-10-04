@@ -15,6 +15,18 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.17",
+    date: "2026-10-04",
+    sections: [
+      { kind: "changed", items: [
+        "MediaTidy/StrmAssistant 媒体信息导入兼容 Emby 缓存中以字符串表示的数值、布尔值和分数帧率字段，同时继续限制字段长度、数值范围和格式。",
+      ] },
+      { kind: "fixed", items: [
+        "修复合法的字符串码率、采样率和分数帧率被误拒的问题，并继续拒绝负数、浮点码率、无穷值和超范围字段。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.16",
     date: "2026-10-04",
     sections: [
