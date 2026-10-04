@@ -289,3 +289,10 @@ test("touch account controls retain a usable hit area", () => {
   assert.match(mobileStyles, /\.lux-account-settings-nav a\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
   assert.match(mobileStyles, /\.lux-account-library-actions button\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
 });
+
+test("mobile admin library surface expands with its negative outer gutter", () => {
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 720px)"));
+  const libraryPageRule = mobileStyles.match(/\.lux-admin-library-page\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(libraryPageRule, /width:\s*auto/);
+});

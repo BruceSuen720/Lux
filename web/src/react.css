@@ -2307,7 +2307,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-library-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 720px) {
-  .lux-admin-library-page { margin-right: -20px; margin-left: -20px; padding-right: 20px; padding-left: 20px; }
+  .lux-admin-library-page { width: auto; margin-right: -20px; margin-left: -20px; padding-right: 20px; padding-left: 20px; }
   .lux-library-management-toolbar { align-items: stretch; flex-direction: column; text-align: center; }
   .lux-library-management-toolbar > div { justify-content: center; flex-wrap: wrap; }
   .lux-admin-library-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
