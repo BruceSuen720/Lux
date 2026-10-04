@@ -1,5 +1,18 @@
 # FILL_MISSING 创建频率与重复补全优化方案
 
+## 当前实现状态
+
+以下第一阶段修复已经落地，生产环境仍需单独构建、发布和验证：
+
+- 只有本轮新确认的 missing claim 才会触发自动 `FILL_MISSING`。
+- 近期 `DEFERRED` job 参与去重，避免 provider 暂不可用时立即重复建任务。
+- completeness fingerprint 只保留会改变补全计划的输入，普通 overview、评分等变化不会重置整套能力。
+- completeness 失败记录在 `retry_after` 到期前不会重新领取。
+- 同一媒体库的自动补全优先并入已有 `QUEUED` job，单个 job 仍限制为 100 条。
+- 默认扫描并发为 2，全量 `RECONCILE_LIBRARY` 使用全局串行队列。
+
+对应提交：`cea0c50d`、`8389bc0e`、`a2272b2b`、`086c8769`。
+
 日期：2026-10-05
 
 状态：待项目所有者确认后实施
