@@ -3617,6 +3617,28 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .expect("deduplicate replay against the active fill-missing job");
     assert!(replayed_active_job.scheduled_job_ids.is_empty());
 
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'DEFERRED', updated_at = unixepoch()
+         WHERE id IN (
+             SELECT job_id FROM metadata_reidentify_job_items WHERE item_id = ?
+         ) AND mode = 'FILL_MISSING'",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("defer the existing fill-missing job");
+    let replayed_deferred_job = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("deduplicate replay against the deferred fill-missing job");
+    assert!(replayed_deferred_job.scheduled_job_ids.is_empty());
+
     sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
         .execute(database.pool())
