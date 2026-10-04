@@ -8352,7 +8352,47 @@ impl Database {
         item_ids: &[String],
     ) -> Result<Vec<String>, StorageError> {
         let mut job_ids = Vec::new();
-        for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        let mut remaining = item_ids.to_vec();
+        if let Some((queued_job_id, queued_count)) = self
+            .query_as::<(String, i64)>(
+                "SELECT id, total_count
+                 FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'
+                   AND status = 'QUEUED' AND cancel_requested = 0
+                 ORDER BY created_at, id
+                 LIMIT 1",
+            )
+            .bind(library_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let capacity = 100usize.saturating_sub(usize::try_from(queued_count).unwrap_or(100));
+            let take = capacity.min(remaining.len());
+            if take > 0 {
+                let queued_items = remaining.drain(..take).collect::<Vec<_>>();
+                self.insert_fill_missing_job_items(transaction, &queued_job_id, &queued_items)
+                    .await?;
+                self.query(
+                    "UPDATE metadata_reidentify_jobs
+                     SET total_count = total_count + ?, updated_at = unixepoch()
+                     WHERE id = ? AND status = 'QUEUED'",
+                )
+                .bind(i64::try_from(queued_items.len()).unwrap_or(i64::MAX))
+                .bind(&queued_job_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                job_ids.push(queued_job_id);
+            }
+        }
+        for chunk in remaining.chunks(BATCH_INSERT_CHUNK_SIZE) {
             if chunk.is_empty() {
                 continue;
             }
@@ -8372,34 +8412,45 @@ impl Database {
                 source,
             })?;
 
-            let values = std::iter::repeat_n(
-                format!(
-                    "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
-                     FROM media_items WHERE id = ?))"
-                ),
-                chunk.len(),
-            )
-            .collect::<Vec<_>>()
-            .join(", ");
-            let query = format!(
-                "INSERT INTO metadata_reidentify_job_items
-                     (job_id, item_id, status, priority)
-                 VALUES {values}"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for item_id in chunk {
-                statement = statement.bind(&job_id).bind(item_id).bind(item_id);
-            }
-            statement
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            self.insert_fill_missing_job_items(transaction, &job_id, chunk)
+                .await?;
             job_ids.push(job_id);
         }
         Ok(job_ids)
+    }
+
+    async fn insert_fill_missing_job_items(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let values = std::iter::repeat_n(
+            format!(
+                "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
+                 FROM media_items WHERE id = ?))"
+            ),
+            item_ids.len(),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+        let query = format!(
+            "INSERT INTO metadata_reidentify_job_items
+                 (job_id, item_id, status, priority)
+             VALUES {values}"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for item_id in item_ids {
+            statement = statement.bind(job_id).bind(item_id).bind(item_id);
+        }
+        statement
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
     }
 
     pub(crate) async fn create_metadata_reidentify_library_job(

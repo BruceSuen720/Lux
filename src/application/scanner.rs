@@ -2879,6 +2879,7 @@ pub struct ScanJobService {
     admin_events: AdminEventHub,
     user_events: UserEventHub,
     scan_lock: Arc<Semaphore>,
+    full_scan_queue: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
@@ -3378,6 +3379,21 @@ fn local_metadata_completeness_commit_batches<'a>(
     batches
 }
 
+fn newly_confirmed_fill_missing_item_ids(
+    checks: &[PendingLocalMetadataCompletenessCheck],
+    claimed_indices: &[usize],
+) -> Vec<String> {
+    let mut item_ids = claimed_indices
+        .iter()
+        .filter_map(|index| checks.get(*index))
+        .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
+        .map(|(item_id, _, _, _, _)| item_id.clone())
+        .collect::<Vec<_>>();
+    item_ids.sort_unstable();
+    item_ids.dedup();
+    item_ids
+}
+
 async fn complete_local_metadata_completeness(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
@@ -3558,13 +3574,8 @@ async fn complete_local_metadata_completeness_for_item_ids(
                 .prepare_and_claim_item_metadata_completeness_checks(&requests)
                 .await
                 .map_err(|error| error.to_string())?;
-            let mut metadata_fill_missing = check_batch
-                .iter()
-                .filter(|(_, _, _, _, eligible)| *eligible)
-                .map(|(item_id, _, _, _, _)| item_id.clone())
-                .collect::<Vec<_>>();
-            metadata_fill_missing.sort_unstable();
-            metadata_fill_missing.dedup();
+            let metadata_fill_missing =
+                newly_confirmed_fill_missing_item_ids(check_batch, &claimed_indices);
             if claimed_indices.is_empty() && metadata_fill_missing.is_empty() {
                 continue;
             }
@@ -3647,6 +3658,7 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             user_events: UserEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
+            full_scan_queue: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
             people: None,
@@ -9511,6 +9523,16 @@ impl ScanJobService {
             self.cancel_running_job(job_id).await?;
             return Ok(());
         };
+        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
+            Some(
+                Arc::clone(&self.full_scan_queue)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ScanJobError::ScanLockClosed)?,
+            )
+        } else {
+            None
+        };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(
                 job_id, batch_size, probe, metadata, thumbnails,
@@ -12000,9 +12022,10 @@ mod tests {
         classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
         infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
         manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
-        merge_movie_provider_ids, normalize_incremental_path, parse_episode_filename,
-        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
-        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        merge_movie_provider_ids, newly_confirmed_fill_missing_item_ids,
+        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
+        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
+        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
@@ -12153,6 +12176,38 @@ mod tests {
         assert_eq!(result_only_batches.len(), 1);
         assert_eq!(result_only_batches[0].0.len(), 1);
         assert!(result_only_batches[0].1.is_empty());
+    }
+
+    #[test]
+    fn fill_missing_dispatch_only_uses_newly_claimed_missing_items() {
+        let checks = vec![
+            (
+                "new-missing".to_owned(),
+                "POSTER".to_owned(),
+                vec![1],
+                true,
+                true,
+            ),
+            (
+                "already-ready-missing".to_owned(),
+                "POSTER".to_owned(),
+                vec![2],
+                true,
+                true,
+            ),
+            (
+                "new-complete".to_owned(),
+                "POSTER".to_owned(),
+                vec![3],
+                false,
+                true,
+            ),
+        ];
+        assert_eq!(
+            newly_confirmed_fill_missing_item_ids(&checks, &[0]),
+            vec!["new-missing".to_owned()]
+        );
+        assert!(newly_confirmed_fill_missing_item_ids(&checks, &[]).is_empty());
     }
 
     fn unsupported_scraper_call<T: Send + 'static>(

@@ -593,7 +593,7 @@ impl MetadataReidentifyService {
         let mut last_concurrency = None;
         loop {
             let configured_concurrency =
-                metadata_worker_default_concurrency(self.database.backend());
+                metadata_worker_configured_concurrency(self.database.backend(), mode);
             let concurrency = metadata_worker_concurrency(
                 self.resources
                     .metadata_concurrency(configured_concurrency)
@@ -1645,6 +1645,17 @@ fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
     }
 }
 
+fn metadata_worker_configured_concurrency(
+    backend: DatabaseBackend,
+    mode: MetadataRefreshMode,
+) -> usize {
+    if matches!(mode, MetadataRefreshMode::FillMissing) {
+        2
+    } else {
+        metadata_worker_default_concurrency(backend)
+    }
+}
+
 fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
     !plan.needs_metadata
         && !plan.needs_images
@@ -1697,9 +1708,10 @@ mod tests {
 
     use super::{
         AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage,
-        MetadataCandidateView, MetadataRequestPlan, best_automatic_candidate,
+        MetadataCandidateView, MetadataRefreshMode, MetadataRequestPlan, best_automatic_candidate,
         candidate_count_for_page, metadata_global_permits, metadata_request_plan_is_complete,
-        metadata_worker_concurrency, metadata_worker_default_concurrency,
+        metadata_worker_concurrency, metadata_worker_configured_concurrency,
+        metadata_worker_default_concurrency,
     };
     use crate::{
         application::{
@@ -2719,6 +2731,31 @@ mod tests {
         );
         assert_eq!(
             metadata_worker_default_concurrency(DatabaseBackend::Postgres),
+            8
+        );
+    }
+
+    #[test]
+    fn fill_missing_worker_default_is_conservative_on_both_backends() {
+        assert_eq!(
+            metadata_worker_configured_concurrency(
+                DatabaseBackend::Sqlite,
+                MetadataRefreshMode::FillMissing,
+            ),
+            2
+        );
+        assert_eq!(
+            metadata_worker_configured_concurrency(
+                DatabaseBackend::Postgres,
+                MetadataRefreshMode::FillMissing,
+            ),
+            2
+        );
+        assert_eq!(
+            metadata_worker_configured_concurrency(
+                DatabaseBackend::Postgres,
+                MetadataRefreshMode::FullRefresh,
+            ),
             8
         );
     }

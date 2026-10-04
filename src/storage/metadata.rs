@@ -84,7 +84,10 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')"
+                    OR item_metadata_completeness.local_state = 'CANCELLED'
+                    OR (item_metadata_completeness.local_state = 'FAILED'
+                        AND (item_metadata_completeness.retry_after IS NULL
+                             OR item_metadata_completeness.retry_after <= unixepoch()))"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for check in batch {
@@ -411,7 +414,9 @@ impl Database {
                      FROM metadata_reidentify_job_items job_items
                      JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
                      WHERE jobs.mode = 'FILL_MISSING'
-                       AND jobs.status IN ('QUEUED', 'RUNNING')
+                       AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
+                       AND (jobs.status <> 'DEFERRED'
+                            OR jobs.updated_at >= unixepoch() - 3600)
                        AND jobs.cancel_requested = 0
                        AND job_items.status IN ('PENDING', 'RUNNING')
                        AND job_items.item_id IN ({placeholders})"
@@ -476,7 +481,10 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')
+                    OR item_metadata_completeness.local_state = 'CANCELLED'
+                    OR (item_metadata_completeness.local_state = 'FAILED'
+                        AND (item_metadata_completeness.retry_after IS NULL
+                             OR item_metadata_completeness.retry_after <= unixepoch()))
                  RETURNING item_id",
             )
             .bind(item_id)
