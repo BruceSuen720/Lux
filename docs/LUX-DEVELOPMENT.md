@@ -7481,17 +7481,17 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-326：在 CI 中运行完整项目质量门
 
-范围：当前 GitHub Actions 工作流构建 Docker 镜像，但未直接执行仓库的 `scripts/check-all.sh`。新增独立质量工作流，在面向 `main`/`test` 的 Pull Request 及推送上运行统一脚本；设置只读仓库权限，并安装项目要求的 Rust、Node 与 pnpm 工具链。不得在质量工作流中发布镜像、读取仓库 secrets 或修改部署流程。
+范围：当前 GitHub Actions 工作流构建 Docker 镜像，但未直接执行仓库的 `scripts/check-all.sh`。新增独立质量工作流，保留手动 `workflow_dispatch` 入口运行统一脚本，不对 Pull Request 或分支推送自动触发；设置只读仓库权限，并安装项目要求的 Rust、Node 与 pnpm 工具链。不得在质量工作流中发布镜像、读取仓库 secrets 或修改部署流程。
 
 验收：
 
-- [x] PR 与 `main`/`test` 推送触发独立的质量检查工作流。
+- [x] 工作流可通过 `workflow_dispatch` 手动运行，不因 PR 或 `main`/`test` 推送自动触发。
 - [x] CI 使用受控的 Rust stable（含 rustfmt/clippy）、Node 22 和固定 pnpm 版本，并运行 `scripts/check-all.sh`。
 - [x] 权限最小化为仓库只读；静态 YAML 校验和本地项目检查通过。
 
-依赖：无。预计文件：`.github/workflows/quality.yml`、`docs/LUX-DEVELOPMENT.md`。此任务增加现有质量脚本的自动触发，不修改应用代码、Docker 发布或分支保护设置。
+依赖：无。预计文件：`.github/workflows/quality.yml`、`docs/LUX-DEVELOPMENT.md`。此任务提供现有质量脚本的手动触发入口，不修改应用代码、Docker 发布或分支保护设置。
 
-结果（2026-10-02）：新增独立只读 `Project quality` 工作流，监听 `main`/`test` 的 PR 与 push；使用 Rust stable、clippy/rustfmt、Node 22 和 pnpm 11.19.0，执行统一 `scripts/check-all.sh`。YAML 解析和 shell 语法检查通过；两个 Python 工具测试 3/3、2/2 通过；pnpm frozen install、Web 测试（Node 108 项、Vitest 546 项）与生产构建通过。Rust build、all-target 测试、fmt 和 Clippy 已在同一代码版本的 LUX-325 验证中通过。工作流尚未推送，GitHub 托管 runner 上的首次结果待后续 CI 触发确认；没有修改仓库分支保护规则。
+结果（2026-10-05）：独立只读 `Project quality` 工作流保留 `workflow_dispatch` 手动入口，不再监听 `main`/`test` 的 PR 或 push；使用 Rust stable、clippy/rustfmt、Node 22 和 pnpm 11.19.0，执行统一 `scripts/check-all.sh`。没有修改仓库分支保护规则。
 
 #### LUX-327：拆分扫描器 Manifest 辅助模块
 
