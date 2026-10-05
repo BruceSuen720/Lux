@@ -13,6 +13,7 @@ const ACTOR_ENRICHMENT_WORKERS: usize = 2;
 
 struct ActorEnrichmentTask {
     _queued_key: QueuedActorEnrichmentKey,
+    _queue_state: Arc<ActorEnrichmentQueueState>,
     work: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -77,7 +78,11 @@ impl ActorEnrichmentQueue {
                     let Some(task) = task else {
                         break;
                     };
-                    let ActorEnrichmentTask { _queued_key, work } = task;
+                    let ActorEnrichmentTask {
+                        _queued_key,
+                        _queue_state,
+                        work,
+                    } = task;
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => break,
@@ -160,6 +165,7 @@ impl ActorEnrichmentQueue {
                     drop(queued);
                     permit.send(ActorEnrichmentTask {
                         _queued_key: QueuedActorEnrichmentKey { key, queued: Arc::clone(&self.state.queued) },
+                        _queue_state: Arc::clone(&self.state),
                         work: Box::pin(work),
                     });
                     true
@@ -282,12 +288,15 @@ mod tests {
     #[tokio::test]
     async fn dropping_queue_owner_keeps_accepted_work_alive() {
         let queue = ActorEnrichmentQueue::with_limits(1, 1);
+        let release = Arc::new(Notify::new());
         let (started_tx, started_rx) = oneshot::channel();
         let (completed_tx, completed_rx) = oneshot::channel::<()>();
+        let worker_release = release.clone();
         assert!(
             queue
                 .enqueue_work("active".into(), async move {
                     let _ = started_tx.send(());
+                    worker_release.notified().await;
                     let _ = completed_tx.send(());
                 })
                 .await
@@ -295,6 +304,7 @@ mod tests {
         started_rx.await.expect("worker started");
         let weak = Arc::downgrade(&queue.state);
         drop(queue);
+        release.notify_one();
         completed_rx.await.expect("accepted work completed");
         for _ in 0..20 {
             if weak.upgrade().is_none() {
