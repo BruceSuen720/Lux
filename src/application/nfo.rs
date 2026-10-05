@@ -2389,7 +2389,8 @@ impl NfoWriteService {
         target: PathBuf,
         write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        self.mirror_item_nfo_if_enabled(item_id, &target).await?;
+        self.mirror_item_nfo_if_enabled(item_id, &target, &write.content)
+            .await?;
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
@@ -2410,6 +2411,7 @@ impl NfoWriteService {
         &self,
         item_id: &str,
         source: &Path,
+        content: &[u8],
     ) -> Result<(), NfoWriteError> {
         let Some(config_dir) = self.config_dir.as_deref() else {
             return Ok(());
@@ -2438,10 +2440,7 @@ impl NfoWriteService {
             .file_name()
             .ok_or_else(|| NfoWriteError::PathOutsideRoot(source.to_owned()))?;
         let target = canonical_directory.join(file_name);
-        let bytes = fs::read(source)
-            .await
-            .map_err(|error| io_error(source, error))?;
-        write_nfo_atomically_with_rewriter(&target, |_| Ok(bytes.clone()), None).await?;
+        write_nfo_atomically_with_rewriter(&target, |_| Ok(content.to_owned()), None).await?;
         Ok(())
     }
 
@@ -2694,6 +2693,7 @@ pub struct NfoWriteReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NfoFileWrite {
     content_fingerprint: Vec<u8>,
+    content: Vec<u8>,
     changed: bool,
 }
 
@@ -2735,6 +2735,7 @@ where
     let rewritten = rewrite(&original)?;
     let write = NfoFileWrite {
         content_fingerprint: nfo_content_fingerprint(&rewritten),
+        content: rewritten.clone(),
         changed: rewritten != original,
     };
     if !write.changed {
