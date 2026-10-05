@@ -8419,6 +8419,80 @@ impl Database {
         Ok(job_ids)
     }
 
+    pub(crate) async fn create_or_merge_fill_missing_job(
+        &self,
+        library_id: &str,
+        item_ids: &[String],
+    ) -> Result<String, StorageError> {
+        if library_id.trim().is_empty() || item_ids.is_empty() || item_ids.len() > 100 {
+            return Err(StorageError::Conflict(
+                "invalid fill-missing job request".to_owned(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.lock_media_items_for_update(&mut transaction, item_ids)
+            .await?;
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = self
+            .query(sqlx::AssertSqlSafe(format!(
+                "SELECT jobs.id, job_items.item_id
+             FROM metadata_reidentify_job_items job_items
+             JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+             WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
+               AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
+               AND (jobs.status <> 'DEFERRED' OR jobs.updated_at >= unixepoch() - 3600)
+               AND jobs.cancel_requested = 0
+               AND job_items.status IN ('PENDING', 'RUNNING')
+               AND job_items.item_id IN ({placeholders})"
+            )))
+            .bind(library_id);
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        let active_rows = statement
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut active_items = std::collections::HashSet::with_capacity(active_rows.len());
+        let mut existing_job_id = None;
+        for row in active_rows {
+            existing_job_id.get_or_insert_with(|| row.get("id"));
+            active_items.insert(row.get::<String, _>("item_id"));
+        }
+        let remaining = item_ids
+            .iter()
+            .filter(|item_id| !active_items.contains(*item_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let job_id = if remaining.is_empty() {
+            existing_job_id.ok_or_else(|| {
+                StorageError::Conflict("fill-missing job has no schedulable items".to_owned())
+            })?
+        } else {
+            self.enqueue_fill_missing_jobs_in_transaction(&mut transaction, library_id, &remaining)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    StorageError::Conflict("fill-missing job was not created".to_owned())
+                })?
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(job_id)
+    }
+
     async fn insert_fill_missing_job_items(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -9146,6 +9220,30 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let cancel_requested: i64 = self
+            .query_scalar("SELECT cancel_requested FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if cancel_requested != 0 || status == "CANCELLED" {
+            self.query(
+                "UPDATE metadata_reidentify_job_items
+                 SET status = 'FAILED', candidate_count = 0,
+                     error = 'JOB_CANCELLED', updated_at = unixepoch()
+                 WHERE job_id = ? AND status IN ('PENDING', 'RUNNING')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
@@ -9247,7 +9345,7 @@ impl Database {
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
                      updated_at = unixepoch()
-                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING')",
+                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING', 'CANCELLED')",
             )
             .bind(job_id)
             .execute(&mut *transaction)

@@ -437,8 +437,9 @@ impl MetadataReidentifyService {
         mode: MetadataRefreshMode,
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         let mut unique_ids = Vec::with_capacity(item_ids.len());
+        let mut seen_ids = HashSet::with_capacity(item_ids.len());
         for item_id in item_ids {
-            if !unique_ids.iter().any(|existing| existing == &item_id) {
+            if seen_ids.insert(item_id.clone()) {
                 unique_ids.push(item_id);
             }
         }
@@ -455,6 +456,22 @@ impl MetadataReidentifyService {
             };
             if item.item_type == "VIDEO" {
                 return Err(MetadataReidentifyError::InvalidItemCount);
+            }
+        }
+        if matches!(mode, MetadataRefreshMode::FillMissing) {
+            let mut library_ids = metadata_by_item
+                .values()
+                .map(|item| item.library_id.as_str())
+                .collect::<Vec<_>>();
+            library_ids.sort_unstable();
+            library_ids.dedup();
+            if let [library_id] = library_ids.as_slice() {
+                let job_id = self
+                    .database
+                    .create_or_merge_fill_missing_job(library_id, &unique_ids)
+                    .await?;
+                self.admin_events.publish(AdminEventScope::Jobs);
+                return self.get_job(&job_id).await;
             }
         }
         let job_id = Uuid::now_v7().to_string();

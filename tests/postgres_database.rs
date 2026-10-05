@@ -135,7 +135,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     // Deletes must efficiently check every referencing FK, including NO ACTION references.
     for index_name in [
         "idx_danmaku_match_job_items_media_source_id",
@@ -634,6 +634,68 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let outcome: Result<(), Box<dyn std::error::Error>> = async {
+        let source_migrations =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+        let deployed_migrations = temp_dir.path().join("migrations-v160");
+        fs::create_dir(&deployed_migrations)?;
+        for entry in fs::read_dir(source_migrations)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("sql") {
+                continue;
+            }
+            let filename = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "migration filename is not UTF-8")?;
+            let version = filename
+                .split_once('_')
+                .ok_or("migration filename has no version separator")?
+                .0
+                .parse::<i64>()?;
+            if version <= 160 {
+                fs::copy(path, deployed_migrations.join(filename))?;
+            }
+        }
+
+        let migration_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate::Migrator::new(deployed_migrations.as_path())
+            .await?
+            .run(&migration_pool)
+            .await?;
+        let deployed_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(&migration_pool)
+            .await?;
+        assert_eq!(deployed_version, 160);
+        migration_pool.close().await;
+
+        let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
+        assert_eq!(upgraded_database.schema_version().await?, 161);
+        upgraded_database.close().await;
+        Ok(())
+    }
+    .await;
+
+    drop_postgres_test_database(&database_name).await?;
+    outcome?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -735,7 +797,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2040,7 +2102,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)

@@ -3558,6 +3558,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         });
+    let mut scheduled_job_ids = Vec::new();
     for (library_id, checks) in checks_by_library {
         for check_batch in checks.chunks(SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE) {
             let requests = check_batch
@@ -3626,18 +3627,20 @@ async fn complete_local_metadata_completeness_for_item_ids(
                         return Err(error.to_string());
                     }
                 };
-                for job_id in completion.scheduled_job_ids {
-                    let Some(metadata_reidentify) = metadata_reidentify.cloned() else {
-                        continue;
-                    };
-                    let user_events = user_events.clone();
-                    tokio::spawn(async move {
-                        metadata_reidentify.run(&job_id).await;
-                        user_events.publish_home_coalesced().await;
-                    });
-                }
+                scheduled_job_ids.extend(completion.scheduled_job_ids);
             }
         }
+    }
+    if let Some(metadata_reidentify) = metadata_reidentify.cloned()
+        && !scheduled_job_ids.is_empty()
+    {
+        let user_events = user_events.clone();
+        tokio::spawn(async move {
+            for job_id in scheduled_job_ids {
+                metadata_reidentify.run(&job_id).await;
+                user_events.publish_home_coalesced().await;
+            }
+        });
     }
     Ok(())
 }
@@ -9234,13 +9237,9 @@ impl ScanJobService {
                 None => enricher,
             };
 
-            loop {
-                if *stop_receiver.borrow() {
-                    return;
-                }
-                let notified = notify.notified();
-                let job = match database.find_scan_job(&worker_job_id).await {
-                    Ok(Some(job)) => job,
+            let mut job = loop {
+                match database.find_scan_job(&worker_job_id).await {
+                    Ok(Some(job)) => break job,
                     Ok(None) => return,
                     Err(error) => {
                         tracing::warn!(
@@ -9256,9 +9255,13 @@ impl ScanJobService {
                             }
                             _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                         }
-                        continue;
                     }
-                };
+                }
+            };
+            loop {
+                if *stop_receiver.borrow() {
+                    return;
+                }
                 if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
                     return;
                 }
@@ -9376,6 +9379,7 @@ impl ScanJobService {
                     }
                     continue;
                 }
+                let notified = notify.notified();
                 tokio::select! {
                     changed = stop_receiver.changed() => {
                         if changed.is_err() || *stop_receiver.borrow() {
@@ -9385,6 +9389,18 @@ impl ScanJobService {
                     _ = notified => {}
                     _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                 }
+                job = match database.find_scan_job(&worker_job_id).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            scan_job_id = %worker_job_id,
+                            %error,
+                            "local metadata worker could not refresh scan job; retrying"
+                        );
+                        continue;
+                    }
+                };
             }
         });
         LocalMetadataWorkerHandle {
@@ -10184,6 +10200,7 @@ impl ScanJobService {
             );
             return;
         };
+        let mut queued_job_ids = Vec::new();
         for item_ids in item_ids.chunks(100) {
             let job = match metadata.create_fill_missing_job(item_ids.to_vec()).await {
                 Ok(job) => job,
@@ -10204,11 +10221,7 @@ impl ScanJobService {
                     continue;
                 }
             };
-            let job_id = job.id.clone();
-            let worker = metadata.clone();
-            tokio::spawn(async move {
-                worker.run(&job_id).await;
-            });
+            queued_job_ids.push(job.id.clone());
             let details = format!(
                 r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
                 job.total_count, job.id
@@ -10221,6 +10234,13 @@ impl ScanJobService {
                 &details,
             )
             .await;
+        }
+        if !queued_job_ids.is_empty() {
+            tokio::spawn(async move {
+                for job_id in queued_job_ids {
+                    metadata.run(&job_id).await;
+                }
+            });
         }
     }
 

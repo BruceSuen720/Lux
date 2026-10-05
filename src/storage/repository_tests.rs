@@ -3863,7 +3863,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         (
             "FILL_MISSING".to_owned(),
             "QUEUED".to_owned(),
-            1,
+            2,
             "ITEMS".to_owned()
         )
     );
@@ -3875,7 +3875,10 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .fetch_all(database.pool())
         .await
         .expect("scheduled item page");
-    assert_eq!(scheduled_items, vec![item_ids[1].clone()]);
+    assert_eq!(
+        scheduled_items,
+        vec![item_ids[0].clone(), item_ids[1].clone()]
+    );
 
     let queued_merge_fingerprint = b"queued-merge-v1";
     assert!(
@@ -3913,7 +3916,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         )
         .await
         .expect("merge into queued fill-missing job");
-    assert_eq!(merged.scheduled_job_ids, vec![scheduled_job_id.clone()]);
+    assert!(merged.scheduled_job_ids.is_empty());
     assert_eq!(
         database
             .query_scalar::<i64>("SELECT total_count FROM metadata_reidentify_jobs WHERE id = ?",)
@@ -3988,8 +3991,8 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             .fetch_one(database.pool())
             .await
             .expect("count fill-missing jobs"),
-        4,
-        "replay, manual, and incremental-policy jobs plus one eligible auto job are retained"
+        2,
+        "queued fill-missing jobs are coalesced per library"
     );
 
     let pagination_root_path = temp_dir.path().join("Pagination Movies");
@@ -5949,6 +5952,7 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             premiere_date: None,
             rating: Some(10.0),
             rating_source: Some("TEST"),
+            provider_ids_json: None,
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "{}",
@@ -5961,6 +5965,33 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .await
             .expect("metadata timestamp");
     assert!(updated_at > 0);
+    sqlx::query("UPDATE media_items SET updated_at = 123 WHERE id = 'rating-low'")
+        .execute(database.pool())
+        .await
+        .expect("set stable metadata timestamp");
+    database
+        .update_media_item_metadata(MediaMetadataUpdate {
+            item_id: "rating-low",
+            title: "rating-low",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: Some(10.0),
+            rating_source: Some("TEST"),
+            provider_ids_json: None,
+            metadata_fingerprint: &[],
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        })
+        .await
+        .expect("no-op metadata update");
+    let unchanged_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'rating-low'")
+            .fetch_one(database.pool())
+            .await
+            .expect("no-op metadata timestamp");
+    assert_eq!(unchanged_at, 123);
     database.reset_query_count();
     let refreshed_rows = database
         .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
@@ -12648,6 +12679,100 @@ async fn empty_reconciliation_batch_is_a_noop() {
     assert_eq!(result.created_items, 0);
     assert!(!result.metadata_targets_changed);
     assert_eq!(database.query_count(), 0);
+}
+
+#[tokio::test]
+async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let media_root = temp_dir.path().join("Movies");
+    for title in ["First Movie (2025)", "Second Movie (2025)"] {
+        let directory = media_root.join(title);
+        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::write(
+            directory.join(format!("{}.mkv", title.replace(' ', "."))),
+            b"video",
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill missing coalesce", LibraryKind::Movie, false)
+        .await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().ok_or("media root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(item_ids.len(), 2);
+    let library_id = library.id.to_string();
+    let first_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    let merged_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids)
+        .await?;
+    assert_eq!(merged_job, first_job);
+    let repeated_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids)
+        .await?;
+    assert_eq!(repeated_job, first_job);
+    let job_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+    let item_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_job_items WHERE job_id = ?")
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(job_count, 1);
+    assert_eq!(item_count, 2);
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(&first_job)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_job(&first_job, "COMPLETED", None)
+        .await?;
+    let cancelled_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'FAILED'",
+        )
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cancelled_items, 2);
+    assert!(database.retry_metadata_reidentify_job(&first_job).await?);
+    let pending_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'PENDING'",
+        )
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(pending_items, 2);
+    Ok(())
 }
 
 #[tokio::test]

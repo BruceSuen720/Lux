@@ -122,6 +122,7 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         series_scraper_id.as_deref(),
     );
     StoredMediaMetadata {
+        library_id: row.get("library_id"),
         item_type: row.get("item_type"),
         title: row.get("title"),
         original_title: row.get("original_title"),
@@ -139,6 +140,7 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         provenance_json: row.get("metadata_provenance_json"),
         locked_fields_json: row.get("locked_fields_json"),
         nfo_metadata_json: row.get("nfo_metadata_json"),
+        metadata_fingerprint: row.get("metadata_fingerprint"),
         series_item_id: row.get("series_id"),
         series_title: row.get("series_title"),
         series_production_year: row.get("series_production_year"),
@@ -3148,12 +3150,13 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT mi.id AS item_id, mi.item_type, mi.title, mi.original_title, mi.overview,
+                "SELECT mi.id AS item_id, mi.library_id AS library_id, mi.item_type, mi.title, mi.original_title, mi.overview,
                         mi.production_year, mi.premiere_date, mi.last_air_date, mi.status,
                         mi.original_language, mi.rating, mi.provider_ids_json,
                         mi.metadata_scraper_id, mi.identification_status,
                         mi.metadata_provenance_json, mi.locked_fields_json,
-                        mi.nfo_metadata_json, mi.series_id, mi.season_number, mi.episode_number,
+                        mi.nfo_metadata_json, mi.metadata_fingerprint, mi.series_id,
+                        mi.season_number, mi.episode_number,
                         series.title AS series_title,
                         series.production_year AS series_production_year,
                         series.provider_ids_json AS series_provider_ids_json,
@@ -3203,7 +3206,8 @@ impl Database {
                         mi.original_language, mi.rating, mi.provider_ids_json,
                         mi.metadata_scraper_id, mi.identification_status,
                         mi.metadata_provenance_json, mi.locked_fields_json,
-                        mi.nfo_metadata_json, mi.series_id, mi.season_number, mi.episode_number,
+                        mi.nfo_metadata_json, mi.metadata_fingerprint, mi.series_id,
+                        mi.season_number, mi.episode_number,
                         series.title AS series_title,
                         series.production_year AS series_production_year,
                         series.provider_ids_json AS series_provider_ids_json,

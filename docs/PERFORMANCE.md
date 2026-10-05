@@ -1412,3 +1412,21 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 2026-10-05 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个媒体库，每库包含待卸载插件的 PRIMARY、SUPPLEMENT 和 BACKUP 三条配置。旧路径先逐库读取/删除/重插配置，再逐库读取主刮削器并更新媒体库，共 1,234 次 storage SQL 调用；新路径读取一次受影响库快照，按有界批次删除、插入和更新，共 12 次，减少 1,222 次（约 99.0%）。回归验证位置重排、PRIMARY/BACKUP 角色和 legacy `scraper_id` 保持正确。
 
 该计数只覆盖数据库事务中的插件配置重建；插件文件删除、章节源同步、配置文件清理、PostgreSQL、NAS 和生产收益不在数值范围内。计数来自 SQLite storage 查询计数器，不代表端到端墙钟。
+
+### LUX-383 普通本地图片登记事务边界
+
+普通电影、剧集、季度和分集图片索引现在统一复用有界 `ItemImageBatchInsert` 写入。图片 upsert 与 `poster_fallback_required` 清理在同一 metadata 写事务中完成；故障注入验证 fallback 更新失败时不会留下部分 `item_images`。该记录只说明事务原子性和 SQL 边界，不代表 FNOS/PostgreSQL/NAS 墙钟或 CPU 收益。
+
+### LUX-384 FILL_MISSING 创建去重边界
+
+通用 `create_fill_missing_job` 现在在同库事务内复用活动条目去重和 queued job 合并；重复条目不会再创建新的 `metadata_reidentify_jobs` 行，新条目只追加到已有 queued job 的容量内。固定 storage 回归验证重复调用最终保留一个 job 和两条 job item；该记录只说明任务创建边界，不代表 FNOS/PostgreSQL/NAS CPU 或墙钟收益。
+
+### LUX-385 取消 metadata job 的残留 item 清理
+
+取消 job 时，仍为 `PENDING/RUNNING` 的 item 统一进入 `FAILED/JOB_CANCELLED`，历史取消 job 由 migration 进行同样的幂等收尾；管理员 retry 时恢复为 `PENDING`。该记录说明队列状态收敛和历史数据清理边界，不代表 migration 执行墙钟或 FNOS CPU 收益。
+
+### LUX-386 unchanged NFO 默认值修复查询调用
+
+实现提交：`0f4dcdcc`。在 `uname -m=arm64` 的开发机上，用临时 SQLite 库、1 个媒体条目、1 个 unchanged NFO 文件和可用的 rich NFO cache 执行 `enrich_nfo_item`。旧路径为 4 次 storage query-wrapper 调用；新路径为 3 次，减少 1 次（25%）。减少的调用是默认值修复中的无变化 SELECT；默认值完整时也不再创建该修复事务。Storage query counter 统计应用层 query-wrapper 调用，不统计 BEGIN/COMMIT，也不测量执行时长。
+
+回归命令：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib unchanged_nfo_with_complete_defaults_skips_repair_query`。另由 `tests/metadata.rs` 验证两种字段单独缺失时仍可修复并保留已有值。该结果只说明 1 项 SQLite fixture 的调用边界；没有测量墙钟、PostgreSQL、FNOS 或 NAS/x86 性能。

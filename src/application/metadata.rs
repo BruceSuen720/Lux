@@ -21,7 +21,8 @@ use crate::{
     domain::ids::LibraryId,
     storage::{
         Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
-        StoredMediaSourcePath, StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
+        StoredMediaMetadata, StoredMediaSourcePath, StoredScanLocalMetadataSource,
+        StoredSeriesMetadataSource,
     },
 };
 
@@ -32,6 +33,34 @@ const MAX_SCAN_JOB_METADATA_BATCH_SIZE: usize = 32;
 const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn merged_provider_ids_json(
+    current_json: Option<&str>,
+    incoming: &BTreeMap<String, String>,
+) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+    let mut merged = current_json
+        .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+        .unwrap_or_default();
+    let mut changed = false;
+    for (provider, provider_id) in incoming {
+        let provider = provider.trim();
+        let provider_id = provider_id.trim();
+        if provider.is_empty()
+            || provider_id.is_empty()
+            || merged
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(provider))
+        {
+            continue;
+        }
+        merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+        changed = true;
+    }
+    changed.then(|| serde_json::to_string(&merged).unwrap_or_default())
+}
 
 fn local_image_read_permits() -> Arc<Semaphore> {
     LOCAL_IMAGE_READ_PERMITS
@@ -1147,25 +1176,11 @@ impl MetadataEnricher {
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
     ) {
-        for source in sources {
-            // Keep the directory/image fast path shared across the batch, but
-            // invoke the fallible series operation one target at a time. A
-            // directory or image error must not turn unrelated episodes into
-            // FAILED targets.
-            let item_id = source.episode_id.clone();
-            let mut item_report = MetadataReport::default();
-            let result = self
-                .enrich_series_sources(vec![source], &mut item_report, context, mode)
-                .await;
-            if let Err(error) = result {
-                tracing::warn!(
-                    item_id = %item_id,
-                    %error,
-                    "local series metadata failed; continuing with remaining targets"
-                );
-                item_report.mark_item_error(&item_id, &error);
-            }
-            report.merge(item_report);
+        if let Err(error) = self
+            .enrich_series_sources(sources, report, context, mode)
+            .await
+        {
+            tracing::warn!(%error, "local series metadata batch failed");
         }
     }
 
@@ -1357,16 +1372,14 @@ impl MetadataEnricher {
                 source_url: None,
             });
         }
-        let inserted_count = self
-            .database
-            .insert_item_images_at_indices(item_id, &records)
-            .await?;
-        if has_primary_artwork {
-            self.database
-                .set_poster_fallback_required(item_id, false)
-                .await?;
-        }
-        Ok(inserted_count)
+        self.database
+            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
+                item_id: item_id.to_owned(),
+                images: records,
+                clear_poster_fallback: has_primary_artwork,
+            }])
+            .await
+            .map_err(MetadataError::Storage)
     }
 
     pub async fn enrich_series_library(
@@ -1419,7 +1432,18 @@ impl MetadataEnricher {
                 continue;
             };
             let series_paths = if process_images {
-                Some(context.directory_cache.get(&series_dir).await?)
+                match context.directory_cache.get(&series_dir).await {
+                    Ok(paths) => Some(paths),
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.episode_id,
+                            %error,
+                            "local series directory could not be read"
+                        );
+                        report.mark_item_error(&source.episode_id, &error);
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -1433,9 +1457,20 @@ impl MetadataEnricher {
                         .await;
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
-                    report.images_found += self
+                    match self
                         .index_images(&source.series_id, find_series_images(series_paths, None))
-                        .await?;
+                        .await
+                    {
+                        Ok(images_found) => report.images_found += images_found,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %source.series_id,
+                                %error,
+                                "local series images could not be indexed"
+                            );
+                            report.mark_item_error(&source.series_id, &error);
+                        }
+                    }
                 }
                 if let Some(last_series_id) = context.last_series_id.as_mut() {
                     *last_series_id = source.series_id.clone();
@@ -1459,7 +1494,18 @@ impl MetadataEnricher {
                 .map(|paths| paths.as_ref().clone())
                 .unwrap_or_default();
             if process_images && season_dir != series_dir {
-                let directory_paths = context.directory_cache.get(season_dir).await?;
+                let directory_paths = match context.directory_cache.get(season_dir).await {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.episode_id,
+                            %error,
+                            "local season directory could not be read"
+                        );
+                        report.mark_item_error(&source.episode_id, &error);
+                        continue;
+                    }
+                };
                 season_paths = season_paths
                     .iter()
                     .filter(|path| is_prefixed_season_image(path, season_number))
@@ -1476,12 +1522,23 @@ impl MetadataEnricher {
                         .await;
                 }
                 if process_images {
-                    report.images_found += self
+                    match self
                         .index_images(
                             &source.season_id,
                             find_series_images(&season_paths, Some(season_number)),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(images_found) => report.images_found += images_found,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %source.season_id,
+                                %error,
+                                "local season images could not be indexed"
+                            );
+                            report.mark_item_error(&source.season_id, &error);
+                        }
+                    }
                 }
                 if let Some(last_season_id) = context.last_season_id.as_mut() {
                     *last_season_id = source.season_id.clone();
@@ -1501,12 +1558,23 @@ impl MetadataEnricher {
                         .await;
                 }
                 if process_images {
-                    report.images_found += self
+                    match self
                         .index_images(
                             &source.episode_id,
                             find_episode_images(&season_paths, &media_path),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(images_found) => report.images_found += images_found,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %source.episode_id,
+                                %error,
+                                "local episode images could not be indexed"
+                            );
+                            report.mark_item_error(&source.episode_id, &error);
+                        }
+                    }
                 }
                 if let Some(last_episode_id) = context.last_episode_id.as_mut() {
                     *last_episode_id = source.episode_id.clone();
@@ -1550,15 +1618,13 @@ impl MetadataEnricher {
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
-        let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
-            self.database
-                .media_item_metadata_fingerprint(item_id)
-                .await?
-                .as_deref()
+        let metadata = self.database.find_media_item_metadata(item_id).await?;
+        let already_checked = fingerprint.as_deref().is_some_and(|fingerprint| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.metadata_fingerprint.as_deref())
                 == Some(fingerprint)
-        } else {
-            false
-        };
+        });
         let cached_nfo = if let Some(local_nfo) = &self.local_nfo {
             local_nfo
                 .read_item_if_usable(item_id)
@@ -1584,15 +1650,16 @@ impl MetadataEnricher {
             false
         };
         if already_checked && !rich_cache_missing && !actor_relation_missing {
-            if let Some(details) = cached_nfo {
+            if let (Some(metadata), Some(details)) = (metadata.as_ref(), cached_nfo.as_ref())
+                && local_nfo_defaults_missing(metadata, details)
+            {
                 self.database
-                    .merge_local_provider_ids(item_id, &details.provider_ids)
+                    .repair_local_nfo_defaults(
+                        item_id,
+                        &details.provider_ids,
+                        local_nfo_premiere_date(details),
+                    )
                     .await?;
-                if let Some(premiere_date) = local_nfo_premiere_date(&details) {
-                    self.database
-                        .update_media_item_premiere_date_if_missing(item_id, premiere_date)
-                        .await?;
-                }
             }
             report.nfo_skipped = 1;
             return Ok(report);
@@ -1622,7 +1689,7 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        let current = self.database.find_media_item_metadata(item_id).await?;
+        let current = metadata;
         if let Some(current) = current.as_ref() {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {
@@ -1679,9 +1746,12 @@ impl MetadataEnricher {
                     .map_err(MetadataError::NfoCache)?;
             }
         }
-        self.database
-            .merge_local_provider_ids(item_id, &projection.details.provider_ids)
-            .await?;
+        let provider_ids_json = merged_provider_ids_json(
+            current
+                .as_ref()
+                .and_then(|metadata| metadata.provider_ids_json.as_deref()),
+            &projection.details.provider_ids,
+        );
         if let Some(people) = &self.people {
             let relation_current = match people
                 .item_actor_relation_is_current(item_id, &source_fingerprint)
@@ -1756,6 +1826,7 @@ impl MetadataEnricher {
                     premiere_date: local_nfo_premiere_date(&projection.details),
                     rating: local_rating,
                     rating_source: local_rating.map(|_| "NFO"),
+                    provider_ids_json: provider_ids_json.as_deref(),
                     metadata_fingerprint: fingerprint,
                     provenance_json: &provenance_json,
                     locked_fields_json: &locked_fields_json,
@@ -1814,16 +1885,14 @@ impl MetadataEnricher {
                 source_url: None,
             });
         }
-        let inserted_count = self
-            .database
-            .insert_item_images_at_indices(item_id, &records)
-            .await?;
-        if has_primary_artwork {
-            self.database
-                .set_poster_fallback_required(item_id, false)
-                .await?;
-        }
-        Ok(inserted_count)
+        self.database
+            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
+                item_id: item_id.to_owned(),
+                images: records,
+                clear_poster_fallback: has_primary_artwork,
+            }])
+            .await
+            .map_err(MetadataError::Storage)
     }
 }
 
@@ -1997,6 +2066,25 @@ fn local_nfo_premiere_date(details: &crate::application::nfo::LocalNfoDetails) -
         .or(details.aired.as_deref())
 }
 
+fn local_nfo_defaults_missing(
+    metadata: &StoredMediaMetadata,
+    details: &crate::application::nfo::LocalNfoDetails,
+) -> bool {
+    let provider_id_missing =
+        merged_provider_ids_json(metadata.provider_ids_json.as_deref(), &details.provider_ids)
+            .is_some();
+    let premiere_date_missing = local_nfo_premiere_date(details)
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|_| {
+            metadata
+                .premiere_date
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        });
+
+    provider_id_missing || premiere_date_missing
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetadataReport {
     pub nfo_loaded: usize,
@@ -2086,6 +2174,162 @@ pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn series_image_registration_rolls_back_when_fallback_update_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Artwork", crate::library::LibraryKind::Series, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, item_type, title, sort_title,
+                identification_status, poster_fallback_required)
+             VALUES ('artwork-item', ?, 'SERIES', 'Show', 'show', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_artwork_fallback BEFORE UPDATE OF poster_fallback_required
+             ON media_items BEGIN SELECT RAISE(ABORT, 'fallback failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let poster = directory.path().join("poster.jpg");
+        tokio::fs::write(&poster, b"local image fixture").await?;
+        let enricher = MetadataEnricher::new(database.clone());
+        assert!(
+            enricher
+                .index_images(
+                    "artwork-item",
+                    vec![LocalImage {
+                        image_type: ImageType::Poster,
+                        path: poster.clone(),
+                    }]
+                )
+                .await
+                .is_err()
+        );
+        assert!(database.list_item_images("artwork-item").await?.is_empty());
+        sqlx::query("DROP TRIGGER reject_artwork_fallback")
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            enricher
+                .index_images(
+                    "artwork-item",
+                    vec![LocalImage {
+                        image_type: ImageType::Poster,
+                        path: poster,
+                    }]
+                )
+                .await?,
+            1
+        );
+        let fallback: i64 = sqlx::query_scalar(
+            "SELECT poster_fallback_required FROM media_items WHERE id = 'artwork-item'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(fallback, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_nfo_with_complete_defaults_skips_repair_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "unchanged-nfo-item";
+        let nfo_path = directory.path().join("movie.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&nfo_path, nfo_bytes).await?;
+        let fingerprint = nfo_fingerprint(&nfo_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, premiere_date, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(r#"{"tmdb":"99"}"#)
+        .bind("2025-01-02")
+        .bind(fingerprint)
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        LocalNfoMetadataStore::new(database.clone())
+            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        database.reset_query_count();
+        let report = enricher.enrich_nfo_item(item_id, &nfo_path).await?;
+
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "unchanged NFO with complete defaults should only read metadata and its rich cache"
+        );
+        let retained_provider_ids: String =
+            sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(retained_provider_ids, r#"{"tmdb":"99"}"#);
+        let retained_premiere_date: Option<String> =
+            sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(retained_premiere_date.as_deref(), Some("2025-01-02"));
+        Ok(())
+    }
+
+    #[test]
+    fn merges_only_new_provider_ids() {
+        let current = Some(r#"{"tmdb":"603"}"#);
+        let incoming = BTreeMap::from([
+            ("TMDB".to_owned(), "999".to_owned()),
+            ("imdb".to_owned(), "tt0133093".to_owned()),
+        ]);
+
+        assert_eq!(
+            merged_provider_ids_json(current, &incoming).as_deref(),
+            Some(r#"{"imdb":"tt0133093","tmdb":"603"}"#)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_incoming_ids_are_already_known() {
+        let current = Some(r#"{"tmdb":"603"}"#);
+        let incoming = BTreeMap::from([(String::from("TMDB"), String::from("603"))]);
+
+        assert!(merged_provider_ids_json(current, &incoming).is_none());
+    }
 
     #[tokio::test]
     async fn directory_path_cache_reuses_a_directory_snapshot()

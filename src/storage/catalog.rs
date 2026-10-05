@@ -2567,19 +2567,20 @@ impl Database {
         })
     }
 
-    pub(crate) async fn merge_local_provider_ids(
+    pub(crate) async fn repair_local_nfo_defaults(
         &self,
         item_id: &str,
         provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
     ) -> Result<(), StorageError> {
-        if provider_ids.is_empty() {
+        if provider_ids.is_empty() && premiere_date.is_none() {
             return Ok(());
         }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let current = self
-            .query_scalar::<Option<String>>(
-                "SELECT provider_ids_json
+            .query_as::<(Option<String>, Option<String>)>(
+                "SELECT provider_ids_json, premiere_date
                  FROM media_items
                  WHERE id = ? AND removed_at IS NULL",
             )
@@ -2589,13 +2590,24 @@ impl Database {
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?
-            .flatten();
-        let mut merged = current
+            })?;
+        let Some((current_provider_ids, current_premiere_date)) = current else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        };
+
+        let mut merged = current_provider_ids
             .as_deref()
             .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
             .unwrap_or_default();
-        let mut changed = false;
+        let mut provider_ids_json = None;
+        let mut provider_ids_changed = false;
         for (provider, provider_id) in provider_ids {
             let provider = provider.trim();
             let provider_id = provider_id.trim();
@@ -2608,17 +2620,31 @@ impl Database {
                 continue;
             }
             merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
-            changed = true;
+            provider_ids_changed = true;
         }
-        if changed {
-            let provider_ids_json = serde_json::to_string(&merged)
-                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        if provider_ids_changed {
+            provider_ids_json = Some(
+                serde_json::to_string(&merged)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            );
+        }
+        let premiere_date = premiere_date
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| {
+                current_premiere_date
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            });
+        if provider_ids_json.is_some() || premiere_date.is_some() {
             self.query(
                 "UPDATE media_items
-                 SET provider_ids_json = ?, updated_at = unixepoch()
+                 SET provider_ids_json = COALESCE(?, provider_ids_json),
+                     premiere_date = COALESCE(?, premiere_date),
+                     updated_at = unixepoch()
                  WHERE id = ? AND removed_at IS NULL",
             )
             .bind(provider_ids_json)
+            .bind(premiere_date)
             .bind(item_id)
             .execute(&mut *transaction)
             .await
@@ -5591,14 +5617,29 @@ impl Database {
                  premiere_date = COALESCE(?, premiere_date),
                  rating = CASE WHEN ? = 1 THEN ? ELSE rating END,
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
+                 provider_ids_json = COALESCE(?, provider_ids_json),
                  metadata_fingerprint = ?,
                  metadata_provenance_json = ?,
                  locked_fields_json = ?,
                  updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ?
+               AND (
+                   title IS DISTINCT FROM ?
+                   OR sort_title IS DISTINCT FROM ?
+                   OR original_title IS DISTINCT FROM ?
+                   OR overview IS DISTINCT FROM ?
+                   OR production_year IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
+                   OR metadata_fingerprint IS DISTINCT FROM ?
+                   OR metadata_provenance_json IS DISTINCT FROM ?
+                   OR locked_fields_json IS DISTINCT FROM ?
+               )",
         )
         .bind(update.title)
-        .bind(sort_title)
+        .bind(&sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -5607,58 +5648,27 @@ impl Database {
         .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
+        .bind(update.provider_ids_json)
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
         .bind(update.item_id)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
-    pub(crate) async fn media_item_metadata_fingerprint(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        self.query_scalar(
-            "SELECT metadata_fingerprint
-             FROM media_items
-             WHERE id = ? AND metadata_fingerprint IS NOT NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn update_media_item_premiere_date_if_missing(
-        &self,
-        item_id: &str,
-        premiere_date: &str,
-    ) -> Result<(), StorageError> {
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE media_items
-             SET premiere_date = ?, updated_at = unixepoch()
-             WHERE id = ? AND NULLIF(premiere_date, '') IS NULL",
-        )
-        .bind(premiere_date)
-        .bind(item_id)
+        .bind(update.title)
+        .bind(&sort_title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.premiere_date)
+        .bind(update.premiere_date)
+        .bind(update.rating)
+        .bind(update.rating)
+        .bind(update.rating_source)
+        .bind(update.rating_source)
+        .bind(update.provider_ids_json)
+        .bind(update.provider_ids_json)
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
         .execute(&mut *transaction)
         .await
         .map(|_| ())
@@ -6059,80 +6069,6 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn insert_item_images_at_indices(
-        &self,
-        item_id: &str,
-        images: &[ItemImageInsert],
-    ) -> Result<usize, StorageError> {
-        if images.is_empty() {
-            return Ok(0);
-        }
-
-        const MAX_ROWS_PER_BATCH: usize = 64;
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let mut inserted_count = 0_usize;
-        for batch in images.chunks(MAX_ROWS_PER_BATCH) {
-            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "INSERT INTO item_images (
-                    id, item_id, image_type, image_index, local_path, width, height,
-                    file_size, content_tag, source, source_url
-                ) VALUES {values}
-                ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
-                    id = excluded.id,
-                    local_path = excluded.local_path,
-                    width = excluded.width,
-                    height = excluded.height,
-                    file_size = excluded.file_size,
-                    content_tag = excluded.content_tag,
-                    source = excluded.source,
-                    source_url = excluded.source_url,
-                    updated_at = unixepoch()
-                WHERE item_images.local_path <> excluded.local_path
-                   OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
-                   OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
-                   OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
-                   OR item_images.source <> excluded.source
-                   OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for image in batch {
-                statement = statement
-                    .bind(Uuid::now_v7().to_string())
-                    .bind(item_id)
-                    .bind(&image.image_type)
-                    .bind(image.image_index)
-                    .bind(&image.local_path)
-                    .bind(image.width)
-                    .bind(image.height)
-                    .bind(image.file_size)
-                    .bind(&image.content_tag)
-                    .bind(&image.source)
-                    .bind(image.source_url.as_deref());
-            }
-            let result = statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            inserted_count = inserted_count.saturating_add(result.rows_affected() as usize);
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(inserted_count)
-    }
-
-    #[allow(dead_code)] // LUX-306 routes the local poster worker through this bounded writer.
     pub(crate) async fn insert_item_images_batch_at_indices(
         &self,
         items: &[ItemImageBatchInsert],
@@ -6252,13 +6188,13 @@ impl Database {
             for item_id in fallback_item_ids {
                 statement = statement.bind(item_id);
             }
-            statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
+            if let Err(source) = statement.execute(&mut *transaction).await {
+                let _ = transaction.rollback().await;
+                return Err(StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
-                })?;
+                });
+            }
         }
 
         transaction
@@ -6271,6 +6207,7 @@ impl Database {
         Ok(inserted_count)
     }
 
+    #[allow(dead_code)] // Storage tests seed fallback state before exercising batch writes.
     pub(crate) async fn set_poster_fallback_required(
         &self,
         item_id: &str,

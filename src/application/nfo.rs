@@ -2389,13 +2389,16 @@ impl NfoWriteService {
         target: PathBuf,
         write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        self.mirror_item_nfo_if_enabled(item_id, &target).await?;
+        self.mirror_item_nfo_if_enabled(item_id, &target, &write.content)
+            .await?;
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
-        self.database
-            .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
-            .await?;
+        if write.changed {
+            self.database
+                .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
+                .await?;
+        }
         Ok(NfoWriteReport {
             path: target,
             fingerprint,
@@ -2408,6 +2411,7 @@ impl NfoWriteService {
         &self,
         item_id: &str,
         source: &Path,
+        content: &[u8],
     ) -> Result<(), NfoWriteError> {
         let Some(config_dir) = self.config_dir.as_deref() else {
             return Ok(());
@@ -2436,10 +2440,7 @@ impl NfoWriteService {
             .file_name()
             .ok_or_else(|| NfoWriteError::PathOutsideRoot(source.to_owned()))?;
         let target = canonical_directory.join(file_name);
-        let bytes = fs::read(source)
-            .await
-            .map_err(|error| io_error(source, error))?;
-        write_nfo_atomically_with_rewriter(&target, |_| Ok(bytes.clone()), None).await?;
+        write_nfo_atomically_with_rewriter(&target, |_| Ok(content.to_owned()), None).await?;
         Ok(())
     }
 
@@ -2646,6 +2647,7 @@ impl MetadataWriteService {
                 premiere_date: None,
                 rating: None,
                 rating_source: None,
+                provider_ids_json: None,
                 metadata_fingerprint: &report.fingerprint,
                 provenance_json: &provenance_json,
                 locked_fields_json: &locked_fields_json,
@@ -2691,6 +2693,7 @@ pub struct NfoWriteReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NfoFileWrite {
     content_fingerprint: Vec<u8>,
+    content: Vec<u8>,
     changed: bool,
 }
 
@@ -2732,6 +2735,7 @@ where
     let rewritten = rewrite(&original)?;
     let write = NfoFileWrite {
         content_fingerprint: nfo_content_fingerprint(&rewritten),
+        content: rewritten.clone(),
         changed: rewritten != original,
     };
     if !write.changed {

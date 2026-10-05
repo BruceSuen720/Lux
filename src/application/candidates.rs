@@ -4455,6 +4455,7 @@ mod tests {
     #[test]
     fn fill_missing_request_plan_only_keeps_missing_capabilities() {
         let mut current = StoredMediaMetadata {
+            library_id: "library".to_owned(),
             item_type: "MOVIE".to_owned(),
             title: "Example Movie".to_owned(),
             original_title: Some("Example Movie".to_owned()),
@@ -4488,6 +4489,7 @@ mod tests {
                 })
                 .to_string(),
             ),
+            metadata_fingerprint: None,
             series_item_id: None,
             series_title: None,
             series_production_year: None,
@@ -4666,6 +4668,7 @@ mod tests {
     #[test]
     fn fill_missing_reuses_provider_id_when_item_scraper_is_not_persisted() {
         let current = StoredMediaMetadata {
+            library_id: "library".to_owned(),
             item_type: "MOVIE".to_owned(),
             title: "Example Movie".to_owned(),
             original_title: None,
@@ -4683,6 +4686,7 @@ mod tests {
             provenance_json: None,
             locked_fields_json: None,
             nfo_metadata_json: None,
+            metadata_fingerprint: None,
             series_item_id: None,
             series_title: None,
             series_production_year: None,
@@ -4705,6 +4709,7 @@ mod tests {
     #[test]
     fn locked_missing_fields_do_not_keep_metadata_requests_pending() {
         let current = StoredMediaMetadata {
+            library_id: "library".to_owned(),
             item_type: "MOVIE".to_owned(),
             title: "Example Movie".to_owned(),
             original_title: Some("Example Movie".to_owned()),
@@ -4729,6 +4734,7 @@ mod tests {
             ),
             locked_fields_json: Some(json!(["overview"]).to_string()),
             nfo_metadata_json: None,
+            metadata_fingerprint: None,
             series_item_id: None,
             series_title: None,
             series_production_year: None,

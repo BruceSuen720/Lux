@@ -8500,6 +8500,58 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-05）：受影响库配置由逐库读取/删除/重插/主项回读改为一次快照读取、一次批量删除、5 次批量插入和 3 次批量更新；固定 205 库 fixture 从 1,234 次降为 12 次 SQL。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
 
+#### LUX-383：普通本地图片登记与 fallback 原子提交
+
+范围：电影、剧集、季度和分集的普通本地图片索引复用 LUX-305 有界图片事务，把图片 upsert 和 poster fallback 清理合并为一个事务。保留图片命名、索引、legacy fanart 排除和处理顺序；不改变文件读取、schema 或在线任务合同。
+
+验收：
+
+- [x] 图片登记成功与 fallback 清理原子完成；注入 fallback 更新失败时图片不部分入库。
+- [x] 重复登记幂等，既有 metadata、series metadata 图片路径回归通过。
+- [x] 格式、相关 Clippy 和定向测试通过；性能记录只说明事务边界，不外推 FNOS CPU。
+
+预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+#### LUX-384：通用 FILL_MISSING 创建入口去重与队列合并
+
+范围：通用 `create_fill_missing_job` 入口此前直接创建新 job，可能绕过本地完整性路径的活动任务去重。按同一媒体库在事务内过滤 QUEUED/RUNNING/近期 DEFERRED 条目，并将新条目合并到现有 queued job；跨库请求保留原有独立 job 语义，不改变最多 100 项限制和执行前再次检查。
+
+验收：
+
+- [x] 同一库、同一条目重复创建只保留一份活动 job；新条目合并进已有 queued job。
+- [x] 取消、运行中、近期 deferred 条目不会重新排队；跨库请求保持原有行为。
+- [x] storage、metadata、reidentify、格式和 Clippy 回归通过；性能记录只说明任务创建边界，不外推 FNOS CPU。
+
+预计文件：`src/application/reidentify.rs`、`src/storage/jobs.rs`、`src/storage/media.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+#### LUX-385：清理取消 metadata job 的残留 item 状态
+
+范围：取消 metadata job 时，将仍为 `PENDING/RUNNING` 的 item 统一写成既有可重试终态 `FAILED`，并记录 `JOB_CANCELLED`；新增 migration 幂等清理历史取消 job 的残留行。显式 retry 仍将这些 item 置回 `PENDING`，不改变任务公共 API。
+
+验收：
+
+- [x] 新取消 job 不再留下 `PENDING/RUNNING` item；retry 后 item 恢复为 `PENDING`。
+- [x] migration 可从空库运行，并能幂等修复历史取消 job，不触碰已完成 item。
+- [x] metadata cancel、storage、build、格式和 Clippy 回归通过。
+
+预计文件：`src/storage/jobs.rs`、`tests/metadata_cancel.rs`、`tests/storage.rs`、`migrations/0158_media_info_chapters.sql`、`migrations-postgres/0158_media_info_chapters.sql`、`migrations/0160_scan_local_metadata_backfill_non_retryable_items.sql`、`migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql`、`migrations/0161_reconcile_cancelled_metadata_job_items.sql`、`migrations-postgres/0161_reconcile_cancelled_metadata_job_items.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+发布兼容性补正（2026-10-05）：部署库已使用 migration 0158 保存媒体章节、0160 保存本地 metadata backfill。保留这两条历史迁移及其 checksum；取消任务残留清理使用新版本 0161，避免升级时发生 SQLx 版本/校验和冲突。
+
+#### LUX-386：跳过 unchanged NFO 的空默认值修复事务
+
+范围：NFO fingerprint 未变化且 rich NFO/人物缓存可用时，复用本轮已读取的媒体元数据快照判断本地 provider IDs 和 premiere date 是否仍有缺失。两类默认值均已存在时不再进入存储事务；发现缺失时继续调用存储层并在事务内复核后修复。保留 NFO fingerprint、缓存恢复和人物关系同步语义。
+
+验收：
+
+- [x] 默认值完整的 unchanged NFO 路径省去空修复查询/事务；查询计数回归证明调用数下降。
+- [x] 缺少 premiere date 或 provider ID 时仍按原逻辑补齐；已有值不覆盖。
+- [x] metadata、NFO cache、格式、build 和 Clippy 回归通过；性能记录不外推 PostgreSQL/NAS/生产墙钟。
+
+预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写 unchanged NFO 查询计数回归，再增加保守的快照判断。
+
+结果（2026-10-05，`0f4dcdcc`）：unchanged NFO 且 rich cache 可用时，先用本轮已读取的 metadata 快照判断 provider IDs 与 premiere date；两者已有值就跳过修复存储调用，仍缺字段则走原子修复事务。回归覆盖两者都缺、仅 provider ID 缺、仅 premiere date 缺及已有值不得覆盖。定向 metadata/NFO cache 测试、全目标 Rust 测试、build、fmt 与 Clippy 通过。SQLite 单项测试查询调用从 4 次降到 3 次；该计数不是墙钟指标，也不外推 PostgreSQL、FNOS 或 x86 性能。详见 `docs/PERFORMANCE.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

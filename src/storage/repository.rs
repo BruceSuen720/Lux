@@ -1990,6 +1990,7 @@ pub(crate) struct NewCollection<'a> {
 
 #[derive(Debug)]
 pub(crate) struct StoredMediaMetadata {
+    pub(crate) library_id: String,
     pub(crate) item_type: String,
     pub(crate) title: String,
     pub(crate) original_title: Option<String>,
@@ -2007,6 +2008,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
     pub(crate) nfo_metadata_json: Option<String>,
+    pub(crate) metadata_fingerprint: Option<Vec<u8>>,
     pub(crate) series_item_id: Option<String>,
     pub(crate) series_title: Option<String>,
     pub(crate) series_production_year: Option<i64>,
@@ -3418,6 +3420,7 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) premiere_date: Option<&'a str>,
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<&'a str>,
+    pub(crate) provider_ids_json: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,

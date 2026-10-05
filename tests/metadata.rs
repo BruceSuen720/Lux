@@ -624,10 +624,14 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(premiere_date.as_deref(), Some("2026-02-17"));
-    sqlx::query("UPDATE media_items SET premiere_date = NULL WHERE id = ?")
-        .bind(&item_id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET premiere_date = NULL, provider_ids_json = '{}'
+         WHERE id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
     let skipped = MetadataEnricher::new(database.clone())
         .with_nfo_store(store.clone())
         .enrich_movie_library(library.id)
@@ -639,6 +643,61 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(repaired_premiere_date.as_deref(), Some("2026-02-17"));
+    let repaired_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(repaired_provider_ids.contains("1462229"));
+
+    sqlx::query(
+        "UPDATE media_items
+         SET premiere_date = '2025-01-01', provider_ids_json = '{}'
+         WHERE id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let provider_repair = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(provider_repair.nfo_skipped, 1);
+    let preserved_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_premiere_date.as_deref(), Some("2025-01-01"));
+    let repaired_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(repaired_provider_ids.contains("1462229"));
+
+    sqlx::query("UPDATE media_items SET premiere_date = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let premiere_repair = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(premiere_repair.nfo_skipped, 1);
+    let repaired_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(repaired_premiere_date.as_deref(), Some("2026-02-17"));
+    let preserved_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(preserved_provider_ids.contains("1462229"));
+
     let stored_json: Option<String> = sqlx::query_scalar(
         "SELECT nfo_metadata_json FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
     )
