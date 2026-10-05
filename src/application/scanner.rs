@@ -3558,6 +3558,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         });
+    let mut scheduled_job_ids = Vec::new();
     for (library_id, checks) in checks_by_library {
         for check_batch in checks.chunks(SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE) {
             let requests = check_batch
@@ -3626,18 +3627,20 @@ async fn complete_local_metadata_completeness_for_item_ids(
                         return Err(error.to_string());
                     }
                 };
-                for job_id in completion.scheduled_job_ids {
-                    let Some(metadata_reidentify) = metadata_reidentify.cloned() else {
-                        continue;
-                    };
-                    let user_events = user_events.clone();
-                    tokio::spawn(async move {
-                        metadata_reidentify.run(&job_id).await;
-                        user_events.publish_home_coalesced().await;
-                    });
-                }
+                scheduled_job_ids.extend(completion.scheduled_job_ids);
             }
         }
+    }
+    if let Some(metadata_reidentify) = metadata_reidentify.cloned()
+        && !scheduled_job_ids.is_empty()
+    {
+        let user_events = user_events.clone();
+        tokio::spawn(async move {
+            for job_id in scheduled_job_ids {
+                metadata_reidentify.run(&job_id).await;
+                user_events.publish_home_coalesced().await;
+            }
+        });
     }
     Ok(())
 }
