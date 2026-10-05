@@ -54,13 +54,22 @@ impl AdminApiKeyService {
             return Ok(None);
         }
 
-        self.database
-            .list_users()
-            .await?
-            .into_iter()
-            .find(|user| user.can_manage_server)
-            .map(user_record)
-            .transpose()
+        let mut fallback = None;
+        for user in self.database.list_users().await? {
+            if !user.can_manage_server {
+                continue;
+            }
+            // Emby clients discover the administrator's user ID from /Users,
+            // then use the shared key for user-scoped item requests. Prefer an
+            // actual administrator so those cross-user requests retain admin scope.
+            if user.is_admin {
+                return user_record(user).map(Some);
+            }
+            if fallback.is_none() {
+                fallback = Some(user);
+            }
+        }
+        fallback.map(user_record).transpose()
     }
 
     fn key_path(&self) -> PathBuf {
