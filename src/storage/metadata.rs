@@ -84,7 +84,10 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')"
+                    OR item_metadata_completeness.local_state = 'CANCELLED'
+                    OR (item_metadata_completeness.local_state = 'FAILED'
+                        AND (item_metadata_completeness.retry_after IS NULL
+                             OR item_metadata_completeness.retry_after <= unixepoch()))"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for check in batch {
@@ -411,7 +414,9 @@ impl Database {
                      FROM metadata_reidentify_job_items job_items
                      JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
                      WHERE jobs.mode = 'FILL_MISSING'
-                       AND jobs.status IN ('QUEUED', 'RUNNING')
+                       AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
+                       AND (jobs.status <> 'DEFERRED'
+                            OR jobs.updated_at >= unixepoch() - 3600)
                        AND jobs.cancel_requested = 0
                        AND job_items.status IN ('PENDING', 'RUNNING')
                        AND job_items.item_id IN ({placeholders})"
@@ -476,7 +481,10 @@ impl Database {
                      updated_at = unixepoch()
                  WHERE item_metadata_completeness.input_fingerprint IS NULL
                     OR item_metadata_completeness.input_fingerprint <> excluded.input_fingerprint
-                    OR item_metadata_completeness.local_state IN ('FAILED', 'CANCELLED')
+                    OR item_metadata_completeness.local_state = 'CANCELLED'
+                    OR (item_metadata_completeness.local_state = 'FAILED'
+                        AND (item_metadata_completeness.retry_after IS NULL
+                             OR item_metadata_completeness.retry_after <= unixepoch()))
                  RETURNING item_id",
             )
             .bind(item_id)
@@ -996,6 +1004,80 @@ impl Database {
             }
         }
         Ok((capability_attempts, image_attempts))
+    }
+
+    pub(crate) async fn list_metadata_attempts_by_item_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<
+        HashMap<
+            String,
+            (
+                Vec<StoredMetadataCapabilityAttempt>,
+                Vec<StoredMetadataImageAttempt>,
+            ),
+        >,
+        StorageError,
+    > {
+        let mut attempts_by_item = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT item_id, 'CAPABILITY' AS attempt_type, provider, provider_id,
+                        capability, status, next_retry_at, NULL AS image_type,
+                        NULL AS candidate_key
+                 FROM metadata_capability_attempts
+                 WHERE item_id IN ({placeholders})
+                 UNION ALL
+                 SELECT item_id, 'IMAGE' AS attempt_type, NULL AS provider,
+                        NULL AS provider_id, NULL AS capability, status,
+                        NULL AS next_retry_at, image_type, candidate_key
+                 FROM metadata_image_attempts
+                 WHERE item_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
+                let entry = attempts_by_item
+                    .entry(item_id)
+                    .or_insert_with(|| (Vec::<StoredMetadataCapabilityAttempt>::new(), Vec::new()));
+                if row.get::<String, _>("attempt_type") == "CAPABILITY" {
+                    entry.0.push(StoredMetadataCapabilityAttempt {
+                        provider: row.get("provider"),
+                        provider_id: row.get("provider_id"),
+                        capability: row.get("capability"),
+                        status: row.get("status"),
+                        next_retry_at: row.get("next_retry_at"),
+                    });
+                } else {
+                    entry.1.push(StoredMetadataImageAttempt {
+                        image_type: row.get("image_type"),
+                        candidate_key: row.get("candidate_key"),
+                        status: row.get("status"),
+                    });
+                }
+            }
+        }
+        Ok(attempts_by_item)
     }
 
     pub(crate) async fn record_metadata_capability_results(

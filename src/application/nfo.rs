@@ -29,7 +29,7 @@ use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
-use crate::storage::{Database, MediaMetadataUpdate, StorageError};
+use crate::storage::{Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalNfoCredit {
@@ -1283,7 +1283,114 @@ fn rewrite_rich_nfo(
         }
         buffer.clear();
     }
-    Ok(writer.into_inner())
+    let rewritten = writer.into_inner();
+    if !original.is_empty()
+        && nfo_semantic_fingerprint(original)? == nfo_semantic_fingerprint(&rewritten)?
+    {
+        return Ok(original.to_vec());
+    }
+    Ok(rewritten)
+}
+
+fn nfo_semantic_fingerprint(bytes: &[u8]) -> Result<Vec<u8>, NfoWriteError> {
+    let projection = parse_local_nfo_projection(bytes)
+        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+    let root = nfo_root_tag(bytes)?;
+    let images = nfo_image_projection(bytes)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-NFO-SEMANTIC-1\0");
+    hasher.update(format!("{root:?}|{projection:?}|{images:?}").as_bytes());
+    Ok(hasher.finalize().to_vec())
+}
+
+fn nfo_root_tag(bytes: &[u8]) -> Result<String, NfoWriteError> {
+    let mut reader = Reader::from_reader(bytes);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event)) => {
+                return String::from_utf8(event.name().as_ref().to_vec())
+                    .map_err(|error| NfoWriteError::InvalidXml(error.to_string()));
+            }
+            Ok(Event::Eof) => {
+                return Err(NfoWriteError::InvalidXml(
+                    "NFO document does not contain a root element".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+}
+
+fn nfo_image_projection(bytes: &[u8]) -> Result<Vec<(String, String, String)>, NfoWriteError> {
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut active: Option<(usize, String, String, String)> = None;
+    let mut images = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                depth = depth.saturating_add(1);
+                let tag = event.name();
+                let tag = tag.as_ref();
+                if (depth == 2 && tag == b"thumb") || (depth == 3 && tag == b"thumb") {
+                    let kind = if depth == 3 { "fanart" } else { "thumb" };
+                    let aspect = attribute_value_bytes(&event, b"aspect")?.unwrap_or_default();
+                    active = Some((depth, kind.to_owned(), aspect, String::new()));
+                }
+            }
+            Ok(Event::Text(event)) if active.as_ref().is_some_and(|item| item.0 == depth) => {
+                if let Some(item) = active.as_mut() {
+                    let decoded = event
+                        .decode()
+                        .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+                    item.3.push_str(
+                        &unescape(decoded.as_ref())
+                            .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?,
+                    );
+                }
+            }
+            Ok(Event::End(_event)) => {
+                if active.as_ref().is_some_and(|item| item.0 == depth) {
+                    if let Some((_, kind, aspect, value)) = active.take() {
+                        if !value.trim().is_empty() {
+                            images.push((kind, aspect, value.trim().to_owned()));
+                        }
+                    }
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(NfoWriteError::InvalidXml(error.to_string())),
+        }
+        buffer.clear();
+    }
+    images.sort();
+    Ok(images)
+}
+
+fn attribute_value_bytes(
+    event: &BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<String>, NfoWriteError> {
+    for attribute in event.attributes().with_checks(false) {
+        let attribute = attribute.map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
+        if attribute.key.as_ref() == name {
+            return attribute
+                .unescape_value()
+                .map(|value| Some(value.into_owned()))
+                .map_err(|error| NfoWriteError::InvalidXml(error.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn rich_root_tag(tag: &[u8]) -> bool {
@@ -2203,17 +2310,17 @@ impl NfoWriteService {
         source_id: &str,
         probe: &MediaProbeResult,
     ) -> Result<bool, NfoWriteError> {
-        let Some(kind) = self.database.find_media_item_kind(item_id).await? else {
+        let mut contexts = self
+            .database
+            .list_media_item_writeback_contexts_by_ids(&[item_id.to_owned()])
+            .await?;
+        let Some(context) = contexts.remove(item_id) else {
             return Ok(false);
         };
-        if kind.item_type != "MOVIE" {
+        if context.item_type != "MOVIE" {
             return Ok(false);
         }
-        let Some(writeback_source) = self
-            .database
-            .find_metadata_writeback_source_path(item_id)
-            .await?
-        else {
+        let Some(writeback_source) = context.source else {
             return Ok(false);
         };
         let is_strm = Path::new(&writeback_source.relative_path)
@@ -2223,7 +2330,9 @@ impl NfoWriteService {
         if writeback_source.source_id != source_id || is_strm {
             return Ok(false);
         }
-        let target = self.item_nfo_target(item_id).await?;
+        let target = self
+            .item_nfo_target_from_source("MOVIE", None, &writeback_source)
+            .await?;
         let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
         let write = write_nfo_atomically_with_rewriter(
             &target,
@@ -2280,19 +2389,16 @@ impl NfoWriteService {
         target: PathBuf,
         write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        self.mirror_item_nfo_if_enabled(item_id, &target).await?;
+        self.mirror_item_nfo_if_enabled(item_id, &target, &write.content)
+            .await?;
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
-        self.database
-            .invalidate_media_item_nfo_metadata_if_source_changed(
-                item_id,
-                &write.content_fingerprint,
-            )
-            .await?;
-        self.database
-            .mark_media_item_metadata_checked(item_id, &fingerprint)
-            .await?;
+        if write.changed {
+            self.database
+                .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
+                .await?;
+        }
         Ok(NfoWriteReport {
             path: target,
             fingerprint,
@@ -2305,6 +2411,7 @@ impl NfoWriteService {
         &self,
         item_id: &str,
         source: &Path,
+        content: &[u8],
     ) -> Result<(), NfoWriteError> {
         let Some(config_dir) = self.config_dir.as_deref() else {
             return Ok(());
@@ -2333,10 +2440,7 @@ impl NfoWriteService {
             .file_name()
             .ok_or_else(|| NfoWriteError::PathOutsideRoot(source.to_owned()))?;
         let target = canonical_directory.join(file_name);
-        let bytes = fs::read(source)
-            .await
-            .map_err(|error| io_error(source, error))?;
-        write_nfo_atomically_with_rewriter(&target, |_| Ok(bytes.clone()), None).await?;
+        write_nfo_atomically_with_rewriter(&target, |_| Ok(content.to_owned()), None).await?;
         Ok(())
     }
 
@@ -2360,6 +2464,16 @@ impl NfoWriteService {
             _ => None,
         }
         .ok_or(NfoWriteError::ItemNotFound)?;
+        self.item_nfo_target_from_source(&kind.item_type, kind.season_number, &source)
+            .await
+    }
+
+    async fn item_nfo_target_from_source(
+        &self,
+        item_type: &str,
+        season_number: Option<i64>,
+        source: &StoredMediaSourcePath,
+    ) -> Result<PathBuf, NfoWriteError> {
         let root = fs::canonicalize(&source.root_path)
             .await
             .map_err(|error| io_error(Path::new(&source.root_path), error))?;
@@ -2379,7 +2493,7 @@ impl NfoWriteService {
         if !directory.starts_with(&root) {
             return Err(NfoWriteError::PathOutsideRoot(directory));
         }
-        let target = match kind.item_type.as_str() {
+        let target = match item_type {
             "MOVIE" => find_nfo_path(&media_path)
                 .await
                 .unwrap_or_else(|| directory.join("movie.nfo")),
@@ -2396,7 +2510,7 @@ impl NfoWriteService {
                 }
                 series_dir.join("tvshow.nfo")
             }
-            "SEASON" => find_season_nfo_target(&directory, kind.season_number).await,
+            "SEASON" => find_season_nfo_target(&directory, season_number).await,
             _ => return Err(NfoWriteError::ItemNotFound),
         };
         let target_parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -2533,6 +2647,7 @@ impl MetadataWriteService {
                 premiere_date: None,
                 rating: None,
                 rating_source: None,
+                provider_ids_json: None,
                 metadata_fingerprint: &report.fingerprint,
                 provenance_json: &provenance_json,
                 locked_fields_json: &locked_fields_json,
@@ -2578,6 +2693,7 @@ pub struct NfoWriteReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NfoFileWrite {
     content_fingerprint: Vec<u8>,
+    content: Vec<u8>,
     changed: bool,
 }
 
@@ -2619,12 +2735,14 @@ where
     let rewritten = rewrite(&original)?;
     let write = NfoFileWrite {
         content_fingerprint: nfo_content_fingerprint(&rewritten),
+        content: rewritten.clone(),
         changed: rewritten != original,
     };
     if !write.changed {
         return Ok(write);
     }
     let temporary = parent.join(format!(".lux-{}.nfo.tmp", Uuid::now_v7()));
+    crate::application::internal_write::register(&temporary);
     let result = async {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2656,6 +2774,7 @@ where
         if !unchanged {
             return Err(NfoWriteError::ConcurrentModification(target.to_owned()));
         }
+        crate::application::internal_write::register(target);
         fs::rename(&temporary, target)
             .await
             .map_err(|source| io_error(target, source))?;
@@ -2666,6 +2785,14 @@ where
             .sync_all()
             .await
             .map_err(|source| io_error(parent, source))?;
+        crate::application::internal_write::finalize(
+            target,
+            crate::application::internal_write::file_stamp(target)
+                .await
+                .ok()
+                .flatten(),
+            &rewritten,
+        );
         Ok(())
     }
     .await;
@@ -2921,6 +3048,114 @@ struct ActiveField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        application::{libraries::LibraryService, scanner::LibraryScanner},
+        config::Config,
+        library::LibraryKind,
+    };
+
+    #[tokio::test]
+    async fn probe_nfo_write_reuses_context_and_preserves_source_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("Movies");
+        fs::create_dir_all(&root).await?;
+        fs::write(root.join("Example.Movie.2020.mkv"), b"fixture").await?;
+        let target = root.join("movie.nfo");
+        fs::write(
+            &target,
+            b"<movie><title>Example</title><custom>keep</custom></movie>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let (item_id, source_id): (String, String) =
+            sqlx::query_as("SELECT item_id, id FROM media_sources LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        let probe = MediaProbeResult {
+            container: Some("mkv".to_owned()),
+            source_size: Some(100),
+            duration_ticks: Some(600_000_000),
+            bitrate: Some(500_000),
+            streams: vec![],
+        };
+        let writer = NfoWriteService::new(database.clone());
+        database.reset_query_count();
+        assert!(
+            writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            3,
+            "context, auxiliary, combined state sync and fingerprint"
+        );
+        let content = fs::read_to_string(&target).await?;
+        assert!(content.contains("<custom>keep</custom>"));
+        assert!(root.join("movie.nfo").exists());
+
+        database.reset_query_count();
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, "wrong-source", &probe)
+                .await?
+        );
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(fs::read_to_string(&target).await?, content);
+
+        sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert!(
+            !writer
+                .write_item_probe_details("missing-item", &source_id, &probe)
+                .await?
+        );
+
+        sqlx::query("UPDATE media_items SET item_type = 'MOVIE' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE filesystem_entries SET relative_path = 'Example.strm' WHERE id = (SELECT filesystem_entry_id FROM media_sources WHERE id = ?)")
+            .bind(&source_id).execute(database.pool()).await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        sqlx::query("DELETE FROM media_sources WHERE id = ?")
+            .bind(&source_id)
+            .execute(database.pool())
+            .await?;
+        assert!(
+            !writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(fs::read_to_string(&target).await?, content);
+        Ok(())
+    }
 
     fn mutate_target(path: &Path) -> std::io::Result<()> {
         std::fs::write(path, b"<movie><title>external</title></movie>")

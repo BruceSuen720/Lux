@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fmt::Write as _,
     io::Cursor,
@@ -509,6 +509,8 @@ pub struct PeopleService {
     client: Client,
     database: Option<Database>,
     rebuild_lock: Arc<AsyncMutex<()>>,
+    person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    relation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     rebuild_coordinator: PersonIndexRebuildCoordinator,
 }
 
@@ -570,6 +572,15 @@ impl PeopleService {
         Ok(())
     }
 
+    pub(super) async fn relation_lock_for(&self, relation_path: &Path) -> Arc<AsyncMutex<()>> {
+        let key = relation_path.to_string_lossy().into_owned();
+        let mut locks = self.relation_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
         let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
             Ok(builder) => match builder.build() {
@@ -583,6 +594,8 @@ impl PeopleService {
             client,
             database: None,
             rebuild_lock: Arc::new(AsyncMutex::new(())),
+            person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            relation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
@@ -821,7 +834,11 @@ fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
+    use tokio::sync::Mutex as AsyncMutex;
 
     use super::{
         ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError,
@@ -855,6 +872,33 @@ mod tests {
         assert!(coordinator.finish().await);
         assert!(!coordinator.finish().await);
         assert!(coordinator.begin().await);
+    }
+
+    #[tokio::test]
+    async fn person_asset_locks_are_sharded_by_person() {
+        let service = PeopleService::new(
+            tempfile::tempdir()
+                .expect("temporary directory")
+                .path()
+                .to_owned(),
+        );
+        let first = {
+            let mut locks = service.person_asset_locks.lock().await;
+            locks
+                .entry("lux-000001".to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let second = {
+            let mut locks = service.person_asset_locks.lock().await;
+            locks
+                .entry("lux-000002".to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        assert!(!Arc::ptr_eq(&first, &second));
+        let _first_guard = first.lock().await;
+        assert!(second.try_lock().is_ok());
     }
 
     #[tokio::test]

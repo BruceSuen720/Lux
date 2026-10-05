@@ -1192,3 +1192,251 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中更新一个包含 705 个媒体库的自定义计划，并将 704 个媒体库移回默认计划。旧实现对每个移出库分别 DELETE 和 INSERT，完整更新路径共 1,420 次 storage SQL 调用；新实现按 500/204 两批使用 `INSERT ... SELECT` 和 DELETE，共 16 次，减少 1,404 次（约 98.9%）。回归验证自定义计划保留 1 个关联、默认计划接收 704 个关联及对应任务配置镜像。
 
 每批最多绑定 502 个值（默认计划、源计划和 500 个媒体库 ID）。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是网络往返、墙钟或数据库写入量；没有据此推断 PostgreSQL、NAS 或生产负载收益。
+
+### LUX-356 手动媒体合并调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中合并 100 个同库电影根条目。旧实现逐条读取根记录，并对每个源条目分别执行媒体源迁移、用户状态合并/清理和根条目标记，共 596 次存储 SQL 调用；新实现按最多 100 个 ID 一批读取根记录，并将电影合并的三类写入改为有界批量 SQL，共 7 次，减少 589 次（约 98.8%）。请求返回的 99 个合并 ID 顺序保持一致。
+
+7 次调用由根记录读取、主条目默认源检查、媒体源批量迁移、默认源归一化、用户状态批量 upsert、源状态批量清理和根条目批量标记组成。每批最多绑定 100 个根 ID，使用 SQLite/PostgreSQL 通用参数化 SQL；剧集层级合并仍保留原有逐层顺序写入，并跳过只供电影路径使用的主条目默认源读取，使现有分集批量读取回归由 20 次降为 19 次。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是网络往返、墙钟、磁盘写入或 PostgreSQL/NAS 生产收益。
+
+### LUX-382 媒体源批量删除调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中删除同一电影条目的两个媒体源。旧路径每个源分别执行存在性 SELECT、DELETE 和条目层级 UPDATE，共 6 次 storage SQL 调用；新路径按有界源 ID 集合执行一次校验、一次 DELETE 和一次层级 UPDATE，共 3 次，减少 3 次（50%）。回归同时验证了源/item 不匹配与缺失源不会部分写入，以及剧集的分集、季度和系列层级最终全部移除。
+
+应用层每批最多提交 250 个源，使最坏的 item、parent、series 三组层级 ID 不超过 750 个绑定值；剧集路径在同一事务中按层级顺序更新，避免父级条件判断读取到未提交的子级状态。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是网络往返、墙钟、磁盘写入或 PostgreSQL/NAS 生产收益。
+
+### LUX-383 计划任务媒体库配置读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中读取两个媒体库的 `RECONCILIATION_SCAN` 任务配置。旧的计划派发路径按媒体库分别调用配置查询；新路径对 owner ID 去重后一次批量查询，固定配置读取为 1 次。运行任务仍按媒体库独立创建，未注册 owner 只影响自身并继续处理其他 owner。
+
+批量读取每次最多绑定 500 个 owner ID，使用 SQLite/PostgreSQL 通用参数化 SQL；计数只衡量 storage SQL 调用，不是网络往返、计划任务墙钟、PostgreSQL/NAS 或生产收益。
+
+### LUX-384 无计划任务配置重复读取
+
+无计划任务分页已经返回完整 `scheduled_task_configs` 行，旧路径随后每个任务再次按 owner 执行同一配置 SELECT；新路径直接复用分页结果进入执行分发，移除每个无计划任务的一次重复读取。新增回归验证无计划媒体库扫描仍创建运行任务；该结论只来自代码调用边界和行为回归，不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-385 服务器设置批量写入调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中保存一组包含播放阈值、媒体策略、管理员库排序和登录背景来源的服务器设置。旧实现对固定五个键逐条 UPSERT，共 5 次 storage SQL 调用；新实现用一条固定五行多值 UPSERT，共 1 次，减少 4 次（80%）。回归同时校验五个键的最终值和冲突更新语义。
+
+该优化只合并同一事务内的固定设置写入，仍保留 `updated_at` 更新和 SQLite/PostgreSQL 参数绑定；计数来自 storage 查询计数器，只衡量 SQL 调用数，不是管理接口墙钟、锁等待、PostgreSQL、NAS 或生产收益。
+
+### LUX-386 插件卸载后的媒体库刮削器重排调用数
+
+2026-10-05 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个各含被卸载插件和备用/补充刮削器的媒体库。旧实现对每库分别读取、删除、逐项重插、读取主刮削器并更新库，共 15 次 storage SQL 调用；当前合并后的实现按最多 100 个媒体库批量读取和删除，按有界批次重插并用一条 `CASE` 更新主刮削器，共 6 次，减少 9 次（60%）。回归验证位置、角色、空刮削器、章节源清理和安装记录删除。
+
+该计数只覆盖卸载事务内的刮削器重排 SQL；插件文件删除、目录扫描、任务同步、事务墙钟、锁等待、PostgreSQL、NAS 和生产收益不在数值范围内。
+
+### LUX-387 Web 播放会话批量回收调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备三个过期和三个不活跃的 Web HLS 会话。旧实现每类先 SELECT 再逐会话条件 UPDATE，共 4 次 storage SQL 调用；新实现每类先 SELECT，再用一条带 ID 集合和 `RETURNING` 的条件 UPDATE，共 2 次，减少 2 次（50%）。多会话回归验证两类清理的返回数量和调用数，既有单会话回归验证停止状态。代码保留过期、计划和心跳条件，并按 `RETURNING` 返回实际成功集合；本次没有增加竞争条件的复现测试。
+
+该计数只覆盖会话状态回收 SQL，不包含 HLS 临时目录删除、播放事件、锁等待、PostgreSQL、NAS 或生产收益。
+
+### LUX-388 剧集合并额外分集重挂载调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中合并一个没有目标季度的源剧集，源季度包含 20 个分集。旧实现对季度和每个分集逐条更新，完整合并共 28 次 storage SQL 调用；新实现按最多 100 个分集 ID批量更新，共 9 次，减少 19 次（约 67.9%）。另有回归覆盖存在目标季度但集号未匹配时的 `parent_id + series_id` 重挂载。
+
+该计数只覆盖固定层级重挂载 fixture；匹配分集的媒体源迁移、用户状态合并、合并标记、事务墙钟、PostgreSQL、NAS 和生产收益不在数值范围内。
+
+### LUX-389 剧集合并匹配分集映射调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 20 个唯一集号匹配的源/目标分集。旧实现每个匹配分集分别执行媒体源迁移与默认源归一化、用户状态写入与删除、合并标记，共 110 次 storage SQL 调用；新实现用映射 CTE 批量处理，共 15 次，减少 95 次（约 86.4%）。重复目标集号的异常形状回退逐项路径并保留版本递增语义。
+
+该计数只覆盖固定匹配分集合并 fixture；季度读取、未匹配分集、事务墙钟、锁等待、PostgreSQL、NAS 和生产收益不在数值范围内。
+
+### LUX-390 季度与剧集已看状态同步调用数
+
+2026-10-04 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备一个含季度和剧集两个父级、两个可播放分集的 fixture。旧实现先读取父级，再对每个父级分别聚合分集状态并 UPSERT，共 5 次 storage SQL 调用；新实现用一条有界父级状态查询和一条多行 UPSERT，共 3 次，减少 2 次（约 40%）。回归验证全看、取消已看、重复同步、播放次数、版本和父级无可播放分集行为。
+
+该计数只覆盖一次分集播放状态同步的 SQL 调用；播放回调其他查询、事务墙钟、锁等待、PostgreSQL、NAS 和生产收益不在数值范围内。
+
+### LUX-391 媒体库刮削器配置写入调用数
+
+2026-10-05 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 5 个有序 scraper 配置。旧创建/编辑循环按源码每项执行一条 `library_scrapers` INSERT，5 项对应 5 条；新 helper 实测为一条多行 INSERT，相比旧循环减少 4 条（80%）。创建和编辑路径共用同一有界 helper，最多 100 行/400 个绑定参数一批。应用层仍最多 16 个 scraper；存储边界额外以 205 行验证分三批、空输入零 SQL 及后续批次失败回滚。
+
+该计数只覆盖 scraper 行写入，不包含媒体库设置、计划任务同步、事务墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-357 STRM 探测任务媒体库预读调用数
+
+2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中为 64 个媒体库创建 STRM 探测任务。旧实现对每个媒体库读取完整库、刮削器和 STRM 来源计数，再写入并回读任务，共 322 次 storage SQL 调用；新实现按 64 个 ID 一批聚合读取库存在性与 STRM 计数，再写入并回读任务，共 131 次，减少 191 次（约 59.3%）。回归验证 64 个任务、顺序和零来源计数。
+
+聚合读取每批最多绑定 100 个媒体库 ID。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是网络往返、墙钟或数据库写入量；没有据此推断 PostgreSQL、NAS 或生产负载收益。
+
+### LUX-358 扫描本地元数据完整性预检读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个 active movie item。旧 scanner 预检对每个 item 分别读取完整元数据和媒体库归属，共 410 次 storage SQL 调用；新路径按最多 500 个 ID 联合读取元数据与 `library_id`，共 1 次，减少 409 次（约 99.8%）。返回的 205 个 item 和库归属均保持一致。
+
+该计数只覆盖完整性预检的两类重复读取；图片索引、NFO 投影、人物关系、attempt 状态、claim、结果提交和在线补缺仍按各自现有边界执行。计数来自 SQLite storage 查询计数器，不代表完整 worker 墙钟、数据库写入量或 PostgreSQL/NAS 生产收益。
+
+### LUX-359 元数据任务创建前校验读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中创建包含 100 个有效 movie item 的元数据任务。旧实现逐 item 读取类型和完整元数据，校验阶段共 200 次 SQL；连同任务写入与回读的完整创建路径共 205 次。新实现按最多 500 个 ID 一批读取元数据，校验阶段 1 次、完整路径 6 次，减少 199 次完整路径调用（约 97.1%）。
+
+缺失 item 和 VIDEO 类型仍按输入顺序返回原错误，去重和任务上限未改变。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不代表元数据 worker 墙钟、网络请求、PostgreSQL 或 NAS 生产收益。
+
+### LUX-360 章节检测 marker 替换写入调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中为一个媒体源替换同一 provider 的 3 个 marker，并启用 source fingerprint 校验。旧实现执行 fingerprint SELECT、旧 marker DELETE 和 3 次逐条 INSERT，共 5 次 storage SQL 调用；新实现将 3 行合并为 1 条多值 INSERT，共 3 次，减少 2 次（约 40%）。
+
+空 marker、fingerprint 不匹配和其他 provider 的 marker 仍沿用原有事务语义。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不代表章节检测端到端墙钟、PostgreSQL 或 NAS 生产收益。
+
+### LUX-361 本地元数据完整性计划依赖预读调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个 active movie item，分别读取媒体策略、图片索引和 metadata attempt 状态。旧路径对每个 item 各执行一次查询，共 615 次；新路径按最多 500 个 ID 批量读取三类依赖，共 3 次，减少 612 次（约 99.5%）。
+
+批量计划仍逐 item 执行本地图片文件存在性、NFO 投影和人物关系文件检查；这些文件读取、后续刮削器资格查询和完整 worker 墙钟不在本次计数范围。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数量，不代表数据库写入量、PostgreSQL、NAS 或生产收益。
+
+### LUX-362 刮削器配置预读调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个使用同一有序 `library_scrapers` 配置的 movie item。旧 resolver 配置读取逐 item 发出 205 次查询；新 storage 入口按最多 500 个 ID 一批读取，共 1 次，减少 204 次（约 99.5%）。另以无有序配置的 item 验证 legacy `libraries.scraper_id` fallback 仍只在单 item resolver 中触发。
+
+该计数只覆盖配置读取，不包含后续插件客户端解析、RPC、缓存命中或 scanner 墙钟；SQLite 查询调用数不代表 PostgreSQL、NAS 或生产收益。
+
+### LUX-363 本地完整性补缺资格批量读取
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的 205 item fixture 上，scanner 只收集有 requestable capability 的 item，并通过 resolver 一次批量加载刮削器配置；配置 SQL 保持 1 次，随后逐 item 使用既有客户端缓存判断可用性。
+
+该记录只覆盖配置读取调用数，不把插件客户端解析、RPC、缓存命中和 scanner 墙钟混入 SQL 结果，也不推断 PostgreSQL、NAS 或生产收益。
+
+### LUX-364 本地完整性图片写回源上下文预读
+
+2026-10-03 在 `uname -m=arm64` 的临时 SQLite 库中准备 205 个 active movie item。旧路径在图片本地检查中对每个 item 分别读取媒体类型和可写回源路径，共 410 次 storage SQL 调用；新路径按最多 500 个 ID 批量读取写回上下文，共 1 次，减少 409 次（约 99.8%）。回归同时覆盖电影直接源和剧集首集源的选择。
+
+该计数只覆盖写回上下文的数据库预读；本地图片文件检查、NFO projection、人物关系文件、attempt 状态、完整性结果提交和在线补缺不在本次数值范围内。计数来自 SQLite storage 查询计数器，不代表数据库往返、墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-365 插件安装状态批量读取
+
+2026-10-03 在 `uname -m=arm64` 的临时 SQLite 库中准备 205 个插件 ID，其中两个有安装状态。旧路径逐插件读取 `installed_plugins`，共 205 次 storage SQL 调用；新路径按最多 500 个 ID 批量读取，共 1 次，减少 204 次（约 99.5%）。回归验证未安装、已禁用和已启用三态映射。
+
+该计数只覆盖安装状态查询；动态插件视图的配置文件解析、运行状态读取、插件 RPC 和管理接口墙钟不在本次数值范围内。计数来自 SQLite storage 查询计数器，不代表数据库往返、墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-366 章节检测计划同步重复读取上界
+
+同步逻辑原来对每个已启用章节插件重新读取一次全部媒体库，并在每个选中库再次读取同一插件设置。改动后，媒体库列表在本次同步中最多读取 1 次，每个有效插件的设置只解析 1 次并复用到其选中库；安装状态复用 LUX-365 的批量读取。该结果是由循环边界和调用位置得到的静态调用上界，未测量墙钟、配置文件解析耗时、PostgreSQL、NAS 或生产收益。
+
+### LUX-367 图片路径冲突修复的候选读取上界
+
+图片冲突修复原来对每个 item 的每个候选 `-thumbnail[-N]` 路径执行一次 `item_images` 占用查询，候选上界为 1,000 次。改动后按冲突 item ID 批量预读图片索引（每批最多 500 个 ID），候选筛选不再访问数据库；实际准备更新前保留至多一次占用复核。该结果是静态 SQL 调用上界，不是墙钟或磁盘测量，也不外推 PostgreSQL、NAS 或生产收益。
+
+### LUX-368 插件服务循环安装状态读取上界
+
+章节源列表、Manifest scheduled task 同步和 IP location provider 选择原来分别在插件循环中逐个读取 `installed_plugins`；改动后每个服务调用先收集候选 ID，再按最多 500 个 ID 批量读取并复用状态。该结果是静态循环调用上界，未测量动态配置文件解析、运行状态、墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-369 插件视图媒体库选项读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个带 `media-libraries` 配置字段的本地插件，并请求已安装插件列表。旧路径除安装状态批量查询外，每个插件分别读取媒体库和 scraper 关联，共 5 次 storage SQL 调用；新路径在列表请求中懒加载一次媒体库快照并复用，共 3 次，减少 2 次（40%）。回归验证两个插件的动态视图仍返回媒体库选项。
+
+该快照只在列表请求内复用；单插件配置接口继续独立读取，章节插件仍过滤电影库。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是墙钟、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-370 Manifest 任务禁用镜像调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备同一插件的两个 Manifest task，并更新其配置/计划镜像。旧路径对每个 task 分别开启事务，分别 UPDATE 两张表，共 4 次 storage SQL 调用；新路径在一个事务中按 task 类型 `IN` 更新两张表，共 2 次，减少 2 次（50%）。回归验证两个 task 的配置表和计划表均被停用。
+
+该优化只合并禁用镜像更新；后续 owner 注册仍按现有字段和顺序执行。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是事务墙钟、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-371 NFO probe 写回上下文读取边界
+
+2026-10-03 检查电影 probe NFO 写回的 SQL 路径。旧路径先读取 item kind、写回 source，再由通用 target 解析重复读取 kind 和 source；新路径一次读取 `StoredMediaWritebackContext`，并复用其中的电影 source 完成 target 路径检查。probe target 选择阶段由 4 次重复类型/源读取收敛为 1 次上下文查询；写回后的通用 auxiliary、fingerprint 和 invalidation SQL 不计入该边界。
+
+该记录是由固定调用路径得到的 SQL 边界，不是墙钟或磁盘基准；NFO writer、series metadata 和 metadata 回归通过，但未据此推断 PostgreSQL、NAS 或生产收益。
+
+### LUX-372 本地 NFO enrichment 元数据读取边界
+
+2026-10-03 检查单条 NFO enrichment 的媒体元数据读取路径。旧流程在身份冲突校验和最终写回之间分别执行两次完整 `find_media_item_metadata` 查询；新流程复用第一次结果，固定路径由 2 次完整读取降为 1 次。provider ID、NFO cache 和人物关系写入不修改媒体元数据列，因此没有引入额外刷新查询。
+
+该记录是 SQL 调用边界，不是墙钟或锁竞争基准；metadata、series metadata 和 NFO writer 回归通过，未据此推断 PostgreSQL、NAS 或生产收益。
+
+### LUX-373 STRM resolver 安装状态读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个已安装的 STRM resolver 插件，并检查 resolver 可用性。旧实现对每个 resolver 分别读取 `installed_plugins`，共 2 次 storage SQL 调用；新实现收集 resolver ID 后执行 1 次有界批量查询，减少 1 次（50%）。动态插件视图、可用性过滤和 resolver 顺序保持不变。
+
+计数来自 SQLite storage 查询计数器，只衡量安装状态读取的 SQL 调用数，不代表插件配置文件解析、resolver RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-374 旧章节插件库选择迁移调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个可分配剧集库、一个电影库、一个已有章节源库和一个重复 ID，并运行旧章节插件的 `libraryIds` 迁移。旧实现对每个配置 ID执行完整 `find_library`，再对两个可分配库执行 `update_library_settings`，共 10 次 storage SQL 调用；新实现先读取一次插件状态，再用一个有界条件 UPDATE 为两个未分配章节源的库写入，共 2 次，减少 8 次（80%）。
+
+条件更新只命中存在、非电影且 `chapter_source_id IS NULL` 的库；计数来自 SQLite storage 查询计数器，不代表迁移墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-375 元数据写回策略读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备一个启用媒体库和一条 active movie item，并检查写回策略。旧实现先读 item 的库 ID，再读完整库（含 scraper 关联）和全局策略，共 4 次 storage SQL 调用；新实现使用已有 item/library JOIN 一次取得本地及全局策略，共 1 次，减少 3 次（75%）。
+
+计数来自 SQLite storage 查询计数器，只衡量策略判断 SQL 调用数，不代表 NFO/图片写回墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-376 Manifest 媒体库 owner 注册调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中注册 205 个唯一 `LIBRARY` task owner，并额外传入 1 个重复 owner。旧实现逐 owner upsert，共 206 次 storage SQL 调用；新实现先去重，再按 100/100/5 三批多行 upsert，共 3 次，减少 203 次（约 98.5%）。
+
+计数来自 SQLite storage 查询计数器，只衡量 owner 配置写入 SQL 调用数，不代表 Manifest 同步墙钟、GLOBAL 计划镜像、PostgreSQL、NAS 或生产收益。
+
+### LUX-377 弹幕多媒体库任务创建调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中配置两个媒体库并创建弹幕匹配任务。旧实现每个库重复读取弹幕配置、媒体库选项、插件状态和动态可用性，共 26 次 storage SQL 调用；新实现复用一次设置读取和一次可用性检查，共 19 次，减少 7 次（约 26.9%）。每库任务仍独立写入并回读。
+
+计数来自 SQLite storage 查询计数器，只衡量任务创建路径的 SQL 调用数，不代表配置文件解析、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-378 Manifest 同步媒体库选项调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中安装两个带媒体库选项和 GLOBAL task 的插件，再同步 Manifest task。旧实现每插件各读一次媒体库和 scraper 关联，共 15 次 storage SQL 调用；新实现复用一次懒加载快照，共 13 次，减少 2 次（约 13.3%）。GLOBAL 计划和 task 写入次数未改变。
+
+计数来自 SQLite storage 查询计数器，只衡量同步路径 SQL 调用数，不代表配置文件解析、插件 RPC、PostgreSQL、NAS 或生产收益。
+
+### LUX-379 缩略图 scraper 重试首轮读取调用数
+
+2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备一个带 scraper 的本地电影条目并检查 scraper-first 重试状态。旧实现先读取本地缩略图源和全局策略，再在图片缺失判断中重复读取本地源并读取图片索引，共 4 次 storage SQL；新实现复用同一源读取并在状态判断中读取一次全局策略和图片索引，共 3 次，减少 1 次（25%）。
+
+元数据刷新完成后的最终图片检查仍独立重新读取最新源和图片索引，避免缓存刷新前状态。计数来自 SQLite storage 查询计数器，只衡量首轮状态读取，不代表刷新墙钟、文件检查、PostgreSQL、NAS 或生产收益。
+
+### LUX-380 弹幕任务取消状态读取调用数
+
+当前弹幕 worker 对每页最多 100 个待处理条目逐条查询 `cancel_requested`，并在页面结束再查询一次；无取消请求时固定边界为 101 次状态读取。改为首项和每 8 个条目查询一次，100 条页面为 13 次间隔检查加 1 次最终检查，共 14 次，减少 87 次（约 86.1%）。
+
+该优化保留最多 8 个条目的取消响应边界；统计只覆盖取消状态 SQL，不包含待处理列表、claim、worker 写回或插件 RPC，也不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-381 STRM 缩略图图片登记调用数
+
+STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，再单独更新 `poster_fallback_required`，固定为 3 次写入和 3 个事务。改用已有有界图片批量写入后，两条图片记录和 fallback 清除在一个批量图片事务中完成，固定为 2 次 SQL 写入和 1 个事务，减少 1 次 SQL（约 33.3%）并减少 2 个短事务。
+
+该记录只覆盖图片登记与 fallback 清除，不包含图片文件写入、STRM 插件 RPC、媒体信息写回或任务进度更新；未据此推断墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-383 Web HLS 会话清理调用数
+
+2026-10-05 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 130 个过期会话和 130 个无心跳 `SERVER_HLS` 会话。旧路径先读取最多 128 个候选，再逐会话执行条件 UPDATE，固定为 129 次 storage SQL 调用；新路径保留候选上限，使用一次参数化 `UPDATE ... RETURNING id` 批量停止，固定为 2 次，减少 127 次（约 98.4%）。回归验证两条路径均只停止前 128 个，剩余 2 个仍为 active，并按候选顺序返回实际停止会话。
+
+该计数只覆盖会话状态清理 SQL；HLS 临时目录删除、调度间隔、锁等待、PostgreSQL、NAS 和生产收益不在数值范围内。计数来自 SQLite storage 查询计数器，不代表数据库往返或端到端墙钟。
+
+### LUX-384 插件卸载媒体库刮削器重建调用数
+
+2026-10-05 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备 205 个媒体库，每库包含待卸载插件的 PRIMARY、SUPPLEMENT 和 BACKUP 三条配置。旧路径先逐库读取/删除/重插配置，再逐库读取主刮削器并更新媒体库，共 1,234 次 storage SQL 调用；新路径读取一次受影响库快照，按有界批次删除、插入和更新，共 12 次，减少 1,222 次（约 99.0%）。回归验证位置重排、PRIMARY/BACKUP 角色和 legacy `scraper_id` 保持正确。
+
+该计数只覆盖数据库事务中的插件配置重建；插件文件删除、章节源同步、配置文件清理、PostgreSQL、NAS 和生产收益不在数值范围内。计数来自 SQLite storage 查询计数器，不代表端到端墙钟。
+
+### LUX-383 普通本地图片登记事务边界
+
+普通电影、剧集、季度和分集图片索引现在统一复用有界 `ItemImageBatchInsert` 写入。图片 upsert 与 `poster_fallback_required` 清理在同一 metadata 写事务中完成；故障注入验证 fallback 更新失败时不会留下部分 `item_images`。该记录只说明事务原子性和 SQL 边界，不代表 FNOS/PostgreSQL/NAS 墙钟或 CPU 收益。
+
+### LUX-384 FILL_MISSING 创建去重边界
+
+通用 `create_fill_missing_job` 现在在同库事务内复用活动条目去重和 queued job 合并；重复条目不会再创建新的 `metadata_reidentify_jobs` 行，新条目只追加到已有 queued job 的容量内。固定 storage 回归验证重复调用最终保留一个 job 和两条 job item；该记录只说明任务创建边界，不代表 FNOS/PostgreSQL/NAS CPU 或墙钟收益。
+
+### LUX-385 取消 metadata job 的残留 item 清理
+
+取消 job 时，仍为 `PENDING/RUNNING` 的 item 统一进入 `FAILED/JOB_CANCELLED`，历史取消 job 由 migration 进行同样的幂等收尾；管理员 retry 时恢复为 `PENDING`。该记录说明队列状态收敛和历史数据清理边界，不代表 migration 执行墙钟或 FNOS CPU 收益。
+
+### LUX-386 unchanged NFO 默认值修复查询调用
+
+实现提交：`0f4dcdcc`。在 `uname -m=arm64` 的开发机上，用临时 SQLite 库、1 个媒体条目、1 个 unchanged NFO 文件和可用的 rich NFO cache 执行 `enrich_nfo_item`。旧路径为 4 次 storage query-wrapper 调用；新路径为 3 次，减少 1 次（25%）。减少的调用是默认值修复中的无变化 SELECT；默认值完整时也不再创建该修复事务。Storage query counter 统计应用层 query-wrapper 调用，不统计 BEGIN/COMMIT，也不测量执行时长。
+
+回归命令：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib unchanged_nfo_with_complete_defaults_skips_repair_query`。另由 `tests/metadata.rs` 验证两种字段单独缺失时仍可修复并保留已有值。该结果只说明 1 项 SQLite fixture 的调用边界；没有测量墙钟、PostgreSQL、FNOS 或 NAS/x86 性能。
+
+### LUX-392 扫描本地 metadata 完整度 source 读取调用数
+
+在单 item、单目录 SQLite fixture 中，完整度阶段旧路径重新展开目录 source 并读取 active metadata，共 3 次 storage query-wrapper 调用；新路径复用 NFO 阶段的 `(item_id, source_id)` 快照，先批量确认首选 source 仍有效，再读取 active metadata，共 2 次，减少 1 次（约 33.3%）。回归同时覆盖首选 source 切换、文件标 missing 和 source 删除时拒绝旧快照。
+
+该计数只覆盖完整度阶段的 source 与 item metadata 读取，不包括 NFO 阶段原有 source 查询、完整度计划、刮削器可用性、结果写入或 `FILL_MISSING` 调度；storage query counter 也不测量 SQL 执行时长。未据此推断墙钟、FNOS CPU、PostgreSQL 或 NAS 性能收益。
+
+### LUX-393 插件卸载刮削器计数回归校准
+
+后续合并后的卸载路径在同一双媒体库 fixture 中固定执行 6 次 storage query-wrapper 调用：配置读取、批量删除、批量重插、批量主刮削器更新、插件引用清理和插件记录删除。旧回归中的 8 次期望与当前实现不符，已按当前 fixture 更新为 6 次；无运行时代码变化。

@@ -1220,6 +1220,7 @@ pub(crate) struct StoredScanLocalMetadataBatch {
     pub(crate) library_root_id: String,
     pub(crate) batch_sequence: i64,
     pub(crate) source_refs_json: String,
+    pub(crate) non_retryable_item_ids_json: String,
     pub(crate) source_count: i64,
     pub(crate) status: String,
     pub(crate) attempts: i64,
@@ -1654,6 +1655,7 @@ fn stored_scan_local_metadata_batch(row: sqlx::any::AnyRow) -> StoredScanLocalMe
         library_root_id: row.get("library_root_id"),
         batch_sequence: row.get("batch_sequence"),
         source_refs_json: row.get("source_refs_json"),
+        non_retryable_item_ids_json: row.get("non_retryable_item_ids_json"),
         source_count: row.get("source_count"),
         status: row.get("status"),
         attempts: row.get("attempts"),
@@ -1987,6 +1989,7 @@ pub(crate) struct NewCollection<'a> {
 
 #[derive(Debug)]
 pub(crate) struct StoredMediaMetadata {
+    pub(crate) library_id: String,
     pub(crate) item_type: String,
     pub(crate) title: String,
     pub(crate) original_title: Option<String>,
@@ -2004,6 +2007,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
     pub(crate) nfo_metadata_json: Option<String>,
+    pub(crate) metadata_fingerprint: Option<Vec<u8>>,
     pub(crate) series_item_id: Option<String>,
     pub(crate) series_title: Option<String>,
     pub(crate) series_production_year: Option<i64>,
@@ -2999,6 +3003,12 @@ pub(crate) struct StoredMediaSourcePath {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredMediaWritebackContext {
+    pub(crate) item_type: String,
+    pub(crate) source: Option<StoredMediaSourcePath>,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredItemScanPath {
     pub(crate) library_id: String,
     pub(crate) library_root_id: String,
@@ -3409,6 +3419,7 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) premiere_date: Option<&'a str>,
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<&'a str>,
+    pub(crate) provider_ids_json: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,
@@ -3593,6 +3604,7 @@ pub(crate) struct MediaProbeUpdate<'a> {
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) bitrate: Option<i64>,
     pub(crate) streams: &'a [MediaStreamUpdate<'a>],
+    pub(crate) chapters: &'a [MediaInfoChapterUpdate],
 }
 
 pub(crate) struct MediaStreamUpdate<'a> {
@@ -3606,6 +3618,12 @@ pub(crate) struct MediaStreamUpdate<'a> {
     pub(crate) is_external: bool,
     pub(crate) is_default: bool,
     pub(crate) is_forced: bool,
+}
+
+pub(crate) struct MediaInfoChapterUpdate {
+    pub(crate) start_position_ticks: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) chapter_index: i64,
 }
 
 #[derive(Debug)]

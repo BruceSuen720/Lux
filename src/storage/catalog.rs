@@ -3,6 +3,7 @@ use super::*;
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
+const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
@@ -2370,6 +2371,44 @@ impl Database {
                     });
             }
         }
+        for source_ids in source_ids.chunks(500) {
+            if source_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", source_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT media_source_id, start_position_ticks, name, chapter_index
+                 FROM media_info_chapters WHERE media_source_id IN ({placeholders})
+                 ORDER BY media_source_id, start_position_ticks, chapter_index, id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for source_id in source_ids {
+                statement = statement.bind(source_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let source_id: String = row.get("media_source_id");
+                chapters
+                    .entry(source_id.clone())
+                    .or_default()
+                    .push(StoredMediaChapter {
+                        source_id,
+                        start_position_ticks: row.get("start_position_ticks"),
+                        name: row.get("name"),
+                        marker_type: "CHAPTER".to_owned(),
+                        chapter_index: row.get("chapter_index"),
+                    });
+            }
+        }
         Ok(chapters)
     }
 
@@ -2528,19 +2567,20 @@ impl Database {
         })
     }
 
-    pub(crate) async fn merge_local_provider_ids(
+    pub(crate) async fn repair_local_nfo_defaults(
         &self,
         item_id: &str,
         provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
     ) -> Result<(), StorageError> {
-        if provider_ids.is_empty() {
+        if provider_ids.is_empty() && premiere_date.is_none() {
             return Ok(());
         }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let current = self
-            .query_scalar::<Option<String>>(
-                "SELECT provider_ids_json
+            .query_as::<(Option<String>, Option<String>)>(
+                "SELECT provider_ids_json, premiere_date
                  FROM media_items
                  WHERE id = ? AND removed_at IS NULL",
             )
@@ -2550,13 +2590,24 @@ impl Database {
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?
-            .flatten();
-        let mut merged = current
+            })?;
+        let Some((current_provider_ids, current_premiere_date)) = current else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        };
+
+        let mut merged = current_provider_ids
             .as_deref()
             .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
             .unwrap_or_default();
-        let mut changed = false;
+        let mut provider_ids_json = None;
+        let mut provider_ids_changed = false;
         for (provider, provider_id) in provider_ids {
             let provider = provider.trim();
             let provider_id = provider_id.trim();
@@ -2569,17 +2620,31 @@ impl Database {
                 continue;
             }
             merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
-            changed = true;
+            provider_ids_changed = true;
         }
-        if changed {
-            let provider_ids_json = serde_json::to_string(&merged)
-                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        if provider_ids_changed {
+            provider_ids_json = Some(
+                serde_json::to_string(&merged)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            );
+        }
+        let premiere_date = premiere_date
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| {
+                current_premiere_date
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            });
+        if provider_ids_json.is_some() || premiere_date.is_some() {
             self.query(
                 "UPDATE media_items
-                 SET provider_ids_json = ?, updated_at = unixepoch()
+                 SET provider_ids_json = COALESCE(?, provider_ids_json),
+                     premiere_date = COALESCE(?, premiere_date),
+                     updated_at = unixepoch()
                  WHERE id = ? AND removed_at IS NULL",
             )
             .bind(provider_ids_json)
+            .bind(premiere_date)
             .bind(item_id)
             .execute(&mut *transaction)
             .await
@@ -2710,6 +2775,127 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
+        })
+    }
+
+    pub(crate) async fn find_strm_source_by_absolute_path(
+        &self,
+        absolute_path: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND ? = lr.canonical_path || '/' || fe.relative_path
+             LIMIT 2",
+        )
+        .bind(absolute_path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .and_then(|rows| {
+            if rows.len() > 1 {
+                return Err(StorageError::Conflict(
+                    "multiple STRM sources match the absolute path".to_owned(),
+                ));
+            }
+            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            }))
+        })
+    }
+
+    pub(crate) async fn find_strm_source_by_path_suffix(
+        &self,
+        external_path: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND ? LIKE '%/' || fe.relative_path
+             LIMIT 2",
+        )
+        .bind(external_path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .and_then(|rows| {
+            if rows.len() > 1 {
+                return Err(StorageError::Conflict(
+                    "multiple STRM sources match the external path suffix".to_owned(),
+                ));
+            }
+            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            }))
+        })
+    }
+
+    pub(crate) async fn find_strm_source_by_emby_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+        self.query(
+            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                    lr.canonical_path AS root_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE ms.source_kind = 'STRM_URL'
+               AND fe.is_missing = 0
+               AND mi.removed_at IS NULL
+               AND (ms.id = ? OR ms.item_id = ?)
+             LIMIT 2",
+        )
+        .bind(id)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+        .and_then(|rows| {
+            if rows.len() > 1 {
+                return Err(StorageError::Conflict(
+                    "multiple STRM sources match the Emby id".to_owned(),
+                ));
+            }
+            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
+                source_id: row.get("source_id"),
+                item_id: row.get("item_id"),
+                probe_status: row.get("probe_status"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+            }))
         })
     }
 
@@ -3710,25 +3896,44 @@ impl Database {
         })
     }
 
-    pub(crate) async fn count_strm_media_sources_for_library(
+    pub(crate) async fn list_strm_media_source_counts_for_libraries(
         &self,
-        library_id: &str,
-    ) -> Result<i64, StorageError> {
-        self.query_scalar(
-            "SELECT COUNT(*)
-             FROM media_sources ms
-             JOIN media_items mi ON mi.id = ms.item_id
-             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-             WHERE mi.library_id = ? AND ms.source_kind = 'STRM_URL'
-               AND fe.is_missing = 0",
-        )
-        .bind(library_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        library_ids: &[String],
+    ) -> Result<HashMap<String, i64>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut counts = HashMap::with_capacity(library_ids.len());
+        for chunk in library_ids.chunks(100) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT l.id, COUNT(fe.id) AS total_count
+                 FROM libraries l
+                 LEFT JOIN media_items mi ON mi.library_id = l.id
+                 LEFT JOIN media_sources ms
+                   ON ms.item_id = mi.id AND ms.source_kind = 'STRM_URL'
+                 LEFT JOIN filesystem_entries fe
+                   ON fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                 WHERE l.id IN ({placeholders})
+                 GROUP BY l.id"
+            )));
+            for library_id in chunk {
+                query = query.bind(library_id);
+            }
+            for row in query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                counts.insert(row.get("id"), row.get("total_count"));
+            }
+        }
+        Ok(counts)
     }
 
     pub(crate) async fn list_strm_media_sources_for_incremental_scan_page(
@@ -3963,6 +4168,88 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_media_item_writeback_contexts_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredMediaWritebackContext>, StorageError> {
+        let mut contexts = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.item_type,
+                        ms.id AS source_id, ms.item_id AS source_item_id,
+                        ms.probe_status, lr.canonical_path AS root_path,
+                        fe.relative_path
+                 FROM media_items mi
+                 LEFT JOIN media_sources ms ON ms.id = CASE
+                     WHEN mi.item_type IN ('SERIES', 'SEASON') THEN (
+                         SELECT episode_source.id
+                         FROM media_items episode
+                         JOIN media_sources episode_source
+                           ON episode_source.item_id = episode.id
+                         JOIN filesystem_entries episode_fe
+                           ON episode_fe.id = episode_source.filesystem_entry_id
+                         WHERE episode.item_type = 'EPISODE'
+                           AND (episode.series_id = mi.id OR episode.parent_id = mi.id)
+                           AND episode_fe.is_missing = 0
+                         ORDER BY episode.id, episode_fe.relative_path
+                         LIMIT 1
+                     )
+                     ELSE (
+                         SELECT direct_source.id
+                         FROM media_sources direct_source
+                         JOIN filesystem_entries direct_fe
+                           ON direct_fe.id = direct_source.filesystem_entry_id
+                         WHERE direct_source.item_id = mi.id
+                           AND direct_source.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                           AND direct_fe.is_missing = 0
+                         ORDER BY direct_source.is_default DESC, direct_source.id
+                         LIMIT 1
+                     )
+                 END
+                 LEFT JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let source_id = row.try_get::<String, _>("source_id").ok();
+                let source = source_id.map(|source_id| StoredMediaSourcePath {
+                    source_id,
+                    item_id: row.get("source_item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                });
+                let item_id = row.get::<String, _>("item_id");
+                contexts.insert(
+                    item_id,
+                    StoredMediaWritebackContext {
+                        item_type: row.get("item_type"),
+                        source,
+                    },
+                );
+            }
+        }
+        Ok(contexts)
     }
 
     pub(crate) async fn list_strm_source_paths_by_ids(
@@ -4314,6 +4601,32 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
+        }
+        self.query("DELETE FROM media_info_chapters WHERE media_source_id = ?")
+            .bind(update.source_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for chapter in update.chapters {
+            self.query(
+                "INSERT INTO media_info_chapters (
+                    id, media_source_id, start_position_ticks, name, chapter_index
+                 ) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(update.source_id)
+            .bind(chapter.start_position_ticks)
+            .bind(&chapter.name)
+            .bind(chapter.chapter_index)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         }
         transaction
             .commit()
@@ -5150,27 +5463,38 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        for marker in markers {
-            self.query(
+        for chunk in markers.chunks(MEDIA_CHAPTER_INSERT_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO media_chapters (
                     id, media_source_id, start_position_ticks, name, marker_type,
                     chapter_index, provider_id, confidence
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(source_id)
-            .bind(marker.start_position_ticks)
-            .bind(marker.name.clone())
-            .bind(marker.marker_type.clone())
-            .bind(marker.chapter_index)
-            .bind(provider_id)
-            .bind(marker.confidence)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for marker in chunk {
+                statement = statement
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(source_id)
+                    .bind(marker.start_position_ticks)
+                    .bind(marker.name.clone())
+                    .bind(marker.marker_type.clone())
+                    .bind(marker.chapter_index)
+                    .bind(provider_id)
+                    .bind(marker.confidence);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         transaction
             .commit()
@@ -5295,14 +5619,29 @@ impl Database {
                  premiere_date = COALESCE(?, premiere_date),
                  rating = CASE WHEN ? = 1 THEN ? ELSE rating END,
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
+                 provider_ids_json = COALESCE(?, provider_ids_json),
                  metadata_fingerprint = ?,
                  metadata_provenance_json = ?,
                  locked_fields_json = ?,
                  updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ?
+               AND (
+                   title IS DISTINCT FROM ?
+                   OR sort_title IS DISTINCT FROM ?
+                   OR original_title IS DISTINCT FROM ?
+                   OR overview IS DISTINCT FROM ?
+                   OR production_year IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
+                   OR metadata_fingerprint IS DISTINCT FROM ?
+                   OR metadata_provenance_json IS DISTINCT FROM ?
+                   OR locked_fields_json IS DISTINCT FROM ?
+               )",
         )
         .bind(update.title)
-        .bind(sort_title)
+        .bind(&sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -5311,58 +5650,27 @@ impl Database {
         .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
+        .bind(update.provider_ids_json)
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
         .bind(update.item_id)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
-    pub(crate) async fn media_item_metadata_fingerprint(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        self.query_scalar(
-            "SELECT metadata_fingerprint
-             FROM media_items
-             WHERE id = ? AND metadata_fingerprint IS NOT NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn update_media_item_premiere_date_if_missing(
-        &self,
-        item_id: &str,
-        premiere_date: &str,
-    ) -> Result<(), StorageError> {
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE media_items
-             SET premiere_date = ?, updated_at = unixepoch()
-             WHERE id = ? AND NULLIF(premiere_date, '') IS NULL",
-        )
-        .bind(premiere_date)
-        .bind(item_id)
+        .bind(update.title)
+        .bind(&sort_title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.premiere_date)
+        .bind(update.premiere_date)
+        .bind(update.rating)
+        .bind(update.rating)
+        .bind(update.rating_source)
+        .bind(update.rating_source)
+        .bind(update.provider_ids_json)
+        .bind(update.provider_ids_json)
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
         .execute(&mut *transaction)
         .await
         .map(|_| ())
@@ -5485,38 +5793,6 @@ impl Database {
             })
     }
 
-    pub(crate) async fn invalidate_media_item_nfo_metadata_if_source_changed(
-        &self,
-        item_id: &str,
-        source_fingerprint: &[u8],
-    ) -> Result<(), StorageError> {
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE media_items
-             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
-                 updated_at = unixepoch()
-             WHERE id = ?
-               AND (nfo_metadata_fingerprint IS NULL OR nfo_metadata_fingerprint <> ?)",
-        )
-        .bind(item_id)
-        .bind(source_fingerprint)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
     pub(crate) async fn mark_media_item_metadata_checked(
         &self,
         item_id: &str,
@@ -5534,6 +5810,57 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn sync_media_item_nfo_state(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+        metadata_fingerprint: &[u8],
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE media_items
+             SET nfo_metadata_json = CASE
+                     WHEN nfo_metadata_fingerprint IS NULL
+                       OR nfo_metadata_fingerprint <> ? THEN NULL
+                     ELSE nfo_metadata_json
+                 END,
+                 nfo_metadata_fingerprint = CASE
+                     WHEN nfo_metadata_fingerprint IS NULL
+                       OR nfo_metadata_fingerprint <> ? THEN NULL
+                     ELSE nfo_metadata_fingerprint
+                 END,
+                 metadata_fingerprint = ?,
+                 updated_at = CASE
+                     WHEN nfo_metadata_fingerprint IS NULL
+                       OR nfo_metadata_fingerprint <> ?
+                       OR metadata_fingerprint IS NULL
+                       OR metadata_fingerprint <> ? THEN unixepoch()
+                     ELSE updated_at
+                 END
+             WHERE id = ?",
+        )
+        .bind(source_fingerprint)
+        .bind(source_fingerprint)
+        .bind(metadata_fingerprint)
+        .bind(source_fingerprint)
+        .bind(metadata_fingerprint)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -5744,80 +6071,6 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn insert_item_images_at_indices(
-        &self,
-        item_id: &str,
-        images: &[ItemImageInsert],
-    ) -> Result<usize, StorageError> {
-        if images.is_empty() {
-            return Ok(0);
-        }
-
-        const MAX_ROWS_PER_BATCH: usize = 64;
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let mut inserted_count = 0_usize;
-        for batch in images.chunks(MAX_ROWS_PER_BATCH) {
-            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "INSERT INTO item_images (
-                    id, item_id, image_type, image_index, local_path, width, height,
-                    file_size, content_tag, source, source_url
-                ) VALUES {values}
-                ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
-                    id = excluded.id,
-                    local_path = excluded.local_path,
-                    width = excluded.width,
-                    height = excluded.height,
-                    file_size = excluded.file_size,
-                    content_tag = excluded.content_tag,
-                    source = excluded.source,
-                    source_url = excluded.source_url,
-                    updated_at = unixepoch()
-                WHERE item_images.local_path <> excluded.local_path
-                   OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
-                   OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
-                   OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
-                   OR item_images.source <> excluded.source
-                   OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for image in batch {
-                statement = statement
-                    .bind(Uuid::now_v7().to_string())
-                    .bind(item_id)
-                    .bind(&image.image_type)
-                    .bind(image.image_index)
-                    .bind(&image.local_path)
-                    .bind(image.width)
-                    .bind(image.height)
-                    .bind(image.file_size)
-                    .bind(&image.content_tag)
-                    .bind(&image.source)
-                    .bind(image.source_url.as_deref());
-            }
-            let result = statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            inserted_count = inserted_count.saturating_add(result.rows_affected() as usize);
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(inserted_count)
-    }
-
-    #[allow(dead_code)] // LUX-306 routes the local poster worker through this bounded writer.
     pub(crate) async fn insert_item_images_batch_at_indices(
         &self,
         items: &[ItemImageBatchInsert],
@@ -5937,13 +6190,13 @@ impl Database {
             for item_id in fallback_item_ids {
                 statement = statement.bind(item_id);
             }
-            statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
+            if let Err(source) = statement.execute(&mut *transaction).await {
+                let _ = transaction.rollback().await;
+                return Err(StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
-                })?;
+                });
+            }
         }
 
         transaction
@@ -5956,6 +6209,7 @@ impl Database {
         Ok(inserted_count)
     }
 
+    #[allow(dead_code)] // Storage tests seed fallback state before exercising batch writes.
     pub(crate) async fn set_poster_fallback_required(
         &self,
         item_id: &str,
@@ -5984,17 +6238,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
-    }
-
-    pub(crate) async fn upsert_item_image(
-        &self,
-        item_id: &str,
-        image_type: &str,
-        local_path: &std::path::Path,
-        metadata: ItemImageMetadata<'_>,
-    ) -> Result<String, StorageError> {
-        self.upsert_item_image_at_index(item_id, image_type, 0, local_path, metadata)
-            .await
     }
 
     pub(crate) async fn upsert_item_image_at_index(
@@ -6149,6 +6392,52 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_item_images_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Vec<StoredItemImage>>, StorageError> {
+        let mut images_by_item = HashMap::<String, Vec<StoredItemImage>>::new();
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT ii.id, ii.item_id, ii.image_type, ii.image_index,
+                        ii.local_path, ii.file_size, ii.content_tag, ii.source,
+                        MIN(lr.canonical_path) AS root_path
+                 FROM item_images ii
+                 JOIN media_items mi ON mi.id = ii.item_id
+                 LEFT JOIN library_roots lr ON lr.library_id = mi.library_id
+                 WHERE ii.item_id IN ({placeholders})
+                 GROUP BY ii.id
+                 ORDER BY ii.item_id, ii.image_type, ii.image_index, ii.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let image = stored_item_image(row);
+                images_by_item
+                    .entry(image.item_id.clone())
+                    .or_default()
+                    .push(image);
+            }
+        }
+        Ok(images_by_item)
     }
 
     pub(crate) async fn list_item_image_path_conflicts(

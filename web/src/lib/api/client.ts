@@ -49,6 +49,7 @@ import type {
   HomeLatestLibrariesResponse,
   HomeResponse,
   UserLibraryOrder,
+  UserPasswordChangeInput,
   LibrariesResponse,
   LuxUser,
   MediaActor,
@@ -320,6 +321,13 @@ export class LuxApiClient {
 
   updateUserSettings(input: Partial<UserPlaybackSettings>) {
     return this.request<UserPlaybackSettings>("/api/v1/auth/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  updatePassword(input: UserPasswordChangeInput) {
+    return this.request<void>("/api/v1/auth/password", {
       method: "PATCH",
       body: JSON.stringify(input),
     });

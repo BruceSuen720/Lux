@@ -30,6 +30,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - 登录失败按来源和用户名限流；失败响应不区分用户不存在、密码错误或暂时封锁。
 - `GET /api/v1/auth/me`：读取当前 Web session，返回用户和权限。
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
+- `PATCH /api/v1/auth/password`：需要当前 Web session 和 `X-CSRF-Token`，不接受用户级客户端令牌。请求体为 `{ "currentPassword": "旧密码", "newPassword": "新密码" }`；当前密码验证成功后写入新的 Argon2id 哈希，成功返回 204，当前密码错误返回 `401 INVALID_CREDENTIALS`。
 
 `lux_session` 为 `HttpOnly; Secure; SameSite=Lax; Path=/`，数据库只保存其 SHA-256 哈希。`lux_csrf` 不设置 HttpOnly，供同源 Web 客户端读取并通过 `X-CSRF-Token` header 发送；数据库保存 CSRF 哈希。session 有效期为 30 天，注销后立即失效。
 

@@ -196,7 +196,11 @@ impl MediaDeleteService {
             .iter()
             .map(|source| (source.item_id.clone(), source.source_id.clone()))
             .collect::<Vec<_>>();
-        match self.database.delete_media_sources(&source_keys).await {
+        match self
+            .database
+            .delete_media_sources_atomically(&source_keys)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 restore_staged_paths(&staged_paths).await;

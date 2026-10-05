@@ -32,7 +32,7 @@ use crate::{
             MediaKind, clean_title, has_multi_part_marker, has_source_variant_marker,
             parse_media_name, parse_media_name_with_variant_suffix,
         },
-        metadata::MetadataEnricher,
+        metadata::{MetadataEnricher, ScanLocalMetadataNfoBatch},
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
         probe::MediaProbeService,
@@ -2879,6 +2879,7 @@ pub struct ScanJobService {
     admin_events: AdminEventHub,
     user_events: UserEventHub,
     scan_lock: Arc<Semaphore>,
+    full_scan_queue: Arc<Semaphore>,
     library_covers: Option<LibraryCoverService>,
     strm_probe: Option<StrmProbeService>,
     people: Option<PeopleService>,
@@ -2987,7 +2988,7 @@ async fn process_scan_local_metadata_batch(
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     batch: StoredScanLocalMetadataBatch,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<(String, String, Vec<String>, Vec<String>)> {
     let batch_id = batch.id.clone();
     let scan_job_id = batch.job_id.clone();
     let source_ids = match serde_json::from_str::<Vec<String>>(&batch.source_refs_json) {
@@ -3008,6 +3009,21 @@ async fn process_scan_local_metadata_batch(
             return None;
         }
     };
+    let non_retryable_item_ids =
+        match serde_json::from_str::<Vec<String>>(&batch.non_retryable_item_ids_json) {
+            Ok(item_ids)
+                if item_ids.len() <= MAX_SCAN_LOCAL_METADATA_SOURCE_IDS
+                    && item_ids.iter().all(|item_id| !item_id.trim().is_empty())
+                    && item_ids.iter().collect::<HashSet<_>>().len() == item_ids.len() =>
+            {
+                item_ids
+            }
+            _ => {
+                fail_scan_local_metadata_batch(database, &batch_id, "invalid NFO exclusion list")
+                    .await;
+                return None;
+            }
+        };
 
     let result = match enricher
         .index_scan_local_metadata_batch_images(&source_ids)
@@ -3033,7 +3049,7 @@ async fn process_scan_local_metadata_batch(
     user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => Some((batch_id, scan_job_id, source_ids)),
+        Ok(()) => Some((batch_id, scan_job_id, source_ids, non_retryable_item_ids)),
         Err(error) => {
             tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
             fail_scan_local_metadata_batch(database, &batch_id, &error).await;
@@ -3049,34 +3065,48 @@ async fn finish_scan_local_metadata_batch(
     batch_id: &str,
     scan_job_id: &str,
     source_ids: &[String],
+    existing_non_retryable_item_ids: &[String],
 ) {
-    let result = enricher
-        .enrich_scan_local_metadata_batch_nfo(source_ids)
+    let mut non_retryable_item_ids = existing_non_retryable_item_ids.to_vec();
+    let result = match enricher
+        .enrich_scan_local_metadata_batch_nfo(source_ids, &non_retryable_item_ids)
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|report| {
-            if report.failed_item_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} local NFO item(s) failed",
-                    report.failed_item_ids.len()
-                ))
+    {
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        }) => {
+            for item_id in &report.non_retryable_failed_item_ids {
+                if !non_retryable_item_ids.contains(item_id) {
+                    non_retryable_item_ids.push(item_id.clone());
+                }
             }
-        });
-    let result = match result {
-        Ok(()) => {
-            complete_local_metadata_completeness(
-                database,
-                context.metadata_selection,
-                context.metadata_reidentify,
-                Some(scan_job_id),
-                source_ids,
-                context.user_events,
-            )
-            .await
+            let retryable_failed_item_count = report.retryable_failed_item_count();
+            if retryable_failed_item_count > 0 {
+                Err(format!(
+                    "{retryable_failed_item_count} local NFO item(s) failed"
+                ))
+            } else {
+                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
+                    format!(
+                        "{} non-retryable local NFO item(s) failed",
+                        non_retryable_item_ids.len()
+                    )
+                });
+                complete_local_metadata_completeness(
+                    database,
+                    context.metadata_selection,
+                    context.metadata_reidentify,
+                    Some(scan_job_id),
+                    &source_identities,
+                    &non_retryable_item_ids,
+                    context.user_events,
+                )
+                .await
+                .map(|()| issue)
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
         home.invalidate();
@@ -3084,22 +3114,36 @@ async fn finish_scan_local_metadata_batch(
     context.user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => match database.complete_scan_local_metadata_batch(batch_id).await {
+        Ok(issue) => match database
+            .complete_scan_local_metadata_batch_with_outcome(
+                batch_id,
+                issue.as_deref(),
+                &non_retryable_item_ids,
+            )
+            .await
+        {
             Ok(true) => {}
             Ok(false) => tracing::debug!(batch_id, "local metadata batch was already terminal"),
             Err(error) => {
                 tracing::warn!(batch_id, %error, "local metadata batch completion could not be saved");
-                fail_scan_local_metadata_batch(
+                fail_scan_local_metadata_batch_with_non_retryable_item_ids(
                     database,
                     batch_id,
                     "local metadata completion failed",
+                    &non_retryable_item_ids,
                 )
                 .await;
             }
         },
         Err(error) => {
             tracing::warn!(batch_id, %error, "local NFO batch failed and will be retried");
-            fail_scan_local_metadata_batch(database, batch_id, &error).await;
+            fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+                database,
+                batch_id,
+                &error,
+                &non_retryable_item_ids,
+            )
+            .await;
         }
     }
 }
@@ -3114,6 +3158,32 @@ async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, err
         .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
         .fail_scan_local_metadata_batch(batch_id, error, Some(retry_at))
+        .await
+    {
+        tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
+    }
+}
+
+async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+    database: &Database,
+    batch_id: &str,
+    error: &str,
+    non_retryable_item_ids: &[String],
+) {
+    let retry_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
+        .unwrap_or(i64::MAX);
+    if let Err(storage_error) = database
+        .fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+            batch_id,
+            error,
+            non_retryable_item_ids,
+            Some(retry_at),
+        )
         .await
     {
         tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
@@ -3149,33 +3219,46 @@ async fn finish_scan_local_metadata_backfill_page(
     context: LocalMetadataCompletionContext<'_>,
     page: StoredScanLocalMetadataBackfillPage,
 ) {
-    let result = enricher
-        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids)
+    let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
+    let result = match enricher
+        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids, &page.non_retryable_item_ids)
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|report| {
-            if report.failed_item_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} local NFO item(s) failed",
-                    report.failed_item_ids.len()
-                ))
+    {
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        }) => {
+            for item_id in &report.non_retryable_failed_item_ids {
+                if !non_retryable_item_ids.contains(item_id) {
+                    non_retryable_item_ids.push(item_id.clone());
+                }
             }
-        });
-    let result = match result {
-        Ok(()) => {
-            complete_local_metadata_completeness(
-                database,
-                context.metadata_selection,
-                context.metadata_reidentify,
-                None,
-                &page.entry_ids,
-                context.user_events,
-            )
-            .await
+            let retryable_failed_item_count = report.retryable_failed_item_count();
+            if retryable_failed_item_count > 0 {
+                Err(format!(
+                    "{retryable_failed_item_count} local NFO item(s) failed"
+                ))
+            } else {
+                let issue = (!non_retryable_item_ids.is_empty()).then(|| {
+                    format!(
+                        "{} non-retryable local NFO item(s) failed",
+                        non_retryable_item_ids.len()
+                    )
+                });
+                complete_local_metadata_completeness(
+                    database,
+                    context.metadata_selection,
+                    context.metadata_reidentify,
+                    None,
+                    &source_identities,
+                    &non_retryable_item_ids,
+                    context.user_events,
+                )
+                .await
+                .map(|()| issue)
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
         home.invalidate();
@@ -3183,8 +3266,8 @@ async fn finish_scan_local_metadata_backfill_page(
     context.user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => match database
-            .complete_scan_local_metadata_backfill_page(&page)
+        Ok(issue) => match database
+            .complete_scan_local_metadata_backfill_page_with_optional_issue(&page, issue.as_deref())
             .await
         {
             Ok(true) => {}
@@ -3202,6 +3285,7 @@ async fn finish_scan_local_metadata_backfill_page(
                     database,
                     &page,
                     "local metadata backfill completion failed",
+                    &non_retryable_item_ids,
                 )
                 .await;
             }
@@ -3212,7 +3296,13 @@ async fn finish_scan_local_metadata_backfill_page(
                 %error,
                 "local metadata backfill NFO failed and will be retried"
             );
-            fail_scan_local_metadata_backfill_page(database, &page, &error).await;
+            fail_scan_local_metadata_backfill_page(
+                database,
+                &page,
+                &error,
+                &non_retryable_item_ids,
+            )
+            .await;
         }
     }
 }
@@ -3221,6 +3311,7 @@ async fn fail_scan_local_metadata_backfill_page(
     database: &Database,
     page: &StoredScanLocalMetadataBackfillPage,
     error: &str,
+    non_retryable_item_ids: &[String],
 ) {
     let retry_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3230,7 +3321,12 @@ async fn fail_scan_local_metadata_backfill_page(
         .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
         .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
-        .fail_scan_local_metadata_backfill_page(page, error, Some(retry_at))
+        .fail_scan_local_metadata_backfill_page_with_exclusions(
+            page,
+            error,
+            non_retryable_item_ids,
+            Some(retry_at),
+        )
         .await
     {
         tracing::warn!(
@@ -3289,25 +3385,42 @@ fn local_metadata_completeness_commit_batches<'a>(
     batches
 }
 
+fn newly_confirmed_fill_missing_item_ids(
+    checks: &[PendingLocalMetadataCompletenessCheck],
+    claimed_indices: &[usize],
+) -> Vec<String> {
+    let mut item_ids = claimed_indices
+        .iter()
+        .filter_map(|index| checks.get(*index))
+        .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
+        .map(|(item_id, _, _, _, _)| item_id.clone())
+        .collect::<Vec<_>>();
+    item_ids.sort_unstable();
+    item_ids.dedup();
+    item_ids
+}
+
 async fn complete_local_metadata_completeness(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
     metadata_reidentify: Option<&MetadataReidentifyService>,
     scan_job_id: Option<&str>,
-    filesystem_entry_ids: &[String],
+    source_identities: &[(String, String)],
+    excluded_item_ids: &[String],
     user_events: &UserEventHub,
 ) -> Result<(), String> {
     if selection.is_none() {
         return Ok(());
     }
-    let sources = database
-        .list_scan_local_metadata_sources(filesystem_entry_ids)
+    let source_identities = source_identities
+        .iter()
+        .filter(|(item_id, _)| !excluded_item_ids.iter().any(|excluded| excluded == item_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut item_ids = database
+        .list_current_scan_local_metadata_item_ids(&source_identities)
         .await
         .map_err(|error| error.to_string())?;
-    let mut item_ids = sources
-        .into_iter()
-        .map(|source| source.item_id)
-        .collect::<Vec<_>>();
     item_ids.sort_unstable();
     item_ids.dedup();
     complete_local_metadata_completeness_for_item_ids(
@@ -3345,46 +3458,83 @@ async fn complete_local_metadata_completeness_for_item_ids(
     } else {
         None
     };
+    let metadata_by_item = database
+        .list_active_media_item_metadata_with_libraries(item_ids)
+        .await
+        .map_err(|error| error.to_string())?;
+    let plan_inputs = item_ids
+        .iter()
+        .filter_map(|item_id| {
+            metadata_by_item
+                .get(item_id)
+                .map(|(_, current)| (item_id.as_str(), current))
+        })
+        .collect::<Vec<_>>();
+    let plans_by_item = selection
+        .local_metadata_completeness_plans(&plan_inputs)
+        .await
+        .map_err(|error| error.to_string())?;
+    let scraper_check_item_ids =
+        if auto_match_policy_override != Some(false) && metadata_reidentify.is_some() {
+            item_ids
+                .iter()
+                .filter(|item_id| {
+                    plans_by_item
+                        .get(*item_id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|plan| plan.has_requestable_capability)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+    let (scraper_availability_by_item, scraper_availability_error) =
+        if let Some(metadata_reidentify) = metadata_reidentify
+            && !scraper_check_item_ids.is_empty()
+        {
+            match metadata_reidentify
+                .has_selected_scrapers_for_items(&scraper_check_item_ids)
+                .await
+            {
+                Ok(available) => (available, None),
+                Err(error) => (HashMap::new(), Some(error.to_string())),
+            }
+        } else {
+            (HashMap::new(), None)
+        };
     let mut checks_by_library: BTreeMap<String, Vec<PendingLocalMetadataCompletenessCheck>> =
         BTreeMap::new();
     for item_id in item_ids {
-        let current = database
-            .find_media_item_metadata(item_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(current) = current else {
+        let Some((library_id, _current)) = metadata_by_item.get(item_id) else {
             continue;
         };
-        let library_id = database
-            .find_item_library_id(item_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(library_id) = library_id else {
-            continue;
-        };
-        let plan = selection
-            .local_metadata_completeness_plan(item_id, &current)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(plan) = plan else {
+        let Some(plan) = plans_by_item.get(item_id).and_then(Option::as_ref) else {
             continue;
         };
         let eligible_for_fill_missing = if plan.has_requestable_capability
             && auto_match_policy_override != Some(false)
         {
-            if let Some(metadata_reidentify) = metadata_reidentify {
-                match metadata_reidentify
-                    .has_selected_scraper_for_item(item_id)
-                    .await
-                {
-                    Ok(available) => available,
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %item_id,
-                            %error,
-                            "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                        );
-                        false
+            if metadata_reidentify.is_some() {
+                if let Some(error) = scraper_availability_error.as_deref() {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        error,
+                        "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                    );
+                    false
+                } else {
+                    match scraper_availability_by_item.get(item_id) {
+                        Some(Ok(available)) => *available,
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                item_id = %item_id,
+                                %error,
+                                "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                            );
+                            false
+                        }
+                        None => false,
                     }
                 }
             } else {
@@ -3393,20 +3543,16 @@ async fn complete_local_metadata_completeness_for_item_ids(
         } else {
             false
         };
-        let checks = checks_by_library.entry(library_id).or_default();
-        checks.extend(
-            plan.capabilities
-                .into_iter()
-                .map(|(capability, is_missing)| {
-                    (
-                        item_id.clone(),
-                        capability,
-                        plan.input_fingerprint.clone(),
-                        is_missing,
-                        eligible_for_fill_missing,
-                    )
-                }),
-        );
+        let checks = checks_by_library.entry(library_id.clone()).or_default();
+        checks.extend(plan.capabilities.iter().map(|(capability, is_missing)| {
+            (
+                item_id.clone(),
+                capability.clone(),
+                plan.input_fingerprint.clone(),
+                *is_missing,
+                eligible_for_fill_missing,
+            )
+        }));
     }
 
     let checked_at = SystemTime::now()
@@ -3414,6 +3560,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         });
+    let mut scheduled_job_ids = Vec::new();
     for (library_id, checks) in checks_by_library {
         for check_batch in checks.chunks(SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE) {
             let requests = check_batch
@@ -3430,13 +3577,8 @@ async fn complete_local_metadata_completeness_for_item_ids(
                 .prepare_and_claim_item_metadata_completeness_checks(&requests)
                 .await
                 .map_err(|error| error.to_string())?;
-            let mut metadata_fill_missing = check_batch
-                .iter()
-                .filter(|(_, _, _, _, eligible)| *eligible)
-                .map(|(item_id, _, _, _, _)| item_id.clone())
-                .collect::<Vec<_>>();
-            metadata_fill_missing.sort_unstable();
-            metadata_fill_missing.dedup();
+            let metadata_fill_missing =
+                newly_confirmed_fill_missing_item_ids(check_batch, &claimed_indices);
             if claimed_indices.is_empty() && metadata_fill_missing.is_empty() {
                 continue;
             }
@@ -3487,18 +3629,20 @@ async fn complete_local_metadata_completeness_for_item_ids(
                         return Err(error.to_string());
                     }
                 };
-                for job_id in completion.scheduled_job_ids {
-                    let Some(metadata_reidentify) = metadata_reidentify.cloned() else {
-                        continue;
-                    };
-                    let user_events = user_events.clone();
-                    tokio::spawn(async move {
-                        metadata_reidentify.run(&job_id).await;
-                        user_events.publish_home_coalesced().await;
-                    });
-                }
+                scheduled_job_ids.extend(completion.scheduled_job_ids);
             }
         }
+    }
+    if let Some(metadata_reidentify) = metadata_reidentify.cloned()
+        && !scheduled_job_ids.is_empty()
+    {
+        let user_events = user_events.clone();
+        tokio::spawn(async move {
+            for job_id in scheduled_job_ids {
+                metadata_reidentify.run(&job_id).await;
+                user_events.publish_home_coalesced().await;
+            }
+        });
     }
     Ok(())
 }
@@ -3519,6 +3663,7 @@ impl ScanJobService {
             admin_events: AdminEventHub::new(),
             user_events: UserEventHub::new(),
             scan_lock: Arc::new(Semaphore::new(1)),
+            full_scan_queue: Arc::new(Semaphore::new(1)),
             library_covers: None,
             strm_probe: None,
             people: None,
@@ -8937,7 +9082,7 @@ impl ScanJobService {
                 }
                 match database.claim_next_scan_local_metadata_batch().await {
                     Ok(Some(batch)) => {
-                        if let Some((batch_id, scan_job_id, source_ids)) =
+                        if let Some((batch_id, scan_job_id, source_ids, non_retryable_item_ids)) =
                             process_scan_local_metadata_batch(
                                 &database,
                                 &enricher,
@@ -8967,6 +9112,7 @@ impl ScanJobService {
                                     &batch_id,
                                     &scan_job_id,
                                     &source_ids,
+                                    &non_retryable_item_ids,
                                 )
                                 .await;
                                 batch_id
@@ -9018,7 +9164,10 @@ impl ScanJobService {
                                             "local metadata backfill image stage failed and will be retried"
                                         );
                                         fail_scan_local_metadata_backfill_page(
-                                            &database, &page, &error,
+                                            &database,
+                                            &page,
+                                            &error,
+                                            &[],
                                         )
                                         .await;
                                     }
@@ -9090,13 +9239,9 @@ impl ScanJobService {
                 None => enricher,
             };
 
-            loop {
-                if *stop_receiver.borrow() {
-                    return;
-                }
-                let notified = notify.notified();
-                let job = match database.find_scan_job(&worker_job_id).await {
-                    Ok(Some(job)) => job,
+            let mut job = loop {
+                match database.find_scan_job(&worker_job_id).await {
+                    Ok(Some(job)) => break job,
                     Ok(None) => return,
                     Err(error) => {
                         tracing::warn!(
@@ -9112,9 +9257,13 @@ impl ScanJobService {
                             }
                             _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                         }
-                        continue;
                     }
-                };
+                }
+            };
+            loop {
+                if *stop_receiver.borrow() {
+                    return;
+                }
                 if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
                     return;
                 }
@@ -9232,6 +9381,7 @@ impl ScanJobService {
                     }
                     continue;
                 }
+                let notified = notify.notified();
                 tokio::select! {
                     changed = stop_receiver.changed() => {
                         if changed.is_err() || *stop_receiver.borrow() {
@@ -9241,6 +9391,18 @@ impl ScanJobService {
                     _ = notified => {}
                     _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                 }
+                job = match database.find_scan_job(&worker_job_id).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            scan_job_id = %worker_job_id,
+                            %error,
+                            "local metadata worker could not refresh scan job; retrying"
+                        );
+                        continue;
+                    }
+                };
             }
         });
         LocalMetadataWorkerHandle {
@@ -9378,6 +9540,16 @@ impl ScanJobService {
         let Some(_run_guard) = self.track_scan_job_run(job_id, &job.library_id) else {
             self.cancel_running_job(job_id).await?;
             return Ok(());
+        };
+        let _full_scan_permit = if job.job_type == "RECONCILE_LIBRARY" {
+            Some(
+                Arc::clone(&self.full_scan_queue)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ScanJobError::ScanLockClosed)?,
+            )
+        } else {
+            None
         };
         let result = self
             .run_to_completion_with_metadata_and_thumbnails_inner(
@@ -10030,6 +10202,7 @@ impl ScanJobService {
             );
             return;
         };
+        let mut queued_job_ids = Vec::new();
         for item_ids in item_ids.chunks(100) {
             let job = match metadata.create_fill_missing_job(item_ids.to_vec()).await {
                 Ok(job) => job,
@@ -10050,11 +10223,7 @@ impl ScanJobService {
                     continue;
                 }
             };
-            let job_id = job.id.clone();
-            let worker = metadata.clone();
-            tokio::spawn(async move {
-                worker.run(&job_id).await;
-            });
+            queued_job_ids.push(job.id.clone());
             let details = format!(
                 r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
                 job.total_count, job.id
@@ -10067,6 +10236,13 @@ impl ScanJobService {
                 &details,
             )
             .await;
+        }
+        if !queued_job_ids.is_empty() {
+            tokio::spawn(async move {
+                for job_id in queued_job_ids {
+                    metadata.run(&job_id).await;
+                }
+            });
         }
     }
 
@@ -11868,9 +12044,10 @@ mod tests {
         classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
         infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
         manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
-        merge_movie_provider_ids, normalize_incremental_path, parse_episode_filename,
-        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
-        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        merge_movie_provider_ids, newly_confirmed_fill_missing_item_ids,
+        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
+        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
+        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
@@ -12021,6 +12198,38 @@ mod tests {
         assert_eq!(result_only_batches.len(), 1);
         assert_eq!(result_only_batches[0].0.len(), 1);
         assert!(result_only_batches[0].1.is_empty());
+    }
+
+    #[test]
+    fn fill_missing_dispatch_only_uses_newly_claimed_missing_items() {
+        let checks = vec![
+            (
+                "new-missing".to_owned(),
+                "POSTER".to_owned(),
+                vec![1],
+                true,
+                true,
+            ),
+            (
+                "already-ready-missing".to_owned(),
+                "POSTER".to_owned(),
+                vec![2],
+                true,
+                true,
+            ),
+            (
+                "new-complete".to_owned(),
+                "POSTER".to_owned(),
+                vec![3],
+                false,
+                true,
+            ),
+        ];
+        assert_eq!(
+            newly_confirmed_fill_missing_item_ids(&checks, &[0]),
+            vec!["new-missing".to_owned()]
+        );
+        assert!(newly_confirmed_fill_missing_item_ids(&checks, &[]).is_empty());
     }
 
     fn unsupported_scraper_call<T: Send + 'static>(

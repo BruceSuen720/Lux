@@ -2672,45 +2672,40 @@ pub(crate) async fn admin_list_task_activity(
             "scanPhase": job.scan_phase,
         })
     }));
-    for status in ["PENDING", "RUNNING"] {
-        let metadata_status = if status == "PENDING" {
-            "QUEUED"
-        } else {
-            status
-        };
-        let metadata_jobs = match database
-            .list_metadata_reidentify_jobs(Some(metadata_status), 0, 100)
-            .await
-        {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        let metadata_labels = match database
-            .list_current_metadata_reidentify_items(
-                &metadata_jobs
-                    .iter()
-                    .map(|job| job.id.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .await
-        {
-            Ok(items) => activity_item_labels(items),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(metadata_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "metadata",
-                "taskType": job.mode,
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-                "cancelRequested": job.cancel_requested,
-                "currentItem": metadata_labels.get(&job.id),
-            })
-        }));
+    let metadata_jobs = match database
+        .list_metadata_reidentify_jobs_for_activity(100)
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let metadata_labels = match database
+        .list_current_metadata_reidentify_items(
+            &metadata_jobs
+                .iter()
+                .map(|job| job.id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+    {
+        Ok(items) => activity_item_labels(items),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    activities.extend(metadata_jobs.iter().map(|job| {
+        json!({
+            "id": job.id,
+            "kind": "metadata",
+            "taskType": job.mode,
+            "libraryId": job.library_id,
+            "status": job.status,
+            "processedCount": job.processed_count,
+            "totalCount": job.total_count,
+            "cancelRequested": job.cancel_requested,
+            "currentItem": metadata_labels.get(&job.id),
+        })
+    }));
 
+    for status in ["PENDING", "RUNNING"] {
         let strm_jobs = match database.list_strm_probe_jobs(Some(status), 0, 100).await {
             Ok(jobs) => jobs,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -4005,11 +4000,24 @@ pub(crate) async fn require_admin(
     state: &AppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
-    if users::lux_user_token_from_headers(headers).is_some()
-        && resolve_shared_admin_api_key(headers, state)
-            .await?
-            .is_none()
-    {
+    if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
+        if !principal.can_manage_server()
+            || (state.remote_access.is_remote(
+                header_str(headers, "x-lux-peer-ip"),
+                header_str(headers, "x-forwarded-for"),
+            ) && !principal.can_remote_access())
+        {
+            return Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "没有服务器管理权限",
+            )
+            .into_response());
+        }
+        return Ok(());
+    }
+    if users::lux_user_token_from_headers(headers).is_some() {
         return Err(api_error(
             headers,
             StatusCode::FORBIDDEN,
@@ -4113,7 +4121,7 @@ pub(crate) async fn require_admin_web_session(
 pub(crate) async fn resolve_shared_admin_api_key(
     headers: &HeaderMap,
     state: &AppState,
-) -> Result<Option<UserRecord>, Response> {
+) -> Result<Option<crate::auth::users::AuthenticationPrincipal>, Response> {
     let Some(candidate) = lux_api_key_from_headers(headers) else {
         return Ok(None);
     };
@@ -4126,7 +4134,7 @@ pub(crate) async fn resolve_shared_admin_api_key(
         )
         .into_response());
     };
-    service.resolve(&candidate).await.map_err(|_| {
+    service.resolve_principal(&candidate).await.map_err(|_| {
         api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4192,7 +4200,7 @@ pub(crate) async fn record_audit_event(
             let Some(service) = state.admin_api_key.as_ref() else {
                 return;
             };
-            let Ok(Some(_)) = service.resolve(&candidate).await else {
+            let Ok(Some(_)) = service.resolve_principal(&candidate).await else {
                 return;
             };
             (None, None, audit_metadata_for_shared_api_key(metadata_json))

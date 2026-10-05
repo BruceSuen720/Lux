@@ -63,6 +63,7 @@ pub struct CatalogService {
     access: MediaAccessService,
     library_page_cache: Arc<LibraryPageCache>,
     search_flights: Arc<SearchFlightRegistry>,
+    recommendation_compute_lock: Arc<Mutex<()>>,
 }
 
 const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -237,6 +238,7 @@ impl LibraryPageCache {
                     access: access.clone(),
                     library_page_cache: cache.clone(),
                     search_flights: search_flights.clone(),
+                    recommendation_compute_lock: Arc::new(Mutex::new(())),
                 };
                 cache.refresh_entries(&service).await;
             }
@@ -286,7 +288,7 @@ impl LibraryPageCache {
         request: LibraryPageRequest,
     ) -> Result<CatalogPage, CatalogError> {
         let key = LibraryPageCacheKey {
-            user_id: request.principal.user_id.to_string(),
+            user_id: request.principal.user_id_string(),
             is_admin: request.principal.is_admin,
             library_id: request.library_id.clone(),
             filter: request.filter.clone(),
@@ -402,7 +404,13 @@ impl CatalogService {
             access,
             library_page_cache,
             search_flights,
+            recommendation_compute_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recommendation_compute_lock(&self) -> Arc<Mutex<()>> {
+        self.recommendation_compute_lock.clone()
     }
 
     pub(crate) fn invalidate_library_pages(&self) {
@@ -542,7 +550,7 @@ impl CatalogService {
         request: &LibraryPageRequest,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = vec![request.library_id.clone()];
-        let user_id = request.principal.user_id.to_string();
+        let user_id = request.principal.user_id_string();
         let filter = &request.filter;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
@@ -594,7 +602,7 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        let user_id = principal.user_id.to_string();
+        let user_id = principal.user_id_string();
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -1078,46 +1086,90 @@ impl CatalogService {
             return Ok(items);
         }
 
-        // Global recommendation statistics are refreshed by ScheduledTaskService. This request
-        // path must remain read-first so a new user's home page cannot wait on the full refresh
-        // transaction while a migration or scan is writing to the database.
-        let rows = self
-            .database
-            .list_recommended_catalog_rows(user_id, library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)
+        let item_ids = self
+            .compute_recommendation_daily_batch(user_id, library_ids, &library_scope_key, batch_key)
             .await?;
-        let mut items = daily_recommendation_items(
-            assemble_items(rows),
-            user_id,
-            batch_key,
-            RECOMMENDATION_CANDIDATE_POOL as usize,
-        );
-        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-        let inserted = self
-            .database
-            .save_recommendation_daily_batch(user_id, &library_scope_key, batch_key, &item_ids)
-            .await?;
-        if !inserted {
-            let stable_item_ids = self
-                .database
-                .find_recommendation_daily_batch(user_id, &library_scope_key, batch_key)
-                .await?
-                .unwrap_or(item_ids);
-            let rows = self
-                .database
-                .list_catalog_rows_by_ids(&stable_item_ids)
-                .await?;
-            items = reorder_catalog_items(assemble_items(rows), &stable_item_ids);
-            items.retain(|item| {
-                library_ids
-                    .iter()
-                    .any(|library_id| library_id == &item.library_id)
-            });
-        }
+        let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
+        let mut items = reorder_catalog_items(assemble_items(rows), &item_ids);
+        items.retain(|item| {
+            library_ids
+                .iter()
+                .any(|library_id| library_id == &item.library_id)
+        });
         self.populate_episode_counts(&mut items).await?;
         Ok(items
             .into_iter()
             .take(usize::try_from(limit).unwrap_or(0))
             .collect())
+    }
+
+    /// Scores the full catalog once and persists the daily batch.
+    ///
+    /// The scoring query is expensive on large libraries, so the work runs in a detached task:
+    /// home-cache refreshes are cancelled whenever the catalog is invalidated (every scan
+    /// batch), and dropping the caller mid-query would otherwise discard the result before it is
+    /// saved, leaving the orphaned PostgreSQL backend running and the next refresh starting the
+    /// same query again. Tasks are serialized and re-check the stored batch, so a burst of
+    /// refreshes costs one scoring pass instead of one per request.
+    async fn compute_recommendation_daily_batch(
+        &self,
+        user_id: &str,
+        library_ids: &[String],
+        library_scope_key: &str,
+        batch_key: i64,
+    ) -> Result<Vec<String>, CatalogError> {
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        let library_ids = library_ids.to_vec();
+        let library_scope_key = library_scope_key.to_owned();
+        tokio::spawn(async move {
+            let _compute_guard = service.recommendation_compute_lock.lock().await;
+            if let Some(item_ids) = service
+                .database
+                .find_recommendation_daily_batch(&user_id, &library_scope_key, batch_key)
+                .await?
+            {
+                return Ok(item_ids);
+            }
+
+            // Global recommendation statistics are refreshed by ScheduledTaskService. This
+            // request path must remain read-first so a new user's home page cannot wait on the
+            // full refresh transaction while a migration or scan is writing to the database.
+            let rows = service
+                .database
+                .list_recommended_catalog_rows(
+                    &user_id,
+                    &library_ids,
+                    0,
+                    RECOMMENDATION_CANDIDATE_POOL,
+                )
+                .await?;
+            let items = daily_recommendation_items(
+                assemble_items(rows),
+                &user_id,
+                batch_key,
+                RECOMMENDATION_CANDIDATE_POOL as usize,
+            );
+            let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+            let inserted = service
+                .database
+                .save_recommendation_daily_batch(&user_id, &library_scope_key, batch_key, &item_ids)
+                .await?;
+            if inserted {
+                return Ok(item_ids);
+            }
+            Ok(service
+                .database
+                .find_recommendation_daily_batch(&user_id, &library_scope_key, batch_key)
+                .await?
+                .unwrap_or(item_ids))
+        })
+        .await
+        .map_err(|error| {
+            CatalogError::Storage(StorageError::Serialization(format!(
+                "recommendation batch task failed: {error}"
+            )))
+        })?
     }
 
     async fn populate_episode_counts(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
@@ -1424,7 +1476,7 @@ impl CatalogService {
             Some(self.access.accessible_library_ids(principal).await?)
         };
         let key = SearchFlightKey {
-            user_id: principal.user_id.to_string(),
+            user_id: principal.user_id_string(),
             is_admin: principal.is_admin,
             library_ids: library_ids.clone(),
             query: query.to_owned(),

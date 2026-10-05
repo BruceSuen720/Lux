@@ -192,6 +192,8 @@ impl PeopleService {
         } else {
             legacy_path
         };
+        let relation_guard = self.relation_lock_for(&relation_path).await;
+        let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
         acquire_exclusive_file_lock(&lock_path).await?;
         let result = self
@@ -223,12 +225,12 @@ impl PeopleService {
             let Some(person) = enriched.person.clone() else {
                 continue;
             };
-            let merged = stored_actor
-                .person
-                .take()
+            let previous = stored_actor.person.clone();
+            let merged = previous
+                .clone()
                 .unwrap_or_default()
                 .supplement_missing_from(person);
-            if stored_actor.person.as_ref() != Some(&merged) {
+            if previous.as_ref() != Some(&merged) {
                 stored_actor.person = Some(merged);
                 changed_indices.push(index);
             }
@@ -294,6 +296,8 @@ impl PeopleService {
             PeopleError::Serialization("people relation path has no parent".to_owned())
         })?;
         create_private_dir(relation_dir).await?;
+        let relation_guard = self.relation_lock_for(&relation_path).await;
+        let _relation_guard = relation_guard.lock().await;
         let lock_path = relation_path.with_file_name(".people.json.lock");
         acquire_exclusive_file_lock(&lock_path).await?;
         let result = self
@@ -632,6 +636,18 @@ impl PeopleService {
         person_key: Option<&str>,
         identities: &[PersonIdentity],
     ) -> PersonAssetResult {
+        let lock_key = person_key
+            .filter(|key| key.starts_with("lux-"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{provider}:{provider_id}"));
+        let person_asset_lock = {
+            let mut locks = self.person_asset_locks.lock().await;
+            locks
+                .entry(lock_key)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _person_asset_guard = person_asset_lock.lock().await;
         let mut pending_assets = Vec::new();
         let person_dir = if let Some(person_key) = person_key.filter(|key| key.starts_with("lux-"))
         {

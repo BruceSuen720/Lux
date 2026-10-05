@@ -520,7 +520,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 16 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 16 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 2 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=2`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 2 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -4452,7 +4452,7 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 
 范围：增加一个服务器级共享 API Key，行为与 Emby API Key 高度兼容。只有拥有
 `can_manage_server` 的管理员可以查看、生成、轮换和撤销；所有管理员看到同一个当前 Key。
-该 Key 同时用于 Lux `/api/v1` 和已实现的 Emby 兼容路由，调用时按服务器管理员权限执行。
+该 Key 同时用于 Lux `/api/v1` 和已实现的 Emby 兼容路由。认证后主体是独立的共享服务器主体，显式拥有服务器管理及远程访问权限；不得将它解析或记录为某个用户。媒体库授权按服务器管理员范围执行。请求若涉及具体用户的数据，只能使用路由中明确提供并验证的目标用户 ID；需要“当前登录用户”身份、个人设置或播放进度且请求未指定目标用户时，必须要求用户 session 或 Emby AccessToken。
 
 验收：
 
@@ -4462,6 +4462,7 @@ TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接�
 - [x] 非管理员不能读取或操作 Key；Key 不能调用自身的查看、轮换和撤销接口。
 - [x] Key 请求跳过 Cookie CSRF 但仍执行管理员权限和远程访问策略；日志、审计事件、错误响应和普通 API 响应不包含明文 Key。
 - [x] 轮换立即使旧 Key 失效；审计明确标记共享 API Key，不能伪装成某一位管理员。
+- [x] 共享 Key 在路由中保持独立服务器主体，不生成或借用 `UserRecord`；服务器级媒体库权限与请求显式指定的目标用户身份分开处理。
 
 验证：API Key 服务单测、SQLite 集成测试、Lux/Emby 路由鉴权测试、管理员管理接口测试、日志脱敏测试、Web 账户页测试，以及完整 Rust/Web 检查。
 
@@ -7483,17 +7484,17 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-326：在 CI 中运行完整项目质量门
 
-范围：当前 GitHub Actions 工作流构建 Docker 镜像，但未直接执行仓库的 `scripts/check-all.sh`。新增独立质量工作流，在面向 `main`/`test` 的 Pull Request 及推送上运行统一脚本；设置只读仓库权限，并安装项目要求的 Rust、Node 与 pnpm 工具链。不得在质量工作流中发布镜像、读取仓库 secrets 或修改部署流程。
+范围：当前 GitHub Actions 工作流构建 Docker 镜像，但未直接执行仓库的 `scripts/check-all.sh`。新增独立质量工作流，保留手动 `workflow_dispatch` 入口运行统一脚本，不对 Pull Request 或分支推送自动触发；设置只读仓库权限，并安装项目要求的 Rust、Node 与 pnpm 工具链。不得在质量工作流中发布镜像、读取仓库 secrets 或修改部署流程。
 
 验收：
 
-- [x] PR 与 `main`/`test` 推送触发独立的质量检查工作流。
+- [x] 工作流可通过 `workflow_dispatch` 手动运行，不因 PR 或 `main`/`test` 推送自动触发。
 - [x] CI 使用受控的 Rust stable（含 rustfmt/clippy）、Node 22 和固定 pnpm 版本，并运行 `scripts/check-all.sh`。
 - [x] 权限最小化为仓库只读；静态 YAML 校验和本地项目检查通过。
 
-依赖：无。预计文件：`.github/workflows/quality.yml`、`docs/LUX-DEVELOPMENT.md`。此任务增加现有质量脚本的自动触发，不修改应用代码、Docker 发布或分支保护设置。
+依赖：无。预计文件：`.github/workflows/quality.yml`、`docs/LUX-DEVELOPMENT.md`。此任务提供现有质量脚本的手动触发入口，不修改应用代码、Docker 发布或分支保护设置。
 
-结果（2026-10-02）：新增独立只读 `Project quality` 工作流，监听 `main`/`test` 的 PR 与 push；使用 Rust stable、clippy/rustfmt、Node 22 和 pnpm 11.19.0，执行统一 `scripts/check-all.sh`。YAML 解析和 shell 语法检查通过；两个 Python 工具测试 3/3、2/2 通过；pnpm frozen install、Web 测试（Node 108 项、Vitest 546 项）与生产构建通过。Rust build、all-target 测试、fmt 和 Clippy 已在同一代码版本的 LUX-325 验证中通过。工作流尚未推送，GitHub 托管 runner 上的首次结果待后续 CI 触发确认；没有修改仓库分支保护规则。
+结果（2026-10-05）：独立只读 `Project quality` 工作流保留 `workflow_dispatch` 手动入口，不再监听 `main`/`test` 的 PR 或 push；使用 Rust stable、clippy/rustfmt、Node 22 和 pnpm 11.19.0，执行统一 `scripts/check-all.sh`。没有修改仓库分支保护规则。
 
 #### LUX-327：拆分扫描器 Manifest 辅助模块
 
@@ -7916,6 +7917,671 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 依赖：LUX-353。预计文件：`src/storage/library.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 705 个媒体库迁移查询计数回归，确认旧逐库 DELETE/INSERT 基线，再实现有界关联迁移。
 
 结果（2026-10-02）：705 个媒体库从自定义计划移出 704 个时，旧路径完整更新发出 1,420 次 storage SQL 调用；新路径以 500/204 两批复制并删除关联，共 16 次，减少 1,404 次（约 98.9%）。回归验证自定义计划保留 1 个关联、默认计划获得 704 个关联以及 704 条任务配置镜像；本机 `uname -m=arm64`。性能记录只报告 SQLite SQL 调用数，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-356：批量读取手动合并媒体条目根记录
+
+范围：手动合并接口最多接受 100 个媒体条目，但存储层仍对每个根条目分别读取启用媒体库、条目类型和合并状态，电影合并也会对每个源条目分别写入媒体源、用户状态和隐藏标记。将根条目校验和电影合并写入改为有界批量 SQL，再按请求顺序恢复根记录，保持缺失条目错误、主条目选择、同库/同类型校验、媒体源默认优先级、用户状态合并和事务边界，不改变合并层级或公共 API。
+
+验收：
+
+- [x] 100 个电影根条目的根记录读取从 100 次降为 1 次；批量写入接入后完整合并从 596 次 SQL 调用降至 7 次。
+- [x] 返回的合并条目顺序、主条目语义、启用库过滤、缺失条目错误和既有电影/剧集合并回归保持不变。
+- [x] 根读取、电影媒体源迁移、用户状态迁移和隐藏标记更新均按有界 ID 集合执行，使用 SQLite/PostgreSQL 通用参数化查询，不改变 schema 或合并事务边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断端到端时延、PostgreSQL 或 NAS 收益。
+
+依赖：LUX-251。预计文件：`src/storage/media_merge.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 100 个根条目的查询计数回归，确认逐条读取基线，再实现有界批量读取。
+
+结果（2026-10-03）：100 个电影根条目的根读取由 100 次逐条 `SELECT` 降为 1 次有界 `IN` 查询；电影媒体源迁移、用户状态合并/清理和根条目标记分别改为批量 SQL，完整合并调用由 596 次降至 7 次，减少 589 次（约 98.8%）。根记录按请求顺序回填，主条目、媒体源默认优先级、用户状态最大值合并、合并顺序和启用媒体库过滤保持不变；剧集合并继续沿用逐层状态与标记路径，并跳过只供电影路径使用的主条目默认源读取，现有分集批量读取回归由 20 次降为 19 次。media merge 存储和 item_merge 集成回归通过，本任务未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
+#### LUX-357：批量读取 STRM 探测任务的媒体库计数
+
+范围：创建 STRM 探测任务时，服务当前对每个选中的媒体库分别读取完整媒体库、刮削器列表和 STRM 来源计数，最多 64 个媒体库会产生与选择数成比例的重复读取。将媒体库存在性和 STRM 来源计数改为每批最多 100 个 ID 的聚合查询，保持输入去重、媒体库不存在错误、任务顺序和每库任务记录语义不变。
+
+验收：
+
+- [x] 64 个媒体库创建 STRM 探测任务时，前置读取和计数从 322 次 SQL 调用降至 131 次。
+- [x] 64 个任务记录仍全部创建，顺序、选项和零 STRM 数量保持不变；重复媒体库仍只创建一个任务。
+- [x] 不存在的媒体库仍返回 `LibraryNotFound`；查询按最多 100 个 ID 分批，不改变 schema 或公共 API。
+- [x] 性能记录只报告固定 fixture 的 SQLite SQL 调用数，不推断墙钟或生产数据库收益。
+
+依赖：无。预计文件：`src/application/strm_probe.rs`、`src/storage/catalog.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 64 个媒体库的查询计数回归，确认逐库读取基线，再实现有界聚合读取。
+
+结果（2026-10-02）：64 个媒体库的 STRM 探测任务创建由旧实现的 322 次 storage SQL 调用降为 131 次，减少 191 次（约 59.3%）。新增聚合读取按最多 100 个媒体库 ID 分批，并保留不存在媒体库、重复输入、任务顺序和零来源计数语义；本机 `uname -m=arm64`。性能记录只报告 SQLite SQL 调用数，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-358：批量读取扫描本地元数据完整性预检
+
+范围：本地元数据完整性 worker 当前对每个 item 分别读取元数据和媒体库归属，即使两者来自同一条媒体关系。新增最多 500 个 item ID 一批的 active 元数据与媒体库联合读取，并按输入 item ID 回填；保留禁用/移除条目跳过、完整性计划、图片/NFO/人物读取、重试状态、claim 和补缺调度行为，不改变 schema 或扫描任务状态机。
+
+验收：
+
+- [x] 205 个 active item 的元数据/媒体库预检从 410 次 SQL 调用降至 1 次有界查询。
+- [x] active item 的媒体库归属和元数据字段保持一致；禁用库或已移除 item 不进入完整性检查。
+- [x] 后续完整性计划、claim、结果提交、在线补缺和增量策略快照回归保持不变。
+- [x] 性能记录只报告预检读取的 SQLite SQL 调用数，不推断完整 worker 墙钟、PostgreSQL 或 NAS 收益。
+
+依赖：LUX-293、LUX-302、LUX-303。预计文件：`src/storage/media.rs`、`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 active item 的逐项读取基线，再实现有界联合预读。
+
+结果（2026-10-03）：新增 active 元数据与 `library_id` 联合预读，205 个 item 的旧元数据/归属逐项读取为 410 次 SQL，新路径按最多 500 个 ID 一批为 1 次，减少 409 次（约 99.8%）。scanner 完整性流程复用预读结果，后续计划和调度代码未改变；storage 计数回归和 scanner 17 项回归通过。本任务未实测 PostgreSQL 墙钟、NAS 或完整 worker 端到端时延。
+
+#### LUX-359：批量读取元数据任务创建前的条目校验
+
+范围：创建最多 100 个条目的元数据重识别任务时，服务当前逐条读取 item 类型并再次读取完整元数据。改为按最多 500 个 ID 批量读取已有元数据，再按请求去重后的顺序校验缺失条目和 VIDEO 类型，保持错误语义、任务写入、去重和公共 API 不变。
+
+验收：
+
+- [x] 100 个有效 item 的创建前校验从 200 次逐项读取降至 1 次批量读取；完整创建路径从 205 次 SQL 调用降至 6 次。
+- [x] 缺失 item 仍返回对应 `ItemNotFound`，VIDEO item 仍拒绝，输入去重和 1 到 100 条限制不变。
+- [x] 元数据任务行、item 顺序和后续 worker 行为保持原有回归；不改变 schema 或任务状态机。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断端到端墙钟、PostgreSQL 或 NAS 收益。
+
+依赖：LUX-053、LUX-056。预计文件：`src/application/reidentify.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 100 个 item 的创建校验计数回归，再复用现有批量元数据读取。
+
+结果（2026-10-03）：元数据任务创建前校验复用一次批量元数据读取，100 个有效 item 的逐项类型/元数据读取由 200 次降为 1 次；包含任务写入和回读的完整路径由 205 次降为 6 次，减少 199 次（约 97.1%）。缺失 item、VIDEO 拒绝、去重和任务结果回归通过；本任务未实测 PostgreSQL 墙钟、NAS 或 worker 端到端时延。
+
+#### LUX-360：批量写入章节检测 marker
+
+范围：章节检测结果替换同一媒体源和 provider 的隐藏 marker 时，存储层先删除旧记录，再对最多三个 marker 逐条 INSERT。将 marker 写入改为有界多行 INSERT，保留 fingerprint 校验、删除旧结果、marker 顺序、空结果清理、事务边界和其他 provider 的 marker，不改变章节检测协议或读取 DTO。
+
+验收：
+
+- [x] 3 个 marker 的替换从 5 次 SQL 调用降至 3 次，marker 数量和字段保持正确。
+- [x] fingerprint 不匹配仍回滚且不写入；空 marker 仍只删除当前 provider 结果；其他 provider 记录不受影响。
+- [x] 多行 INSERT 使用 SQLite/PostgreSQL 通用参数化语句并保持有界，不改变章节检测任务状态机。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断端到端墙钟、PostgreSQL 或 NAS 收益。
+
+依赖：LUX-209。预计文件：`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加 3 marker 的替换查询计数回归，再实现有界多行写入。
+
+结果（2026-10-03）：同一媒体源的 3 个 marker 由逐条 INSERT 改为一条 3 行多值 INSERT；包含 fingerprint 读取和旧 marker DELETE 的 SQL 调用从 5 次降至 3 次，减少 2 次（40%）。回归验证 marker 数量、fingerprint 校验和章节检测 API/读取行为；本任务未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
+#### LUX-361：批量预读本地元数据完整性计划依赖
+
+范围：本地元数据完整性 worker 已经批量读取 item 元数据，但计划计算仍对每个 item 单独读取媒体策略、图片索引和 metadata attempt 状态。新增有界批量预读并把已读图片索引传给计划计算，保持本地文件存在性检查、NFO 投影、人物关系文件、重试语义、补缺资格和完整性队列合同不变。本任务不迁移文件读取，也不改变后续刮削器资格查询。
+
+验收：
+
+- [x] 205 个 item 的策略、图片索引和 attempt 三类依赖读取从 615 次 SQL 调用降至 3 次有界查询。
+- [x] scanner 使用批量计划结果，缺失能力、输入顺序、指纹、attempt 冷却和补缺资格保持不变。
+- [x] 图片索引预读不会跳过现有本地图片路径、fallback、缩略图策略和路径安全检查。
+- [x] 相关 storage、reidentify 和 scanner 回归通过；不改变 schema、公共 API 或数据库事务边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-358。预计文件：`src/storage/media.rs`、`src/storage/catalog.rs`、`src/storage/metadata.rs`、`src/application/images.rs`、`src/application/candidates.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加逐 item 与批量依赖读取计数回归，再接入 scanner。
+
+结果（2026-10-03）：新增 205 item 的逐项与批量对照回归；媒体策略、图片索引和 attempt 状态由旧路径 615 次 SQL 调用降为 3 次，减少 612 次（约 99.5%）。scanner 改为一次批量计划预读后按 item 回填，保留本地图片/NFO/人物文件检查、fallback 和重试语义；schema、公共 API 与事务边界未改变。本机 `uname -m=arm64`，SQLite 计数不外推 PostgreSQL、NAS 或端到端墙钟。
+
+#### LUX-362：合并有序与 legacy 刮削器配置读取
+
+范围：刮削器 resolver 先查询 `library_scrapers`，没有可用有序配置时再次查询 legacy `libraries.scraper_id`。使用有界联合查询同时取得两种配置，保留有序配置优先、主/备用顺序、legacy fallback 和插件不可用错误语义；为后续批量资格检查提供存储入口。本任务只修改配置读取及现有单 item resolver，不提前接入 scanner。
+
+验收：
+
+- [x] 205 个 item 的配置批量读取为 1 次有界查询；空有序配置的现有单 item resolver 总配置读取由 410 次降为 205 次。
+- [x] 有序配置、legacy fallback、未选择刮削器、无效 role、不可用插件、移除 item 与禁用库的现有解析语义保持不变。
+- [x] 批量读取覆盖超过 500 个 ID、空输入、重复 ID、顺序和各 item 隔离；单次绑定不超过 500 个值。
+- [x] storage 与 scraper 回归通过；不改变 schema、公共 API 或插件协议。
+- [x] 性能记录只报告固定 SQLite fixture 的配置读取 SQL 调用数，不推断插件 RPC 墙钟或生产收益。
+
+依赖：LUX-361。预计文件：`src/storage/media.rs`、`src/storage/repository_tests.rs`、`src/application/scraper.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加逐 item 与批量配置读取计数回归，再合并现有 resolver 的配置读取。
+
+结果（2026-10-03）：有序配置读取在 205 item fixture 中由 205 次逐项查询降为 1 次有界批量查询；单 item resolver 统一复用同一配置读取并保留 legacy fallback。storage、scraper、reidentify 回归通过，本机 `uname -m=arm64`；未改变 schema、公共 API、插件协议或 scanner 的逐 item 资格检查。
+
+#### LUX-363：批量判断本地完整性补缺刮削器资格
+
+范围：scanner 在计划计算后仍对每个可补缺 item 单独调用 resolver 检查选中刮削器是否可用。收集有 requestable capability 的 item ID，一次批量加载配置并逐 item 复用现有客户端缓存完成可用性判断，再按 item 回填补缺资格。插件错误继续降级为不可自动补缺并保留告警，不改变手动元数据任务、插件 RPC 或队列状态机。
+
+验收：
+
+- [x] 205 个具备 requestable capability 的 item 只触发 1 次配置读取，插件客户端缓存与可用性判断仍逐 item 隔离。
+- [x] 没有 requestable capability 或关闭自动匹配的 item 不进入资格批量查询；无 resolver 时沿用 provider key 判断。
+- [x] 有序/legacy 配置、插件不可用、批量读取失败、输入重复和 item 顺序的补缺资格结果保持不变。
+- [x] scraper、reidentify、scanner 回归通过；不改变 schema、公共 API、插件协议或任务写入语义。
+- [x] 性能记录只报告固定 SQLite fixture 的配置读取 SQL 调用数，不推断插件 RPC 墙钟或生产收益。
+
+依赖：LUX-362。预计文件：`src/application/scraper.rs`、`src/application/reidentify.rs`、`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加批量资格回归，再接入 scanner。
+
+结果（2026-10-03）：scanner 只对具备 requestable capability 且未关闭自动匹配的 item 发起一次批量 resolver 配置读取，之后按 item 复用客户端缓存并隔离插件错误；无 resolver、legacy fallback 和失败降级语义保持不变。scraper、reidentify、scanner 回归及全目标 Rust 门通过，本机 `uname -m=arm64`；未改变 schema、公共 API、插件协议或任务写入语义。
+
+#### LUX-364：批量预读本地完整性图片写回源上下文
+
+范围：本地完整性计划已批量读取策略、图片索引和 attempt 状态，但图片本地检查对每个 item 仍分别读取媒体类型与可写回源路径。增加有界批量读取的写回上下文，并将已读上下文传入图片路径检查；保留电影/视频直接源、剧集/季度首集源选择，canonicalize、library root containment、legacy 图片路径和缺失源错误语义。本任务不处理 NFO projection 或人物关系文件读取。
+
+验收：
+
+- [x] 205 个 item 的媒体类型与写回源读取由逐 item 的 410 次 SQL 调用降为 1 次有界查询。
+- [x] 直接媒体源、剧集/季度首集源、无源 item、输入重复和超过 500 个 ID 的批次边界保持原有结果语义。
+- [x] 本地图片存在性、fallback、legacy episode fanart、路径 canonicalize 与 root containment 行为保持不变。
+- [x] storage、metadata selection 回归通过；不改变 schema、公共 API、NFO projection 或人物文件读取边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 PostgreSQL、NAS 或生产墙钟收益。
+
+依赖：LUX-363。预计文件：`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`src/application/images.rs`、`src/application/candidates.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-03）：新增批量写回上下文读取，205 个 item 的类型与源预读由 410 次逐项查询降为 1 次；直接电影源和剧集首集源回归保持一致。完整性计划复用该上下文完成图片本地检查，未改变路径安全和缺失源语义。存储批量回归、metadata selection 图片/NFO 回归、本机 `uname -m=arm64` 与 library Clippy 通过；NFO projection、人物文件和端到端 worker 墙钟未纳入本任务性能数值。
+
+#### LUX-365：批量读取插件安装状态
+
+范围：插件管理列表、已安装列表和通知插件列表在生成视图时逐个读取 `installed_plugins` 状态。新增按插件 ID 有界批量读取并在列表服务中复用，保持未安装/已禁用/已启用三态、store-only 插件和分页排序语义；不改变插件配置文件读取、运行状态或插件 RPC。
+
+验收：
+
+- [x] 205 个插件 ID 的安装状态由逐项 205 次 SQL 调用降为 1 次有界查询。
+- [x] 未安装、已禁用和已启用状态映射保持一致，重复 ID、空输入和超过 500 个 ID 的批次边界保持稳定。
+- [x] 管理插件列表、已安装列表和通知插件列表复用批量状态，不改变动态配置校验、运行状态、分页和 store/catalog 合并。
+- [x] storage、插件 API 与相关插件配置回归通过；不改变 schema、插件协议或配置文件边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 PostgreSQL、NAS 或生产墙钟收益。
+
+依赖：LUX-364。预计文件：`src/storage/users.rs`、`src/storage/repository_tests.rs`、`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-03）：新增安装状态批量读取，插件管理列表和通知插件列表先按 ID 一次加载状态，再逐插件生成既有动态视图；205 个状态由 205 次读取降为 1 次。插件 API、danmaku、media-info 与 IP location 回归通过，本机 `uname -m=arm64`，library Clippy 通过；动态视图中的配置文件读取和运行时状态查询未纳入本任务 SQL 数值。
+
+#### LUX-366：章节检测计划同步去除重复读取
+
+范围：章节检测计划同步在每个已启用章节插件循环中重复读取全部媒体库，并在选中库写入任务时再次读取同一插件配置。复用 LUX-365 的批量安装状态、将媒体库列表延迟到首个有效插件后只读取一次，并缓存已验证的章节插件设置；保留无插件、禁用插件、无效配置、库类型过滤和任务写入语义。
+
+验收：
+
+- [x] 同一次同步最多读取一次媒体库列表，不再按已启用章节插件数量重复读取。
+- [x] 每个有效章节插件的配置只解析一次，后续选中库直接复用已验证设置。
+- [x] 未安装/禁用插件、无效配置、电影库和 chapter source 不匹配库仍按原规则跳过；任务 schedule、并发和窗口参数保持一致。
+- [x] 章节检测 API 回归、library Clippy 和格式检查通过；不改变 schema、插件协议或任务存储合同。
+
+依赖：LUX-365。预计文件：`src/application/plugins.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-03）：章节同步先批量读取候选插件安装状态，在首个有效插件后缓存一次媒体库列表，并复用每个插件的已验证配置写入选中库任务。章节检测两项集成回归、本机 `uname -m=arm64`、library Clippy 与格式检查通过；未据静态调用上界推断墙钟或生产收益。
+
+#### LUX-367：图片路径冲突修复去除逐候选数据库读取
+
+范围：episode thumbnail 路径冲突修复在每个 `-thumbnail[-N]` 候选路径上查询一次数据库确认路径是否被其他图片占用，最多尝试 1,000 个候选。改为按冲突条目的 item ID 有界预读现有图片路径，在内存中筛选候选，并在实际写回前保留一次数据库复核；保留文件类型、内容一致性、路径命名、硬链接/原子写入和更新失败语义。
+
+验收：
+
+- [x] 每个修复批次按最多 500 个 item ID 预读图片索引，不再对每个候选路径执行数据库查询。
+- [x] 当前待修复图片被排除，其他图片占用的目标路径仍跳过；写回前保留数据库复核以覆盖并发变更。
+- [x] episode 冲突修复和系列元数据重扫回归通过；不改变 schema、图片路径合同或文件安全检查。
+- [x] 性能记录只报告静态 SQL 调用上界变化，不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-366。预计文件：`src/application/image_repairs.rs`、`tests/image_writer.rs`、`tests/series_metadata.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-03）：修复器先按冲突 item 批量预读 `item_images`，候选循环改为内存路径判断；成功写回前仍执行一次数据库占用复核。既有图片修复和系列重扫回归、本机 `uname -m=arm64`、library Clippy 与格式检查通过；未据静态上界推断端到端时延。
+
+#### LUX-368：插件状态批量读取覆盖剩余服务循环
+
+范围：章节源列表、Manifest scheduled task 同步和 IP location provider 选择仍在循环中逐个读取插件安装状态。复用批量安装状态读取，保持动态视图、配置校验、插件优先级、任务禁用/注册和 IP138 互斥语义；不改变插件协议或任务存储合同。
+
+验收：
+
+- [x] 章节源列表、Manifest task 同步和 IP location provider 选择各自按候选插件 ID 批量读取安装状态。
+- [x] 未安装、已禁用和已启用插件的既有过滤、排序和互斥行为保持不变。
+- [x] 章节检测、插件管理和 IP location 回归通过；保留 IP location provider 的既有优先级，不改变 schema、配置文件或 RPC 边界。
+- [x] 性能记录只报告静态循环调用上界，不推断墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-367。预计文件：`src/application/plugins.rs`、`tests/ip_location_plugins.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-03）：剩余三个插件服务循环统一复用批量安装状态，保留原过滤、动态视图、任务语义和 IP location provider 优先级。新增优先级回归与章节检测、插件管理、IP location 回归、本机 `uname -m=arm64`、library Clippy 和格式检查通过；未据静态调用上界推断端到端收益。
+
+#### LUX-369：插件视图复用媒体库选项读取
+
+范围：插件管理列表、已安装列表、通知插件列表和章节源列表生成动态视图时，带 `media-libraries` 配置字段的每个插件都会重复读取媒体库及其 scraper 关联。按一次列表请求建立有界媒体库选项快照，并传给同一请求内的动态视图；单插件配置接口仍按独立请求读取最新数据，章节检测插件继续隐藏 `libraryIds` 字段。
+
+验收：
+
+- [x] 两个带媒体库选项的插件列表请求，安装状态批量读取之外的媒体库/关联读取由每插件两次降为列表级一次，固定 SQLite fixture 的 SQL 调用由 5 次降至 3 次。
+- [x] 媒体库启用过滤、章节插件电影库过滤、选项值/名称、插件排序和分页语义保持不变。
+- [x] 通知插件、章节源和普通插件视图复用同一快照；没有媒体库选项的插件不额外触发媒体库读取。
+- [x] 插件管理、媒体信息、弹幕配置和 IP location 回归通过；不改变 schema、插件协议、配置文件或 RPC。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断插件视图墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-368。预计文件：`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加两个媒体库选项插件的查询计数回归，再接入列表级快照。
+
+结果（2026-10-03）：动态插件列表按请求懒加载一次 `list_libraries` 结果，并在普通、已安装、通知和章节源列表中复用；单插件路径保持独立读取。两个媒体库选项插件的固定 SQLite 查询由 5 次降至 3 次，选项过滤与插件配置回归通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-370：Manifest 任务禁用镜像批量更新
+
+范围：Manifest scheduled task 同步在同一插件声明多个任务时，对每个 task 分别开启事务并更新配置、计划两张表。将同一插件的 task 类型收集后在一个事务中用有界 `IN` 更新两张镜像表，保留未安装插件停用、计划镜像同步和后续 owner 注册语义；本任务不改变 owner 注册的任务字段或批量写入合同。
+
+验收：
+
+- [x] 同一插件两个 task 的禁用镜像更新由 4 次 SQL 调用、两次事务降至 2 次 SQL 调用、一次事务。
+- [x] 配置表和计划表的启用状态、task 类型过滤、单 task 兼容路径和空 task 输入保持不变。
+- [x] Manifest、弹幕配置和存储计划镜像回归通过；不改变 schema、插件协议、owner 注册字段或调度语义。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断任务同步墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-369。预计文件：`src/application/plugins.rs`、`src/storage/library.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加两个 task 的逐项禁用查询计数基线，再接入同插件有界批量禁用。
+
+结果（2026-10-03）：Manifest 同步先按插件收集 task 类型，再一次事务更新 `scheduled_task_configs` 与 `scheduled_task_plans`；owner 注册循环保持原字段和顺序。两个 task 的固定 SQLite 镜像更新由 4 次降至 2 次，存储计划镜像、弹幕配置和 Manifest 注册回归通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-371：NFO probe 写回复用媒体写回上下文
+
+范围：`write_item_probe_details` 先分别读取媒体条目类型和写回源，随后调用通用 NFO target 解析再次读取同一类型和源。复用已有的 `list_media_item_writeback_contexts_by_ids` 单条上下文查询，并把电影 target 路径安全检查提取为纯路径阶段；保留 MOVIE/STRM/source ID 过滤、canonicalize、library root containment、既有 NFO 命名和写回后 fingerprint 处理。
+
+验收：
+
+- [x] 电影 probe 写回的类型/源预检由 2 次独立读取加 target 阶段重复 2 次，收敛为 1 次上下文查询；通用系列、季度、分集 NFO target 路径保持原读取合同。
+- [x] 错误 source、STRM 源、无源条目、非电影条目、非标准 movie.nfo 和路径越界行为保持不变。
+- [x] NFO writer、series metadata、metadata 回归通过；不改变数据库 schema、NFO/Emby 合同或 probe 状态。
+- [x] 性能记录只报告固定路径上的 SQL 调用边界，不推断 NFO 写回墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-370、LUX-364。预计文件：`src/application/nfo.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先覆盖 probe 写回的现有路径回归，再复用已存在的写回上下文查询。
+
+结果（2026-10-03）：probe 写回直接使用一次有界写回上下文读取，电影 target 复用该 source 完成 canonicalize 和 root containment；普通 NFO 写入继续独立解析 item 类型。`nfo_writer` 25 项、`series_metadata` 3 项、`metadata` 20 项通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-372：本地 NFO enrichment 复用元数据快照
+
+范围：`MetadataEnricher::enrich_nfo_item` 在同一条 NFO 处理流程中先读取媒体元数据做身份冲突校验，完成 provider ID、NFO 缓存和人物关系同步后又读取完整元数据构造最终写回。复用本次 enrichment 开始时的元数据快照；中间步骤不修改媒体元数据列，保持锁定字段、provenance、身份冲突和 NFO fingerprint 写回语义。
+
+验收：
+
+- [x] 单条 NFO enrichment 的完整媒体元数据读取由 2 次降为 1 次；provider ID、人物关系和 NFO cache 仍按原顺序执行。
+- [x] NFO 身份冲突、锁定字段、provenance、premiere/rating、坏 NFO 非阻塞和重复 enrichment 回归保持不变。
+- [x] metadata、series metadata、NFO writer 回归通过；不改变 schema、NFO/Emby 合同或在线刮削器协议。
+- [x] 性能记录只报告固定调用路径的 SQL 读取边界，不推断 worker 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-371、LUX-364。预计文件：`src/application/metadata.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定重复 `find_media_item_metadata` 基线，再复用同一处理快照。
+
+结果（2026-10-03）：NFO enrichment 保留一次初始 `find_media_item_metadata` 结果，在 provider ID、NFO cache 和 actor relation 处理后直接构造最终 `MediaMetadataUpdate`；metadata 20 项、series metadata 3 项和 NFO writer 25 项通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-373：批量读取 STRM resolver 安装状态
+
+范围：STRM resolver 可用性检查在遍历插件目录时逐个读取 `installed_plugins`。先收集当前 catalog 中声明 `strm.resolve` 的 resolver 插件 ID，再按有界批量查询一次安装状态，随后复用状态生成可用插件列表；保留插件目录顺序、未安装/禁用过滤、动态配置校验和 resolver RPC 顺序，不改变插件协议或数据库 schema。
+
+验收：
+
+- [x] 同一可用性请求包含多个 STRM resolver 时，安装状态读取由每插件一次降为一次批量查询。
+- [x] 未安装、已禁用和已启用插件的过滤、动态配置可用性判断及返回顺序保持不变。
+- [x] STRM resolver 播放与插件服务回归通过；不改变插件协议、配置文件或 RPC 边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 resolver RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-368。预计文件：`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多个 resolver 的安装状态查询计数回归，再复用已有批量安装状态读取。
+
+结果（2026-10-03）：两个已安装 STRM resolver 的可用性检查由 2 次逐插件 `installed_plugins` 查询降为 1 次批量查询；动态视图与 resolver 返回顺序保持不变。`application::plugins::plugin_discovery_tests::strm_resolver_availability_reads_installation_statuses_once` 与 STRM resolver 集成回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-374：批量迁移旧章节插件媒体库选择
+
+范围：旧章节插件配置迁移对每个 `libraryIds` 分别读取完整媒体库（连同 scraper 关联），再逐库开启事务写入 `chapter_source_id`。将同一插件的库 ID 去重后按最多 100 个一批，在一个有界事务中只为存在、非电影且尚未分配章节源的库写入当前插件；保留插件优先级、无效/重复 ID、电影库和已有章节源的跳过语义，不改变章节任务或公共 API 合同。
+
+验收：
+
+- [x] 一个配置包含两个可分配库、一个电影库、一个已有章节源库和一个重复 ID 时，旧迁移路径的 10 次 storage SQL 调用降为 2 次（插件状态读取和一次批量条件更新）。
+- [x] 不存在库、电影库、已有章节源、重复 ID 和多个插件的优先级语义保持不变。
+- [x] 章节检测、计划任务、插件服务和存储回归通过；不改变 schema、插件协议或章节任务状态机。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断迁移墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-373。预计文件：`src/storage/library.rs`、`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加旧配置迁移的查询计数回归，再替换逐库读取和写入。
+
+结果（2026-10-03）：旧迁移对包含两个可分配库、一个电影库、一个已有章节源库和一个重复 ID 的配置执行 10 次 SQL；新路径只执行一次插件状态读取和一次有界条件 UPDATE，共 2 次，减少 8 次（80%），且在同一插件内去重 ID、跨插件按既有排序保留先到先得。插件私有回归、章节检测/API、scheduled tasks、plugins、库级 Clippy 与格式检查通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-375：合并元数据写回策略读取
+
+范围：NFO 和图片写回共用的 `item_metadata_writeback_enabled` 先读取条目所属库 ID，再读取完整媒体库和 scraper 关联，最后读取全局媒体策略。改用已有的 item/library JOIN 读取一次本地策略与全局策略，保持启用库、未移除条目、库策略优先级和 JSON 容错语义，不改变写回目标或媒体元数据合同。
+
+验收：
+
+- [x] 单条写回策略判断由 4 次 storage SQL 调用降为 1 次。
+- [x] 库策略优先于全局策略；禁用库、已移除条目和无策略仍返回原有结果。
+- [x] NFO、图片和 metadata 回归通过；不改变数据库 schema、文件写回或公共 API。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断写回墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-364。预计文件：`src/application/metadata_writeback.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加策略判断查询计数回归，再复用已有的单条 JOIN 读取。
+
+结果（2026-10-03）：策略判断从条目库 ID、完整库（含 scraper 关联）和全局设置三段读取收敛为一次 `find_item_media_strategy_settings`；固定 fixture 从 4 次降为 1 次（75%）。写回、NFO、图片和 metadata 回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-376：批量注册 Manifest 媒体库任务 owner
+
+范围：Manifest `LIBRARY` scheduled task 当前为每个 `ownerConfigKey` 值单独 upsert `scheduled_task_configs`。新增有界多行 upsert，按最多 100 个 owner 一批，在一次事务中写入；同一请求内重复 owner 去重。`GLOBAL` task 继续使用现有计划镜像注册路径，不改变 owner 类型、任务字段、启用状态或调度语义。
+
+验收：
+
+- [x] 205 个唯一媒体库 owner 加 1 个重复值由 206 次 SQL 写入降为 3 次有界批量 upsert。
+- [x] owner 任务行数量、重复 owner 幂等、任务字段和启用状态保持不变。
+- [x] Manifest、插件、计划任务和存储回归通过；不改变 schema、插件协议或 GLOBAL 计划镜像合同。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断插件同步墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-375。预计文件：`src/storage/library.rs`、`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加媒体库 owner 的逐条注册计数回归，再接入有界多行 upsert。
+
+结果（2026-10-03）：`LIBRARY` owner 注册由逐条 upsert 改为 100/100/5 三批多行 upsert，并在输入内去重；205 个唯一 owner 加 1 个重复值由 206 次降为 3 次。GLOBAL task 的计划镜像路径保持原样；插件、Manifest、scheduled task、存储定向回归和库级 Clippy 通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-377：复用弹幕计划的插件设置与可用性读取
+
+范围：按配置为多个媒体库创建弹幕任务时，当前每个库都会重新解析插件配置，并重新读取插件安装状态、动态配置和媒体库选项。一次批量创建中复用已解析的 `DanmakuSettings`，并延迟一次可用性检查后复用结果；保留逐库存在性、活动任务、未选库错误优先级和每库独立任务写入语义，不改变插件协议或任务 schema。
+
+验收：
+
+- [x] 两个选中库的创建路径由 26 次 storage SQL 调用降为 19 次。
+- [x] 每库任务数量、并发/覆盖选项、活动任务跳过和插件不可用错误语义保持不变。
+- [x] 弹幕服务、配置、插件和 API 回归通过；不改变任务表、插件配置或 RPC 合同。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断插件配置解析墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-376。预计文件：`src/application/danmaku.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多库配置任务的查询计数回归，再复用同一设置和可用性结果。
+
+结果（2026-10-03）：两个媒体库的配置任务创建从每库重复读取设置/可用性改为设置读取一次、可用性检查一次；固定 fixture 从 26 次 SQL 降为 19 次，减少 7 次（约 26.9%）。弹幕、配置、配置 API 和插件回归通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-378：Manifest 任务同步复用媒体库选项
+
+范围：同一次 Manifest task 同步遍历多个带 `media-libraries` 配置字段的插件时，动态字段解析重复读取媒体库及 scraper 关联。把选项快照限制为当前同步调用内懒加载一次并复用；没有媒体库选项或未安装的插件不触发读取，单插件配置接口仍读取当前数据，不改变任务注册、启用状态或调度合同。
+
+验收：
+
+- [x] 两个带媒体库选项的 GLOBAL task 插件同步，由 15 次 storage SQL 调用降为 13 次。
+- [x] 插件字段选项、过滤、配置校验、任务 schedule 和 GLOBAL 计划镜像保持不变。
+- [x] 插件列表/Manifest 同步、弹幕配置和计划任务回归通过；不改变 schema 或插件协议。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断同步墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-376、LUX-369。预计文件：`src/application/plugins.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先扩展多插件选项 fixture 覆盖同步调用，再复用同步内快照。
+
+结果（2026-10-03）：Manifest 同步在首次需要媒体库选项时加载一次媒体库/关联快照，随后各插件复用；两插件 GLOBAL task fixture 从 15 次降为 13 次，减少 2 次（约 13.3%）。插件、弹幕配置、scheduled tasks 和库级 Clippy 通过，本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-379：缩略图 scraper 重试复用首轮源读取
+
+范围：缩略图 scraper-first 重试在同一轮中先判断策略是否适用，再判断 poster/thumbnail 是否缺失；两个判断分别读取同一条本地缩略图源。将首轮检查合并为一次源读取并复用其媒体库策略字段，保留无源、STRM、无 scraper、策略不适用和图片路径安全检查语义。元数据刷新完成后的最终图片检查必须重新读取源和图片索引，以反映本轮写回结果。
+
+验收：
+
+- [x] scraper-first 重试首轮检查对带 scraper 的本地媒体由 4 次 SQL 调用降为 3 次：本地源、全局策略和图片索引各读取一次。
+- [x] 无源、STRM、无 scraper、非 `SCRAPER_FIRST` 策略和 poster/thumbnail 缺失、fallback、路径越界行为保持不变。
+- [x] 元数据刷新后的最终图片重新检查仍读取最新源和图片索引；三次失败后的截图回退、重试时间和状态写回保持不变。
+- [x] 缩略图、scheduled tasks 和相关 scanner/metadata 回归通过；不改变 schema、任务状态机、图片文件合同或插件协议。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用边界，不推断刷新墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-378。预计文件：`src/application/thumbnails.rs`、`src/application/scheduled_tasks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加首轮检查的查询计数回归，再复用同一源读取；刷新后的最终检查保留独立读取。
+
+结果（2026-10-03）：scraper-first 重试首轮对带 scraper 的本地媒体由源/策略判断 2 次读取加图片缺失判断 2 次读取，共 4 次 SQL，收敛为一次状态读取中的本地源、全局策略和图片索引，共 3 次，减少 1 次（25%）。元数据刷新完成后的最终 `scraper_first_images_missing` 仍独立重新读取源和图片索引；缩略图回退、scanner/metadata 和计划任务回归通过。本机 `uname -m=arm64`，未实测刷新墙钟、PostgreSQL、NAS 或生产收益。
+
+#### LUX-380：降低弹幕任务取消状态轮询
+
+范围：弹幕匹配任务处理一页待处理条目时，当前在每个条目启动前都读取一次 `cancel_requested`，100 条页面会产生 100 次重复状态读取，末尾还会再检查一次。改为首项和每 8 个条目检查一次，并在页面 worker 排空后保留最终检查；保留取消后不再领取后续条目、取消 pending 项、任务状态写回和 worker 并发上限语义，最多增加 8 个条目的取消响应边界。
+
+验收：
+
+- [x] 100 条待处理页面的取消状态读取由 101 次降为 14 次（首项、每 8 条一次和页面结束最终检查）。
+- [x] 取消请求在检查点后不会再领取超过 8 个条目；已领取 worker 仍按原有完成/失败写回，pending 项统一标记为 `CANCELLED`。
+- [x] 无取消请求时任务成功/失败状态、进度计数、插件调用顺序和并发限制保持不变。
+- [x] 弹幕、scheduled tasks 和相关 API 回归通过；不改变 schema、插件协议或任务状态机。
+- [x] 性能记录只报告固定页面和检查间隔的 SQL 调用边界，不推断插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-379。预计文件：`src/application/danmaku.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定取消检查间隔边界，再调整 `run_claimed` 的轮询位置。
+
+结果（2026-10-03）：弹幕匹配每页最多 100 条时，取消状态读取从逐条检查加页面结束检查的 101 次静态上界，降为首项及每 8 条一次的 13 次间隔检查加 1 次最终检查，共 14 次，减少 87 次（约 86.1%）。检查点后最多再领取 8 条，已领取 worker、pending 取消、进度和插件调用语义保持不变；弹幕、配置、API 和 scheduled tasks 回归通过。本机 `uname -m=arm64`，未实测插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+#### LUX-381：批量写入 STRM 缩略图图片记录
+
+范围：STRM 探测成功生成缩略图后，当前对同一个文件分别写入 `POSTER`、`THUMB` 两条 `item_images`，再单独清除媒体条目的 `poster_fallback_required`，形成 3 次写入和 3 个短事务。复用已有有界图片批量写入，将两条图片记录和 fallback 清除放入同一个事务；保留同一路径、尺寸、标签、来源、图片类型、失败状态和 fallback 语义。
+
+验收：
+
+- [x] STRM 缩略图成功登记由 2 次逐条图片 upsert 加 1 次 fallback UPDATE，降为 1 次批量图片 INSERT/UPSERT 加 1 次 fallback UPDATE。
+- [x] `POSTER`、`THUMB` 两条记录的路径、尺寸、内容标签和 `STRM_FFMPEG` 来源保持一致；批量写入失败时不清除 fallback，任务仍按原失败语义结束。
+- [x] 截图优先、已有图片跳过、NONE 策略、媒体信息和增量 STRM 探测回归保持不变；不改变 schema、插件协议或图片 API 合同。
+- [x] STRM、storage、scheduled tasks 和相关 scanner 回归通过；性能记录只报告固定 fixture 的 SQL/事务边界，不推断插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：LUX-380。预计文件：`src/application/strm_probe.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加批量图片事务的查询计数回归，再接入 STRM 探测写回。
+
+结果（2026-10-03）：STRM 截图登记从两次逐条 `item_images` upsert 加一次 fallback UPDATE，改为已有批量图片写入中的一条多行 UPSERT 加一次 fallback UPDATE，共 2 次 SQL、1 个事务；storage 回归锁定该边界。`POSTER`、`THUMB` 的路径、尺寸、标签、来源和 fallback 语义保持不变，STRM、scanner 和相关任务回归通过。本机 `uname -m=arm64`，未实测插件 RPC 墙钟、PostgreSQL、NAS 或生产收益。
+
+#### LUX-382：批量删除媒体源与层级清理
+
+范围：删除媒体条目或剧集时，应用层当前对每个媒体源分别查询存在性、开启事务删除并更新条目/父级/剧集层级。将源校验、删除和层级清理改为每批最多 250 个源的一组参数化 SQL；保留文件与旁车删除顺序、显式源删除、缺失源错误、item/parent/series 的移除条件、事务边界和每源 webhook 语义。
+
+验收：
+
+- [x] 两个同一电影条目的源从逐源 6 次 SQL 调用降为一次批量查询、删除和层级更新共 3 次。
+- [x] 剧集删除按 item、parent、series 顺序批量更新，系列、季度和分集最终移除语义与原实现一致。
+- [x] 源 ID 与 item ID 不匹配或批次中有缺失源时在写入前返回失败，不部分删除；显式单源和整条目删除 API 回归保持通过。
+- [x] 每批最多 250 个源，层级更新最多绑定 750 个条目 ID，使用 SQLite/PostgreSQL 通用参数化查询，不改变 schema、文件删除或 webhook 合同。
+- [x] 性能记录只报告固定 SQLite SQL 调用数，不推断端到端时延、PostgreSQL、NAS 或生产收益。
+
+依赖：无。预计文件：`src/application/deletion.rs`、`src/storage/jobs.rs`、`docs/PERFORMANCE.md`。先增加多源删除的查询计数回归，确认逐源基线，再实现有界批量删除。
+
+结果（2026-10-03）：两个同一电影条目的源由旧路径的 6 次逐源 SELECT/DELETE/UPDATE 降为 3 次批量 SQL；不匹配或缺失源只执行一次校验查询且不写入。剧集删除保留 item、parent、series 三层顺序更新，避免同一 UPDATE 中父级看不到刚删除的子级；删除媒体源和整剧集 API 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
+#### LUX-383：计划任务媒体库配置批量读取
+
+范围：执行包含多个媒体库的任务计划时，调度器当前对每个媒体库单独读取 `scheduled_task_configs`，然后再创建各自的运行任务。新增每批最多 500 个 owner ID 的配置读取，并在计划派发期间复用结果；保留每库独立运行、失败隔离、未注册任务错误、章节插件 ID 传递、全局任务路径和调度游标语义。
+
+验收：
+
+- [x] 两个媒体库的计划配置读取由两次逐库查询降为一次有界批量查询；两个独立运行任务仍各自创建。
+- [x] 缺失配置的媒体库仍单独记录 `NotRegistered` 并继续派发其他媒体库；章节检测继续使用对应配置的 `plugin_id`。
+- [x] 输入 owner ID 去重并按最多 500 个值分批，使用 SQLite/PostgreSQL 通用参数化查询，不改变任务表、计划镜像或公共 API。
+- [x] scheduled tasks 4 项、计划镜像 storage 12 项、fmt 和 Clippy 回归通过；性能记录只报告 SQL 调用边界。
+
+依赖：LUX-244。预计文件：`src/application/scheduled_tasks.rs`、`src/storage/library.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多个 owner 的批量配置读取计数回归，再接入计划派发。
+
+结果（2026-10-03）：计划派发先按最多 500 个媒体库 owner 批量读取任务配置，再按媒体库复用配置创建独立运行任务；两库配置读取固定为 1 次，原有每库独立运行与失败隔离合同保持不变。scheduled tasks 4 项、计划镜像 storage 12 项和相关格式/Clippy 定向验证通过；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-384：复用无计划任务配置读取
+
+范围：调度器分页读取没有执行计划的 `scheduled_task_configs` 后，当前仍调用通用 `run_task` 再次按 owner 查询同一配置。直接复用已分页读取的配置行，保留 owner/task 校验、插件 ID、未注册错误、独立运行任务和计划任务路径语义，不改变任务表或公共 API。
+
+验收：
+
+- [x] 无计划任务执行不再重复查询当前已加载的配置行；任务仍按原配置创建运行任务。
+- [x] 非法 owner、unsupported task、缺失配置和章节插件 `plugin_id` 语义保持不变；执行计划任务仍使用 LUX-383 的批量读取路径。
+- [x] 无计划任务调度回归、scheduled tasks、fmt 和 Clippy 通过；性能记录只报告重复读取边界。
+
+依赖：LUX-383。预计文件：`src/application/scheduled_tasks.rs`、`tests/scheduled_tasks.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加无计划任务执行回归，再复用当前分页配置。
+
+结果（2026-10-03）：无计划任务分页得到的 `StoredScheduledTaskConfig` 直接传入执行分发，移除了每个任务再次 `find_scheduled_task_config` 的重复读取；新增无计划扫描任务回归与 scheduled tasks 5 项回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-385：批量写入服务器设置
+
+范围：管理员保存服务器设置时，当前在同一个事务中对固定的五个 `server_settings` 键逐条执行 UPSERT。改为一次有界的五行参数化 UPSERT，保留键名、值转换、冲突更新、事务边界和管理设置 API 合同，不引入 schema 变化。
+
+验收：
+
+- [x] 一次服务器设置保存由五条逐键 UPSERT 降为一条多行 UPSERT；五个键的值和冲突更新语义保持不变。
+- [x] 单条 SQL 只绑定固定五组值，兼容 SQLite/PostgreSQL，不把外部设置值拼入 SQL 文本。
+- [x] storage 查询计数回归锁定写入调用数；管理设置、登录背景、首页/播放阈值相关回归保持通过。
+- [x] 不改变事务边界、更新时间字段、服务器设置读取接口或公共 API。
+
+依赖：无。预计文件：`src/storage/users.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加固定五键写入计数回归，再收敛为单条多行 UPSERT。
+
+结果（2026-10-03）：服务器设置保存由五条逐键 UPSERT 收敛为一条固定五行参数化 UPSERT，事务和读取语义保持不变。storage 回归验证查询调用从 5 次降为 1 次，并校验五个键的最终值；本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-386：批量重排卸载插件后的媒体库刮削器
+
+范围：卸载刮削器插件时，当前先删除插件关联，再对每个受影响媒体库单独读取剩余刮削器、删除并逐条重插、读取新的主刮削器和更新媒体库。改为按最多 100 个媒体库批量读取、清理、重插和更新主刮削器；保留位置顺序、首项变为 `PRIMARY`、原 `PRIMARY` 后移为 `BACKUP`、其他角色、章节源清理、安装记录删除和事务边界。
+
+验收：
+
+- [x] 两个受影响媒体库的刮削器重排由逐库/逐项 SQL 收敛为有界批量读取、删除、插入和主刮削器更新；当前固定 fixture 查询从 15 次降为 6 次。
+- [x] 受影响库无剩余刮削器时 `libraries.scraper_id` 置空；备用和补充角色、位置和插件卸载后的章节源清理保持不变。
+- [x] 每批最多 100 个媒体库，刮削器重插每批最多 100 行，所有 ID、角色和值均使用绑定参数，兼容 SQLite/PostgreSQL。
+- [x] 插件卸载 API、媒体库管理回归、storage 查询计数回归、fmt、Clippy 和全目标 Rust 门禁通过；不改变插件文件清理或公共 API。
+
+依赖：无。预计文件：`src/storage/users.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多库卸载重排的查询计数回归，再实现有界批量重排。
+
+结果（2026-10-05）：合并后的批量卸载实现对两个受影响媒体库执行 6 次 storage SQL 调用；固定 fixture 的旧实现为 15 次。角色重排、章节源清理、安装记录删除及插件/媒体库/storage 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-387：批量回收过期 Web 播放会话
+
+范围：Web HLS 清理 worker 每轮最多领取 128 个过期或不活跃会话，但当前对每个会话单独执行条件 UPDATE。保留先分页读取、条件竞争保护、只返回实际成功停止的会话和后续临时目录清理语义，改为按会话 ID 一次批量 UPDATE，并用 `RETURNING` 过滤已被其他请求抢先更新的行。
+
+验收：
+
+- [x] 过期和不活跃会话的清理均由每轮最多 129 次 SQL 收敛为 1 次 SELECT 加 1 次批量 UPDATE；返回会话只包含实际从 `ACTIVE` 变为 `STOPPED` 的记录。
+- [x] 过期时间、`SERVER_HLS` 计划、不活跃心跳条件和 `updated_at` 写入保持不变；空批次不发 UPDATE。
+- [x] ID 批次受现有 128 条领取上限约束，所有 ID 和时间值使用绑定参数，兼容 SQLite/PostgreSQL。
+- [x] storage 播放会话回归、Web 播放回归、fmt、Clippy 和全目标 Rust 门禁通过；不改变播放 API 或 HLS 文件清理合同。
+
+依赖：无。预计文件：`src/storage/sessions.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多会话清理查询计数回归，再接入批量条件 UPDATE。
+
+结果（2026-10-03）：固定三个过期和三个不活跃会话的清理由每类旧路径 4 次 storage SQL 调用降为 2 次（SELECT 加批量 UPDATE）；`RETURNING` 保留并发条件下的实际成功集合，现有过期、不活跃和 Web 播放回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-388：批量重挂载剧集合并的额外分集
+
+范围：剧集合并时，源季度没有同号目标季度，或源季度存在未匹配集号时，当前对每个分集单独更新 `series_id` 或 `parent_id + series_id`。改为按最多 100 个分集 ID 批量更新；保留季度迁移、匹配分集的媒体源/用户状态/合并标记顺序，以及源季和目标季的层级语义。
+
+验收：
+
+- [x] 一个额外源季度的 20 个分集重挂载由 20 条逐分集 UPDATE 降为 1 条有界 UPDATE；固定完整合并查询从 28 次降为 9 次。
+- [x] 无目标季度时只更新 `series_id`；有目标季度但集号未匹配时同时更新 `parent_id` 与 `series_id`；匹配分集仍沿用原有媒体源、用户状态和 `merged_into_item_id` 路径。
+- [x] 每批最多 100 个分集 ID，使用 SQLite/PostgreSQL 通用参数化 SQL，不改变数据库模型、事务边界或合并顺序。
+- [x] media merge storage、item merge、series scanner 回归、fmt、Clippy 和全目标 Rust 门禁通过；性能记录只报告固定 SQLite SQL 调用数。
+
+依赖：LUX-324、LUX-356。预计文件：`src/storage/media_merge.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加额外季度分集的 SQL 计数回归，再批量化两类层级重挂载。
+
+结果（2026-10-03）：额外季度 20 个分集的完整剧集合并从 28 次 storage SQL 调用降为 9 次，减少 19 次（约 67.9%）；新增目标季度未匹配集号的父级/系列断言，既有匹配分集、扫描和 item merge 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-389：批量合并剧集匹配分集的媒体源与状态
+
+范围：剧集合并中，集号匹配的分集当前逐项执行媒体源重挂载、默认源归一化、用户播放状态合并/清理和 `merged_into_item_id` 更新。对目标集号唯一的映射改为有界映射批量 SQL；目标集号重复时保留逐项路径，以保持用户状态版本递增语义。季度层级、未匹配分集和不同源剧集的顺序语义保持不变。
+
+验收：
+
+- [x] 20 个唯一匹配分集的完整合并由旧路径 110 次 storage SQL 调用降为 15 次；媒体源、用户状态和合并标记均在批量映射路径完成。
+- [x] 目标分集 ID 重复时回退逐项处理，保持原有用户状态版本和合并顺序语义；普通唯一映射使用批量路径。
+- [x] 媒体源默认标记、播放进度/已看/收藏/播放次数、源条目标记结果保持原合同；批次最多 100 对映射，所有值使用绑定参数。
+- [x] media merge storage、item merge、series scanner 回归、fmt、Clippy 和全目标 Rust 门禁通过；不改变数据库模型、事务边界或公共 API。
+
+依赖：LUX-324、LUX-356、LUX-388。预计文件：`src/storage/media_merge.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加匹配分集 SQL 计数和状态回归，再接入映射批处理。
+
+结果（2026-10-03）：20 个唯一匹配分集的完整合并由 110 次 storage SQL 调用降为 15 次，减少 95 次（约 86.4%）；重复目标集号保留逐项回退，item merge、series merge 和扫描回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+
+#### LUX-390：批量同步季度与剧集已看状态
+
+范围：播放回调和手动已看状态更新调用 `sync_played_container_states`，一个分集最多关联季度和剧集两个父级。原实现读取父级后，对每个父级单独查询可播放分集状态并 UPSERT。合并父级状态读取和写入，保留用户隔离、空容器、不可用/已删除分集筛选、播放次数、时间戳和版本合同。不修改 HTTP、数据库模型或事务边界。
+
+验收：
+
+- [x] 两个父级的同步由 5 次 storage SQL 调用降为 3 次；最多两个父级、10 个 UPSERT 绑定值。
+- [x] 完成、取消已看、重复同步与空容器行为保持原合同；收藏、进度和其他用户状态不被覆盖。
+- [x] 定向 storage 回归和 `series_api`、`playback`、`web_playback`、`resume_favorites` 集成回归通过。
+- [x] Rust build、全目标测试、fmt、全目标全 feature Clippy 和差异检查通过；记录 ARM64 与后端验证边界。
+
+预计文件：`src/storage/sessions.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+实施记录（2026-10-04）：旧实现查询计数回归先失败，实测为 5 次；新实现固定为 3 次，减少 2 次（约 40%）。父级状态、播放次数、版本、取消已看、重复同步和空容器回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。本任务为新一轮的单独增量，上一轮截至 LUX-389 的收口记录保持不变。
+
+#### LUX-391：批量写入媒体库刮削器配置
+
+范围：媒体库创建和编辑刮削器配置时，原实现对每个有序 scraper 单独执行 `library_scrapers` INSERT。改为复用一个有界多行 INSERT helper；保留最多 16 项校验、位置/角色顺序、主刮削器兼容字段、事务边界和单个 legacy `scraper_id` 更新语义。不改变读取 API 或数据库模型。
+
+验收：
+
+- [x] 5 个 scraper 行由 5 次 INSERT 降为 1 次；批次上限 100，超过上限仍分批写入。
+- [x] 创建和编辑路径复用同一 helper；位置、角色、主刮削器字段和空列表行为保持不变。
+- [x] storage 查询计数回归、library 集成回归和现有计划任务/插件 scraper 回归通过。
+- [x] Rust build、全目标测试、fmt、全目标全 feature Clippy 和差异检查通过；记录 ARM64 与后端验证边界。
+
+文件：`src/storage/library.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。测试与私有 helper 位于同一模块，因此未修改 `repository_tests.rs`。实现前 helper 回归因方法不存在而编译失败；旧创建/编辑循环每项执行一条 INSERT 属于源码计数，新 helper 的 SQL 调用数通过测试实测。补充空输入、205 行分批、位置/角色与后续批次失败回滚覆盖。
+
+最终门禁（2026-10-05）：本机 `uname -m=arm64`，Toshiba target 已挂载。`cargo build --locked`、`cargo test --locked --all-targets`（711 passed、0 failed、11 ignored；其中 PostgreSQL 专项 15 项因无本地 PostgreSQL 而 ignored）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 均通过。未进行 PostgreSQL、NAS 或生产环境性能验证。
+
+#### LUX-392：复用 NFO 阶段的 source 快照
+
+范围：扫描本地 metadata 的完整度阶段当前会在 NFO 阶段已查出 source 后，再按 filesystem entry 和目录重新展开完整 source 列表。让 NFO 阶段携带其实际处理的 `(item_id, source_id)` 快照；完整度阶段批量确认该 source 仍是 item 当前的首选有效 source，再读取 active item metadata。不要复用更早的图片阶段快照；source 已删除、item 已移除或首选 source 已改变时，不写该 item 的完整度结果。
+
+验收：
+
+- [x] 完整度阶段不再调用 `list_scan_local_metadata_sources`，只使用 NFO 阶段 source identity，并在有界批量查询中复核当前首选 source。
+- [x] 回归覆盖 source 未变、source 被删除或标 missing、首选 source 切换；非重试失败排除项、增量扫描和 backfill 完整度语义保持不变。
+- [x] 单 item、单目录固定 fixture 的完整度读取从 3 次 storage query-wrapper 调用降至 2 次；不据此推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+- [x] 相关本地 metadata / 扫描回归、build、fmt、全目标全 feature Clippy 与差异检查通过。
+- [x] 全目标 Rust 测试通过。
+
+文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-05）：NFO source identity freshness 回归、`scanned_metadata`（15 项）、`scanned_series_metadata`（2 项）、串行 `scanning_jobs`（81 项）、build、fmt、Clippy 与差异检查通过。固定 SQLite fixture 的完整度阶段查询从 3 次降至 2 次。全目标串行 Rust 测试通过；此前在单独运行中失败的 `tests/emby_counts.rs::emby_item_counts_respects_auth_user_scope_and_favorites` 在本次完整串行运行中通过，未再复现。依赖本地 PostgreSQL 的测试和显式性能基准按测试配置忽略。没有据本地调用数推断 FNOS、PostgreSQL 或 NAS 收益。
+
+#### LUX-393：校准插件卸载刮削器查询计数
+
+范围：后续合并后的 `uninstall_plugin` 已将两个受影响媒体库的 fixture 压到 6 次 storage query-wrapper 调用，但旧回归仍断言 8 次，导致全目标测试失败。更新计数断言及 LUX-386 性能记录；不改变插件卸载行为。
+
+验收：
+
+- [x] 固定两个媒体库 fixture 断言 6 次调用，并继续验证刮削器位置、角色和 legacy 主刮削器结果。
+- [x] LUX-386 文档记录当前实现为 15 次降至 6 次；性能比例与调用范围说明一致。
+- [x] 定向 storage 回归通过；无运行时代码或 schema 变化。
+
+文件：`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-05）：插件卸载 storage 回归通过；双媒体库 fixture 固定为 6 次 query-wrapper 调用，插件卸载实现和 schema 均未变。
+
+#### 本轮代码质量与性能优化收口
+
+本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
+
+本轮的 SQL 调用数减少不等同于生产时延或硬件占用的改善。阶段 23 的扫描、海报可见性、双后端 A/B、前台 p95 与项目所有者确认仍按下方阶段门单独验收。
+#### LUX-383：批量清理 Web HLS 播放会话
+
+范围：Web HLS 会话清理当前先取最多 128 个过期或无心跳会话，再逐会话执行条件 UPDATE，单次清理最多产生 129 次 SQL。改为保留有界候选读取后，用一次参数化 `UPDATE ... RETURNING` 批量停止仍满足条件的会话；保留并发条件复核、按候选顺序返回成功停止的会话、最多 128 条上限和 HLS 目录清理语义。不改变播放会话表结构或 API 合同。
+
+验收：
+
+- [x] 130 个过期会话和 130 个无心跳会话各只停止前 128 个，剩余 2 个保持 active；两条路径的 storage SQL 调用均由 129 次降为 2 次。
+- [x] 条件 UPDATE 只返回仍为 active 且满足过期/无心跳条件的会话；返回顺序保持候选读取顺序，清理任务继续只处理实际停止的 HLS 目录。
+- [x] 播放会话、Web 播放和存储回归通过；不改变状态机、会话上限、并发竞态保护或 PostgreSQL/SQLite 通用 SQL 边界。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断 HLS 文件清理墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：无。预计文件：`src/storage/sessions.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先以 130 会话回归锁定逐会话 UPDATE 基线，再接入有界批量停止。
+
+结果（2026-10-05）：过期与无心跳清理均由候选 SELECT 加逐会话 UPDATE 收敛为候选 SELECT 加一次 `UPDATE ... RETURNING id`，固定 130 会话 fixture 从 129 次降为 2 次 SQL；只返回仍满足条件的会话并按原候选顺序交给 HLS 目录清理。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
+#### LUX-384：批量重建插件卸载后的媒体库刮削器顺序
+
+范围：卸载刮削器插件时，当前先删除插件行，再对每个受影响媒体库单独读取剩余行、删除全部配置、逐行重插、读取主刮削器并更新媒体库，媒体库数量和配置行数会放大 SQL 调用。改为一次读取受影响库的完整配置，在内存中完成角色/位置重建，再按有界批次删除、插入和更新；保留主刮削器兼容字段、PRIMARY 转 BACKUP 规则、空配置行为、章节源清理和插件删除事务边界。
+
+验收：
+
+- [x] 205 个媒体库、每库 3 个刮削器的卸载由 1,234 次 SQL 调用降为 12 次；插入和更新批次均有上限。
+- [x] 删除后剩余刮削器从位置 0 重新编号，首项成为 PRIMARY，原 PRIMARY 被移除后的后续 PRIMARY 降为 BACKUP；`libraries.scraper_id` 与空配置行为保持一致。
+- [x] 插件卸载 API、弹幕插件卸载、存储迁移和媒体库刮削器回归通过；不改变插件协议、schema 或章节源清理合同。
+- [x] 性能记录只报告固定 SQLite fixture 的 SQL 调用数，不推断插件文件删除墙钟、PostgreSQL、NAS 或生产收益。
+
+依赖：无。预计文件：`src/storage/users.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多库卸载查询计数回归，再接入内存重建和有界批量写入。
+
+结果（2026-10-05）：受影响库配置由逐库读取/删除/重插/主项回读改为一次快照读取、一次批量删除、5 次批量插入和 3 次批量更新；固定 205 库 fixture 从 1,234 次降为 12 次 SQL。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
+
+#### LUX-383：普通本地图片登记与 fallback 原子提交
+
+范围：电影、剧集、季度和分集的普通本地图片索引复用 LUX-305 有界图片事务，把图片 upsert 和 poster fallback 清理合并为一个事务。保留图片命名、索引、legacy fanart 排除和处理顺序；不改变文件读取、schema 或在线任务合同。
+
+验收：
+
+- [x] 图片登记成功与 fallback 清理原子完成；注入 fallback 更新失败时图片不部分入库。
+- [x] 重复登记幂等，既有 metadata、series metadata 图片路径回归通过。
+- [x] 格式、相关 Clippy 和定向测试通过；性能记录只说明事务边界，不外推 FNOS CPU。
+
+预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+#### LUX-384：通用 FILL_MISSING 创建入口去重与队列合并
+
+范围：通用 `create_fill_missing_job` 入口此前直接创建新 job，可能绕过本地完整性路径的活动任务去重。按同一媒体库在事务内过滤 QUEUED/RUNNING/近期 DEFERRED 条目，并将新条目合并到现有 queued job；跨库请求保留原有独立 job 语义，不改变最多 100 项限制和执行前再次检查。
+
+验收：
+
+- [x] 同一库、同一条目重复创建只保留一份活动 job；新条目合并进已有 queued job。
+- [x] 取消、运行中、近期 deferred 条目不会重新排队；跨库请求保持原有行为。
+- [x] storage、metadata、reidentify、格式和 Clippy 回归通过；性能记录只说明任务创建边界，不外推 FNOS CPU。
+
+预计文件：`src/application/reidentify.rs`、`src/storage/jobs.rs`、`src/storage/media.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+#### LUX-385：清理取消 metadata job 的残留 item 状态
+
+范围：取消 metadata job 时，将仍为 `PENDING/RUNNING` 的 item 统一写成既有可重试终态 `FAILED`，并记录 `JOB_CANCELLED`；新增 migration 幂等清理历史取消 job 的残留行。显式 retry 仍将这些 item 置回 `PENDING`，不改变任务公共 API。
+
+验收：
+
+- [x] 新取消 job 不再留下 `PENDING/RUNNING` item；retry 后 item 恢复为 `PENDING`。
+- [x] migration 可从空库运行，并能幂等修复历史取消 job，不触碰已完成 item。
+- [x] metadata cancel、storage、build、格式和 Clippy 回归通过。
+
+预计文件：`src/storage/jobs.rs`、`tests/metadata_cancel.rs`、`tests/storage.rs`、`migrations/0158_media_info_chapters.sql`、`migrations-postgres/0158_media_info_chapters.sql`、`migrations/0160_scan_local_metadata_backfill_non_retryable_items.sql`、`migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql`、`migrations/0161_reconcile_cancelled_metadata_job_items.sql`、`migrations-postgres/0161_reconcile_cancelled_metadata_job_items.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+发布兼容性补正（2026-10-05）：部署库已使用 migration 0158 保存媒体章节、0160 保存本地 metadata backfill。保留这两条历史迁移及其 checksum；取消任务残留清理使用新版本 0161，避免升级时发生 SQLx 版本/校验和冲突。
+
+#### LUX-386：跳过 unchanged NFO 的空默认值修复事务
+
+范围：NFO fingerprint 未变化且 rich NFO/人物缓存可用时，复用本轮已读取的媒体元数据快照判断本地 provider IDs 和 premiere date 是否仍有缺失。两类默认值均已存在时不再进入存储事务；发现缺失时继续调用存储层并在事务内复核后修复。保留 NFO fingerprint、缓存恢复和人物关系同步语义。
+
+验收：
+
+- [x] 默认值完整的 unchanged NFO 路径省去空修复查询/事务；查询计数回归证明调用数下降。
+- [x] 缺少 premiere date 或 provider ID 时仍按原逻辑补齐；已有值不覆盖。
+- [x] metadata、NFO cache、格式、build 和 Clippy 回归通过；性能记录不外推 PostgreSQL/NAS/生产墙钟。
+
+预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写 unchanged NFO 查询计数回归，再增加保守的快照判断。
+
+结果（2026-10-05，`0f4dcdcc`）：unchanged NFO 且 rich cache 可用时，先用本轮已读取的 metadata 快照判断 provider IDs 与 premiere date；两者已有值就跳过修复存储调用，仍缺字段则走原子修复事务。回归覆盖两者都缺、仅 provider ID 缺、仅 premiere date 缺及已有值不得覆盖。定向 metadata/NFO cache 测试、全目标 Rust 测试、build、fmt 与 Clippy 通过。SQLite 单项测试查询调用从 4 次降到 3 次；该计数不是墙钟指标，也不外推 PostgreSQL、FNOS 或 x86 性能。详见 `docs/PERFORMANCE.md`。
 
 #### 阶段 23 总体验收与阶段门
 

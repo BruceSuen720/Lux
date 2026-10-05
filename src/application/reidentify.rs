@@ -437,30 +437,41 @@ impl MetadataReidentifyService {
         mode: MetadataRefreshMode,
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         let mut unique_ids = Vec::with_capacity(item_ids.len());
+        let mut seen_ids = HashSet::with_capacity(item_ids.len());
         for item_id in item_ids {
-            if !unique_ids.iter().any(|existing| existing == &item_id) {
+            if seen_ids.insert(item_id.clone()) {
                 unique_ids.push(item_id);
             }
         }
         if unique_ids.is_empty() || unique_ids.len() > 100 {
             return Err(MetadataReidentifyError::InvalidItemCount);
         }
+        let metadata_by_item = self
+            .database
+            .list_media_item_metadata_by_ids(&unique_ids)
+            .await?;
         for item_id in &unique_ids {
-            if self
-                .database
-                .find_media_item_kind(item_id)
-                .await?
-                .is_some_and(|kind| kind.item_type == "VIDEO")
-            {
+            let Some(item) = metadata_by_item.get(item_id) else {
+                return Err(MetadataReidentifyError::ItemNotFound(item_id.clone()));
+            };
+            if item.item_type == "VIDEO" {
                 return Err(MetadataReidentifyError::InvalidItemCount);
             }
-            if self
-                .database
-                .find_media_item_metadata(item_id)
-                .await?
-                .is_none()
-            {
-                return Err(MetadataReidentifyError::ItemNotFound(item_id.clone()));
+        }
+        if matches!(mode, MetadataRefreshMode::FillMissing) {
+            let mut library_ids = metadata_by_item
+                .values()
+                .map(|item| item.library_id.as_str())
+                .collect::<Vec<_>>();
+            library_ids.sort_unstable();
+            library_ids.dedup();
+            if let [library_id] = library_ids.as_slice() {
+                let job_id = self
+                    .database
+                    .create_or_merge_fill_missing_job(library_id, &unique_ids)
+                    .await?;
+                self.admin_events.publish(AdminEventScope::Jobs);
+                return self.get_job(&job_id).await;
             }
         }
         let job_id = Uuid::now_v7().to_string();
@@ -599,7 +610,7 @@ impl MetadataReidentifyService {
         let mut last_concurrency = None;
         loop {
             let configured_concurrency =
-                metadata_worker_default_concurrency(self.database.backend());
+                metadata_worker_configured_concurrency(self.database.backend(), mode);
             let concurrency = metadata_worker_concurrency(
                 self.resources
                     .metadata_concurrency(configured_concurrency)
@@ -1048,20 +1059,32 @@ impl MetadataReidentifyService {
         Ok(Some(clients))
     }
 
-    pub(crate) async fn has_selected_scraper_for_item(
+    pub(crate) async fn has_selected_scrapers_for_items(
         &self,
-        item_id: &str,
-    ) -> Result<bool, MetadataReidentifyError> {
+        item_ids: &[String],
+    ) -> Result<HashMap<String, Result<bool, MetadataReidentifyError>>, MetadataReidentifyError>
+    {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut available = HashMap::with_capacity(item_ids.len());
         if self.selection.is_none() {
-            return Ok(false);
+            available.extend(item_ids.iter().cloned().map(|item_id| (item_id, Ok(false))));
+            return Ok(available);
         }
-        if self.resolver.is_none() {
-            return Ok(!self.scraper.provider_key().trim().is_empty());
-        }
-        self.providers_for_item(item_id, true)
+        let Some(resolver) = &self.resolver else {
+            let value = !self.scraper.provider_key().trim().is_empty();
+            available.extend(item_ids.iter().cloned().map(|item_id| (item_id, Ok(value))));
+            return Ok(available);
+        };
+        let resolved = resolver
+            .has_selected_scrapers_for_items(item_ids)
             .await
-            .map(|providers| providers.is_some_and(|providers| !providers.is_empty()))
-            .map_err(MetadataReidentifyError::Scraper)
+            .map_err(MetadataReidentifyError::Scraper)?;
+        for (item_id, result) in resolved {
+            available.insert(item_id, result.map_err(MetadataReidentifyError::Scraper));
+        }
+        Ok(available)
     }
 
     async fn refresh_with_scraper_roles(
@@ -1635,6 +1658,17 @@ fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
     }
 }
 
+fn metadata_worker_configured_concurrency(
+    backend: DatabaseBackend,
+    mode: MetadataRefreshMode,
+) -> usize {
+    if matches!(mode, MetadataRefreshMode::FillMissing) {
+        2
+    } else {
+        metadata_worker_default_concurrency(backend)
+    }
+}
+
 fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
     !plan.needs_metadata
         && !plan.needs_images
@@ -1687,9 +1721,10 @@ mod tests {
 
     use super::{
         AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage,
-        MetadataCandidateView, MetadataRequestPlan, best_automatic_candidate,
+        MetadataCandidateView, MetadataRefreshMode, MetadataRequestPlan, best_automatic_candidate,
         candidate_count_for_page, metadata_global_permits, metadata_request_plan_is_complete,
-        metadata_worker_concurrency, metadata_worker_default_concurrency,
+        metadata_worker_concurrency, metadata_worker_configured_concurrency,
+        metadata_worker_default_concurrency,
     };
     use crate::{
         application::{
@@ -1967,6 +2002,50 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         Ok((temp_dir, config, database, item_id))
+    }
+
+    #[tokio::test]
+    async fn metadata_job_creation_validates_items_with_one_batch_read()
+    -> Result<(), Box<dyn Error>> {
+        const ITEM_COUNT: usize = 100;
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Metadata jobs", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let item_ids = (0..ITEM_COUNT)
+            .map(|index| format!("metadata-job-item-{index:03}"))
+            .collect::<Vec<_>>();
+        for item_id in &item_ids {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            crate::application::scraper::ScraperProvider::unconfigured(),
+        );
+        database.reset_query_count();
+        let job = service.create_job(item_ids).await?;
+
+        assert_eq!(job.total_count, ITEM_COUNT as i64);
+        assert_eq!(database.query_count(), 6);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2665,6 +2744,31 @@ mod tests {
         );
         assert_eq!(
             metadata_worker_default_concurrency(DatabaseBackend::Postgres),
+            8
+        );
+    }
+
+    #[test]
+    fn fill_missing_worker_default_is_conservative_on_both_backends() {
+        assert_eq!(
+            metadata_worker_configured_concurrency(
+                DatabaseBackend::Sqlite,
+                MetadataRefreshMode::FillMissing,
+            ),
+            2
+        );
+        assert_eq!(
+            metadata_worker_configured_concurrency(
+                DatabaseBackend::Postgres,
+                MetadataRefreshMode::FillMissing,
+            ),
+            2
+        );
+        assert_eq!(
+            metadata_worker_configured_concurrency(
+                DatabaseBackend::Postgres,
+                MetadataRefreshMode::FullRefresh,
+            ),
             8
         );
     }

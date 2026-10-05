@@ -288,10 +288,18 @@ impl ScheduledTaskService {
                 {
                     continue;
                 }
-                if let Err(error) = self
-                    .run_task(&task.owner_type, &task.owner_id, &task.task_type)
-                    .await
-                {
+                let result = match normalize_scheduled_task_request(
+                    &task.owner_type,
+                    &task.owner_id,
+                    &task.task_type,
+                ) {
+                    Ok((owner_type, owner_id, task_type)) => {
+                        self.run_task_with_config(&owner_type, &owner_id, &task_type, &task)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
                     match error {
                         ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
                         | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive) => {}
@@ -320,8 +328,41 @@ impl ScheduledTaskService {
             }
             return;
         }
+        let task_type = plan.task_type.trim().to_ascii_uppercase();
+        let owner_ids = plan
+            .libraries
+            .iter()
+            .map(|library| library.id.clone())
+            .collect::<Vec<_>>();
+        let configs = match self
+            .database
+            .list_scheduled_task_configs_by_owner_ids("LIBRARY", &owner_ids, &task_type)
+            .await
+        {
+            Ok(configs) => configs,
+            Err(error) => {
+                self.log_dispatch_error(key, ScheduledTaskError::Storage(error));
+                return;
+            }
+        };
         for library in &plan.libraries {
-            if let Err(error) = self.run_task("LIBRARY", &library.id, &plan.task_type).await {
+            let result = match normalize_scheduled_task_request("LIBRARY", &library.id, &task_type)
+            {
+                Ok((owner_type, owner_id, normalized_task_type)) => match configs.get(&owner_id) {
+                    Some(task) => {
+                        self.run_task_with_config(
+                            &owner_type,
+                            &owner_id,
+                            &normalized_task_type,
+                            task,
+                        )
+                        .await
+                    }
+                    None => Err(ScheduledTaskError::NotRegistered),
+                },
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
                 self.log_dispatch_error(key, error);
             }
         }
@@ -398,43 +439,25 @@ impl ScheduledTaskService {
         owner_id: &str,
         task_type: &str,
     ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
-        let owner_type = owner_type.trim().to_ascii_uppercase();
-        let owner_id = owner_id.trim();
-        let task_type = task_type.trim().to_ascii_uppercase();
-        if !matches!(owner_type.as_str(), "GLOBAL" | "LIBRARY") || owner_id.is_empty() {
-            return Err(ScheduledTaskError::InvalidOwner);
-        }
-        if owner_type == "GLOBAL" && owner_id != "global" {
-            return Err(ScheduledTaskError::InvalidOwner);
-        }
-        if owner_type == "LIBRARY" && owner_id.parse::<LibraryId>().is_err() {
-            return Err(ScheduledTaskError::InvalidOwner);
-        }
-        if owner_type == "GLOBAL"
-            && !matches!(
-                task_type.as_str(),
-                STRM_MEDIA_INFO_TASK_TYPE | DANMAKU_MATCH_TASK_TYPE
-            )
-        {
-            return Err(ScheduledTaskError::UnsupportedTask);
-        }
-        if owner_type == "LIBRARY"
-            && !matches!(
-                task_type.as_str(),
-                RECONCILIATION_TASK_TYPE
-                    | METADATA_TASK_TYPE
-                    | CHAPTER_DETECTION_TASK_TYPE
-                    | AUTO_LIBRARY_COVER_TASK_TYPE
-            )
-        {
-            return Err(ScheduledTaskError::UnsupportedTask);
-        }
+        let (owner_type, owner_id, task_type) =
+            normalize_scheduled_task_request(owner_type, owner_id, task_type)?;
         let task = self
             .database
-            .find_scheduled_task_config(&owner_type, owner_id, &task_type)
+            .find_scheduled_task_config(&owner_type, &owner_id, &task_type)
             .await?
             .ok_or(ScheduledTaskError::NotRegistered)?;
-        match (owner_type.as_str(), task_type.as_str()) {
+        self.run_task_with_config(&owner_type, &owner_id, &task_type, &task)
+            .await
+    }
+
+    async fn run_task_with_config(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        task_type: &str,
+        task: &StoredScheduledTaskConfig,
+    ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
+        match (owner_type, task_type) {
             ("LIBRARY", RECONCILIATION_TASK_TYPE) => self.run_reconciliation(owner_id).await,
             ("LIBRARY", METADATA_TASK_TYPE) => self.run_metadata(owner_id).await,
             ("GLOBAL", STRM_MEDIA_INFO_TASK_TYPE) => self.run_strm_media_info().await,
@@ -628,6 +651,45 @@ impl ScheduledTaskService {
     }
 }
 
+fn normalize_scheduled_task_request(
+    owner_type: &str,
+    owner_id: &str,
+    task_type: &str,
+) -> Result<(String, String, String), ScheduledTaskError> {
+    let owner_type = owner_type.trim().to_ascii_uppercase();
+    let owner_id = owner_id.trim().to_owned();
+    let task_type = task_type.trim().to_ascii_uppercase();
+    if !matches!(owner_type.as_str(), "GLOBAL" | "LIBRARY") || owner_id.is_empty() {
+        return Err(ScheduledTaskError::InvalidOwner);
+    }
+    if owner_type == "GLOBAL" && owner_id != "global" {
+        return Err(ScheduledTaskError::InvalidOwner);
+    }
+    if owner_type == "LIBRARY" && owner_id.parse::<LibraryId>().is_err() {
+        return Err(ScheduledTaskError::InvalidOwner);
+    }
+    if owner_type == "GLOBAL"
+        && !matches!(
+            task_type.as_str(),
+            STRM_MEDIA_INFO_TASK_TYPE | DANMAKU_MATCH_TASK_TYPE
+        )
+    {
+        return Err(ScheduledTaskError::UnsupportedTask);
+    }
+    if owner_type == "LIBRARY"
+        && !matches!(
+            task_type.as_str(),
+            RECONCILIATION_TASK_TYPE
+                | METADATA_TASK_TYPE
+                | CHAPTER_DETECTION_TASK_TYPE
+                | AUTO_LIBRARY_COVER_TASK_TYPE
+        )
+    {
+        return Err(ScheduledTaskError::UnsupportedTask);
+    }
+    Ok((owner_type, owner_id, task_type))
+}
+
 async fn run_thumbnail_scraper_retry(
     database: Database,
     metadata: MetadataReidentifyService,
@@ -640,28 +702,20 @@ async fn run_thumbnail_scraper_retry(
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
-    let applicable = match thumbnails.scraper_first_retry_is_applicable(&item_id).await {
-        Ok(applicable) => applicable,
+    let retry_state = match thumbnails.scraper_first_retry_state(&item_id).await {
+        Ok(retry_state) => retry_state,
         Err(error) => {
             release_thumbnail_scraper_retry(&database, &retry, now).await;
-            tracing::warn!(item_id, %error, "thumbnail scraper retry policy could not be checked");
+            tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be checked");
             return;
         }
     };
-    if !applicable {
+    if !retry_state.applicable {
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }
 
-    let images_missing = match thumbnails.scraper_first_images_missing(&item_id).await {
-        Ok(images_missing) => images_missing,
-        Err(error) => {
-            release_thumbnail_scraper_retry(&database, &retry, now).await;
-            tracing::warn!(item_id, %error, "thumbnail scraper retry images could not be checked");
-            return;
-        }
-    };
-    if !images_missing {
+    if !retry_state.images_missing {
         finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
         return;
     }

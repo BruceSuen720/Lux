@@ -1,5 +1,5 @@
 use super::*;
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
@@ -8,8 +8,53 @@ const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+// One item ID per bind keeps source freshness checks below SQLite's conservative limit.
+const SCAN_LOCAL_METADATA_SOURCE_IDENTITY_BATCH_SIZE: usize = 500;
+pub(crate) const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
 // Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
 const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
+
+fn parse_scan_local_metadata_non_retryable_item_ids(
+    value: &str,
+    max_count: usize,
+) -> Result<Vec<String>, StorageError> {
+    let item_ids = serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+        StorageError::Conflict(format!("invalid scan metadata exclusions: {error}"))
+    })?;
+    if item_ids.len() > max_count
+        || item_ids.iter().any(|item_id| item_id.trim().is_empty())
+        || item_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != item_ids.len()
+    {
+        return Err(StorageError::Conflict(
+            "scan metadata exclusions are invalid".into(),
+        ));
+    }
+    Ok(item_ids)
+}
+
+fn serialize_scan_local_metadata_non_retryable_item_ids(
+    item_ids: &[String],
+    max_count: usize,
+) -> Result<String, StorageError> {
+    if item_ids.len() > max_count
+        || item_ids.iter().any(|item_id| item_id.trim().is_empty())
+        || item_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != item_ids.len()
+    {
+        return Err(StorageError::Conflict(
+            "scan metadata exclusions are invalid".into(),
+        ));
+    }
+    serde_json::to_string(item_ids).map_err(|error| StorageError::Serialization(error.to_string()))
+}
+
 const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
     WHEN item_type IN ('MOVIE', 'SERIES') THEN 0
     WHEN item_type = 'SEASON' THEN 1
@@ -23,6 +68,7 @@ pub(crate) struct StoredScanLocalMetadataBackfillPage {
     pub(crate) library_root_id: String,
     pub(crate) cursor_entry_id: Option<String>,
     pub(crate) entry_ids: Vec<String>,
+    pub(crate) non_retryable_item_ids: Vec<String>,
     pub(crate) next_cursor_entry_id: String,
     pub(crate) has_more: bool,
     pub(crate) attempts: i64,
@@ -191,14 +237,14 @@ impl Database {
                     })?;
                 return Ok(None);
             };
-            let claimed: Option<(Option<String>, i64)> = self
+            let claimed: Option<(Option<String>, i64, String)> = self
                 .query_as(
                     "UPDATE scan_local_metadata_backfills
                      SET status = 'RUNNING', attempts = attempts + 1,
                          next_attempt_at = NULL, error = NULL, updated_at = unixepoch()
                      WHERE library_root_id = ? AND status IN ('PENDING', 'FAILED')
                        AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
-                     RETURNING cursor_entry_id, attempts",
+                     RETURNING cursor_entry_id, attempts, non_retryable_item_ids_json",
                 )
                 .bind(&library_root_id)
                 .fetch_optional(&mut *transaction)
@@ -207,7 +253,7 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            let Some((cursor_entry_id, attempts)) = claimed else {
+            let Some((cursor_entry_id, attempts, non_retryable_item_ids_json)) = claimed else {
                 transaction
                     .commit()
                     .await
@@ -217,6 +263,10 @@ impl Database {
                     })?;
                 continue;
             };
+            let non_retryable_item_ids = parse_scan_local_metadata_non_retryable_item_ids(
+                &non_retryable_item_ids_json,
+                MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
+            )?;
             let mut entry_ids = self
                 .query_scalar::<String>(
                     "SELECT DISTINCT entry.id
@@ -245,6 +295,7 @@ impl Database {
                 self.query(
                     "UPDATE scan_local_metadata_backfills
                      SET status = 'COMPLETED', next_attempt_at = NULL, error = NULL,
+                         non_retryable_item_ids_json = '[]',
                          updated_at = unixepoch()
                      WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
                        AND cursor_entry_id IS NOT DISTINCT FROM ?",
@@ -286,6 +337,7 @@ impl Database {
                 library_root_id,
                 cursor_entry_id,
                 entry_ids,
+                non_retryable_item_ids,
                 next_cursor_entry_id,
                 has_more,
                 attempts,
@@ -297,6 +349,20 @@ impl Database {
         &self,
         page: &StoredScanLocalMetadataBackfillPage,
     ) -> Result<bool, StorageError> {
+        self.complete_scan_local_metadata_backfill_page_with_optional_issue(page, None)
+            .await
+    }
+
+    pub(crate) async fn complete_scan_local_metadata_backfill_page_with_optional_issue(
+        &self,
+        page: &StoredScanLocalMetadataBackfillPage,
+        issue: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if issue.is_some_and(|issue| issue.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES) {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill issue exceeds the storage limit".into(),
+            ));
+        }
         let status = if page.has_more {
             "PENDING"
         } else {
@@ -306,13 +372,15 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_local_metadata_backfills
-                 SET cursor_entry_id = ?, status = ?, next_attempt_at = NULL, error = NULL,
+                 SET cursor_entry_id = ?, status = ?, next_attempt_at = NULL, error = ?,
+                     non_retryable_item_ids_json = '[]',
                      updated_at = unixepoch()
                  WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
                    AND cursor_entry_id IS NOT DISTINCT FROM ?",
             )
             .bind(&page.next_cursor_entry_id)
             .bind(status)
+            .bind(issue)
             .bind(&page.library_root_id)
             .bind(page.attempts)
             .bind(page.cursor_entry_id.as_deref())
@@ -331,22 +399,64 @@ impl Database {
         error: &str,
         next_attempt_at: Option<i64>,
     ) -> Result<bool, StorageError> {
+        self.fail_scan_local_metadata_backfill_page_with_exclusions(
+            page,
+            error,
+            &[],
+            next_attempt_at,
+        )
+        .await
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_backfill_page_with_exclusions(
+        &self,
+        page: &StoredScanLocalMetadataBackfillPage,
+        error: &str,
+        newly_non_retryable_item_ids: &[String],
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
         if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
             return Err(StorageError::Conflict(
                 "scan metadata backfill error exceeds the storage limit".into(),
             ));
         }
+        let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
+        let mut unique_item_ids = non_retryable_item_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for item_id in newly_non_retryable_item_ids {
+            if item_id.trim().is_empty() {
+                return Err(StorageError::Conflict(
+                    "scan metadata backfill exclusion item id is empty".into(),
+                ));
+            }
+            if unique_item_ids.insert(item_id.clone()) {
+                non_retryable_item_ids.push(item_id.clone());
+            }
+        }
+        if non_retryable_item_ids.len() > MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill exclusion count exceeds the page limit".into(),
+            ));
+        }
+        let non_retryable_item_ids_json = serialize_scan_local_metadata_non_retryable_item_ids(
+            &non_retryable_item_ids,
+            MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE,
+        )?;
         let _write_guard = self.acquire_metadata_write_lock().await;
         let result = self
             .query(
                 "UPDATE scan_local_metadata_backfills
                  SET status = 'FAILED', next_attempt_at = ?, error = ?,
+                     non_retryable_item_ids_json = ?,
                      updated_at = unixepoch()
                  WHERE library_root_id = ? AND status = 'RUNNING' AND attempts = ?
                    AND cursor_entry_id IS NOT DISTINCT FROM ?",
             )
             .bind(next_attempt_at)
             .bind(error)
+            .bind(non_retryable_item_ids_json)
             .bind(&page.library_root_id)
             .bind(page.attempts)
             .bind(page.cursor_entry_id.as_deref())
@@ -795,6 +905,68 @@ impl Database {
         Ok(sources)
     }
 
+    pub(crate) async fn list_current_scan_local_metadata_item_ids(
+        &self,
+        source_identities: &[(String, String)],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut expected_source_by_item = HashMap::with_capacity(source_identities.len());
+        for (item_id, source_id) in source_identities {
+            expected_source_by_item.insert(item_id.as_str(), source_id.as_str());
+        }
+        let mut item_ids = expected_source_by_item.keys().copied().collect::<Vec<_>>();
+        item_ids.sort_unstable();
+
+        let mut current_item_ids = Vec::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(SCAN_LOCAL_METADATA_SOURCE_IDENTITY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, preferred.id AS source_id
+                 FROM media_items mi
+                 JOIN media_sources preferred ON preferred.id = (
+                     SELECT candidate.id FROM media_sources candidate
+                     JOIN filesystem_entries candidate_entry
+                       ON candidate_entry.id = candidate.filesystem_entry_id
+                     WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
+                     ORDER BY candidate.is_default DESC, candidate.id
+                     LIMIT 1
+                 )
+                 JOIN filesystem_entries preferred_entry
+                   ON preferred_entry.id = preferred.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
+                   AND preferred_entry.is_missing = 0"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id: String = row.get("item_id");
+                let source_id: String = row.get("source_id");
+                if expected_source_by_item.get(item_id.as_str()) == Some(&source_id.as_str()) {
+                    current_item_ids.push(item_id);
+                }
+            }
+        }
+
+        current_item_ids.sort_unstable();
+        current_item_ids.dedup();
+        Ok(current_item_ids)
+    }
+
     pub(crate) async fn mark_scan_local_metadata_images_complete(
         &self,
         batch_id: &str,
@@ -897,6 +1069,41 @@ impl Database {
             .await
     }
 
+    pub(crate) async fn complete_scan_local_metadata_batch_with_outcome(
+        &self,
+        batch_id: &str,
+        issue: Option<&str>,
+        non_retryable_item_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        if issue.is_some_and(|issue| issue.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES) {
+            return Err(StorageError::Conflict(
+                "scan local metadata issue exceeds the storage limit".into(),
+            ));
+        }
+        let non_retryable_item_ids_json = serialize_scan_local_metadata_non_retryable_item_ids(
+            non_retryable_item_ids,
+            MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES,
+        )?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'COMPLETED', next_attempt_at = NULL, error = ?,
+                     non_retryable_item_ids_json = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(issue)
+            .bind(non_retryable_item_ids_json)
+            .bind(batch_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn fail_scan_local_metadata_batch(
         &self,
         batch_id: &str,
@@ -910,6 +1117,43 @@ impl Database {
         }
         self.transition_scan_local_metadata_batch(batch_id, next_attempt_at, Some(error))
             .await
+    }
+
+    pub(crate) async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+        &self,
+        batch_id: &str,
+        error: &str,
+        non_retryable_item_ids: &[String],
+        next_attempt_at: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        if error.len() > MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES {
+            return Err(StorageError::Conflict(
+                "scan local metadata error exceeds the storage limit".into(),
+            ));
+        }
+        let non_retryable_item_ids_json = serialize_scan_local_metadata_non_retryable_item_ids(
+            non_retryable_item_ids,
+            MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES,
+        )?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let result = self
+            .query(
+                "UPDATE scan_local_metadata_batches
+                 SET status = 'FAILED', next_attempt_at = ?, error = ?,
+                     non_retryable_item_ids_json = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(next_attempt_at)
+            .bind(error)
+            .bind(non_retryable_item_ids_json)
+            .bind(batch_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn transition_scan_local_metadata_batch(
@@ -8174,7 +8418,47 @@ impl Database {
         item_ids: &[String],
     ) -> Result<Vec<String>, StorageError> {
         let mut job_ids = Vec::new();
-        for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        let mut remaining = item_ids.to_vec();
+        if let Some((queued_job_id, queued_count)) = self
+            .query_as::<(String, i64)>(
+                "SELECT id, total_count
+                 FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'
+                   AND status = 'QUEUED' AND cancel_requested = 0
+                 ORDER BY created_at, id
+                 LIMIT 1",
+            )
+            .bind(library_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let capacity = 100usize.saturating_sub(usize::try_from(queued_count).unwrap_or(100));
+            let take = capacity.min(remaining.len());
+            if take > 0 {
+                let queued_items = remaining.drain(..take).collect::<Vec<_>>();
+                self.insert_fill_missing_job_items(transaction, &queued_job_id, &queued_items)
+                    .await?;
+                self.query(
+                    "UPDATE metadata_reidentify_jobs
+                     SET total_count = total_count + ?, updated_at = unixepoch()
+                     WHERE id = ? AND status = 'QUEUED'",
+                )
+                .bind(i64::try_from(queued_items.len()).unwrap_or(i64::MAX))
+                .bind(&queued_job_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                job_ids.push(queued_job_id);
+            }
+        }
+        for chunk in remaining.chunks(BATCH_INSERT_CHUNK_SIZE) {
             if chunk.is_empty() {
                 continue;
             }
@@ -8194,34 +8478,119 @@ impl Database {
                 source,
             })?;
 
-            let values = std::iter::repeat_n(
-                format!(
-                    "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
-                     FROM media_items WHERE id = ?))"
-                ),
-                chunk.len(),
-            )
-            .collect::<Vec<_>>()
-            .join(", ");
-            let query = format!(
-                "INSERT INTO metadata_reidentify_job_items
-                     (job_id, item_id, status, priority)
-                 VALUES {values}"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for item_id in chunk {
-                statement = statement.bind(&job_id).bind(item_id).bind(item_id);
-            }
-            statement
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            self.insert_fill_missing_job_items(transaction, &job_id, chunk)
+                .await?;
             job_ids.push(job_id);
         }
         Ok(job_ids)
+    }
+
+    pub(crate) async fn create_or_merge_fill_missing_job(
+        &self,
+        library_id: &str,
+        item_ids: &[String],
+    ) -> Result<String, StorageError> {
+        if library_id.trim().is_empty() || item_ids.is_empty() || item_ids.len() > 100 {
+            return Err(StorageError::Conflict(
+                "invalid fill-missing job request".to_owned(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.lock_media_items_for_update(&mut transaction, item_ids)
+            .await?;
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = self
+            .query(sqlx::AssertSqlSafe(format!(
+                "SELECT jobs.id, job_items.item_id
+             FROM metadata_reidentify_job_items job_items
+             JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+             WHERE jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
+               AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
+               AND (jobs.status <> 'DEFERRED' OR jobs.updated_at >= unixepoch() - 3600)
+               AND jobs.cancel_requested = 0
+               AND job_items.status IN ('PENDING', 'RUNNING')
+               AND job_items.item_id IN ({placeholders})"
+            )))
+            .bind(library_id);
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        let active_rows = statement
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut active_items = std::collections::HashSet::with_capacity(active_rows.len());
+        let mut existing_job_id = None;
+        for row in active_rows {
+            existing_job_id.get_or_insert_with(|| row.get("id"));
+            active_items.insert(row.get::<String, _>("item_id"));
+        }
+        let remaining = item_ids
+            .iter()
+            .filter(|item_id| !active_items.contains(*item_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let job_id = if remaining.is_empty() {
+            existing_job_id.ok_or_else(|| {
+                StorageError::Conflict("fill-missing job has no schedulable items".to_owned())
+            })?
+        } else {
+            self.enqueue_fill_missing_jobs_in_transaction(&mut transaction, library_id, &remaining)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    StorageError::Conflict("fill-missing job was not created".to_owned())
+                })?
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(job_id)
+    }
+
+    async fn insert_fill_missing_job_items(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let values = std::iter::repeat_n(
+            format!(
+                "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
+                 FROM media_items WHERE id = ?))"
+            ),
+            item_ids.len(),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+        let query = format!(
+            "INSERT INTO metadata_reidentify_job_items
+                 (job_id, item_id, status, priority)
+             VALUES {values}"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for item_id in item_ids {
+            statement = statement.bind(job_id).bind(item_id).bind(item_id);
+        }
+        statement
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
     }
 
     pub(crate) async fn create_metadata_reidentify_library_job(
@@ -8423,6 +8792,32 @@ impl Database {
             .await
         };
         rows.map(|rows| {
+            rows.into_iter()
+                .map(stored_metadata_reidentify_job)
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_metadata_reidentify_jobs_for_activity(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
+        self.query(
+            "SELECT id, status, processed_count, total_count, error,
+                    created_at, updated_at, started_at, finished_at, mode,
+                    cancel_requested, library_id, job_scope, 0 AS pending_count
+             FROM metadata_reidentify_jobs
+             WHERE status IN ('QUEUED', 'RUNNING')
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
             rows.into_iter()
                 .map(stored_metadata_reidentify_job)
                 .collect()
@@ -8891,6 +9286,30 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let cancel_requested: i64 = self
+            .query_scalar("SELECT cancel_requested FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if cancel_requested != 0 || status == "CANCELLED" {
+            self.query(
+                "UPDATE metadata_reidentify_job_items
+                 SET status = 'FAILED', candidate_count = 0,
+                     error = 'JOB_CANCELLED', updated_at = unixepoch()
+                 WHERE job_id = ? AND status IN ('PENDING', 'RUNNING')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
@@ -8992,7 +9411,7 @@ impl Database {
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
                      updated_at = unixepoch()
-                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING')",
+                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING', 'CANCELLED')",
             )
             .bind(job_id)
             .execute(&mut *transaction)
@@ -10855,7 +11274,7 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) async fn delete_media_sources(
+    pub(crate) async fn delete_media_sources_atomically(
         &self,
         sources: &[(String, String)],
     ) -> Result<bool, StorageError> {
@@ -10870,76 +11289,17 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let mut source_item_ids = Vec::new();
-        let mut parent_item_ids = Vec::new();
-        let mut series_item_ids = Vec::new();
-        for (item_id, source_id) in sources {
-            let Some((old_item_id, parent_id, series_id)) = self
-                .query_as::<(String, Option<String>, Option<String>)>(
-                    "SELECT ms.item_id, old_item.parent_id, old_item.series_id
-                     FROM media_sources ms
-                     JOIN media_items old_item ON old_item.id = ms.item_id
-                     WHERE ms.id = ? AND ms.item_id = ?",
-                )
-                .bind(source_id)
-                .bind(item_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-            else {
+        for source_batch in sources.chunks(MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE) {
+            let source_pairs = source_batch
+                .iter()
+                .map(|(item_id, source_id)| (item_id.as_str(), source_id.as_str()))
+                .collect::<Vec<_>>();
+            if !self
+                .delete_media_sources_in_transaction(&mut transaction, &source_pairs)
+                .await?
+            {
                 return Ok(false);
-            };
-            self.query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
-                .bind(source_id)
-                .bind(&old_item_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            if !source_item_ids.iter().any(|id| id == &old_item_id) {
-                source_item_ids.push(old_item_id);
             }
-            if let Some(parent_id) = parent_id {
-                if !parent_item_ids.iter().any(|id| id == &parent_id) {
-                    parent_item_ids.push(parent_id);
-                }
-            }
-            if let Some(series_id) = series_id {
-                if !series_item_ids.iter().any(|id| id == &series_id) {
-                    series_item_ids.push(series_id);
-                }
-            }
-        }
-        for related_item_id in source_item_ids
-            .into_iter()
-            .chain(parent_item_ids)
-            .chain(series_item_ids)
-        {
-            self.query(
-                "UPDATE media_items
-                 SET removed_at = unixepoch(), updated_at = unixepoch()
-                 WHERE id = ? AND removed_at IS NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM media_sources WHERE item_id = media_items.id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM media_items child
-                       WHERE child.parent_id = media_items.id
-                         AND child.removed_at IS NULL
-                   )",
-            )
-            .bind(related_item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         }
         transaction
             .commit()
@@ -10950,13 +11310,130 @@ impl Database {
             })?;
         Ok(true)
     }
+
+    async fn delete_media_sources_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_pairs: &[(&str, &str)],
+    ) -> Result<bool, StorageError> {
+        if source_pairs.is_empty() {
+            return Ok(true);
+        }
+        let source_placeholders = std::iter::repeat_n("?", source_pairs.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut lookup = self.query_as::<(String, String, Option<String>, Option<String>)>(
+            sqlx::AssertSqlSafe(format!(
+                "SELECT ms.id, ms.item_id, old_item.parent_id, old_item.series_id
+                 FROM media_sources ms
+                 JOIN media_items old_item ON old_item.id = ms.item_id
+                 WHERE ms.id IN ({source_placeholders})"
+            )),
+        );
+        for (_, source_id) in source_pairs {
+            lookup = lookup.bind(source_id);
+        }
+        let rows = lookup
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let requested_pairs = source_pairs.iter().copied().collect::<HashSet<_>>();
+        if rows.len() != source_pairs.len()
+            || rows.iter().any(|(stored_source_id, stored_item_id, _, _)| {
+                !requested_pairs.contains(&(stored_item_id.as_str(), stored_source_id.as_str()))
+            })
+        {
+            return Ok(false);
+        }
+
+        let mut item_ids = HashSet::with_capacity(rows.len());
+        let mut parent_ids = HashSet::with_capacity(rows.len());
+        let mut series_ids = HashSet::with_capacity(rows.len());
+        for (_, old_item_id, parent_id, series_id) in rows {
+            item_ids.insert(old_item_id);
+            if let Some(parent_id) = parent_id {
+                parent_ids.insert(parent_id);
+            }
+            if let Some(series_id) = series_id {
+                series_ids.insert(series_id);
+            }
+        }
+
+        let delete_predicates = std::iter::repeat_n("(id = ? AND item_id = ?)", source_pairs.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM media_sources WHERE {delete_predicates}"
+        )));
+        for (item_id, source_id) in source_pairs {
+            delete_query = delete_query.bind(source_id).bind(item_id);
+        }
+        let deleted = delete_query
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if usize::try_from(deleted.rows_affected()).unwrap_or(usize::MAX) != source_pairs.len() {
+            return Ok(false);
+        }
+        self.mark_media_items_removed_in_transaction(transaction, &item_ids)
+            .await?;
+        self.mark_media_items_removed_in_transaction(transaction, &parent_ids)
+            .await?;
+        self.mark_media_items_removed_in_transaction(transaction, &series_ids)
+            .await?;
+        Ok(true)
+    }
+
+    async fn mark_media_items_removed_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_ids: &HashSet<String>,
+    ) -> Result<(), StorageError> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut update_query = self.query(sqlx::AssertSqlSafe(format!(
+            "UPDATE media_items
+             SET removed_at = unixepoch(), updated_at = unixepoch()
+             WHERE id IN ({placeholders}) AND removed_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_sources WHERE item_id = media_items.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_items child
+                   WHERE child.parent_id = media_items.id
+                     AND child.removed_at IS NULL
+               )"
+        )));
+        for item_id in item_ids {
+            update_query = update_query.bind(item_id);
+        }
+        update_query
+            .execute(&mut **transaction)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
+        Database, MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE, NewScanManifest, NewScanManifestDelta,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
+        prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
 
@@ -10987,6 +11464,200 @@ mod tests {
             .await?;
         assert_eq!(status, "CANCELLED");
         database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finishing_a_cancelled_scan_job_cannot_restore_terminal_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+                 VALUES ('job', 'lib', 'RECONCILE_LIBRARY', 'RUNNING', 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        database.request_scan_job_cancel("job").await?;
+        database
+            .finish_scan_job("job", "COMPLETED", Some("late worker completion"))
+            .await?;
+        let (status, error): (String, Option<String>) = database
+            .query_as("SELECT status, error FROM scan_jobs WHERE id = 'job'")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(status, "CANCELLED");
+        assert_eq!(error, None);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_completeness_reuses_current_source_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/media', '/media', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('item', 'lib', 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES
+                    ('entry-old', 'root', 'Movie/movie.mkv', 'FILE', 10, 1, 'generation'),
+                    ('entry-new', 'root', 'Movie/movie-alt.mkv', 'FILE', 10, 1, 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+                 ) VALUES
+                    ('source-old', 'item', 'LOCAL_FILE', 'entry-old', 1, 'READY'),
+                    ('source-new', 'item', 'LOCAL_FILE', 'entry-new', 0, 'READY')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let source_ids = vec!["entry-old".to_owned()];
+        database.reset_query_count();
+        let sources = database
+            .list_scan_local_metadata_sources(&source_ids)
+            .await?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id, "source-old");
+        let metadata = database
+            .list_active_media_item_metadata_with_libraries(&["item".to_owned()])
+            .await?;
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the old path expands the directory again"
+        );
+
+        let identities = vec![("item".to_owned(), "source-old".to_owned())];
+        database.reset_query_count();
+        assert_eq!(
+            database
+                .list_current_scan_local_metadata_item_ids(&identities)
+                .await?,
+            vec!["item".to_owned()]
+        );
+        let metadata = database
+            .list_active_media_item_metadata_with_libraries(&["item".to_owned()])
+            .await?;
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(database.query_count(), 2);
+
+        database
+            .query("UPDATE media_sources SET is_default = 0 WHERE id = 'source-old'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("UPDATE media_sources SET is_default = 1 WHERE id = 'source-new'")
+            .execute(database.pool())
+            .await?;
+        database.reset_query_count();
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&identities)
+                .await?
+                .is_empty(),
+            "a preferred source changed after NFO processing, so the old identity is stale"
+        );
+        assert_eq!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?,
+            vec!["item".to_owned()]
+        );
+        database
+            .query("UPDATE media_items SET removed_at = unixepoch() WHERE id = 'item'")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?
+                .is_empty(),
+            "a removed item cannot pass freshness validation"
+        );
+        database
+            .query("UPDATE media_items SET removed_at = NULL WHERE id = 'item'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'entry-new'")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?
+                .is_empty(),
+            "a preferred source with a missing entry is not current"
+        );
+        database
+            .query("UPDATE filesystem_entries SET is_missing = 0 WHERE id = 'entry-new'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("DELETE FROM media_sources WHERE id = 'source-new'")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?
+                .is_empty(),
+            "a source deleted after NFO processing cannot pass freshness validation"
+        );
         Ok(())
     }
 
@@ -11466,5 +12137,157 @@ mod tests {
             prune_sidecar_directories(vec!["Show/Season 01".to_owned(), ".".to_owned()]),
             vec![".".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_media_sources_batches_item_cleanup_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('item', 'lib', 'MOVIE', 'Item', 'item', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        for source_id in ["source-a", "source-b"] {
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, 'item', 'LOCAL_FILE', 1, 'PENDING')",
+                )
+                .bind(source_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        database.reset_query_count();
+        let invalid_sources = [("wrong-item", "source-a"), ("item", "missing")]
+            .map(|(item_id, source_id)| (item_id.to_owned(), source_id.to_owned()));
+        assert!(
+            !database
+                .delete_media_sources_atomically(&invalid_sources)
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "invalid pairs stop before writes"
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            2
+        );
+        database.reset_query_count();
+        let sources = [("item", "source-a"), ("item", "source-b")]
+            .map(|(item_id, source_id)| (item_id.to_owned(), source_id.to_owned()));
+        assert!(database.delete_media_sources_atomically(&sources).await?);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "two source rows should share one lookup, delete, and hierarchy cleanup"
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert!(
+            database
+                .query_scalar::<Option<i64>>("SELECT removed_at FROM media_items WHERE id = 'item'")
+                .fetch_one(database.pool())
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_media_sources_atomically_rolls_back_across_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('item', 'lib', 'MOVIE', 'Item', 'item', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        let sources = (0..=MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE)
+            .map(|index| ("item".to_owned(), format!("source-{index}")))
+            .collect::<Vec<_>>();
+        for (_, source_id) in &sources {
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, 'item', 'LOCAL_FILE', 1, 'PENDING')",
+                )
+                .bind(source_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        let mut missing_source = sources.clone();
+        missing_source[MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE].1 = "missing".to_owned();
+        assert!(
+            !database
+                .delete_media_sources_atomically(&missing_source)
+                .await?
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            i64::try_from(sources.len())?
+        );
+
+        database.reset_query_count();
+        assert!(database.delete_media_sources_atomically(&sources).await?);
+        assert_eq!(
+            database.query_count(),
+            6,
+            "each of two source batches should use one lookup, delete, and hierarchy cleanup"
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert!(
+            database
+                .query_scalar::<Option<i64>>("SELECT removed_at FROM media_items WHERE id = 'item'")
+                .fetch_one(database.pool())
+                .await?
+                .is_some()
+        );
+        Ok(())
     }
 }
