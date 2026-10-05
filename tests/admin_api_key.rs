@@ -33,10 +33,6 @@ async fn shared_admin_key_survives_restart_and_can_be_revoked()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    let users = UserStore::new(database.clone())?;
-    let admin = users
-        .create_initial_admin("Admin", "Administrator", "correct horse battery staple")
-        .await?;
     let service = AdminApiKeyService::new(config.config_dir.clone(), database.clone());
 
     assert!(service.current().await?.is_none());
@@ -53,19 +49,19 @@ async fn shared_admin_key_survives_restart_and_can_be_revoked()
         0o600
     );
     assert_eq!(
-        service.resolve(&key).await?.map(|user| user.id),
-        Some(admin.id)
+        service.resolve_principal(&key).await?,
+        Some(luxd::auth::users::AuthenticationPrincipal::SharedAdminApiKey)
     );
 
     let restarted = AdminApiKeyService::new(config.config_dir.clone(), database.clone());
     assert_eq!(
-        restarted.resolve(&key).await?.map(|user| user.id),
-        Some(admin.id)
+        restarted.resolve_principal(&key).await?,
+        Some(luxd::auth::users::AuthenticationPrincipal::SharedAdminApiKey)
     );
 
     service.revoke().await?;
     assert!(service.current().await?.is_none());
-    assert!(service.resolve(&key).await?.is_none());
+    assert!(service.resolve_principal(&key).await?.is_none());
 
     database.close().await;
     Ok(())
@@ -194,6 +190,24 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let target = users
         .create_user("target", "Target", "target password", false)
         .await?;
+    let disabled_target = users
+        .create_user(
+            "disabled-target",
+            "Disabled Target",
+            "disabled password",
+            false,
+        )
+        .await?;
+    users
+        .update_user(
+            &disabled_target.id.to_string(),
+            UserUpdate {
+                is_disabled: Some(true),
+                ..UserUpdate::default()
+            },
+        )
+        .await?
+        .ok_or("disabled target disappeared")?;
     users
         .update_user(
             &manager.id.to_string(),
@@ -251,6 +265,19 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let views_body = views.json::<serde_json::Value>().await?;
     assert_eq!(views_body["TotalRecordCount"], 1);
     assert_eq!(views_body["Items"][0]["Id"], emby_library_id);
+
+    for unknown_or_disabled_user_id in [
+        "00000000-0000-4000-8000-000000000001".to_owned(),
+        disabled_target.id.to_string(),
+    ] {
+        let views = client
+            .get(format!(
+                "http://{address}/Users/{unknown_or_disabled_user_id}/Views?api_key={key}"
+            ))
+            .send()
+            .await?;
+        assert_eq!(views.status(), reqwest::StatusCode::NOT_FOUND);
+    }
 
     for path in ["/Library/VirtualFolders", "/emby/Library/VirtualFolders"] {
         let virtual_folders = client
@@ -388,6 +415,27 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
         .as_str()
         .ok_or("missing Emby movie id")?
         .to_owned();
+    let marked_played = client
+        .post(format!(
+            "http://{address}/Users/{}/PlayedItems/{movie_id}?api_key={key}",
+            target.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(marked_played.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        marked_played.json::<serde_json::Value>().await?["Played"],
+        true
+    );
+    let playback_event = client
+        .post(format!("http://{address}/Sessions/Playing?api_key={key}"))
+        .json(&json!({
+            "ItemId": movie_id,
+            "PositionTicks": 123,
+        }))
+        .send()
+        .await?;
+    assert_eq!(playback_event.status(), reqwest::StatusCode::UNAUTHORIZED);
     let movie_detail = client
         .get(format!(
             "http://{address}/emby/Users/{}/Items/{movie_id}?Fields=MediaSources&api_key={key}",
@@ -397,6 +445,59 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
         .await?;
     assert_eq!(movie_detail.status(), reqwest::StatusCode::OK);
     assert!(movie_detail.json::<serde_json::Value>().await?["MediaSources"].is_array());
+
+    let search_hints = client
+        .get(format!(
+            "http://{address}/Search/Hints?SearchTerm=Movie&api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(search_hints.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        search_hints.json::<serde_json::Value>().await?["TotalRecordCount"],
+        1
+    );
+
+    let stream = client
+        .get(format!(
+            "http://{address}/Videos/{movie_id}/stream?api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(stream.bytes().await?.as_ref(), b"movie");
+
+    let internal_movie_id = uuid::Uuid::from_u128(movie_id.parse()?).to_string();
+    sqlx::query(
+        "INSERT INTO playback_sessions (
+            id, user_id, item_id, play_session_id, device_id, state, last_event_at
+         ) VALUES ('shared-key-session', ?, ?, 'shared-key-play', 'test-device', 'PLAYING', unixepoch())",
+    )
+    .bind(target.id.to_string())
+    .bind(&internal_movie_id)
+    .execute(database.pool())
+    .await?;
+    let sessions = client
+        .get(format!("http://{address}/Sessions?api_key={key}"))
+        .send()
+        .await?;
+    assert_eq!(sessions.status(), reqwest::StatusCode::OK);
+    let sessions_body = sessions.json::<serde_json::Value>().await?;
+    assert_eq!(sessions_body[0]["Id"], "shared-key-session");
+    assert_eq!(sessions_body[0]["UserName"], "Target");
+
+    let stop_session = client
+        .post(format!(
+            "http://{address}/Sessions/shared-key-session/Playing/Stop?api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(stop_session.status(), reqwest::StatusCode::NO_CONTENT);
+    let session_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = 'shared-key-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(session_state, "STOPPED");
 
     server.abort();
     database.close().await;
