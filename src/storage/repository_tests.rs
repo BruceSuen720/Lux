@@ -3761,7 +3761,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         (
             "FILL_MISSING".to_owned(),
             "QUEUED".to_owned(),
-            1,
+            2,
             "ITEMS".to_owned()
         )
     );
@@ -3773,7 +3773,10 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .fetch_all(database.pool())
         .await
         .expect("scheduled item page");
-    assert_eq!(scheduled_items, vec![item_ids[1].clone()]);
+    assert_eq!(
+        scheduled_items,
+        vec![item_ids[0].clone(), item_ids[1].clone()]
+    );
 
     let queued_merge_fingerprint = b"queued-merge-v1";
     assert!(
@@ -3811,7 +3814,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         )
         .await
         .expect("merge into queued fill-missing job");
-    assert_eq!(merged.scheduled_job_ids, vec![scheduled_job_id.clone()]);
+    assert!(merged.scheduled_job_ids.is_empty());
     assert_eq!(
         database
             .query_scalar::<i64>("SELECT total_count FROM metadata_reidentify_jobs WHERE id = ?",)
@@ -3886,8 +3889,8 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             .fetch_one(database.pool())
             .await
             .expect("count fill-missing jobs"),
-        4,
-        "replay, manual, and incremental-policy jobs plus one eligible auto job are retained"
+        2,
+        "queued fill-missing jobs are coalesced per library"
     );
 
     let pagination_root_path = temp_dir.path().join("Pagination Movies");
