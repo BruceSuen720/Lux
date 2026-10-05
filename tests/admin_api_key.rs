@@ -3,8 +3,10 @@ use luxd::{
     application::setup::SetupService,
     application::{libraries::LibraryService, scanner::LibraryScanner},
     auth::{
-        admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService,
-        users::UserStore,
+        admin_api_key::AdminApiKeyService,
+        emby::EmbyAuthService,
+        sessions::WebAuthService,
+        users::{UserStore, UserUpdate},
     },
     config::Config,
     library::LibraryKind,
@@ -176,6 +178,20 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let admin = setup
         .complete("Admin", "Administrator", "correct horse battery staple")
         .await?;
+    let users = UserStore::new(database.clone())?;
+    let manager = users
+        .create_user("aaaoperator", "Operator", "operator password", false)
+        .await?;
+    users
+        .update_user(
+            &manager.id.to_string(),
+            UserUpdate {
+                can_manage_server: Some(true),
+                ..UserUpdate::default()
+            },
+        )
+        .await?
+        .ok_or("operator disappeared after permission update")?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -342,6 +358,28 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
         items.json::<serde_json::Value>().await?["TotalRecordCount"],
         1
     );
+
+    let movies = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=10&api_key={key}",
+            admin.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(movies.status(), reqwest::StatusCode::OK);
+    let movie_id = movies.json::<serde_json::Value>().await?["Items"][0]["Id"]
+        .as_str()
+        .ok_or("missing Emby movie id")?
+        .to_owned();
+    let movie_detail = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Items/{movie_id}?Fields=MediaSources&api_key={key}",
+            admin.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(movie_detail.status(), reqwest::StatusCode::OK);
+    assert!(movie_detail.json::<serde_json::Value>().await?["MediaSources"].is_array());
 
     server.abort();
     database.close().await;
