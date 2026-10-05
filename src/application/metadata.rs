@@ -43,7 +43,7 @@ fn merged_provider_ids_json(
     let mut merged = current_json
         .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
         .unwrap_or_default();
-    let before = merged.clone();
+    let mut changed = false;
     for (provider, provider_id) in incoming {
         let provider = provider.trim();
         let provider_id = provider_id.trim();
@@ -56,8 +56,9 @@ fn merged_provider_ids_json(
             continue;
         }
         merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+        changed = true;
     }
-    (merged != before).then(|| serde_json::to_string(&merged).unwrap_or_default())
+    changed.then(|| serde_json::to_string(&merged).unwrap_or_default())
 }
 
 fn local_image_read_permits() -> Arc<Semaphore> {
