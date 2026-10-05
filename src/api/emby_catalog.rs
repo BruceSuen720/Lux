@@ -785,7 +785,7 @@ pub(super) async fn emby_user_root_response(
     Json(json!({
         "Name": "Media Folders",
         "SortName": "Media Folders",
-        "Id": principal.user_id.to_string(),
+        "Id": principal.user_id_string(),
         "ServerId": state.server_id,
         "Type": "Folder",
         "IsFolder": true,
@@ -820,7 +820,7 @@ pub(super) async fn emby_visible_library_items(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let views = libraries
         .list_libraries_for_user(
-            &principal.user_id.to_string(),
+            &principal.user_id_string(),
             principal.is_admin,
             &accessible_library_ids,
         )
@@ -1848,7 +1848,7 @@ pub(super) async fn emby_list_items(
     can_delete: bool,
     query: &EmbyItemsQuery,
 ) -> Response {
-    let root_id = principal.user_id.to_string();
+    let root_id = principal.user_id_string();
     if emby_query_targets_user_root_views(query, &root_id) {
         return match emby_visible_library_items(state, principal).await {
             Ok(items) => Json(json!({
@@ -1870,7 +1870,7 @@ pub(super) async fn emby_list_items(
             let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
             emby_catalog_page_for_user_with_preferred_source_and_options(
                 state,
-                &principal.user_id.to_string(),
+                &principal.user_id_string(),
                 &page,
                 query.fields.as_deref(),
                 can_download,
@@ -1972,14 +1972,14 @@ pub(super) async fn emby_single_id_lookup_response(
         None
     };
     let user_state = match database
-        .find_user_item_state(&principal.user_id.to_string(), &item.id)
+        .find_user_item_state(&principal.user_id_string(), &item.id)
         .await
     {
         Ok(state) => state,
         Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
     };
     let unplayed_item_count =
-        match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item).await {
+        match emby_unplayed_episode_count(catalog, &principal.user_id_string(), &item).await {
             Ok(count) => count,
             Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
         };
@@ -2487,7 +2487,7 @@ pub(super) async fn emby_item_response(
     can_delete: bool,
     fields: Option<&str>,
 ) -> Response {
-    if item_id == principal.user_id.to_string() {
+    if item_id == principal.user_id_string() {
         return emby_user_root_response(state, principal).await;
     }
     let response_fields = emby_item_detail_response_fields(fields);
@@ -2553,13 +2553,16 @@ pub(super) async fn emby_item_response(
         };
     match catalog_item {
         Some(item) if resolved_from_media_source_id => {
-            let unplayed_item_count =
-                match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
+            let unplayed_item_count = match emby_unplayed_episode_count(
+                catalog,
+                &principal.user_id_string(),
+                &item,
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
@@ -2599,7 +2602,7 @@ pub(super) async fn emby_item_response(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            let user_id = principal.user_id.to_string();
+            let user_id = principal.user_id_string();
             let (nfo, user_state, aspect_ratio, actors) = tokio::join!(
                 async {
                     if work_plan.read_nfo {
@@ -2640,13 +2643,16 @@ pub(super) async fn emby_item_response(
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let unplayed_item_count =
-                match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
+            let unplayed_item_count = match emby_unplayed_episode_count(
+                catalog,
+                &principal.user_id_string(),
+                &item,
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,

@@ -286,7 +286,7 @@ impl LibraryPageCache {
         request: LibraryPageRequest,
     ) -> Result<CatalogPage, CatalogError> {
         let key = LibraryPageCacheKey {
-            user_id: request.principal.user_id.to_string(),
+            user_id: request.principal.user_id_string(),
             is_admin: request.principal.is_admin,
             library_id: request.library_id.clone(),
             filter: request.filter.clone(),
@@ -542,7 +542,7 @@ impl CatalogService {
         request: &LibraryPageRequest,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = vec![request.library_id.clone()];
-        let user_id = request.principal.user_id.to_string();
+        let user_id = request.principal.user_id_string();
         let filter = &request.filter;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
@@ -594,7 +594,7 @@ impl CatalogService {
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let library_ids = self.access.accessible_library_ids(principal).await?;
-        let user_id = principal.user_id.to_string();
+        let user_id = principal.user_id_string();
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -1424,7 +1424,7 @@ impl CatalogService {
             Some(self.access.accessible_library_ids(principal).await?)
         };
         let key = SearchFlightKey {
-            user_id: principal.user_id.to_string(),
+            user_id: principal.user_id_string(),
             is_admin: principal.is_admin,
             library_ids: library_ids.clone(),
             query: query.to_owned(),
