@@ -81,11 +81,15 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
     };
     let database = Database::connect(&config).await?;
     let users = UserStore::new(database.clone())?;
-    users
+    let admin = users
         .create_initial_admin("Admin", "Administrator", "correct horse battery staple")
         .await?;
     let key_service = AdminApiKeyService::new(config.config_dir.clone(), database.clone());
     let key = key_service.rotate().await?;
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let setup = SetupService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
         config,
@@ -147,6 +151,10 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
     let audit_body = audit.json::<serde_json::Value>().await?;
     assert_eq!(audit_body["events"][0]["metadata"]["auth"], "admin_api_key");
     assert!(!audit_body.to_string().contains(&key));
+
+    users
+        .create_initial_admin("Admin", "Administrator", "correct horse battery staple")
+        .await?;
 
     let emby = client
         .get(format!("http://{address}/System/Info?api_key={key}"))

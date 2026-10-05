@@ -1057,7 +1057,7 @@ async fn standard_emby_playback_api_key(
     // for administration. Never copy it into a playback URL, even when it
     // was supplied as the query api_key.
     if let Some(service) = state.admin_api_key.as_ref() {
-        match service.resolve(&token).await {
+        match service.resolve_principal(&token).await {
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) => {}
         }

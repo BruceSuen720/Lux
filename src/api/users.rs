@@ -2011,9 +2011,9 @@ async fn resolve_lux_client_user(
     state: &AppState,
 ) -> Result<Option<UserRecord>, Response> {
     if lux_api_key_from_headers(headers).is_some()
-        && let Some(user) = resolve_shared_admin_api_key(headers, state).await?
+        && let Some(principal) = resolve_shared_admin_api_key(headers, state).await?
     {
-        return Ok(Some(user));
+        return Ok(principal.user().cloned());
     }
 
     let Some(token) = lux_user_token_from_headers(headers) else {
