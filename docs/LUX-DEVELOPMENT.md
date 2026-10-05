@@ -8373,11 +8373,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 默认值完整的 unchanged NFO 路径省去空修复查询/事务；查询计数回归证明调用数下降。
-- [ ] 缺少 premiere date 或 provider ID 时仍按原逻辑补齐；已有值不覆盖。
-- [ ] metadata、NFO cache、格式、build 和 Clippy 回归通过；性能记录不外推 PostgreSQL/NAS/生产墙钟。
+- [x] 默认值完整的 unchanged NFO 路径省去空修复查询/事务；查询计数回归证明调用数下降。
+- [x] 缺少 premiere date 或 provider ID 时仍按原逻辑补齐；已有值不覆盖。
+- [x] metadata、NFO cache、格式、build 和 Clippy 回归通过；性能记录不外推 PostgreSQL/NAS/生产墙钟。
 
 预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写 unchanged NFO 查询计数回归，再增加保守的快照判断。
+
+结果（2026-10-05，`0f4dcdcc`）：unchanged NFO 且 rich cache 可用时，先用本轮已读取的 metadata 快照判断 provider IDs 与 premiere date；两者已有值就跳过修复存储调用，仍缺字段则走原子修复事务。回归覆盖两者都缺、仅 provider ID 缺、仅 premiere date 缺及已有值不得覆盖。定向 metadata/NFO cache 测试、全目标 Rust 测试、build、fmt 与 Clippy 通过。SQLite 单项测试查询调用从 4 次降到 3 次；该计数不是墙钟指标，也不外推 PostgreSQL、FNOS 或 x86 性能。详见 `docs/PERFORMANCE.md`。
 
 #### 阶段 23 总体验收与阶段门
 

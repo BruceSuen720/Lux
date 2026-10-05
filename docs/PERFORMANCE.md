@@ -1360,3 +1360,9 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 ### LUX-385 取消 metadata job 的残留 item 清理
 
 取消 job 时，仍为 `PENDING/RUNNING` 的 item 统一进入 `FAILED/JOB_CANCELLED`，历史取消 job 由 migration 进行同样的幂等收尾；管理员 retry 时恢复为 `PENDING`。该记录说明队列状态收敛和历史数据清理边界，不代表 migration 执行墙钟或 FNOS CPU 收益。
+
+### LUX-386 unchanged NFO 默认值修复查询调用
+
+实现提交：`0f4dcdcc`。在 `uname -m=arm64` 的开发机上，用临时 SQLite 库、1 个媒体条目、1 个 unchanged NFO 文件和可用的 rich NFO cache 执行 `enrich_nfo_item`。旧路径为 4 次 storage query-wrapper 调用；新路径为 3 次，减少 1 次（25%）。减少的调用是默认值修复中的无变化 SELECT；默认值完整时也不再创建该修复事务。Storage query counter 统计应用层 query-wrapper 调用，不统计 BEGIN/COMMIT，也不测量执行时长。
+
+回归命令：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib unchanged_nfo_with_complete_defaults_skips_repair_query`。另由 `tests/metadata.rs` 验证两种字段单独缺失时仍可修复并保留已有值。该结果只说明 1 项 SQLite fixture 的调用边界；没有测量墙钟、PostgreSQL、FNOS 或 NAS/x86 性能。
