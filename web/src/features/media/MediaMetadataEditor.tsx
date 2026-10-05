@@ -127,8 +127,8 @@ export function MediaMetadataEditor({ item, onClose, onSaved }: MediaMetadataEdi
           <footer className="lux-media-editor-footer">
             <span>{loading ? "正在读取已有元数据…" : "每个字段都可以单独锁定"}</span>
             <div>
-              <button className="lux-button lux-button-secondary" type="button" onClick={onClose}>取消</button>
-              <button className="lux-button lux-button-primary" type="submit" disabled={saving || loading}><Save size={16} /> {saving ? "保存中…" : "保存"}</button>
+              <button className="lux-button lux-button-touch lux-button-secondary" type="button" onClick={onClose}>取消</button>
+              <button className="lux-button lux-button-touch lux-button-primary" type="submit" disabled={saving || loading}><Save size={16} /> {saving ? "保存中…" : "保存"}</button>
             </div>
           </footer>
         </form>

@@ -61,12 +61,24 @@ export function LuxSelect(props: LuxSelectProps) {
     const trigger = triggerRef.current;
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
-    const menuHeight = Math.min(260, Math.max(42, options.length * 40 + 10));
-    const openUpwards = window.innerHeight - rect.bottom < menuHeight + 12 && rect.top > menuHeight + 12;
-    const width = Math.max(rect.width, 160);
-    const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - width - 8));
+    const visualViewport = window.visualViewport;
+    const viewportWidth = visualViewport?.width ?? window.innerWidth;
+    const viewportHeight = visualViewport?.height ?? window.innerHeight;
+    const viewportOffsetLeft = visualViewport?.offsetLeft ?? 0;
+    const viewportOffsetTop = visualViewport?.offsetTop ?? 0;
+    const menuHeight = Math.min(260, Math.max(42, options.length * 40 + 10), Math.max(42, viewportHeight - 16));
+    const visibleTop = viewportOffsetTop + 8;
+    const visibleBottom = viewportOffsetTop + viewportHeight - 8;
+    const openUpwards = visibleBottom - rect.bottom < menuHeight + 12 && rect.top - visibleTop > menuHeight + 12;
+    const width = Math.min(Math.max(rect.width, 160), Math.max(160, viewportWidth - 16));
+    const minLeft = viewportOffsetLeft + 8;
+    const maxLeft = viewportOffsetLeft + Math.max(8, viewportWidth - width - 8);
+    const left = Math.min(Math.max(minLeft, rect.left), maxLeft);
+    const top = openUpwards
+      ? Math.max(visibleTop, rect.top - menuHeight - 6)
+      : Math.min(rect.bottom + 6, Math.max(visibleTop, visibleBottom - menuHeight));
     setMenuPosition({
-      top: openUpwards ? Math.max(8, rect.top - menuHeight - 6) : rect.bottom + 6,
+      top,
       left,
       width,
       maxHeight: menuHeight,
@@ -79,9 +91,14 @@ export function LuxSelect(props: LuxSelectProps) {
     const handleViewportChange = () => updateMenuPosition();
     window.addEventListener("resize", handleViewportChange);
     document.addEventListener("scroll", handleViewportChange, true);
+    const visualViewport = window.visualViewport;
+    visualViewport?.addEventListener("resize", handleViewportChange);
+    visualViewport?.addEventListener("scroll", handleViewportChange);
     return () => {
       window.removeEventListener("resize", handleViewportChange);
       document.removeEventListener("scroll", handleViewportChange, true);
+      visualViewport?.removeEventListener("resize", handleViewportChange);
+      visualViewport?.removeEventListener("scroll", handleViewportChange);
     };
   }, [open, updateMenuPosition]);
 
