@@ -2393,9 +2393,11 @@ impl NfoWriteService {
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
-        self.database
-            .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
-            .await?;
+        if write.changed {
+            self.database
+                .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
+                .await?;
+        }
         Ok(NfoWriteReport {
             path: target,
             fingerprint,
