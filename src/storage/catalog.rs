@@ -5437,10 +5437,24 @@ impl Database {
                  metadata_provenance_json = ?,
                  locked_fields_json = ?,
                  updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ?
+               AND (
+                   title IS DISTINCT FROM ?
+                   OR sort_title IS DISTINCT FROM ?
+                   OR original_title IS DISTINCT FROM ?
+                   OR overview IS DISTINCT FROM ?
+                   OR production_year IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
+                   OR metadata_fingerprint IS DISTINCT FROM ?
+                   OR metadata_provenance_json IS DISTINCT FROM ?
+                   OR locked_fields_json IS DISTINCT FROM ?
+               )",
         )
         .bind(update.title)
-        .bind(sort_title)
+        .bind(&sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -5454,6 +5468,22 @@ impl Database {
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
         .bind(update.item_id)
+        .bind(update.title)
+        .bind(&sort_title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.premiere_date)
+        .bind(update.premiere_date)
+        .bind(update.rating)
+        .bind(update.rating)
+        .bind(update.rating_source)
+        .bind(update.rating_source)
+        .bind(update.provider_ids_json)
+        .bind(update.provider_ids_json)
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
         .execute(&mut *transaction)
         .await
         .map(|_| ())

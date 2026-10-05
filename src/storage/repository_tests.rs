@@ -5860,6 +5860,33 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .await
             .expect("metadata timestamp");
     assert!(updated_at > 0);
+    sqlx::query("UPDATE media_items SET updated_at = 123 WHERE id = 'rating-low'")
+        .execute(database.pool())
+        .await
+        .expect("set stable metadata timestamp");
+    database
+        .update_media_item_metadata(MediaMetadataUpdate {
+            item_id: "rating-low",
+            title: "rating-low",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: Some(10.0),
+            rating_source: Some("TEST"),
+            provider_ids_json: None,
+            metadata_fingerprint: &[],
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        })
+        .await
+        .expect("no-op metadata update");
+    let unchanged_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'rating-low'")
+            .fetch_one(database.pool())
+            .await
+            .expect("no-op metadata timestamp");
+    assert_eq!(unchanged_at, 123);
     database.reset_query_count();
     let refreshed_rows = database
         .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
