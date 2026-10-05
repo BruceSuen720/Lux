@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.18",
+    date: "2026-10-05",
+    sections: [
+      { kind: "changed", items: [
+        "共享管理员 API Key 改为独立服务器主体，认证响应及审计不再借用某个管理员账号；需要当前登录用户身份的接口仍要求用户会话或 AccessToken。",
+        "扫描本地元数据的完整度检查复用 NFO 阶段的媒体源快照，并批量复核源是否仍有效，减少重复目录展开与数据库查询。",
+      ] },
+      { kind: "fixed", items: [
+        "Emby 媒体库、搜索和会话管理保持共享 API Key 的服务器权限；涉及用户数据时校验明确提供的目标用户，拒绝不存在或已禁用的用户。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.17",
     date: "2026-10-04",
     sections: [
