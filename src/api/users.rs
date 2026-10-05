@@ -886,6 +886,56 @@ pub(super) async fn auth_login(
 }
 
 pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(candidate) = lux_api_key_from_headers(&headers) {
+        let Some(service) = state.admin_api_key.as_ref() else {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证服务尚未就绪",
+            )
+            .into_response();
+        };
+        match service.resolve_principal(&candidate).await {
+            Ok(Some(principal)) => {
+                if state.remote_access.is_remote(
+                    header_str(&headers, "x-lux-peer-ip"),
+                    header_str(&headers, "x-forwarded-for"),
+                ) && !principal.can_remote_access()
+                {
+                    return api_error(
+                        &headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前主体不允许远程访问",
+                    )
+                    .into_response();
+                }
+                let server_name = current_emby_server_name(&state).await;
+                return Json(json!({
+                    "principal": {
+                        "type": "shared_admin_api_key",
+                        "permissions": {
+                            "canManageServer": principal.can_manage_server(),
+                            "canRemoteAccess": principal.can_remote_access(),
+                        },
+                    },
+                    "serverName": server_name,
+                }))
+                .into_response();
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response();
+            }
+        }
+    }
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,

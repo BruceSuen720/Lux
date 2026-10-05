@@ -105,10 +105,11 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
         .send()
         .await?;
     assert_eq!(me.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        me.json::<serde_json::Value>().await?["user"]["isAdmin"],
-        true
-    );
+    let me_body = me.json::<serde_json::Value>().await?;
+    assert_eq!(me_body["principal"]["type"], "shared_admin_api_key");
+    assert_eq!(me_body["principal"]["permissions"]["canManageServer"], true);
+    assert_eq!(me_body["principal"]["permissions"]["canRemoteAccess"], true);
+    assert!(me_body.get("user").is_none());
 
     for request in [
         client

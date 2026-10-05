@@ -20,6 +20,49 @@ pub struct UserRecord {
     pub last_activity_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticationPrincipal {
+    User(UserRecord),
+    SharedAdminApiKey,
+}
+
+impl AuthenticationPrincipal {
+    pub fn user(&self) -> Option<&UserRecord> {
+        match self {
+            Self::User(user) => Some(user),
+            Self::SharedAdminApiKey => None,
+        }
+    }
+
+    pub const fn is_admin(&self) -> bool {
+        match self {
+            Self::User(user) => user.is_admin,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+
+    pub const fn can_manage_server(&self) -> bool {
+        match self {
+            Self::User(user) => user.can_manage_server,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+
+    pub const fn can_remote_access(&self) -> bool {
+        match self {
+            Self::User(user) => user.can_remote_access,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+
+    pub const fn can_download(&self) -> bool {
+        match self {
+            Self::User(user) => user.can_download,
+            Self::SharedAdminApiKey => true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UserStore {
     database: Database,

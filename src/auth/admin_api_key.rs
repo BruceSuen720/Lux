@@ -7,7 +7,7 @@ use subtle::ConstantTimeEq;
 use tokio::{fs, sync::Mutex};
 
 use crate::{
-    auth::users::UserRecord,
+    auth::users::{AuthenticationPrincipal, UserRecord},
     domain::ids::UserId,
     storage::{Database, StorageError},
 };
@@ -44,6 +44,20 @@ impl AdminApiKeyService {
     pub async fn revoke(&self) -> Result<(), AdminApiKeyError> {
         let _guard = self.write_lock.lock().await;
         write_key(&self.key_path(), None).await
+    }
+
+    pub async fn resolve_principal(
+        &self,
+        candidate: &str,
+    ) -> Result<Option<AuthenticationPrincipal>, AdminApiKeyError> {
+        let Some(stored_key) = read_key(&self.key_path()).await? else {
+            return Ok(None);
+        };
+        if keys_match(candidate.trim(), &stored_key) {
+            Ok(Some(AuthenticationPrincipal::SharedAdminApiKey))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn resolve(&self, candidate: &str) -> Result<Option<UserRecord>, AdminApiKeyError> {
