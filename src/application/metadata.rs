@@ -1175,25 +1175,11 @@ impl MetadataEnricher {
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
     ) {
-        for source in sources {
-            // Keep the directory/image fast path shared across the batch, but
-            // invoke the fallible series operation one target at a time. A
-            // directory or image error must not turn unrelated episodes into
-            // FAILED targets.
-            let item_id = source.episode_id.clone();
-            let mut item_report = MetadataReport::default();
-            let result = self
-                .enrich_series_sources(vec![source], &mut item_report, context, mode)
-                .await;
-            if let Err(error) = result {
-                tracing::warn!(
-                    item_id = %item_id,
-                    %error,
-                    "local series metadata failed; continuing with remaining targets"
-                );
-                item_report.mark_item_error(&item_id, &error);
-            }
-            report.merge(item_report);
+        if let Err(error) = self
+            .enrich_series_sources(sources, report, context, mode)
+            .await
+        {
+            tracing::warn!(%error, "local series metadata batch failed");
         }
     }
 
@@ -1447,7 +1433,18 @@ impl MetadataEnricher {
                 continue;
             };
             let series_paths = if process_images {
-                Some(context.directory_cache.get(&series_dir).await?)
+                match context.directory_cache.get(&series_dir).await {
+                    Ok(paths) => Some(paths),
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.episode_id,
+                            %error,
+                            "local series directory could not be read"
+                        );
+                        report.mark_item_error(&source.episode_id, &error);
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -1461,9 +1458,20 @@ impl MetadataEnricher {
                         .await;
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
-                    report.images_found += self
+                    match self
                         .index_images(&source.series_id, find_series_images(series_paths, None))
-                        .await?;
+                        .await
+                    {
+                        Ok(images_found) => report.images_found += images_found,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %source.series_id,
+                                %error,
+                                "local series images could not be indexed"
+                            );
+                            report.mark_item_error(&source.series_id, &error);
+                        }
+                    }
                 }
                 if let Some(last_series_id) = context.last_series_id.as_mut() {
                     *last_series_id = source.series_id.clone();
@@ -1487,7 +1495,18 @@ impl MetadataEnricher {
                 .map(|paths| paths.as_ref().clone())
                 .unwrap_or_default();
             if process_images && season_dir != series_dir {
-                let directory_paths = context.directory_cache.get(season_dir).await?;
+                let directory_paths = match context.directory_cache.get(season_dir).await {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.episode_id,
+                            %error,
+                            "local season directory could not be read"
+                        );
+                        report.mark_item_error(&source.episode_id, &error);
+                        continue;
+                    }
+                };
                 season_paths = season_paths
                     .iter()
                     .filter(|path| is_prefixed_season_image(path, season_number))
@@ -1504,12 +1523,23 @@ impl MetadataEnricher {
                         .await;
                 }
                 if process_images {
-                    report.images_found += self
+                    match self
                         .index_images(
                             &source.season_id,
                             find_series_images(&season_paths, Some(season_number)),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(images_found) => report.images_found += images_found,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %source.season_id,
+                                %error,
+                                "local season images could not be indexed"
+                            );
+                            report.mark_item_error(&source.season_id, &error);
+                        }
+                    }
                 }
                 if let Some(last_season_id) = context.last_season_id.as_mut() {
                     *last_season_id = source.season_id.clone();
@@ -1529,12 +1559,23 @@ impl MetadataEnricher {
                         .await;
                 }
                 if process_images {
-                    report.images_found += self
+                    match self
                         .index_images(
                             &source.episode_id,
                             find_episode_images(&season_paths, &media_path),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(images_found) => report.images_found += images_found,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %source.episode_id,
+                                %error,
+                                "local episode images could not be indexed"
+                            );
+                            report.mark_item_error(&source.episode_id, &error);
+                        }
+                    }
                 }
                 if let Some(last_episode_id) = context.last_episode_id.as_mut() {
                     *last_episode_id = source.episode_id.clone();
