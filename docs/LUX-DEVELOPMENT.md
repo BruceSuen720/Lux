@@ -8341,6 +8341,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
 
+#### LUX-384：通用 FILL_MISSING 创建入口去重与队列合并
+
+范围：通用 `create_fill_missing_job` 入口此前直接创建新 job，可能绕过本地完整性路径的活动任务去重。按同一媒体库在事务内过滤 QUEUED/RUNNING/近期 DEFERRED 条目，并将新条目合并到现有 queued job；跨库请求保留原有独立 job 语义，不改变最多 100 项限制和执行前再次检查。
+
+验收：
+
+- [x] 同一库、同一条目重复创建只保留一份活动 job；新条目合并进已有 queued job。
+- [x] 取消、运行中、近期 deferred 条目不会重新排队；跨库请求保持原有行为。
+- [x] storage、metadata、reidentify、格式和 Clippy 回归通过；性能记录只说明任务创建边界，不外推 FNOS CPU。
+
+预计文件：`src/application/reidentify.rs`、`src/storage/jobs.rs`、`src/storage/media.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

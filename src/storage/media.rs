@@ -122,6 +122,7 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         series_scraper_id.as_deref(),
     );
     StoredMediaMetadata {
+        library_id: row.get("library_id"),
         item_type: row.get("item_type"),
         title: row.get("title"),
         original_title: row.get("original_title"),
@@ -3149,7 +3150,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT mi.id AS item_id, mi.item_type, mi.title, mi.original_title, mi.overview,
+                "SELECT mi.id AS item_id, mi.library_id AS library_id, mi.item_type, mi.title, mi.original_title, mi.overview,
                         mi.production_year, mi.premiere_date, mi.last_air_date, mi.status,
                         mi.original_language, mi.rating, mi.provider_ids_json,
                         mi.metadata_scraper_id, mi.identification_status,

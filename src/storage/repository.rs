@@ -1989,6 +1989,7 @@ pub(crate) struct NewCollection<'a> {
 
 #[derive(Debug)]
 pub(crate) struct StoredMediaMetadata {
+    pub(crate) library_id: String,
     pub(crate) item_type: String,
     pub(crate) title: String,
     pub(crate) original_title: Option<String>,

@@ -1352,3 +1352,7 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 ### LUX-383 普通本地图片登记事务边界
 
 普通电影、剧集、季度和分集图片索引现在统一复用有界 `ItemImageBatchInsert` 写入。图片 upsert 与 `poster_fallback_required` 清理在同一 metadata 写事务中完成；故障注入验证 fallback 更新失败时不会留下部分 `item_images`。该记录只说明事务原子性和 SQL 边界，不代表 FNOS/PostgreSQL/NAS 墙钟或 CPU 收益。
+
+### LUX-384 FILL_MISSING 创建去重边界
+
+通用 `create_fill_missing_job` 现在在同库事务内复用活动条目去重和 queued job 合并；重复条目不会再创建新的 `metadata_reidentify_jobs` 行，新条目只追加到已有 queued job 的容量内。固定 storage 回归验证重复调用最终保留一个 job 和两条 job item；该记录只说明任务创建边界，不代表 FNOS/PostgreSQL/NAS CPU 或墙钟收益。

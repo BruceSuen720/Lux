@@ -12253,6 +12253,73 @@ async fn empty_reconciliation_batch_is_a_noop() {
 }
 
 #[tokio::test]
+async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let media_root = temp_dir.path().join("Movies");
+    for title in ["First Movie (2025)", "Second Movie (2025)"] {
+        let directory = media_root.join(title);
+        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::write(
+            directory.join(format!("{}.mkv", title.replace(' ', "."))),
+            b"video",
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill missing coalesce", LibraryKind::Movie, false)
+        .await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, media_root.to_str().ok_or("media root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = database
+        .query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(item_ids.len(), 2);
+    let library_id = library.id.to_string();
+    let first_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    let merged_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids)
+        .await?;
+    assert_eq!(merged_job, first_job);
+    let repeated_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids)
+        .await?;
+    assert_eq!(repeated_job, first_job);
+    let job_count: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+    let item_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_job_items WHERE job_id = ?")
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(job_count, 1);
+    assert_eq!(item_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn person_credit_refresh_preserves_unchanged_rows() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
