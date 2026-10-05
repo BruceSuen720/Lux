@@ -13,7 +13,6 @@ const ACTOR_ENRICHMENT_WORKERS: usize = 2;
 
 struct ActorEnrichmentTask {
     _queued_key: QueuedActorEnrichmentKey,
-    _queue_state: Arc<ActorEnrichmentQueueState>,
     work: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -78,11 +77,7 @@ impl ActorEnrichmentQueue {
                     let Some(task) = task else {
                         break;
                     };
-                    let ActorEnrichmentTask {
-                        _queued_key,
-                        _queue_state,
-                        work,
-                    } = task;
+                    let ActorEnrichmentTask { _queued_key, work } = task;
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => break,
@@ -165,7 +160,6 @@ impl ActorEnrichmentQueue {
                     drop(queued);
                     permit.send(ActorEnrichmentTask {
                         _queued_key: QueuedActorEnrichmentKey { key, queued: Arc::clone(&self.state.queued) },
-                        _queue_state: Arc::clone(&self.state),
                         work: Box::pin(work),
                     });
                     true

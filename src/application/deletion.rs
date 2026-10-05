@@ -153,16 +153,46 @@ impl MediaDeleteService {
                 }
             }
         }
-        for path in &paths {
-            fs::remove_file(path).await?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut staged_paths = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            let parent = path
+                .parent()
+                .ok_or_else(|| MediaDeleteError::PathOutsideRoot(path.clone()))?;
+            let staged = parent.join(format!(".lux-delete-{nonce}-{index}"));
+            if let Err(error) = fs::rename(path, &staged).await {
+                for (original, moved) in staged_paths.iter().rev() {
+                    let _ = fs::rename(moved, original).await;
+                }
+                return Err(error.into());
+            }
+            staged_paths.push((path.clone(), staged));
         }
-        for source in &sources {
-            if !self
-                .database
-                .delete_media_source(&source.item_id, &source.source_id)
-                .await?
-            {
+        let source_keys = sources
+            .iter()
+            .map(|source| (source.item_id.clone(), source.source_id.clone()))
+            .collect::<Vec<_>>();
+        match self.database.delete_media_sources(&source_keys).await {
+            Ok(true) => {}
+            Ok(false) => {
+                for (original, moved) in staged_paths.iter().rev() {
+                    let _ = fs::rename(moved, original).await;
+                }
                 return Err(MediaDeleteError::ItemNotFound);
+            }
+            Err(error) => {
+                for (original, moved) in staged_paths.iter().rev() {
+                    let _ = fs::rename(moved, original).await;
+                }
+                return Err(error.into());
+            }
+        }
+        for (_, staged) in &staged_paths {
+            if let Err(error) = fs::remove_file(staged).await {
+                tracing::warn!(path = %staged.display(), %error, "staged media deletion cleanup failed");
             }
         }
         let report = MediaDeleteReport {

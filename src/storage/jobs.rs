@@ -8034,7 +8034,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE strm_probe_jobs
-             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
         .bind(status)
@@ -9685,7 +9687,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET status = ?, error = ?, cursor = NULL, current_item = NULL,
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 cursor = NULL, current_item = NULL,
                  scan_phase = 'IDLE',
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
@@ -10851,29 +10855,13 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) async fn delete_media_source(
+    pub(crate) async fn delete_media_sources(
         &self,
-        item_id: &str,
-        source_id: &str,
+        sources: &[(String, String)],
     ) -> Result<bool, StorageError> {
-        let Some((old_item_id, parent_id, series_id)) = self
-            .query_as::<(String, Option<String>, Option<String>)>(
-                "SELECT ms.item_id, old_item.parent_id, old_item.series_id
-                 FROM media_sources ms
-                 JOIN media_items old_item ON old_item.id = ms.item_id
-                 WHERE ms.id = ? AND ms.item_id = ?",
-            )
-            .bind(source_id)
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-        else {
+        if sources.is_empty() {
             return Ok(false);
-        };
+        }
         let mut transaction = self
             .pool
             .begin()
@@ -10882,19 +10870,45 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
-            .bind(source_id)
-            .bind(&old_item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        for related_item_id in [Some(old_item_id), parent_id, series_id]
-            .into_iter()
-            .flatten()
-        {
+        let mut related_item_ids = Vec::new();
+        for (item_id, source_id) in sources {
+            let Some((old_item_id, parent_id, series_id)) = self
+                .query_as::<(String, Option<String>, Option<String>)>(
+                    "SELECT ms.item_id, old_item.parent_id, old_item.series_id
+                     FROM media_sources ms
+                     JOIN media_items old_item ON old_item.id = ms.item_id
+                     WHERE ms.id = ? AND ms.item_id = ?",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            else {
+                return Ok(false);
+            };
+            self.query("DELETE FROM media_sources WHERE id = ? AND item_id = ?")
+                .bind(source_id)
+                .bind(&old_item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for related_item_id in [Some(old_item_id), parent_id, series_id]
+                .into_iter()
+                .flatten()
+            {
+                if !related_item_ids.iter().any(|id| id == &related_item_id) {
+                    related_item_ids.push(related_item_id);
+                }
+            }
+        }
+        for related_item_id in related_item_ids {
             self.query(
                 "UPDATE media_items
                  SET removed_at = unixepoch(), updated_at = unixepoch()
@@ -10934,6 +10948,36 @@ mod tests {
         NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
+
+    #[tokio::test]
+    async fn finishing_a_cancelled_strm_job_cannot_restore_terminal_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("INSERT INTO strm_probe_jobs (id, operation_id, library_id, status, concurrency) VALUES ('job', 'op', 'lib', 'RUNNING', 1)")
+            .execute(database.pool())
+            .await?;
+        database.request_strm_probe_job_cancel("job").await?;
+        database
+            .finish_strm_probe_job("job", "COMPLETED", None)
+            .await?;
+        let status: String = database
+            .query_scalar("SELECT status FROM strm_probe_jobs WHERE id = 'job'")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(status, "CANCELLED");
+        database.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn scan_manifest_creation_is_atomic_and_idempotent()
