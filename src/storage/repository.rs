@@ -3417,6 +3417,7 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) premiere_date: Option<&'a str>,
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<&'a str>,
+    pub(crate) provider_ids_json: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,

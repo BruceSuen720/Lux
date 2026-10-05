@@ -5847,6 +5847,7 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             premiere_date: None,
             rating: Some(10.0),
             rating_source: Some("TEST"),
+            provider_ids_json: None,
             metadata_fingerprint: &[],
             provenance_json: "{}",
             locked_fields_json: "{}",

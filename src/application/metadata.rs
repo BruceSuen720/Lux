@@ -33,6 +33,33 @@ const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+fn merged_provider_ids_json(
+    current_json: Option<&str>,
+    incoming: &BTreeMap<String, String>,
+) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+    let mut merged = current_json
+        .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+        .unwrap_or_default();
+    let before = merged.clone();
+    for (provider, provider_id) in incoming {
+        let provider = provider.trim();
+        let provider_id = provider_id.trim();
+        if provider.is_empty()
+            || provider_id.is_empty()
+            || merged
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(provider))
+        {
+            continue;
+        }
+        merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+    }
+    (merged != before).then(|| serde_json::to_string(&merged).unwrap_or_default())
+}
+
 fn local_image_read_permits() -> Arc<Semaphore> {
     LOCAL_IMAGE_READ_PERMITS
         .get_or_init(|| Arc::new(Semaphore::new(LOCAL_IMAGE_READ_CONCURRENCY)))
@@ -1678,9 +1705,12 @@ impl MetadataEnricher {
                     .map_err(MetadataError::NfoCache)?;
             }
         }
-        self.database
-            .merge_local_provider_ids(item_id, &projection.details.provider_ids)
-            .await?;
+        let provider_ids_json = merged_provider_ids_json(
+            current
+                .as_ref()
+                .and_then(|metadata| metadata.provider_ids_json.as_deref()),
+            &projection.details.provider_ids,
+        );
         if let Some(people) = &self.people {
             let relation_current = match people
                 .item_actor_relation_is_current(item_id, &source_fingerprint)
@@ -1755,6 +1785,7 @@ impl MetadataEnricher {
                     premiere_date: local_nfo_premiere_date(&projection.details),
                     rating: local_rating,
                     rating_source: local_rating.map(|_| "NFO"),
+                    provider_ids_json: provider_ids_json.as_deref(),
                     metadata_fingerprint: fingerprint,
                     provenance_json: &provenance_json,
                     locked_fields_json: &locked_fields_json,
@@ -2085,6 +2116,28 @@ pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_only_new_provider_ids() {
+        let current = Some(r#"{"tmdb":"603"}"#);
+        let incoming = BTreeMap::from([
+            ("TMDB".to_owned(), "999".to_owned()),
+            ("imdb".to_owned(), "tt0133093".to_owned()),
+        ]);
+
+        assert_eq!(
+            merged_provider_ids_json(current, &incoming).as_deref(),
+            Some(r#"{"imdb":"tt0133093","tmdb":"603"}"#)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_incoming_ids_are_already_known() {
+        let current = Some(r#"{"tmdb":"603"}"#);
+        let incoming = BTreeMap::from([(String::from("TMDB"), String::from("603"))]);
+
+        assert!(merged_provider_ids_json(current, &incoming).is_none());
+    }
 
     #[tokio::test]
     async fn directory_path_cache_reuses_a_directory_snapshot()

@@ -2529,75 +2529,6 @@ impl Database {
         })
     }
 
-    pub(crate) async fn merge_local_provider_ids(
-        &self,
-        item_id: &str,
-        provider_ids: &BTreeMap<String, String>,
-    ) -> Result<(), StorageError> {
-        if provider_ids.is_empty() {
-            return Ok(());
-        }
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let current = self
-            .query_scalar::<Option<String>>(
-                "SELECT provider_ids_json
-                 FROM media_items
-                 WHERE id = ? AND removed_at IS NULL",
-            )
-            .bind(item_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .flatten();
-        let mut merged = current
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
-            .unwrap_or_default();
-        let mut changed = false;
-        for (provider, provider_id) in provider_ids {
-            let provider = provider.trim();
-            let provider_id = provider_id.trim();
-            if provider.is_empty()
-                || provider_id.is_empty()
-                || merged
-                    .keys()
-                    .any(|existing| existing.eq_ignore_ascii_case(provider))
-            {
-                continue;
-            }
-            merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
-            changed = true;
-        }
-        if changed {
-            let provider_ids_json = serde_json::to_string(&merged)
-                .map_err(|error| StorageError::Serialization(error.to_string()))?;
-            self.query(
-                "UPDATE media_items
-                 SET provider_ids_json = ?, updated_at = unixepoch()
-                 WHERE id = ? AND removed_at IS NULL",
-            )
-            .bind(provider_ids_json)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
     pub(crate) async fn repair_local_nfo_defaults(
         &self,
         item_id: &str,
@@ -5501,6 +5432,7 @@ impl Database {
                  premiere_date = COALESCE(?, premiere_date),
                  rating = CASE WHEN ? = 1 THEN ? ELSE rating END,
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
+                 provider_ids_json = COALESCE(?, provider_ids_json),
                  metadata_fingerprint = ?,
                  metadata_provenance_json = ?,
                  locked_fields_json = ?,
@@ -5517,6 +5449,7 @@ impl Database {
         .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
+        .bind(update.provider_ids_json)
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)

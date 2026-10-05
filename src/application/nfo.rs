@@ -2648,6 +2648,7 @@ impl MetadataWriteService {
                 premiere_date: None,
                 rating: None,
                 rating_source: None,
+                provider_ids_json: None,
                 metadata_fingerprint: &report.fingerprint,
                 provenance_json: &provenance_json,
                 locked_fields_json: &locked_fields_json,
