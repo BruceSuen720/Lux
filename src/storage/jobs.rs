@@ -10870,7 +10870,9 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let mut related_item_ids = Vec::new();
+        let mut source_item_ids = Vec::new();
+        let mut parent_item_ids = Vec::new();
+        let mut series_item_ids = Vec::new();
         for (item_id, source_id) in sources {
             let Some((old_item_id, parent_id, series_id)) = self
                 .query_as::<(String, Option<String>, Option<String>)>(
@@ -10899,16 +10901,25 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            for related_item_id in [Some(old_item_id), parent_id, series_id]
-                .into_iter()
-                .flatten()
-            {
-                if !related_item_ids.iter().any(|id| id == &related_item_id) {
-                    related_item_ids.push(related_item_id);
+            if !source_item_ids.iter().any(|id| id == &old_item_id) {
+                source_item_ids.push(old_item_id);
+            }
+            if let Some(parent_id) = parent_id {
+                if !parent_item_ids.iter().any(|id| id == &parent_id) {
+                    parent_item_ids.push(parent_id);
+                }
+            }
+            if let Some(series_id) = series_id {
+                if !series_item_ids.iter().any(|id| id == &series_id) {
+                    series_item_ids.push(series_id);
                 }
             }
         }
-        for related_item_id in related_item_ids {
+        for related_item_id in source_item_ids
+            .into_iter()
+            .chain(parent_item_ids)
+            .chain(series_item_ids)
+        {
             self.query(
                 "UPDATE media_items
                  SET removed_at = unixepoch(), updated_at = unixepoch()
