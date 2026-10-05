@@ -437,8 +437,9 @@ impl MetadataReidentifyService {
         mode: MetadataRefreshMode,
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         let mut unique_ids = Vec::with_capacity(item_ids.len());
+        let mut seen_ids = HashSet::with_capacity(item_ids.len());
         for item_id in item_ids {
-            if !unique_ids.iter().any(|existing| existing == &item_id) {
+            if seen_ids.insert(item_id.clone()) {
                 unique_ids.push(item_id);
             }
         }
