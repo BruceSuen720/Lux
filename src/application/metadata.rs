@@ -21,7 +21,8 @@ use crate::{
     domain::ids::LibraryId,
     storage::{
         Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
-        StoredMediaSourcePath, StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
+        StoredMediaMetadata, StoredMediaSourcePath, StoredScanLocalMetadataSource,
+        StoredSeriesMetadataSource,
     },
 };
 
@@ -1649,7 +1650,9 @@ impl MetadataEnricher {
             false
         };
         if already_checked && !rich_cache_missing && !actor_relation_missing {
-            if let Some(details) = cached_nfo.as_ref() {
+            if let (Some(metadata), Some(details)) = (metadata.as_ref(), cached_nfo.as_ref())
+                && local_nfo_defaults_missing(metadata, details)
+            {
                 self.database
                     .repair_local_nfo_defaults(
                         item_id,
@@ -2063,6 +2066,25 @@ fn local_nfo_premiere_date(details: &crate::application::nfo::LocalNfoDetails) -
         .or(details.aired.as_deref())
 }
 
+fn local_nfo_defaults_missing(
+    metadata: &StoredMediaMetadata,
+    details: &crate::application::nfo::LocalNfoDetails,
+) -> bool {
+    let provider_id_missing =
+        merged_provider_ids_json(metadata.provider_ids_json.as_deref(), &details.provider_ids)
+            .is_some();
+    let premiere_date_missing = local_nfo_premiere_date(details)
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|_| {
+            metadata
+                .premiere_date
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        });
+
+    provider_id_missing || premiere_date_missing
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetadataReport {
     pub nfo_loaded: usize,
@@ -2216,6 +2238,74 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(fallback, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_nfo_with_complete_defaults_skips_repair_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "unchanged-nfo-item";
+        let nfo_path = directory.path().join("movie.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&nfo_path, nfo_bytes).await?;
+        let fingerprint = nfo_fingerprint(&nfo_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, premiere_date, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(r#"{"tmdb":"99"}"#)
+        .bind("2025-01-02")
+        .bind(fingerprint)
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        LocalNfoMetadataStore::new(database.clone())
+            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        database.reset_query_count();
+        let report = enricher.enrich_nfo_item(item_id, &nfo_path).await?;
+
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "unchanged NFO with complete defaults should only read metadata and its rich cache"
+        );
+        let retained_provider_ids: String =
+            sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(retained_provider_ids, r#"{"tmdb":"99"}"#);
+        let retained_premiere_date: Option<String> =
+            sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(retained_premiere_date.as_deref(), Some("2025-01-02"));
         Ok(())
     }
 

@@ -8367,6 +8367,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 发布兼容性补正（2026-10-05）：部署库已使用 migration 0158 保存媒体章节、0160 保存本地 metadata backfill。保留这两条历史迁移及其 checksum；取消任务残留清理使用新版本 0161，避免升级时发生 SQLx 版本/校验和冲突。
 
+#### LUX-386：跳过 unchanged NFO 的空默认值修复事务
+
+范围：NFO fingerprint 未变化且 rich NFO/人物缓存可用时，复用本轮已读取的媒体元数据快照判断本地 provider IDs 和 premiere date 是否仍有缺失。两类默认值均已存在时不再进入存储事务；发现缺失时继续调用存储层并在事务内复核后修复。保留 NFO fingerprint、缓存恢复和人物关系同步语义。
+
+验收：
+
+- [ ] 默认值完整的 unchanged NFO 路径省去空修复查询/事务；查询计数回归证明调用数下降。
+- [ ] 缺少 premiere date 或 provider ID 时仍按原逻辑补齐；已有值不覆盖。
+- [ ] metadata、NFO cache、格式、build 和 Clippy 回归通过；性能记录不外推 PostgreSQL/NAS/生产墙钟。
+
+预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写 unchanged NFO 查询计数回归，再增加保守的快照判断。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
