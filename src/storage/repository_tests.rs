@@ -795,6 +795,73 @@ async fn listing_recommendations_does_not_refresh_global_stats_synchronously() {
     assert_eq!(batch_key, -1);
 }
 
+#[tokio::test]
+async fn cancelled_recommendation_listing_still_saves_the_daily_batch() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendations", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, has_available_source
+             ) VALUES ('cancel-recommendation-item', ?, 'MOVIE',
+                       'Cancel recommendation item', 'cancel recommendation item',
+                       'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+    let service = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+
+    // Hold the scoring lock so the detached task is parked after it has been spawned, then drop
+    // the caller the way a home-cache invalidation does.
+    let compute_lock = service.recommendation_compute_lock();
+    let held = compute_lock.lock().await;
+    let caller = {
+        let service = service.clone();
+        let library_id = library_id.clone();
+        let user_id = user_id.clone();
+        tokio::spawn(async move {
+            service
+                .list_recommended_for_library_ids(&[library_id], &user_id, 7)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    caller.abort();
+    let _ = caller.await;
+    drop(held);
+
+    let mut saved = 0_i64;
+    for _ in 0..100 {
+        saved = sqlx::query_scalar("SELECT COUNT(*) FROM recommendation_daily_batches")
+            .fetch_one(database.pool())
+            .await
+            .expect("daily batch count");
+        if saved > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(saved, 1, "the detached scoring task must persist its batch");
+}
+
 #[test]
 fn database_pool_max_connections_uses_backend_defaults() {
     assert_eq!(
