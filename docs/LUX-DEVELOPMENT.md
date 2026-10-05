@@ -8363,7 +8363,9 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] migration 可从空库运行，并能幂等修复历史取消 job，不触碰已完成 item。
 - [x] metadata cancel、storage、build、格式和 Clippy 回归通过。
 
-预计文件：`src/storage/jobs.rs`、`tests/metadata_cancel.rs`、`tests/storage.rs`、`migrations/0160_reconcile_cancelled_metadata_job_items.sql`、`migrations-postgres/0160_reconcile_cancelled_metadata_job_items.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+预计文件：`src/storage/jobs.rs`、`tests/metadata_cancel.rs`、`tests/storage.rs`、`migrations/0158_media_info_chapters.sql`、`migrations-postgres/0158_media_info_chapters.sql`、`migrations/0160_scan_local_metadata_backfill_non_retryable_items.sql`、`migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql`、`migrations/0161_reconcile_cancelled_metadata_job_items.sql`、`migrations-postgres/0161_reconcile_cancelled_metadata_job_items.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+发布兼容性补正（2026-10-05）：部署库已使用 migration 0158 保存媒体章节、0160 保存本地 metadata backfill。保留这两条历史迁移及其 checksum；取消任务残留清理使用新版本 0161，避免升级时发生 SQLx 版本/校验和冲突。
 
 #### 阶段 23 总体验收与阶段门
 

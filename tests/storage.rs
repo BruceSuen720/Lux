@@ -48,6 +48,65 @@ fn migration_versions_are_unique_per_backend() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn metadata_migrations_preserve_historical_version_sequence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    for directory in ["migrations", "migrations-postgres"] {
+        let migrations = repository.join(directory);
+        for name in [
+            "0158_media_info_chapters.sql",
+            "0160_scan_local_metadata_backfill_non_retryable_items.sql",
+            "0161_reconcile_cancelled_metadata_job_items.sql",
+        ] {
+            assert!(
+                migrations.join(name).is_file(),
+                "{directory} must preserve the historical migration sequence at {name}"
+            );
+        }
+
+        let chapters = fs::read_to_string(migrations.join("0158_media_info_chapters.sql"))?;
+        let backfill = fs::read_to_string(
+            migrations.join("0160_scan_local_metadata_backfill_non_retryable_items.sql"),
+        )?;
+        assert!(chapters.contains("CREATE TABLE media_info_chapters"));
+        assert!(backfill.contains("non_retryable_item_ids_json"));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn metadata_migrations_keep_deployed_checksums() -> Result<(), Box<dyn std::error::Error>> {
+    for (path, checksum) in [
+        (
+            "migrations/0158_media_info_chapters.sql",
+            "7f467f8bcf880efea58d07fdd434f3e4bcf0e64671effa68f03c21d359c2460cbc5996ca6ce7cb21ba729e82c62df4ce",
+        ),
+        (
+            "migrations-postgres/0158_media_info_chapters.sql",
+            "765fd88f82535e66cca0b46bb746f66ca30ecdd75f30886e89b8650d3a9c477ac3b19881f88e11053fda953665f8d969",
+        ),
+        (
+            "migrations/0160_scan_local_metadata_backfill_non_retryable_items.sql",
+            "3522909b3fa8daaab26a6acf1fb43bde5f6a79359b670a7dd19b9a406c949976305ae9f691133e9127b702fc8619b786",
+        ),
+        (
+            "migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql",
+            "3522909b3fa8daaab26a6acf1fb43bde5f6a79359b670a7dd19b9a406c949976305ae9f691133e9127b702fc8619b786",
+        ),
+    ] {
+        let migration = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))?;
+        assert_eq!(
+            format!("{:x}", Sha384::digest(migration.as_bytes())),
+            checksum
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn historical_media_catalog_migration_keeps_its_original_checksum() {
     let migration = include_str!("../migrations/0006_media_catalog.sql");
 
@@ -453,7 +512,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -473,7 +532,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 160);
+    assert_eq!(second_database.schema_version().await?, 161);
     second_database.close().await;
     Ok(())
 }
@@ -549,7 +608,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 160);
+    assert_eq!(schema_version, 161);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -910,7 +969,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 160);
+    assert_eq!(schema_version, 161);
     database.close().await;
     Ok(())
 }
@@ -1258,7 +1317,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
 
     database.close().await;
     Ok(())
@@ -1952,7 +2011,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     Ok(())
 }
 
@@ -2124,7 +2183,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     Ok(())
 }
 
@@ -2211,7 +2270,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     database.close().await;
     Ok(())
 }
@@ -2342,7 +2401,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -2524,7 +2583,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 160);
+    assert_eq!(database.schema_version().await?, 161);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
