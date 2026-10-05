@@ -8353,6 +8353,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/reidentify.rs`、`src/storage/jobs.rs`、`src/storage/media.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
 
+#### LUX-385：清理取消 metadata job 的残留 item 状态
+
+范围：取消 metadata job 时，将仍为 `PENDING/RUNNING` 的 item 统一写成既有可重试终态 `FAILED`，并记录 `JOB_CANCELLED`；新增 migration 幂等清理历史取消 job 的残留行。显式 retry 仍将这些 item 置回 `PENDING`，不改变任务公共 API。
+
+验收：
+
+- [x] 新取消 job 不再留下 `PENDING/RUNNING` item；retry 后 item 恢复为 `PENDING`。
+- [x] migration 可从空库运行，并能幂等修复历史取消 job，不触碰已完成 item。
+- [x] metadata cancel、storage、build、格式和 Clippy 回归通过。
+
+预计文件：`src/storage/jobs.rs`、`tests/metadata_cancel.rs`、`tests/storage.rs`、`migrations/0160_reconcile_cancelled_metadata_job_items.sql`、`migrations-postgres/0160_reconcile_cancelled_metadata_job_items.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

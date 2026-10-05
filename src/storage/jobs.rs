@@ -9219,6 +9219,30 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let cancel_requested: i64 = self
+            .query_scalar("SELECT cancel_requested FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if cancel_requested != 0 || status == "CANCELLED" {
+            self.query(
+                "UPDATE metadata_reidentify_job_items
+                 SET status = 'FAILED', candidate_count = 0,
+                     error = 'JOB_CANCELLED', updated_at = unixepoch()
+                 WHERE job_id = ? AND status IN ('PENDING', 'RUNNING')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
@@ -9320,7 +9344,7 @@ impl Database {
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
                      updated_at = unixepoch()
-                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING')",
+                 WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING', 'CANCELLED')",
             )
             .bind(job_id)
             .execute(&mut *transaction)

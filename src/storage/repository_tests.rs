@@ -12316,6 +12316,33 @@ async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dy
         .await?;
     assert_eq!(job_count, 1);
     assert_eq!(item_count, 2);
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(&first_job)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_job(&first_job, "COMPLETED", None)
+        .await?;
+    let cancelled_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'FAILED'",
+        )
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cancelled_items, 2);
+    assert!(database.retry_metadata_reidentify_job(&first_job).await?);
+    let pending_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND status = 'PENDING'",
+        )
+        .bind(&first_job)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(pending_items, 2);
     Ok(())
 }
 

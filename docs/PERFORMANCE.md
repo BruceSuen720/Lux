@@ -1356,3 +1356,7 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 ### LUX-384 FILL_MISSING 创建去重边界
 
 通用 `create_fill_missing_job` 现在在同库事务内复用活动条目去重和 queued job 合并；重复条目不会再创建新的 `metadata_reidentify_jobs` 行，新条目只追加到已有 queued job 的容量内。固定 storage 回归验证重复调用最终保留一个 job 和两条 job item；该记录只说明任务创建边界，不代表 FNOS/PostgreSQL/NAS CPU 或墙钟收益。
+
+### LUX-385 取消 metadata job 的残留 item 清理
+
+取消 job 时，仍为 `PENDING/RUNNING` 的 item 统一进入 `FAILED/JOB_CANCELLED`，历史取消 job 由 migration 进行同样的幂等收尾；管理员 retry 时恢复为 `PENDING`。该记录说明队列状态收敛和历史数据清理边界，不代表 migration 执行墙钟或 FNOS CPU 收益。
