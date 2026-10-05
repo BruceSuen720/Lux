@@ -191,6 +191,9 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let manager = users
         .create_user("aaaoperator", "Operator", "operator password", false)
         .await?;
+    let target = users
+        .create_user("target", "Target", "target password", false)
+        .await?;
     users
         .update_user(
             &manager.id.to_string(),
@@ -218,6 +221,11 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
         .rotate()
         .await?;
+    sqlx::query("DELETE FROM users WHERE id IN (?, ?)")
+        .bind(admin.id.to_string())
+        .bind(manager.id.to_string())
+        .execute(database.pool())
+        .await?;
     let app = app_with_state(AppState::ready(
         config,
         database.clone(),
@@ -235,7 +243,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let views = client
         .get(format!(
             "http://{address}/Users/{}/Views?api_key={key}",
-            admin.id
+            target.id
         ))
         .send()
         .await?;
@@ -348,7 +356,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let root = client
         .get(format!(
             "http://{address}/Users/{}/Items/Root?api_key={key}",
-            admin.id
+            target.id
         ))
         .send()
         .await?;
@@ -358,7 +366,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let items = client
         .get(format!(
             "http://{address}/Users/{}/Items?ParentId={}&IncludeItemTypes=CollectionFolder&Limit=10&api_key={key}",
-            admin.id, admin.id
+            target.id, target.id
         ))
         .send()
         .await?;
@@ -371,7 +379,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let movies = client
         .get(format!(
             "http://{address}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=10&api_key={key}",
-            admin.id
+            target.id
         ))
         .send()
         .await?;
@@ -383,7 +391,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let movie_detail = client
         .get(format!(
             "http://{address}/emby/Users/{}/Items/{movie_id}?Fields=MediaSources&api_key={key}",
-            admin.id
+            target.id
         ))
         .send()
         .await?;

@@ -2439,6 +2439,81 @@ pub(super) async fn require_emby_user_with_query(
     Ok(user)
 }
 
+pub(super) async fn require_emby_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+    api_key: Option<&str>,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    let query = EmbyTokenQuery {
+        api_key: api_key.map(str::to_owned),
+        tag: None,
+        fields: None,
+        active_within_seconds: None,
+    };
+    require_emby_principal_with_query(headers, state, &query).await
+}
+
+pub(super) async fn require_emby_principal_with_query(
+    headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyTokenQuery,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let token = emby_token_from_headers(headers)
+        .or_else(|| query.api_key.clone())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let principal = if let Some(service) = state.admin_api_key.as_ref() {
+        match service.resolve_principal(&token).await {
+            Ok(Some(principal)) => Some(principal),
+            Ok(None) => None,
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    } else {
+        None
+    };
+    let principal = if let Some(principal) = principal {
+        principal
+    } else {
+        match auth.resolve_token(&token).await {
+            Ok(Some(user)) => crate::auth::users::AuthenticationPrincipal::User(user),
+            Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    };
+    if state.remote_access.is_remote(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-for"),
+    ) && !principal.can_remote_access()
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(principal)
+}
+
+pub(super) fn emby_access_principal(
+    principal: &crate::auth::users::AuthenticationPrincipal,
+    target_user_id: Option<&str>,
+) -> Result<AccessPrincipal, StatusCode> {
+    let target_user_id = target_user_id
+        .map(str::parse::<UserId>)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Some(user) = principal.user() {
+        if target_user_id.is_some_and(|target_user_id| !user.is_admin && target_user_id != user.id)
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Ok(AccessPrincipal::new(
+            target_user_id.unwrap_or(user.id),
+            user.is_admin,
+        ))
+    } else {
+        Ok(AccessPrincipal::server_admin(target_user_id))
+    }
+}
+
 pub(super) async fn emby_logout(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,

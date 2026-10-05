@@ -34,6 +34,10 @@ impl AuthenticationPrincipal {
         }
     }
 
+    pub fn user_id(&self) -> Option<UserId> {
+        self.user().map(|user| user.id)
+    }
+
     pub const fn is_admin(&self) -> bool {
         match self {
             Self::User(user) => user.is_admin,
