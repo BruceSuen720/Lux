@@ -1584,15 +1584,14 @@ impl MetadataEnricher {
             false
         };
         if already_checked && !rich_cache_missing && !actor_relation_missing {
-            if let Some(details) = cached_nfo {
+            if let Some(details) = cached_nfo.as_ref() {
                 self.database
-                    .merge_local_provider_ids(item_id, &details.provider_ids)
+                    .repair_local_nfo_defaults(
+                        item_id,
+                        &details.provider_ids,
+                        local_nfo_premiere_date(details),
+                    )
                     .await?;
-                if let Some(premiere_date) = local_nfo_premiere_date(&details) {
-                    self.database
-                        .update_media_item_premiere_date_if_missing(item_id, premiere_date)
-                        .await?;
-                }
             }
             report.nfo_skipped = 1;
             return Ok(report);

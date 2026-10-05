@@ -2598,6 +2598,101 @@ impl Database {
             })
     }
 
+    pub(crate) async fn repair_local_nfo_defaults(
+        &self,
+        item_id: &str,
+        provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if provider_ids.is_empty() && premiere_date.is_none() {
+            return Ok(());
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let current = self
+            .query_as::<(Option<String>, Option<String>)>(
+                "SELECT provider_ids_json, premiere_date
+                 FROM media_items
+                 WHERE id = ? AND removed_at IS NULL",
+            )
+            .bind(item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((current_provider_ids, current_premiere_date)) = current else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        };
+
+        let mut merged = current_provider_ids
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+            .unwrap_or_default();
+        let mut provider_ids_json = None;
+        let mut provider_ids_changed = false;
+        for (provider, provider_id) in provider_ids {
+            let provider = provider.trim();
+            let provider_id = provider_id.trim();
+            if provider.is_empty()
+                || provider_id.is_empty()
+                || merged
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(provider))
+            {
+                continue;
+            }
+            merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+            provider_ids_changed = true;
+        }
+        if provider_ids_changed {
+            provider_ids_json = Some(
+                serde_json::to_string(&merged)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            );
+        }
+        let premiere_date = premiere_date
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| {
+                current_premiere_date
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            });
+        if provider_ids_json.is_some() || premiere_date.is_some() {
+            self.query(
+                "UPDATE media_items
+                 SET provider_ids_json = COALESCE(?, provider_ids_json),
+                     premiere_date = COALESCE(?, premiere_date),
+                     updated_at = unixepoch()
+                 WHERE id = ? AND removed_at IS NULL",
+            )
+            .bind(provider_ids_json)
+            .bind(premiere_date)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn update_local_provider_ids_for_identity_if_empty(
         &self,
         identity_key: &str,
@@ -5458,36 +5553,6 @@ impl Database {
             path: self.path.clone(),
             source,
         })
-    }
-
-    pub(crate) async fn update_media_item_premiere_date_if_missing(
-        &self,
-        item_id: &str,
-        premiere_date: &str,
-    ) -> Result<(), StorageError> {
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE media_items
-             SET premiere_date = ?, updated_at = unixepoch()
-             WHERE id = ? AND NULLIF(premiere_date, '') IS NULL",
-        )
-        .bind(premiere_date)
-        .bind(item_id)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
     }
 
     pub(crate) async fn media_item_nfo_metadata_json(
