@@ -4000,11 +4000,24 @@ pub(crate) async fn require_admin(
     state: &AppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
-    if users::lux_user_token_from_headers(headers).is_some()
-        && resolve_shared_admin_api_key(headers, state)
-            .await?
-            .is_none()
-    {
+    if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
+        if !principal.can_manage_server()
+            || (state.remote_access.is_remote(
+                header_str(headers, "x-lux-peer-ip"),
+                header_str(headers, "x-forwarded-for"),
+            ) && !principal.can_remote_access())
+        {
+            return Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "没有服务器管理权限",
+            )
+            .into_response());
+        }
+        return Ok(());
+    }
+    if users::lux_user_token_from_headers(headers).is_some() {
         return Err(api_error(
             headers,
             StatusCode::FORBIDDEN,
@@ -4108,7 +4121,7 @@ pub(crate) async fn require_admin_web_session(
 pub(crate) async fn resolve_shared_admin_api_key(
     headers: &HeaderMap,
     state: &AppState,
-) -> Result<Option<UserRecord>, Response> {
+) -> Result<Option<crate::auth::users::AuthenticationPrincipal>, Response> {
     let Some(candidate) = lux_api_key_from_headers(headers) else {
         return Ok(None);
     };
@@ -4121,7 +4134,7 @@ pub(crate) async fn resolve_shared_admin_api_key(
         )
         .into_response());
     };
-    service.resolve(&candidate).await.map_err(|_| {
+    service.resolve_principal(&candidate).await.map_err(|_| {
         api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4187,7 +4200,7 @@ pub(crate) async fn record_audit_event(
             let Some(service) = state.admin_api_key.as_ref() else {
                 return;
             };
-            let Ok(Some(_)) = service.resolve(&candidate).await else {
+            let Ok(Some(_)) = service.resolve_principal(&candidate).await else {
                 return;
             };
             (None, None, audit_metadata_for_shared_api_key(metadata_json))

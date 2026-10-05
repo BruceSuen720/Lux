@@ -886,6 +886,56 @@ pub(super) async fn auth_login(
 }
 
 pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(candidate) = lux_api_key_from_headers(&headers) {
+        let Some(service) = state.admin_api_key.as_ref() else {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证服务尚未就绪",
+            )
+            .into_response();
+        };
+        match service.resolve_principal(&candidate).await {
+            Ok(Some(principal)) => {
+                if state.remote_access.is_remote(
+                    header_str(&headers, "x-lux-peer-ip"),
+                    header_str(&headers, "x-forwarded-for"),
+                ) && !principal.can_remote_access()
+                {
+                    return api_error(
+                        &headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前主体不允许远程访问",
+                    )
+                    .into_response();
+                }
+                let server_name = current_emby_server_name(&state).await;
+                return Json(json!({
+                    "principal": {
+                        "type": "shared_admin_api_key",
+                        "permissions": {
+                            "canManageServer": principal.can_manage_server(),
+                            "canRemoteAccess": principal.can_remote_access(),
+                        },
+                    },
+                    "serverName": server_name,
+                }))
+                .into_response();
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response();
+            }
+        }
+    }
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
@@ -1781,9 +1831,40 @@ pub(super) async fn require_web_user(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<UserRecord, Response> {
+    match require_web_principal(headers, state).await? {
+        crate::auth::users::AuthenticationPrincipal::User(user) => Ok(user),
+        crate::auth::users::AuthenticationPrincipal::SharedAdminApiKey => Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要用户身份",
+        )
+        .into_response()),
+    }
+}
+
+pub(super) async fn require_web_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<crate::auth::users::AuthenticationPrincipal, Response> {
     if has_client_token(headers) {
-        let user = resolve_lux_client_user(headers, state).await?;
-        let Some(user) = user else {
+        if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
+            if state.remote_access.is_remote(
+                header_str(headers, "x-lux-peer-ip"),
+                header_str(headers, "x-forwarded-for"),
+            ) && !principal.can_remote_access()
+            {
+                return Err(api_error(
+                    headers,
+                    StatusCode::FORBIDDEN,
+                    lux::ApiErrorCode::PermissionDenied,
+                    "当前主体不允许远程访问",
+                )
+                .into_response());
+            }
+            return Ok(principal);
+        }
+        let Some(token) = lux_user_token_from_headers(headers) else {
             return Err(api_error(
                 headers,
                 StatusCode::UNAUTHORIZED,
@@ -1792,20 +1873,48 @@ pub(super) async fn require_web_user(
             )
             .into_response());
         };
-        if state.remote_access.is_remote(
-            header_str(headers, "x-lux-peer-ip"),
-            header_str(headers, "x-forwarded-for"),
-        ) && !user.can_remote_access
-        {
+        let Some(auth) = state.emby_auth.as_ref() else {
             return Err(api_error(
                 headers,
-                StatusCode::FORBIDDEN,
-                lux::ApiErrorCode::PermissionDenied,
-                "当前管理员不允许远程访问",
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证服务尚未就绪",
             )
             .into_response());
-        }
-        return Ok(user);
+        };
+        return match auth.resolve_token(&token).await {
+            Ok(Some(user)) => {
+                if state.remote_access.is_remote(
+                    header_str(headers, "x-lux-peer-ip"),
+                    header_str(headers, "x-forwarded-for"),
+                ) && !user.can_remote_access
+                {
+                    Err(api_error(
+                        headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前管理员不允许远程访问",
+                    )
+                    .into_response())
+                } else {
+                    Ok(crate::auth::users::AuthenticationPrincipal::User(user))
+                }
+            }
+            Ok(None) => Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要有效的客户端令牌",
+            )
+            .into_response()),
+            Err(_) => Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
+            )
+            .into_response()),
+        };
     }
     let Some(auth) = state.auth.as_ref() else {
         return Err(api_error(
@@ -1840,7 +1949,9 @@ pub(super) async fn require_web_user(
                 )
                 .into_response());
             }
-            Ok(session.user)
+            Ok(crate::auth::users::AuthenticationPrincipal::User(
+                session.user,
+            ))
         }
         Ok(None) => Err(api_error(
             headers,
@@ -1954,40 +2065,6 @@ fn parse_lux_user_token(value: &str) -> Option<String> {
     let value = value.trim();
     let value = value.strip_prefix("Bearer ").unwrap_or(value).trim();
     (!value.is_empty()).then(|| value.to_owned())
-}
-
-async fn resolve_lux_client_user(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<Option<UserRecord>, Response> {
-    if lux_api_key_from_headers(headers).is_some()
-        && let Some(user) = resolve_shared_admin_api_key(headers, state).await?
-    {
-        return Ok(Some(user));
-    }
-
-    let Some(token) = lux_user_token_from_headers(headers) else {
-        return Ok(None);
-    };
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "认证服务尚未就绪",
-        )
-        .into_response());
-    };
-    match auth.resolve_token(&token).await {
-        Ok(user) => Ok(user),
-        Err(_) => Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "认证暂时不可用",
-        )
-        .into_response()),
-    }
 }
 
 pub(super) fn api_routes() -> Router<AppState> {

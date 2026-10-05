@@ -19,11 +19,12 @@ pub(super) async fn emby_sync_media_info(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !body.is_empty() && !user.is_admin {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !body.is_empty() && !auth_principal.is_admin() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(plugins) = state.plugins.as_ref() else {
@@ -319,16 +320,20 @@ pub(super) async fn emby_danmaku_info(
     Query(query): Query<DanmakuQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let public_item_id = item_id.clone();
     let item_id = emby_internal_id(&item_id);
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
+    };
     match access.can_view_item(principal, &item_id).await {
         Ok(true) => {}
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
@@ -357,15 +362,19 @@ pub(super) async fn emby_danmaku_raw(
     Query(query): Query<DanmakuQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let item_id = emby_internal_id(&item_id);
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
+    };
     match access.can_view_item(principal, &item_id).await {
         Ok(true) => {}
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
@@ -416,10 +425,7 @@ pub(super) async fn emby_system_info(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    if let Err(status) = require_emby_token(&headers, &query, auth, &state).await {
+    if let Err(status) = require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
         return status.into_response();
     }
     let server_name = current_emby_server_name(&state).await;
@@ -445,11 +451,12 @@ pub(super) async fn emby_refresh_item(
     Query(query): Query<EmbyRefreshQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     if query.recursive == Some(false) {
@@ -516,11 +523,12 @@ pub(super) async fn emby_refresh_library(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -571,11 +579,12 @@ pub(super) async fn emby_media_updated(
     State(state): State<AppState>,
     Json(request): Json<EmbyMediaUpdatedRequest>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -657,11 +666,12 @@ pub(super) async fn emby_scheduled_tasks(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -773,12 +783,17 @@ pub(super) async fn emby_display_preferences(
     Query(query): Query<EmbyDisplayPreferencesQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user_with_query(&headers, &state, &query.auth).await {
-        Ok(user) => user,
+    let principal = match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let requested_user_id = query.user_id.unwrap_or_else(|| user.id.to_string());
-    if let Err(status) = ensure_emby_user_scope(&user, &requested_user_id) {
+    if principal.user_id().is_none() && query.user_id.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let requested_user_id = query.user_id.as_deref();
+    if let Err(status) =
+        emby_access_principal_for_target(&state, &principal, requested_user_id).await
+    {
         return status.into_response();
     }
     let Some(client) = query
@@ -844,11 +859,12 @@ pub(super) async fn emby_users(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(auth) = state.emby_auth.as_ref() else {
@@ -912,11 +928,12 @@ pub(super) async fn emby_query_users(
     Query(query): Query<EmbyUsersQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let acting_user = match require_emby_user_with_query(&headers, &state, &query.auth).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !acting_user.can_manage_server {
+    let acting_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let (offset, limit) = match emby_users_page_params(&query) {
@@ -998,27 +1015,22 @@ pub(super) async fn emby_user(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let principal = match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    if user_id.parse::<UserId>().is_err() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let user = if user.id.to_string() == user_id {
-        user
-    } else {
-        if !user.can_manage_server {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-        let Some(auth) = state.emby_auth.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let _access_principal =
+        match emby_access_principal_for_target(&state, &principal, Some(&user_id)).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
         };
-        match auth.user_by_id(&user_id).await {
-            Ok(Some(user)) => user,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user = match auth.user_by_id(&user_id).await {
+        Ok(Some(user)) if !user.is_disabled => user,
+        Ok(Some(_) | None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let server_name = current_emby_server_name(&state).await;
     let ordered_views = emby_ordered_views(&state, &user).await;
@@ -1061,11 +1073,12 @@ pub(super) async fn emby_create_collection(
     Query(query): Query<EmbyCollectionMutationQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(name) = query
@@ -1125,11 +1138,12 @@ async fn emby_mutate_collection_items(
     state: &AppState,
     add: bool,
 ) -> Response {
-    let user = match require_emby_user(headers, state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server {
+    let principal =
+        match require_emby_principal(headers, state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let ids = match parse_emby_collection_item_ids(query.ids.as_deref()) {
@@ -1182,12 +1196,12 @@ pub(super) async fn emby_create_user(
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
-    let acting_user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await
-    {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !acting_user.can_manage_server {
+    let acting_principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(name) = request
@@ -1317,11 +1331,12 @@ pub(super) async fn emby_delete_user(
     if user_id.parse::<UserId>().is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !acting_user.can_manage_server {
+    let acting_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -1602,14 +1617,19 @@ pub(super) async fn emby_update_user(
     if let Err(status) = check_emby_target_id(request.id.as_deref(), &user_id) {
         return status.into_response();
     }
-    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !acting_user.can_manage_server && acting_user.id.to_string() != user_id {
+    let acting_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !acting_principal.can_manage_server()
+        && acting_principal
+            .user_id()
+            .is_none_or(|id| id.to_string() != user_id)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if request.policy.is_some() && !acting_user.can_manage_server {
+    if request.policy.is_some() && !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -1688,11 +1708,12 @@ pub(super) async fn emby_update_user_policy(
     if let Err(status) = check_emby_target_id(None, &user_id) {
         return status.into_response();
     }
-    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !acting_user.can_manage_server {
+    let acting_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(database) = state.database.as_ref() else {
@@ -1737,11 +1758,16 @@ pub(super) async fn emby_update_user_password(
     if let Err(status) = check_emby_target_id(request.id.as_deref(), &user_id) {
         return status.into_response();
     }
-    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !acting_user.can_manage_server && acting_user.id.to_string() != user_id {
+    let acting_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !acting_principal.can_manage_server()
+        && acting_principal
+            .user_id()
+            .is_none_or(|id| id.to_string() != user_id)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(new_password) = request.new_pw.as_deref() else {
@@ -1758,6 +1784,9 @@ pub(super) async fn emby_update_user_password(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if let Some(current_password) = request.current_pw.as_deref() {
+        let Some(acting_user) = acting_principal.user() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
         match users
             .authenticate(&acting_user.username_normalized, current_password)
             .await
@@ -1858,11 +1887,16 @@ async fn update_emby_user_avatar(
     {
         return status.into_response();
     }
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server && user.id.to_string() != user_id {
+    let principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !principal.can_manage_server()
+        && principal
+            .user_id()
+            .is_none_or(|id| id.to_string() != user_id)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(avatars) = state.user_avatars.as_ref() else {
@@ -1971,11 +2005,16 @@ async fn delete_emby_user_avatar(
     {
         return status.into_response();
     }
-    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
-    if !user.can_manage_server && user.id.to_string() != user_id {
+    let principal =
+        match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !principal.can_manage_server()
+        && principal
+            .user_id()
+            .is_none_or(|id| id.to_string() != user_id)
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(avatars) = state.user_avatars.as_ref() else {
@@ -2275,39 +2314,14 @@ pub(super) struct EmbyPersonQuery {
     pub(super) user_id: Option<String>,
 }
 
-pub(super) async fn require_emby_token(
-    headers: &HeaderMap,
-    query: &EmbyTokenQuery,
-    auth: &EmbyAuthService,
-    state: &AppState,
-) -> Result<(), StatusCode> {
-    let user = resolve_emby_user_with_auth(headers, query, auth, state).await?;
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !user.can_remote_access
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    Ok(())
-}
-
 pub(super) async fn resolve_emby_user_with_auth(
     headers: &HeaderMap,
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
-    state: &AppState,
 ) -> Result<UserRecord, StatusCode> {
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if let Some(service) = state.admin_api_key.as_ref() {
-        match service.resolve(&token).await {
-            Ok(Some(user)) => return Ok(user),
-            Ok(None) => {}
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-        }
-    }
     match auth.resolve_token(&token).await {
         Ok(Some(user)) => Ok(user),
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
@@ -2428,7 +2442,7 @@ pub(super) async fn require_emby_user_with_query(
     let Some(auth) = state.emby_auth.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let user = resolve_emby_user_with_auth(headers, query, auth, state).await?;
+    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
     if state.remote_access.is_remote(
         header_str(headers, "x-lux-peer-ip"),
         header_str(headers, "x-forwarded-for"),
@@ -2437,6 +2451,103 @@ pub(super) async fn require_emby_user_with_query(
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(user)
+}
+
+pub(super) async fn require_emby_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+    api_key: Option<&str>,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    let query = EmbyTokenQuery {
+        api_key: api_key.map(str::to_owned),
+        tag: None,
+        fields: None,
+        active_within_seconds: None,
+    };
+    require_emby_principal_with_query(headers, state, &query).await
+}
+
+pub(super) async fn require_emby_principal_with_query(
+    headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyTokenQuery,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let token = emby_token_from_headers(headers)
+        .or_else(|| query.api_key.clone())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let principal = if let Some(service) = state.admin_api_key.as_ref() {
+        match service.resolve_principal(&token).await {
+            Ok(Some(principal)) => Some(principal),
+            Ok(None) => None,
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    } else {
+        None
+    };
+    let principal = if let Some(principal) = principal {
+        principal
+    } else {
+        match auth.resolve_token(&token).await {
+            Ok(Some(user)) => crate::auth::users::AuthenticationPrincipal::User(user),
+            Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    };
+    if state.remote_access.is_remote(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-for"),
+    ) && !principal.can_remote_access()
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(principal)
+}
+
+pub(super) fn emby_access_principal(
+    principal: &crate::auth::users::AuthenticationPrincipal,
+    target_user_id: Option<&str>,
+) -> Result<AccessPrincipal, StatusCode> {
+    let target_user_id = target_user_id
+        .map(str::parse::<UserId>)
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Some(user) = principal.user() {
+        if target_user_id.is_some_and(|target_user_id| !user.is_admin && target_user_id != user.id)
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Ok(AccessPrincipal::new(
+            target_user_id.unwrap_or(user.id),
+            user.is_admin,
+        ))
+    } else {
+        Ok(AccessPrincipal::server_admin(target_user_id))
+    }
+}
+
+pub(super) async fn emby_access_principal_for_target(
+    state: &AppState,
+    principal: &crate::auth::users::AuthenticationPrincipal,
+    target_user_id: Option<&str>,
+) -> Result<AccessPrincipal, StatusCode> {
+    let access_principal = emby_access_principal(principal, target_user_id)?;
+    let Some(target_user_id) = access_principal.user_id else {
+        return Ok(access_principal);
+    };
+    if principal.user_id() == Some(target_user_id) {
+        return Ok(access_principal);
+    }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    match auth.user_by_id(&target_user_id.to_string()).await {
+        Ok(Some(user)) if !user.is_disabled => Ok(access_principal),
+        Ok(Some(_) | None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 pub(super) async fn emby_logout(

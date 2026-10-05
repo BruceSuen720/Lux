@@ -624,6 +624,13 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
     users::require_web_user(headers, state).await
 }
 
+async fn require_web_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<crate::auth::users::AuthenticationPrincipal, Response> {
+    users::require_web_principal(headers, state).await
+}
+
 async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
     users::require_web_csrf(headers, state).await
 }
@@ -1054,9 +1061,13 @@ async fn lux_search_people(
     Query(query): Query<LuxPeopleSearchQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let Some(raw_query) = query
         .q
@@ -1087,10 +1098,7 @@ async fn lux_search_people(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1126,9 +1134,13 @@ async fn lux_get_person_items(
     Query(query): Query<LuxPageQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let (offset, limit) = match lux_page_params(&query) {
         Ok(params) => params,
@@ -1145,10 +1157,7 @@ async fn lux_get_person_items(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1183,16 +1192,12 @@ async fn lux_get_person_items(
         ..CatalogFilter::default()
     };
     match catalog
-        .list_all_items_filtered(
-            AccessPrincipal::new(user.id, user.is_admin),
-            &filter,
-            offset,
-            limit,
-        )
+        .list_all_items_filtered(principal, &filter, offset, limit)
         .await
     {
         Ok(page) => {
-            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+            match lux_catalog_page_json_for_user(database, &principal.user_id_string(), &page).await
+            {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
@@ -1217,17 +1222,18 @@ async fn lux_get_person(
     Path(person_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1239,12 +1245,15 @@ async fn lux_get_person(
     };
     match people.find_person(&library_ids, "Actor", &person_id).await {
         Ok(Some(mut person)) => {
-            person.is_favorite = match database
-                .find_user_person_favorite(&user.id.to_string(), &person.id)
-                .await
-            {
-                Ok(is_favorite) => is_favorite,
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            person.is_favorite = match auth_principal.user_id() {
+                Some(user_id) => match database
+                    .find_user_person_favorite(&user_id.to_string(), &person.id)
+                    .await
+                {
+                    Ok(is_favorite) => is_favorite,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                },
+                None => false,
             };
             Json(person).into_response()
         }
@@ -1350,9 +1359,13 @@ async fn lux_update_person(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
+    let auth_principal = match require_web_principal(&headers, &state).await {
+        Ok(principal) => principal,
         Err(response) => return response,
+    };
+    let principal = match emby_access_principal(&auth_principal, None) {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     if !person_update_is_bounded(&request) {
         return api_error(
@@ -1366,10 +1379,7 @@ async fn lux_update_person(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let library_ids = match access
-        .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
-        .await
-    {
+    let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1505,7 +1515,7 @@ async fn lux_get_person_image_inner(
     person_id: String,
     state: AppState,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
+    if let Err(response) = require_web_principal(&headers, &state).await {
         return response;
     }
     let Some(people) = state.people.as_ref() else {
