@@ -9234,13 +9234,9 @@ impl ScanJobService {
                 None => enricher,
             };
 
-            loop {
-                if *stop_receiver.borrow() {
-                    return;
-                }
-                let notified = notify.notified();
-                let job = match database.find_scan_job(&worker_job_id).await {
-                    Ok(Some(job)) => job,
+            let mut job = loop {
+                match database.find_scan_job(&worker_job_id).await {
+                    Ok(Some(job)) => break job,
                     Ok(None) => return,
                     Err(error) => {
                         tracing::warn!(
@@ -9256,9 +9252,13 @@ impl ScanJobService {
                             }
                             _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                         }
-                        continue;
                     }
-                };
+                }
+            };
+            loop {
+                if *stop_receiver.borrow() {
+                    return;
+                }
                 if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
                     return;
                 }
@@ -9376,6 +9376,7 @@ impl ScanJobService {
                     }
                     continue;
                 }
+                let notified = notify.notified();
                 tokio::select! {
                     changed = stop_receiver.changed() => {
                         if changed.is_err() || *stop_receiver.borrow() {
@@ -9385,6 +9386,18 @@ impl ScanJobService {
                     _ = notified => {}
                     _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                 }
+                job = match database.find_scan_job(&worker_job_id).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            scan_job_id = %worker_job_id,
+                            %error,
+                            "local metadata worker could not refresh scan job; retrying"
+                        );
+                        continue;
+                    }
+                };
             }
         });
         LocalMetadataWorkerHandle {
