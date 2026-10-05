@@ -8381,14 +8381,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [x] 两个受影响媒体库的刮削器重排由逐库/逐项 SQL 收敛为有界批量读取、删除、插入和主刮削器更新；固定 fixture 查询从 15 次降为 8 次。
+- [x] 两个受影响媒体库的刮削器重排由逐库/逐项 SQL 收敛为有界批量读取、删除、插入和主刮削器更新；当前固定 fixture 查询从 15 次降为 6 次。
 - [x] 受影响库无剩余刮削器时 `libraries.scraper_id` 置空；备用和补充角色、位置和插件卸载后的章节源清理保持不变。
 - [x] 每批最多 100 个媒体库，刮削器重插每批最多 100 行，所有 ID、角色和值均使用绑定参数，兼容 SQLite/PostgreSQL。
 - [x] 插件卸载 API、媒体库管理回归、storage 查询计数回归、fmt、Clippy 和全目标 Rust 门禁通过；不改变插件文件清理或公共 API。
 
 依赖：无。预计文件：`src/storage/users.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先增加多库卸载重排的查询计数回归，再实现有界批量重排。
 
-结果（2026-10-03）：两个受影响媒体库的卸载重排由旧路径 15 次 storage SQL 调用降为 8 次，批量重排保留主/备用/补充角色和章节源清理；插件、媒体库 API 与 storage 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
+结果（2026-10-05）：合并后的批量卸载实现对两个受影响媒体库执行 6 次 storage SQL 调用；固定 fixture 的旧实现为 15 次。角色重排、章节源清理、安装记录删除及插件/媒体库/storage 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产收益。
 
 #### LUX-387：批量回收过期 Web 播放会话
 
@@ -8464,6 +8464,36 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 文件：`src/storage/library.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。测试与私有 helper 位于同一模块，因此未修改 `repository_tests.rs`。实现前 helper 回归因方法不存在而编译失败；旧创建/编辑循环每项执行一条 INSERT 属于源码计数，新 helper 的 SQL 调用数通过测试实测。补充空输入、205 行分批、位置/角色与后续批次失败回滚覆盖。
 
 最终门禁（2026-10-05）：本机 `uname -m=arm64`，Toshiba target 已挂载。`cargo build --locked`、`cargo test --locked --all-targets`（711 passed、0 failed、11 ignored；其中 PostgreSQL 专项 15 项因无本地 PostgreSQL 而 ignored）、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check` 均通过。未进行 PostgreSQL、NAS 或生产环境性能验证。
+
+#### LUX-392：复用 NFO 阶段的 source 快照
+
+范围：扫描本地 metadata 的完整度阶段当前会在 NFO 阶段已查出 source 后，再按 filesystem entry 和目录重新展开完整 source 列表。让 NFO 阶段携带其实际处理的 `(item_id, source_id)` 快照；完整度阶段批量确认该 source 仍是 item 当前的首选有效 source，再读取 active item metadata。不要复用更早的图片阶段快照；source 已删除、item 已移除或首选 source 已改变时，不写该 item 的完整度结果。
+
+验收：
+
+- [x] 完整度阶段不再调用 `list_scan_local_metadata_sources`，只使用 NFO 阶段 source identity，并在有界批量查询中复核当前首选 source。
+- [x] 回归覆盖 source 未变、source 被删除或标 missing、首选 source 切换；非重试失败排除项、增量扫描和 backfill 完整度语义保持不变。
+- [x] 单 item、单目录固定 fixture 的完整度读取从 3 次 storage query-wrapper 调用降至 2 次；不据此推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+- [x] 相关本地 metadata / 扫描回归、build、fmt、全目标全 feature Clippy 与差异检查通过。
+- [x] 全目标 Rust 测试通过。
+
+文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/storage/jobs.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-05）：NFO source identity freshness 回归、`scanned_metadata`（15 项）、`scanned_series_metadata`（2 项）、串行 `scanning_jobs`（81 项）、build、fmt、Clippy 与差异检查通过。固定 SQLite fixture 的完整度阶段查询从 3 次降至 2 次。全目标串行 Rust 测试通过；此前在单独运行中失败的 `tests/emby_counts.rs::emby_item_counts_respects_auth_user_scope_and_favorites` 在本次完整串行运行中通过，未再复现。依赖本地 PostgreSQL 的测试和显式性能基准按测试配置忽略。没有据本地调用数推断 FNOS、PostgreSQL 或 NAS 收益。
+
+#### LUX-393：校准插件卸载刮削器查询计数
+
+范围：后续合并后的 `uninstall_plugin` 已将两个受影响媒体库的 fixture 压到 6 次 storage query-wrapper 调用，但旧回归仍断言 8 次，导致全目标测试失败。更新计数断言及 LUX-386 性能记录；不改变插件卸载行为。
+
+验收：
+
+- [x] 固定两个媒体库 fixture 断言 6 次调用，并继续验证刮削器位置、角色和 legacy 主刮削器结果。
+- [x] LUX-386 文档记录当前实现为 15 次降至 6 次；性能比例与调用范围说明一致。
+- [x] 定向 storage 回归通过；无运行时代码或 schema 变化。
+
+文件：`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-05）：插件卸载 storage 回归通过；双媒体库 fixture 固定为 6 次 query-wrapper 调用，插件卸载实现和 schema 均未变。
 
 #### 本轮代码质量与性能优化收口
 

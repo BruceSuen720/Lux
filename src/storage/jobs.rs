@@ -1,5 +1,5 @@
 use super::*;
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
@@ -8,6 +8,8 @@ const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
+// One item ID per bind keeps source freshness checks below SQLite's conservative limit.
+const SCAN_LOCAL_METADATA_SOURCE_IDENTITY_BATCH_SIZE: usize = 500;
 pub(crate) const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
 // Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
 const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
@@ -901,6 +903,68 @@ impl Database {
         let mut seen_items = std::collections::HashSet::with_capacity(sources.len());
         sources.retain(|source| seen_items.insert(source.item_id.clone()));
         Ok(sources)
+    }
+
+    pub(crate) async fn list_current_scan_local_metadata_item_ids(
+        &self,
+        source_identities: &[(String, String)],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut expected_source_by_item = HashMap::with_capacity(source_identities.len());
+        for (item_id, source_id) in source_identities {
+            expected_source_by_item.insert(item_id.as_str(), source_id.as_str());
+        }
+        let mut item_ids = expected_source_by_item.keys().copied().collect::<Vec<_>>();
+        item_ids.sort_unstable();
+
+        let mut current_item_ids = Vec::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(SCAN_LOCAL_METADATA_SOURCE_IDENTITY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, preferred.id AS source_id
+                 FROM media_items mi
+                 JOIN media_sources preferred ON preferred.id = (
+                     SELECT candidate.id FROM media_sources candidate
+                     JOIN filesystem_entries candidate_entry
+                       ON candidate_entry.id = candidate.filesystem_entry_id
+                     WHERE candidate.item_id = mi.id AND candidate_entry.is_missing = 0
+                     ORDER BY candidate.is_default DESC, candidate.id
+                     LIMIT 1
+                 )
+                 JOIN filesystem_entries preferred_entry
+                   ON preferred_entry.id = preferred.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = preferred_entry.library_root_id
+                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
+                   AND preferred_entry.is_missing = 0"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id: String = row.get("item_id");
+                let source_id: String = row.get("source_id");
+                if expected_source_by_item.get(item_id.as_str()) == Some(&source_id.as_str()) {
+                    current_item_ids.push(item_id);
+                }
+            }
+        }
+
+        current_item_ids.sort_unstable();
+        current_item_ids.dedup();
+        Ok(current_item_ids)
     }
 
     pub(crate) async fn mark_scan_local_metadata_images_complete(
@@ -11350,6 +11414,166 @@ mod tests {
         prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
+
+    #[tokio::test]
+    async fn local_metadata_completeness_reuses_current_source_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/media', '/media', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('item', 'lib', 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES
+                    ('entry-old', 'root', 'Movie/movie.mkv', 'FILE', 10, 1, 'generation'),
+                    ('entry-new', 'root', 'Movie/movie-alt.mkv', 'FILE', 10, 1, 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+                 ) VALUES
+                    ('source-old', 'item', 'LOCAL_FILE', 'entry-old', 1, 'READY'),
+                    ('source-new', 'item', 'LOCAL_FILE', 'entry-new', 0, 'READY')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let source_ids = vec!["entry-old".to_owned()];
+        database.reset_query_count();
+        let sources = database
+            .list_scan_local_metadata_sources(&source_ids)
+            .await?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id, "source-old");
+        let metadata = database
+            .list_active_media_item_metadata_with_libraries(&["item".to_owned()])
+            .await?;
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the old path expands the directory again"
+        );
+
+        let identities = vec![("item".to_owned(), "source-old".to_owned())];
+        database.reset_query_count();
+        assert_eq!(
+            database
+                .list_current_scan_local_metadata_item_ids(&identities)
+                .await?,
+            vec!["item".to_owned()]
+        );
+        let metadata = database
+            .list_active_media_item_metadata_with_libraries(&["item".to_owned()])
+            .await?;
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(database.query_count(), 2);
+
+        database
+            .query("UPDATE media_sources SET is_default = 0 WHERE id = 'source-old'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("UPDATE media_sources SET is_default = 1 WHERE id = 'source-new'")
+            .execute(database.pool())
+            .await?;
+        database.reset_query_count();
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&identities)
+                .await?
+                .is_empty(),
+            "a preferred source changed after NFO processing, so the old identity is stale"
+        );
+        assert_eq!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?,
+            vec!["item".to_owned()]
+        );
+        database
+            .query("UPDATE media_items SET removed_at = unixepoch() WHERE id = 'item'")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?
+                .is_empty(),
+            "a removed item cannot pass freshness validation"
+        );
+        database
+            .query("UPDATE media_items SET removed_at = NULL WHERE id = 'item'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("UPDATE filesystem_entries SET is_missing = 1 WHERE id = 'entry-new'")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?
+                .is_empty(),
+            "a preferred source with a missing entry is not current"
+        );
+        database
+            .query("UPDATE filesystem_entries SET is_missing = 0 WHERE id = 'entry-new'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("DELETE FROM media_sources WHERE id = 'source-new'")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            database
+                .list_current_scan_local_metadata_item_ids(&[(
+                    "item".to_owned(),
+                    "source-new".to_owned(),
+                )])
+                .await?
+                .is_empty(),
+            "a source deleted after NFO processing cannot pass freshness validation"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn scan_manifest_creation_is_atomic_and_idempotent()

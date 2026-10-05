@@ -1223,7 +1223,7 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 
 ### LUX-386 插件卸载后的媒体库刮削器重排调用数
 
-2026-10-03 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个各含被卸载插件和备用/补充刮削器的媒体库。旧实现对每库分别读取、删除、逐项重插、读取主刮削器并更新库，共 15 次 storage SQL 调用；新实现按最多 100 个媒体库批量读取和删除，按有界批次重插并用一条 `CASE` 更新主刮削器，共 8 次，减少 7 次（约 46.7%）。回归验证位置、角色、空刮削器、章节源清理和安装记录删除。
+2026-10-05 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中准备两个各含被卸载插件和备用/补充刮削器的媒体库。旧实现对每库分别读取、删除、逐项重插、读取主刮削器并更新库，共 15 次 storage SQL 调用；当前合并后的实现按最多 100 个媒体库批量读取和删除，按有界批次重插并用一条 `CASE` 更新主刮削器，共 6 次，减少 9 次（60%）。回归验证位置、角色、空刮削器、章节源清理和安装记录删除。
 
 该计数只覆盖卸载事务内的刮削器重排 SQL；插件文件删除、目录扫描、任务同步、事务墙钟、锁等待、PostgreSQL、NAS 和生产收益不在数值范围内。
 
@@ -1430,3 +1430,13 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 实现提交：`0f4dcdcc`。在 `uname -m=arm64` 的开发机上，用临时 SQLite 库、1 个媒体条目、1 个 unchanged NFO 文件和可用的 rich NFO cache 执行 `enrich_nfo_item`。旧路径为 4 次 storage query-wrapper 调用；新路径为 3 次，减少 1 次（25%）。减少的调用是默认值修复中的无变化 SELECT；默认值完整时也不再创建该修复事务。Storage query counter 统计应用层 query-wrapper 调用，不统计 BEGIN/COMMIT，也不测量执行时长。
 
 回归命令：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib unchanged_nfo_with_complete_defaults_skips_repair_query`。另由 `tests/metadata.rs` 验证两种字段单独缺失时仍可修复并保留已有值。该结果只说明 1 项 SQLite fixture 的调用边界；没有测量墙钟、PostgreSQL、FNOS 或 NAS/x86 性能。
+
+### LUX-392 扫描本地 metadata 完整度 source 读取调用数
+
+在单 item、单目录 SQLite fixture 中，完整度阶段旧路径重新展开目录 source 并读取 active metadata，共 3 次 storage query-wrapper 调用；新路径复用 NFO 阶段的 `(item_id, source_id)` 快照，先批量确认首选 source 仍有效，再读取 active metadata，共 2 次，减少 1 次（约 33.3%）。回归同时覆盖首选 source 切换、文件标 missing 和 source 删除时拒绝旧快照。
+
+该计数只覆盖完整度阶段的 source 与 item metadata 读取，不包括 NFO 阶段原有 source 查询、完整度计划、刮削器可用性、结果写入或 `FILL_MISSING` 调度；storage query counter 也不测量 SQL 执行时长。未据此推断墙钟、FNOS CPU、PostgreSQL 或 NAS 性能收益。
+
+### LUX-393 插件卸载刮削器计数回归校准
+
+后续合并后的卸载路径在同一双媒体库 fixture 中固定执行 6 次 storage query-wrapper 调用：配置读取、批量删除、批量重插、批量主刮削器更新、插件引用清理和插件记录删除。旧回归中的 8 次期望与当前实现不符，已按当前 fixture 更新为 6 次；无运行时代码变化。

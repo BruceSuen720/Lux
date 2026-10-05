@@ -982,12 +982,16 @@ impl MetadataEnricher {
         &self,
         filesystem_entry_ids: &[String],
         excluded_item_ids: &[String],
-    ) -> Result<MetadataReport, MetadataError> {
+    ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
         let mut sources = self
             .database
             .list_scan_local_metadata_sources(filesystem_entry_ids)
             .await?;
         sources.retain(|source| !excluded_item_ids.contains(&source.item_id));
+        let source_identities = sources
+            .iter()
+            .map(|source| (source.item_id.clone(), source.source_id.clone()))
+            .collect();
         let (movies, home_videos, episodes) = split_scan_local_metadata_sources(sources);
         let mut report = MetadataReport::default();
         for source in movies {
@@ -1031,7 +1035,10 @@ impl MetadataEnricher {
             SeriesEnrichmentMode::NfoOnly,
         )
         .await;
-        Ok(report)
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        })
     }
 
     async fn enrich_scan_job_batch(
@@ -2095,6 +2102,12 @@ pub struct MetadataReport {
     pub(crate) locally_enriched_item_ids: Vec<String>,
     pub(crate) failed_item_ids: Vec<String>,
     pub(crate) non_retryable_failed_item_ids: Vec<String>,
+}
+
+pub(crate) struct ScanLocalMetadataNfoBatch {
+    pub(crate) report: MetadataReport,
+    // Each pair is (item_id, preferred source_id) from the NFO stage's source snapshot.
+    pub(crate) source_identities: Vec<(String, String)>,
 }
 
 impl MetadataReport {

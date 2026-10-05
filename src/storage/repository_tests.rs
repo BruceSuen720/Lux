@@ -9509,7 +9509,7 @@ async fn uninstalling_a_plugin_batches_library_scraper_rewrites()
 
     database.reset_query_count();
     database.uninstall_plugin(REMOVED_PLUGIN).await?;
-    assert_eq!(database.query_count(), 8);
+    assert_eq!(database.query_count(), 6);
 
     let first_scrapers: Vec<(String, i64, String)> = sqlx::query_as(
         "SELECT scraper_id, position, role FROM library_scrapers

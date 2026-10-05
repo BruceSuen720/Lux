@@ -32,7 +32,7 @@ use crate::{
             MediaKind, clean_title, has_multi_part_marker, has_source_variant_marker,
             parse_media_name, parse_media_name_with_variant_suffix,
         },
-        metadata::MetadataEnricher,
+        metadata::{MetadataEnricher, ScanLocalMetadataNfoBatch},
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
         probe::MediaProbeService,
@@ -3072,7 +3072,10 @@ async fn finish_scan_local_metadata_batch(
         .enrich_scan_local_metadata_batch_nfo(source_ids, &non_retryable_item_ids)
         .await
     {
-        Ok(report) => {
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        }) => {
             for item_id in &report.non_retryable_failed_item_ids {
                 if !non_retryable_item_ids.contains(item_id) {
                     non_retryable_item_ids.push(item_id.clone());
@@ -3095,7 +3098,7 @@ async fn finish_scan_local_metadata_batch(
                     context.metadata_selection,
                     context.metadata_reidentify,
                     Some(scan_job_id),
-                    source_ids,
+                    &source_identities,
                     &non_retryable_item_ids,
                     context.user_events,
                 )
@@ -3221,7 +3224,10 @@ async fn finish_scan_local_metadata_backfill_page(
         .enrich_scan_local_metadata_batch_nfo(&page.entry_ids, &page.non_retryable_item_ids)
         .await
     {
-        Ok(report) => {
+        Ok(ScanLocalMetadataNfoBatch {
+            report,
+            source_identities,
+        }) => {
             for item_id in &report.non_retryable_failed_item_ids {
                 if !non_retryable_item_ids.contains(item_id) {
                     non_retryable_item_ids.push(item_id.clone());
@@ -3244,7 +3250,7 @@ async fn finish_scan_local_metadata_backfill_page(
                     context.metadata_selection,
                     context.metadata_reidentify,
                     None,
-                    &page.entry_ids,
+                    &source_identities,
                     &non_retryable_item_ids,
                     context.user_events,
                 )
@@ -3399,26 +3405,22 @@ async fn complete_local_metadata_completeness(
     selection: Option<&MetadataSelectionService>,
     metadata_reidentify: Option<&MetadataReidentifyService>,
     scan_job_id: Option<&str>,
-    filesystem_entry_ids: &[String],
+    source_identities: &[(String, String)],
     excluded_item_ids: &[String],
     user_events: &UserEventHub,
 ) -> Result<(), String> {
     if selection.is_none() {
         return Ok(());
     }
-    let sources = database
-        .list_scan_local_metadata_sources(filesystem_entry_ids)
+    let source_identities = source_identities
+        .iter()
+        .filter(|(item_id, _)| !excluded_item_ids.iter().any(|excluded| excluded == item_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut item_ids = database
+        .list_current_scan_local_metadata_item_ids(&source_identities)
         .await
         .map_err(|error| error.to_string())?;
-    let mut item_ids = sources
-        .into_iter()
-        .filter(|source| {
-            !excluded_item_ids
-                .iter()
-                .any(|excluded| excluded == &source.item_id)
-        })
-        .map(|source| source.item_id)
-        .collect::<Vec<_>>();
     item_ids.sort_unstable();
     item_ids.dedup();
     complete_local_metadata_completeness_for_item_ids(
