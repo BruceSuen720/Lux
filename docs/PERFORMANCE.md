@@ -1348,3 +1348,7 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，再单独更新 `poster_fallback_required`，固定为 3 次写入和 3 个事务。改用已有有界图片批量写入后，两条图片记录和 fallback 清除在一个批量图片事务中完成，固定为 2 次 SQL 写入和 1 个事务，减少 1 次 SQL（约 33.3%）并减少 2 个短事务。
 
 该记录只覆盖图片登记与 fallback 清除，不包含图片文件写入、STRM 插件 RPC、媒体信息写回或任务进度更新；未据此推断墙钟、PostgreSQL、NAS 或生产收益。
+
+### LUX-383 普通本地图片登记事务边界
+
+普通电影、剧集、季度和分集图片索引现在统一复用有界 `ItemImageBatchInsert` 写入。图片 upsert 与 `poster_fallback_required` 清理在同一 metadata 写事务中完成；故障注入验证 fallback 更新失败时不会留下部分 `item_images`。该记录只说明事务原子性和 SQL 边界，不代表 FNOS/PostgreSQL/NAS 墙钟或 CPU 收益。

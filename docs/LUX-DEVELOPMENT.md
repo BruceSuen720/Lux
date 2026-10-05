@@ -8329,6 +8329,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-03）：两个同一电影条目的源由旧路径的 6 次逐源 SELECT/DELETE/UPDATE 降为 3 次批量 SQL；不匹配或缺失源只执行一次校验查询且不写入。剧集删除保留 item、parent、series 三层顺序更新，避免同一 UPDATE 中父级看不到刚删除的子级；删除媒体源和整剧集 API 回归通过。本机 `uname -m=arm64`，未实测 PostgreSQL 墙钟、NAS 或生产负载。
 
+#### LUX-383：普通本地图片登记与 fallback 原子提交
+
+范围：电影、剧集、季度和分集的普通本地图片索引复用 LUX-305 有界图片事务，把图片 upsert 和 poster fallback 清理合并为一个事务。保留图片命名、索引、legacy fanart 排除和处理顺序；不改变文件读取、schema 或在线任务合同。
+
+验收：
+
+- [x] 图片登记成功与 fallback 清理原子完成；注入 fallback 更新失败时图片不部分入库。
+- [x] 重复登记幂等，既有 metadata、series metadata 图片路径回归通过。
+- [x] 格式、相关 Clippy 和定向测试通过；性能记录只说明事务边界，不外推 FNOS CPU。
+
+预计文件：`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
 #### 阶段 23 总体验收与阶段门
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

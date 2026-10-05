@@ -1371,16 +1371,14 @@ impl MetadataEnricher {
                 source_url: None,
             });
         }
-        let inserted_count = self
-            .database
-            .insert_item_images_at_indices(item_id, &records)
-            .await?;
-        if has_primary_artwork {
-            self.database
-                .set_poster_fallback_required(item_id, false)
-                .await?;
-        }
-        Ok(inserted_count)
+        self.database
+            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
+                item_id: item_id.to_owned(),
+                images: records,
+                clear_poster_fallback: has_primary_artwork,
+            }])
+            .await
+            .map_err(MetadataError::Storage)
     }
 
     pub async fn enrich_series_library(
@@ -1884,16 +1882,14 @@ impl MetadataEnricher {
                 source_url: None,
             });
         }
-        let inserted_count = self
-            .database
-            .insert_item_images_at_indices(item_id, &records)
-            .await?;
-        if has_primary_artwork {
-            self.database
-                .set_poster_fallback_required(item_id, false)
-                .await?;
-        }
-        Ok(inserted_count)
+        self.database
+            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
+                item_id: item_id.to_owned(),
+                images: records,
+                clear_poster_fallback: has_primary_artwork,
+            }])
+            .await
+            .map_err(MetadataError::Storage)
     }
 }
 
@@ -2156,6 +2152,72 @@ pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn series_image_registration_rolls_back_when_fallback_update_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Artwork", crate::library::LibraryKind::Series, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, item_type, title, sort_title,
+                identification_status, poster_fallback_required)
+             VALUES ('artwork-item', ?, 'SERIES', 'Show', 'show', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_artwork_fallback BEFORE UPDATE OF poster_fallback_required
+             ON media_items BEGIN SELECT RAISE(ABORT, 'fallback failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let poster = directory.path().join("poster.jpg");
+        tokio::fs::write(&poster, b"local image fixture").await?;
+        let enricher = MetadataEnricher::new(database.clone());
+        assert!(
+            enricher
+                .index_images(
+                    "artwork-item",
+                    vec![LocalImage {
+                        image_type: ImageType::Poster,
+                        path: poster.clone(),
+                    }]
+                )
+                .await
+                .is_err()
+        );
+        assert!(database.list_item_images("artwork-item").await?.is_empty());
+        sqlx::query("DROP TRIGGER reject_artwork_fallback")
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            enricher
+                .index_images(
+                    "artwork-item",
+                    vec![LocalImage {
+                        image_type: ImageType::Poster,
+                        path: poster,
+                    }]
+                )
+                .await?,
+            1
+        );
+        let fallback: i64 = sqlx::query_scalar(
+            "SELECT poster_fallback_required FROM media_items WHERE id = 'artwork-item'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(fallback, 0);
+        Ok(())
+    }
 
     #[test]
     fn merges_only_new_provider_ids() {
