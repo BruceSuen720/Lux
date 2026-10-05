@@ -10197,6 +10197,7 @@ impl ScanJobService {
             );
             return;
         };
+        let mut queued_job_ids = Vec::new();
         for item_ids in item_ids.chunks(100) {
             let job = match metadata.create_fill_missing_job(item_ids.to_vec()).await {
                 Ok(job) => job,
@@ -10217,11 +10218,7 @@ impl ScanJobService {
                     continue;
                 }
             };
-            let job_id = job.id.clone();
-            let worker = metadata.clone();
-            tokio::spawn(async move {
-                worker.run(&job_id).await;
-            });
+            queued_job_ids.push(job.id.clone());
             let details = format!(
                 r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
                 job.total_count, job.id
@@ -10234,6 +10231,13 @@ impl ScanJobService {
                 &details,
             )
             .await;
+        }
+        if !queued_job_ids.is_empty() {
+            tokio::spawn(async move {
+                for job_id in queued_job_ids {
+                    metadata.run(&job_id).await;
+                }
+            });
         }
     }
 
