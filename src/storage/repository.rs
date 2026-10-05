@@ -2006,6 +2006,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
     pub(crate) nfo_metadata_json: Option<String>,
+    pub(crate) metadata_fingerprint: Option<Vec<u8>>,
     pub(crate) series_item_id: Option<String>,
     pub(crate) series_title: Option<String>,
     pub(crate) series_production_year: Option<i64>,

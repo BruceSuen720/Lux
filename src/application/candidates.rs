@@ -4488,6 +4488,7 @@ mod tests {
                 })
                 .to_string(),
             ),
+            metadata_fingerprint: None,
             series_item_id: None,
             series_title: None,
             series_production_year: None,
@@ -4683,6 +4684,7 @@ mod tests {
             provenance_json: None,
             locked_fields_json: None,
             nfo_metadata_json: None,
+            metadata_fingerprint: None,
             series_item_id: None,
             series_title: None,
             series_production_year: None,
@@ -4729,6 +4731,7 @@ mod tests {
             ),
             locked_fields_json: Some(json!(["overview"]).to_string()),
             nfo_metadata_json: None,
+            metadata_fingerprint: None,
             series_item_id: None,
             series_title: None,
             series_production_year: None,

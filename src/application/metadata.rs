@@ -1578,15 +1578,13 @@ impl MetadataEnricher {
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
-        let already_checked = if let Some(fingerprint) = fingerprint.as_deref() {
-            self.database
-                .media_item_metadata_fingerprint(item_id)
-                .await?
-                .as_deref()
+        let metadata = self.database.find_media_item_metadata(item_id).await?;
+        let already_checked = fingerprint.as_deref().is_some_and(|fingerprint| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.metadata_fingerprint.as_deref())
                 == Some(fingerprint)
-        } else {
-            false
-        };
+        });
         let cached_nfo = if let Some(local_nfo) = &self.local_nfo {
             local_nfo
                 .read_item_if_usable(item_id)
@@ -1649,7 +1647,7 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
-        let current = self.database.find_media_item_metadata(item_id).await?;
+        let current = metadata;
         if let Some(current) = current.as_ref() {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {
