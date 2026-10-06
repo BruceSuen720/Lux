@@ -2625,6 +2625,7 @@ where
         return Ok(write);
     }
     let temporary = parent.join(format!(".lux-{}.nfo.tmp", Uuid::now_v7()));
+    crate::application::images::register_internal_image_write(&temporary);
     let result = async {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2656,6 +2657,7 @@ where
         if !unchanged {
             return Err(NfoWriteError::ConcurrentModification(target.to_owned()));
         }
+        crate::application::images::register_internal_image_write(target);
         fs::rename(&temporary, target)
             .await
             .map_err(|source| io_error(target, source))?;
@@ -2666,6 +2668,7 @@ where
             .sync_all()
             .await
             .map_err(|source| io_error(parent, source))?;
+        crate::application::images::finalize_internal_metadata_write(target).await;
         Ok(())
     }
     .await;
@@ -2950,6 +2953,36 @@ mod tests {
         ));
         let content = tokio::fs::read_to_string(&target).await.expect("target");
         assert!(content.contains("external"));
+    }
+
+    #[tokio::test]
+    async fn atomic_nfo_write_is_marked_for_watcher_suppression() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("movie.nfo");
+        write_movie_nfo_atomically(
+            &target,
+            &MovieNfoMetadata {
+                base: NfoMetadata {
+                    title: Some("movie".to_owned()),
+                    ..NfoMetadata::default()
+                },
+                ..MovieNfoMetadata::default()
+            },
+        )
+        .await
+        .expect("write nfo");
+
+        assert!(
+            crate::application::images::should_suppress_internal_image_write(&target).await,
+            "the watcher should recognize Lux-owned NFO writes"
+        );
+        tokio::fs::write(&target, b"<movie><title>external edit</title></movie>")
+            .await
+            .expect("external edit");
+        assert!(
+            !crate::application::images::should_suppress_internal_image_write(&target).await,
+            "an external edit should invalidate the internal-write marker"
+        );
     }
 
     #[test]

@@ -168,6 +168,10 @@ fn finalize_internal_image_write(path: &Path, expected_stamp: Option<ImageFileSt
     }
 }
 
+pub(crate) async fn finalize_internal_metadata_write(path: &Path) {
+    finalize_internal_image_write(path, image_file_stamp(path).await.ok().flatten());
+}
+
 pub(crate) async fn should_suppress_internal_image_write(path: &Path) -> bool {
     let now = Instant::now();
     let marker = {
