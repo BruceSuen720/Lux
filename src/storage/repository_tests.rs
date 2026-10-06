@@ -5759,6 +5759,32 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .await
             .expect("metadata timestamp");
     assert!(updated_at > 0);
+    sqlx::query("UPDATE media_items SET updated_at = 123 WHERE id = 'rating-low'")
+        .execute(database.pool())
+        .await
+        .expect("set stable metadata timestamp");
+    database
+        .update_media_item_metadata(MediaMetadataUpdate {
+            item_id: "rating-low",
+            title: "rating-low",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: Some(10.0),
+            rating_source: Some("TEST"),
+            metadata_fingerprint: &[],
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        })
+        .await
+        .expect("no-op metadata update");
+    let unchanged_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'rating-low'")
+            .fetch_one(database.pool())
+            .await
+            .expect("no-op metadata timestamp");
+    assert_eq!(unchanged_at, 123);
     database.reset_query_count();
     let refreshed_rows = database
         .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
@@ -5771,6 +5797,108 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .map(|row| row.item_id.as_str())
             .collect::<Vec<_>>(),
         ["rating-low", "rating-top", "rating-unknown"]
+    );
+}
+
+#[tokio::test]
+async fn unchanged_media_search_fields_do_not_rebuild_fts_row() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    for item_id in ["fts-first", "fts-second"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let original_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("initial FTS row");
+
+    sqlx::query("UPDATE media_items SET overview = 'new overview' WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("non-search metadata update");
+    let unchanged_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("FTS row after non-search update");
+    assert_eq!(unchanged_rowid, original_rowid);
+
+    sqlx::query("UPDATE media_items SET title = 'renamed media' WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("search metadata update");
+    let renamed_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("renamed FTS row");
+    assert_eq!(renamed_rowid, original_rowid);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND title MATCH 'renamed'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("updated FTS content"),
+        1
+    );
+
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('fts-alias', 'fts-first', 'first alias', 'first alias')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("insert alias");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("inserted alias search"),
+        1
+    );
+    sqlx::query(
+        "UPDATE item_aliases SET alias = 'second alias', alias_normalized = 'second alias'
+         WHERE id = 'fts-alias'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("update alias");
+    sqlx::query("DELETE FROM item_aliases WHERE id = 'fts-alias'")
+        .execute(database.pool())
+        .await
+        .expect("delete alias");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("deleted alias search"),
+        0
     );
 }
 
