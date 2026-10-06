@@ -3009,23 +3009,27 @@ async fn process_scan_local_metadata_batch(
         }
     };
 
-    let result = match enricher
-        .index_scan_local_metadata_batch_images(&source_ids)
-        .await
-    {
-        Ok(report) if !report.failed_item_ids.is_empty() => Err(format!(
-            "{} local image item(s) failed",
-            report.failed_item_ids.len()
-        )),
-        Ok(_) => match database
-            .mark_scan_local_metadata_images_complete(&batch_id)
+    let result = if batch.images_completed_at.is_some() {
+        Ok(())
+    } else {
+        match enricher
+            .index_scan_local_metadata_batch_images(&source_ids)
             .await
         {
-            Ok(true) => Ok(()),
-            Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+            Ok(report) if !report.failed_item_ids.is_empty() => Err(format!(
+                "{} local image item(s) failed",
+                report.failed_item_ids.len()
+            )),
+            Ok(_) => match database
+                .mark_scan_local_metadata_images_complete(&batch_id)
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+                Err(error) => Err(error.to_string()),
+            },
             Err(error) => Err(error.to_string()),
-        },
-        Err(error) => Err(error.to_string()),
+        }
     };
     if let Some(home) = home {
         home.invalidate();

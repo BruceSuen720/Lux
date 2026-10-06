@@ -1180,6 +1180,12 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(retryable.id, "retry-batch");
     assert!(
         database
+            .mark_scan_local_metadata_images_complete(&retryable.id)
+            .await
+            .expect("mark local image stage complete before NFO work")
+    );
+    assert!(
+        database
             .fail_scan_local_metadata_batch(&retryable.id, "temporary failure", Some(i64::MAX))
             .await
             .expect("fail with delayed retry")
@@ -1204,17 +1210,12 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
         .expect("due retry");
     assert_eq!(retried.id, retryable.id);
     assert_eq!(retried.attempts, 2);
+    assert!(retried.images_completed_at.is_some());
     assert!(
-        database
+        !database
             .has_pending_scan_local_metadata_images("retry-job")
             .await
-            .expect("claim resets the image stage")
-    );
-    assert!(
-        database
-            .mark_scan_local_metadata_images_complete(&retried.id)
-            .await
-            .expect("mark retried images complete")
+            .expect("completed image stage remains complete across retries")
     );
     assert!(
         database
@@ -1273,11 +1274,12 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
         .expect("recovered batch");
     assert_eq!(recovered.id, "batch-e");
     assert_eq!(recovered.attempts, 2);
+    assert!(recovered.images_completed_at.is_some());
     assert!(
-        database
+        !database
             .has_pending_scan_local_metadata_images("interrupted-job")
             .await
-            .expect("reclaimed batch reruns the image stage")
+            .expect("recovered batch keeps its completed image stage")
     );
 
     database.close().await;
