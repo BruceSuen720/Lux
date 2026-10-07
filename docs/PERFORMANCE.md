@@ -1192,3 +1192,11 @@ SQLite 查询计数只衡量 SQL 调用数量，不是数据库写入量或墙�
 2026-10-02 在 ARM64 开发机（`uname -m=arm64`）的临时 SQLite 库中更新一个包含 705 个媒体库的自定义计划，并将 704 个媒体库移回默认计划。旧实现对每个移出库分别 DELETE 和 INSERT，完整更新路径共 1,420 次 storage SQL 调用；新实现按 500/204 两批使用 `INSERT ... SELECT` 和 DELETE，共 16 次，减少 1,404 次（约 98.9%）。回归验证自定义计划保留 1 个关联、默认计划接收 704 个关联及对应任务配置镜像。
 
 每批最多绑定 502 个值（默认计划、源计划和 500 个媒体库 ID）。计数来自 SQLite storage 查询计数器，只衡量 SQL 调用数，不是网络往返、墙钟或数据库写入量；没有据此推断 PostgreSQL、NAS 或生产负载收益。
+
+### LUX-CPU NAS 部署复测
+
+2026-10-08 在飞牛 NAS（Intel Core i9-12900H，16 CPU，`uname -m=x86_64`）部署提交 `5a542b36`。数据集为现有 PostgreSQL 媒体库（约 890,000 条 filesystem entry、367,000 条 media source；来自修复前 `EXPLAIN` 估算）。部署前 `docker stats --no-stream` 两次采样间隔 12 秒，PostgreSQL 分别占用 1439% 和 1469% CPU；`pg_stat_activity` 同时观察到 21 条相同的 `COUNT(DISTINCT media_sources...)` 全库计数查询，最长运行约 96 秒。
+
+新 amd64 镜像在 NAS 使用 `docker buildx bake --load --set app.platform=linux/amd64 ... app` 构建，revision 标签为 `5a542b36`；以 `docker compose up -d --no-deps lux` 替换 Lux，PostgreSQL 未重建。容器内 `/health/live`、`/health/ready`，主机映射端口 readiness 和公网 readiness 均成功；ready 报告 `databaseWritable=true`、`schemaVersion=157`。重启后首个 12 秒窗口 PostgreSQL CPU 从 424% 降到 10.06%；再观察 45 秒后降至 1.32%，Lux 为 20.64%。此时活跃查询列表中不再有全库计数，最近 60 秒没有 metadata refresh 调度或 `.nfo`/`.tmp` 日志。
+
+这是目标 NAS 生产库上的短时前后观测，不是固定负载下的 A/B 或长期 p95 基准。重启后的首分钟仍有本地 metadata backfill 与缺少 `org.lux.tmdb` 插件的告警，因此 Lux CPU 数字包含启动后工作；没有据此声称所有扫描/刮削负载下 CPU 恒定。观察窗口内，原先持续占满 PostgreSQL 的重复全库计数停止，修复达到本次线上复测目标。
