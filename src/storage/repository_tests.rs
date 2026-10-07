@@ -12,10 +12,184 @@ use crate::{
     library::LibraryKind,
     storage::{
         ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
-        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMetadataCandidate,
-        NewNotificationDestination, NewNotificationEvent,
+        NewFilesystemEntry, NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult,
+        NewMetadataCandidate, NewNotificationDestination, NewNotificationEvent,
     },
 };
+
+#[tokio::test]
+async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_scopes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("STRM count", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root_path.to_str().expect("UTF-8 media root"),
+        )
+        .await
+        .expect("library root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+
+    for (entry_id, path) in [
+        ("strm-count-nfo-entry", "Movie/Movie.nfo"),
+        ("strm-count-video-entry", "Movie/Movie.strm"),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: &root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                inode: None,
+                fingerprint: b"fingerprint",
+                last_seen_generation: "strm-count-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('strm-count-item', ?, 'MOVIE', 'STRM Movie', 'strm-movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+         VALUES ('strm-count-source', 'strm-count-item', 'STRM_URL', 'strm-count-video-entry')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("STRM media source");
+
+    database
+        .create_scan_job(
+            "strm-count-nfo",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "nfo",
+            0,
+            false,
+        )
+        .await
+        .expect("NFO scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-nfo", &root_id, "Movie/Movie.nfo", "MODIFY")
+        .await
+        .expect("enqueue NFO scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-nfo'")
+        .execute(database.pool())
+        .await
+        .expect("mark NFO scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-nfo")
+            .await
+            .expect("count NFO scan STRM sources"),
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "file-only scans use the narrow path"
+    );
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED' WHERE id = 'strm-count-nfo'")
+        .execute(database.pool())
+        .await
+        .expect("complete NFO scan job");
+
+    database
+        .create_scan_job(
+            "strm-count-strm",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "strm",
+            0,
+            false,
+        )
+        .await
+        .expect("STRM scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-strm", &root_id, "Movie/Movie.strm", "MODIFY")
+        .await
+        .expect("enqueue STRM scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-strm'")
+        .execute(database.pool())
+        .await
+        .expect("mark STRM scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-strm")
+            .await
+            .expect("count STRM scan sources"),
+        1
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "STRM file scans use the narrow path"
+    );
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED' WHERE id = 'strm-count-strm'")
+        .execute(database.pool())
+        .await
+        .expect("complete STRM scan job");
+
+    database
+        .create_scan_job(
+            "strm-count-directory",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "directory",
+            0,
+            false,
+        )
+        .await
+        .expect("directory scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-directory", &root_id, ".", "MODIFY")
+        .await
+        .expect("enqueue directory scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-directory'")
+        .execute(database.pool())
+        .await
+        .expect("mark directory scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-directory")
+            .await
+            .expect("count directory STRM sources"),
+        1
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "directory scans retain recursive counting"
+    );
+
+    database.close().await;
+}
 
 async fn refresh_recommendation_stats(database: &Database) {
     sqlx::query(
