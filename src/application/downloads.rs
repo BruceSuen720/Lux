@@ -264,6 +264,11 @@ pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> 
     let Some((candidate_stem, extension)) = candidate_name.rsplit_once('.') else {
         return false;
     };
+    if extension.eq_ignore_ascii_case("json")
+        && candidate_stem.eq_ignore_ascii_case(&format!("{selected_stem}-mediainfo"))
+    {
+        return true;
+    }
     if !is_sidecar_extension(extension) {
         return false;
     }
@@ -284,6 +289,7 @@ fn is_sidecar_extension(extension: &str) -> bool {
             | "sup"
             | "idx"
             | "nfo"
+            | "xml"
             | "jpg"
             | "jpeg"
             | "png"
@@ -367,6 +373,14 @@ mod tests {
         assert!(is_matching_sidecar(
             "二毛 (2019) - 2160p - H.265 - AAC - test.mkv",
             "二毛 (2019) - 2160p - H.265 - AAC - test.zh.ass",
+        ));
+        assert!(is_matching_sidecar(
+            "Example.Movie.2024.mkv",
+            "Example.Movie.2024.xml",
+        ));
+        assert!(is_matching_sidecar(
+            "Example.Movie.2024.strm",
+            "Example.Movie.2024-mediainfo.json",
         ));
         assert!(!is_matching_sidecar(
             "二毛 (2019) - 2160p - H.265 - AAC - test.mkv",

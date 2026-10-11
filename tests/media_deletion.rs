@@ -26,7 +26,11 @@ async fn concurrent_media_deletions_leave_no_orphaned_file()
     let root = temp_dir.path().join("Movies");
     fs::create_dir_all(&root)?;
     let media_file = root.join("Example.Movie.2024.mkv");
+    let danmaku_file = root.join("Example.Movie.2024.xml");
+    let mediainfo_file = root.join("Example.Movie.2024-mediainfo.json");
     fs::write(&media_file, b"fixture")?;
+    fs::write(&danmaku_file, b"<i></i>")?;
+    fs::write(&mediainfo_file, b"{}")?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-UTF-8 path")?)
         .await?;
@@ -67,6 +71,8 @@ async fn concurrent_media_deletions_leave_no_orphaned_file()
             .await?;
     assert_eq!(remaining_sources, 0);
     assert!(!media_file.exists());
+    assert!(!danmaku_file.exists());
+    assert!(!mediainfo_file.exists());
     assert_no_staged_deletion_files(&root)?;
     Ok(())
 }
