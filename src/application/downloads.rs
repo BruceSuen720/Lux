@@ -255,9 +255,6 @@ fn remote_file_name(url: &Url) -> Option<String> {
 }
 
 pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> bool {
-    if selected_name.eq_ignore_ascii_case(candidate_name) {
-        return true;
-    }
     let Some(selected_stem) = selected_name.rsplit_once('.').map(|(stem, _)| stem) else {
         return false;
     };
@@ -392,5 +389,11 @@ mod tests {
             "二毛 (2019) - 2160p - H.265 - AAC - test.mkv",
             "二毛 (2019) - 1080p - H.264 - AAC.mkv",
         ));
+    }
+
+    #[test]
+    fn media_files_are_never_classified_as_sidecars() {
+        assert!(!is_matching_sidecar("Movie.mkv", "movie.MKV"));
+        assert!(!is_matching_sidecar("Movie.strm", "movie.STRM"));
     }
 }
