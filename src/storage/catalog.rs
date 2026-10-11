@@ -2,6 +2,7 @@ use super::*;
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
+const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
@@ -2576,90 +2577,15 @@ impl Database {
         if provider_ids.is_empty() && premiere_date.is_none() {
             return Ok(());
         }
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let current = self
-            .query_as::<(Option<String>, Option<String>)>(
-                "SELECT provider_ids_json, premiere_date
-                 FROM media_items
-                 WHERE id = ? AND removed_at IS NULL",
-            )
-            .bind(item_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some((current_provider_ids, current_premiere_date)) = current else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(());
-        };
-
-        let mut merged = current_provider_ids
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
-            .unwrap_or_default();
-        let mut provider_ids_json = None;
-        let mut provider_ids_changed = false;
-        for (provider, provider_id) in provider_ids {
-            let provider = provider.trim();
-            let provider_id = provider_id.trim();
-            if provider.is_empty()
-                || provider_id.is_empty()
-                || merged
-                    .keys()
-                    .any(|existing| existing.eq_ignore_ascii_case(provider))
-            {
-                continue;
-            }
-            merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
-            provider_ids_changed = true;
-        }
-        if provider_ids_changed {
-            provider_ids_json = Some(
-                serde_json::to_string(&merged)
-                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
-            );
-        }
-        let premiere_date = premiere_date
-            .filter(|value| !value.trim().is_empty())
-            .filter(|_| {
-                current_premiere_date
-                    .as_deref()
-                    .is_none_or(|value| value.trim().is_empty())
-            });
-        if provider_ids_json.is_some() || premiere_date.is_some() {
-            self.query(
-                "UPDATE media_items
-                 SET provider_ids_json = COALESCE(?, provider_ids_json),
-                     premiere_date = COALESCE(?, premiere_date),
-                     updated_at = unixepoch()
-                 WHERE id = ? AND removed_at IS NULL",
-            )
-            .bind(provider_ids_json)
-            .bind(premiere_date)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.commit_local_nfo_state_batch(
+            &[],
+            &[LocalNfoDefaultsRepair {
+                item_id,
+                provider_ids,
+                premiere_date,
+            }],
+        )
+        .await
     }
 
     pub(crate) async fn update_local_provider_ids_for_identity_if_empty(
@@ -2944,7 +2870,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -2955,21 +2881,10 @@ impl Database {
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
-             ORDER BY ms.item_id, fe.relative_path",
-        )
+               AND {SCOPE}
+             ORDER BY ms.item_id, fe.relative_path"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
@@ -2994,7 +2909,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3005,21 +2920,10 @@ impl Database {
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
-             ORDER BY ms.item_id, fe.relative_path",
-        )
+               AND {SCOPE}
+             ORDER BY ms.item_id, fe.relative_path"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
@@ -3682,7 +3586,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
@@ -3693,22 +3597,11 @@ impl Database {
              WHERE ms.source_kind = 'LOCAL_FILE'
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
+               AND {SCOPE}
              ORDER BY ms.item_id, ms.is_default DESC, ms.id
-             LIMIT ? OFFSET ?",
-        )
+             LIMIT ? OFFSET ?"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .bind(offset.max(0))
@@ -3943,7 +3836,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
         let rows = if let Some(after_source_id) = after_source_id {
-            self.query(
+            self.query(sqlx::AssertSqlSafe(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -3977,28 +3870,18 @@ impl Database {
                   AND ii.image_index = 0
                  WHERE ms.source_kind = 'STRM_URL'
                    AND fe.is_missing = 0 AND mi.removed_at IS NULL
-                   AND ms.id > ? AND EXISTS (
-                       SELECT 1 FROM scan_job_paths sjp
-                       WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                         AND sjp.library_root_id = fe.library_root_id
-                         AND (
-                               sjp.relative_path = '.'
-                               OR
-                               fe.relative_path = sjp.relative_path
-                               OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                                  = sjp.relative_path || '/'
-                             )
-                   )
+                   AND ms.id > ? AND {SCOPE}
                  ORDER BY ms.id, fe.relative_path
-                 LIMIT ?",
-            )
+                 LIMIT ?"
+                    .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+            ))
             .bind(after_source_id)
             .bind(scan_job_id)
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
             .await
         } else {
-            self.query(
+            self.query(sqlx::AssertSqlSafe(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -4032,21 +3915,11 @@ impl Database {
                   AND ii.image_index = 0
                  WHERE ms.source_kind = 'STRM_URL'
                    AND fe.is_missing = 0 AND mi.removed_at IS NULL
-                   AND EXISTS (
-                       SELECT 1 FROM scan_job_paths sjp
-                       WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                         AND sjp.library_root_id = fe.library_root_id
-                         AND (
-                               sjp.relative_path = '.'
-                               OR
-                               fe.relative_path = sjp.relative_path
-                               OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                                  = sjp.relative_path || '/'
-                             )
-                   )
+                   AND {SCOPE}
                  ORDER BY ms.id, fe.relative_path
-                 LIMIT ?",
-            )
+                 LIMIT ?"
+                    .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+            ))
             .bind(scan_job_id)
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
@@ -4077,26 +3950,59 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<i64, StorageError> {
-        self.query_scalar(
+        let has_directory_scope: i64 = self
+            .query_scalar(
+                // CASE keeps a portable 0/1 integer: PostgreSQL returns BOOLEAN for a bare EXISTS.
+                "SELECT CAST(CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM scan_job_paths sjp
+                    LEFT JOIN filesystem_entries path_entry
+                      ON path_entry.library_root_id = sjp.library_root_id
+                     AND path_entry.relative_path = sjp.relative_path
+                    WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                      AND (sjp.relative_path = '.' OR path_entry.entry_kind = 'DIRECTORY')
+                ) THEN 1 ELSE 0 END AS BIGINT)",
+            )
+            .bind(scan_job_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if has_directory_scope == 0 {
+            return self
+                .query_scalar(
+                    "SELECT COUNT(*)
+                     FROM scan_job_paths sjp
+                     JOIN filesystem_entries fe
+                       ON fe.library_root_id = sjp.library_root_id
+                      AND fe.relative_path = sjp.relative_path
+                     JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                       AND ms.source_kind = 'STRM_URL'
+                       AND fe.is_missing = 0 AND mi.removed_at IS NULL",
+                )
+                .bind(scan_job_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+        }
+
+        self.query_scalar(sqlx::AssertSqlSafe(
             "SELECT COUNT(DISTINCT ms.id)
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              WHERE ms.source_kind = 'STRM_URL'
                AND fe.is_missing = 0 AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                         )
-               )",
-        )
+               AND {SCOPE}"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_one(&self.pool)
         .await
@@ -4250,6 +4156,89 @@ impl Database {
             }
         }
         Ok(contexts)
+    }
+
+    pub(crate) async fn find_movie_nfo_writeback_context(
+        &self,
+        item_id: &str,
+    ) -> Result<
+        Option<(
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<StoredMediaSourcePath>,
+        )>,
+        StorageError,
+    > {
+        let row = self
+            .query(
+                "SELECT mi.item_type, mi.season_number,
+                        CASE WHEN mi.item_type = 'MOVIE' AND mi.removed_at IS NULL
+                             THEN mi.sort_title END AS sort_title,
+                        CASE WHEN mi.item_type = 'MOVIE' AND mi.removed_at IS NULL
+                             THEN mi.added_at END AS added_at,
+                        ms.id AS source_id, ms.item_id AS source_item_id,
+                        ms.probe_status, lr.canonical_path AS root_path,
+                        fe.relative_path
+                 FROM media_items mi
+                 LEFT JOIN media_sources ms ON ms.id = CASE
+                     WHEN mi.item_type IN ('SERIES', 'SEASON') THEN (
+                         SELECT episode_source.id
+                         FROM media_items episode
+                         JOIN media_sources episode_source
+                           ON episode_source.item_id = episode.id
+                         JOIN filesystem_entries episode_fe
+                           ON episode_fe.id = episode_source.filesystem_entry_id
+                         WHERE episode.item_type = 'EPISODE'
+                           AND (episode.series_id = mi.id OR episode.parent_id = mi.id)
+                           AND episode_fe.is_missing = 0
+                         ORDER BY episode.id, episode_fe.relative_path
+                         LIMIT 1
+                     )
+                     WHEN mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO') THEN (
+                         SELECT direct_source.id
+                         FROM media_sources direct_source
+                         JOIN filesystem_entries direct_fe
+                           ON direct_fe.id = direct_source.filesystem_entry_id
+                         WHERE direct_source.item_id = mi.id
+                           AND direct_source.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                           AND direct_fe.is_missing = 0
+                         ORDER BY direct_source.is_default DESC, direct_source.id
+                         LIMIT 1
+                     )
+                     ELSE NULL
+                 END
+                 LEFT JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.map(|row| {
+            let source =
+                row.try_get::<String, _>("source_id")
+                    .ok()
+                    .map(|source_id| StoredMediaSourcePath {
+                        source_id,
+                        item_id: row.get("source_item_id"),
+                        probe_status: row.get("probe_status"),
+                        root_path: row.get("root_path"),
+                        relative_path: row.get("relative_path"),
+                    });
+            (
+                row.get("item_type"),
+                row.get("season_number"),
+                row.get("sort_title"),
+                row.get("added_at"),
+                source,
+            )
+        }))
     }
 
     pub(crate) async fn list_strm_source_paths_by_ids(
@@ -4689,7 +4678,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT series.id AS series_id, season.id AS season_id,
                     episode.id AS episode_id, season.season_number,
                     lr.canonical_path AS root_path, fe.relative_path
@@ -4705,21 +4694,10 @@ impl Database {
                AND episode.removed_at IS NULL
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
-             ORDER BY series.id, season.season_number, episode.id, fe.relative_path",
-        )
+               AND {SCOPE}
+             ORDER BY series.id, season.season_number, episode.id, fe.relative_path"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
@@ -5606,9 +5584,146 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
-        let sort_title = update.title.to_lowercase();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.update_media_item_metadata_in_transaction(&mut transaction, &update)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn commit_local_nfo_state_batch(
+        &self,
+        updates: &[MediaMetadataUpdate<'_>],
+        defaults_repairs: &[LocalNfoDefaultsRepair<'_>],
+    ) -> Result<(), StorageError> {
+        let defaults_repairs = defaults_repairs
+            .iter()
+            .filter(|repair| !repair.provider_ids.is_empty() || repair.premiere_date.is_some())
+            .collect::<Vec<_>>();
+        let mut update_offset = 0;
+        let mut repair_offset = 0;
+        while update_offset < updates.len() || repair_offset < defaults_repairs.len() {
+            let update_end = (update_offset + MEDIA_METADATA_UPDATE_BATCH_SIZE).min(updates.len());
+            let update_count = update_end - update_offset;
+            let repair_end = (repair_offset + MEDIA_METADATA_UPDATE_BATCH_SIZE - update_count)
+                .min(defaults_repairs.len());
+            let update_chunk = &updates[update_offset..update_end];
+            let repair_chunk = &defaults_repairs[repair_offset..repair_end];
+            let _write_guard = self.acquire_metadata_write_lock().await;
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            for update in update_chunk {
+                self.update_media_item_metadata_in_transaction(&mut transaction, update)
+                    .await?;
+            }
+            for repair in repair_chunk {
+                self.repair_local_nfo_defaults_in_transaction(&mut transaction, repair)
+                    .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            update_offset = update_end;
+            repair_offset = repair_end;
+        }
+        Ok(())
+    }
+
+    async fn repair_local_nfo_defaults_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        repair: &LocalNfoDefaultsRepair<'_>,
+    ) -> Result<(), StorageError> {
+        if repair.provider_ids.is_empty() && repair.premiere_date.is_none() {
+            return Ok(());
+        }
+        let current = self
+            .query_as::<(Option<String>, Option<String>)>(
+                "SELECT provider_ids_json, premiere_date
+                 FROM media_items
+                 WHERE id = ? AND removed_at IS NULL",
+            )
+            .bind(repair.item_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((current_provider_ids, current_premiere_date)) = current else {
+            return Ok(());
+        };
+
+        let mut merged = current_provider_ids
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+            .unwrap_or_default();
+        let mut provider_ids_json = None;
+        for (provider, provider_id) in repair.provider_ids {
+            let provider = provider.trim();
+            let provider_id = provider_id.trim();
+            if provider.is_empty()
+                || provider_id.is_empty()
+                || merged
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(provider))
+            {
+                continue;
+            }
+            merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+            provider_ids_json = Some(
+                serde_json::to_string(&merged)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            );
+        }
+        let premiere_date = repair
+            .premiere_date
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| {
+                current_premiere_date
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            });
+        if provider_ids_json.is_some() || premiere_date.is_some() {
+            self.query(
+                "UPDATE media_items
+                 SET provider_ids_json = COALESCE(?, provider_ids_json),
+                     premiere_date = COALESCE(?, premiere_date),
+                     updated_at = unixepoch()
+                 WHERE id = ? AND removed_at IS NULL",
+            )
+            .bind(provider_ids_json)
+            .bind(premiere_date)
+            .bind(repair.item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn update_media_item_metadata_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        update: &MediaMetadataUpdate<'_>,
+    ) -> Result<(), StorageError> {
+        // The rating comparison binds the presence flag and a plain f64 (like the SET clause)
+        // instead of an `Option<f64>`: PostgreSQL rejects the optional float in the repeated
+        // `? IS NOT NULL` position ("incorrect binary data format in bind parameter 23"),
+        // which failed every update of an item whose NFO carries a rating.
+        let sort_title = update.title.to_lowercase();
         self.query(
             "UPDATE media_items
              SET title = ?,
@@ -5632,7 +5747,7 @@ impl Database {
                    OR overview IS DISTINCT FROM ?
                    OR production_year IS DISTINCT FROM ?
                    OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
-                   OR (? IS NOT NULL AND rating IS DISTINCT FROM ?)
+                   OR (? = 1 AND rating IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
                    OR metadata_fingerprint IS DISTINCT FROM ?
@@ -5662,8 +5777,8 @@ impl Database {
         .bind(update.production_year)
         .bind(update.premiere_date)
         .bind(update.premiere_date)
-        .bind(update.rating)
-        .bind(update.rating)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
@@ -5671,20 +5786,13 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(())
     }
 
     pub(crate) async fn media_item_nfo_metadata_json(
@@ -5693,6 +5801,24 @@ impl Database {
     ) -> Result<Option<String>, StorageError> {
         self.query_scalar(
             "SELECT nfo_metadata_json
+             FROM media_items
+             WHERE id = ? AND nfo_metadata_json IS NOT NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn media_item_nfo_metadata_snapshot(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(String, Option<Vec<u8>>)>, StorageError> {
+        self.query_as(
+            "SELECT nfo_metadata_json, nfo_metadata_fingerprint
              FROM media_items
              WHERE id = ? AND nfo_metadata_json IS NOT NULL",
         )
@@ -6952,6 +7078,53 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+/// Restricts a query over `filesystem_entries fe` to the entries touched by the paths of one
+/// incremental scan job (one `?` placeholder: the job id).
+///
+/// SQLite keeps the correlated `EXISTS`. PostgreSQL cannot use an index for the
+/// `substr(...) = path || '/'` form and evaluated it for every candidate entry (the STRM probe
+/// target count averaged about a minute on a library of several hundred thousand files), so there
+/// the matching entries are collected per scanned path with byte-order range operators served by
+/// `idx_filesystem_entries_dir_prefix` (same approach as the sidecar target lookup).
+fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
+    if backend == DatabaseBackend::Postgres {
+        "fe.id IN (
+                   SELECT matched.id
+                   FROM scan_job_paths sjp
+                   CROSS JOIN LATERAL (
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE sjp.relative_path = '.'
+                         AND entry.library_root_id = sjp.library_root_id
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                       UNION ALL
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE entry.library_root_id = sjp.library_root_id
+                         AND entry.relative_path = sjp.relative_path
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                       UNION ALL
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE entry.library_root_id = sjp.library_root_id
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                         AND entry.relative_path ~>=~ (sjp.relative_path || '/')
+                         AND entry.relative_path ~<~ (sjp.relative_path || '0')
+                   ) matched
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+               )"
+    } else {
+        "EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           sjp.relative_path = '.'
+                           OR fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                         )
+               )"
     }
 }
 

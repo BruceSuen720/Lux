@@ -24,8 +24,8 @@ use crate::{
         plugins::PluginService,
         probe::MediaProbeService,
         reidentify::{
-            MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
-            MetadataReidentifyService,
+            MetadataDispatchError, MetadataRefreshMode, MetadataReidentifyError,
+            MetadataReidentifyJob, MetadataReidentifyService,
         },
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::{
@@ -50,6 +50,7 @@ const SCHEDULER_PAGE_SIZE: i64 = 100;
 const THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE: i64 = 4;
 const THUMBNAIL_SCRAPER_RETRY_LEASE_SECONDS: i64 = 15 * 60;
 const THUMBNAIL_SCRAPER_RETRY_INTERNAL_FAILURE_DELAY_SECONDS: i64 = 5 * 60;
+const THUMBNAIL_METADATA_JOB_STATUS_FALLBACK: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct ScheduledTaskService {
@@ -117,6 +118,7 @@ pub enum ScheduledTaskError {
     ServiceUnavailable,
     Scan(ScanJobError),
     Metadata(MetadataReidentifyError),
+    MetadataDispatch(MetadataDispatchError),
     Strm(StrmProbeError),
     Chapter(ChapterDetectionError),
     Cover(LibraryCoverError),
@@ -136,6 +138,7 @@ impl fmt::Display for ScheduledTaskError {
             }
             Self::Scan(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
+            Self::MetadataDispatch(error) => error.fmt(formatter),
             Self::Strm(error) => error.fmt(formatter),
             Self::Chapter(error) => error.fmt(formatter),
             Self::Cover(error) => error.fmt(formatter),
@@ -519,11 +522,10 @@ impl ScheduledTaskService {
             .create_library_refresh_job(library_id, MetadataRefreshMode::FillMissing)
             .await
             .map_err(ScheduledTaskError::Metadata)?;
-        let worker = service.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
-        });
+        service
+            .enqueue_fill_missing_job(&job)
+            .await
+            .map_err(ScheduledTaskError::MetadataDispatch)?;
         Ok(ScheduledTaskRun::Metadata { job })
     }
 
@@ -747,7 +749,27 @@ async fn run_thumbnail_scraper_retry(
             return;
         }
     };
-    metadata.run(&job.id).await;
+    let completion = match metadata.enqueue_fill_missing_job(&job).await {
+        Ok(completion) => completion,
+        Err(error) => {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry metadata job could not be dispatched");
+            return;
+        }
+    };
+    if let Some(completion) = completion {
+        if completion.await.is_err()
+            && let Err(error) = wait_for_metadata_job_terminal(&metadata, &job.id).await
+        {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry metadata job status could not be checked");
+            return;
+        }
+    } else if let Err(error) = wait_for_metadata_job_terminal(&metadata, &job.id).await {
+        release_thumbnail_scraper_retry(&database, &retry, now).await;
+        tracing::warn!(item_id, %error, "thumbnail scraper retry metadata job status could not be checked");
+        return;
+    }
 
     let attempted_at = OffsetDateTime::now_utc().unix_timestamp();
     let attempt_count = retry.attempt_count.saturating_add(1).min(3);
@@ -778,6 +800,19 @@ async fn run_thumbnail_scraper_retry(
             attempted_at,
         )
         .await;
+    }
+}
+
+async fn wait_for_metadata_job_terminal(
+    metadata: &MetadataReidentifyService,
+    job_id: &str,
+) -> Result<(), MetadataReidentifyError> {
+    loop {
+        let job = metadata.get_job(job_id).await?;
+        if !matches!(job.status.as_str(), "QUEUED" | "RUNNING") {
+            return Ok(());
+        }
+        tokio::time::sleep(THUMBNAIL_METADATA_JOB_STATUS_FALLBACK).await;
     }
 }
 

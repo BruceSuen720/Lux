@@ -451,7 +451,7 @@ Lux 的核心价值不是功能数量，而是：
 - 空闲常驻内存目标小于 300 MB。
 - 默认扫描时常驻内存目标小于 750 MB。
 - 所有后台队列有界；队列满时合并事件或施加背压，不无限增长。
-- 元数据补全使用独立的网络 I/O 并发策略：SQLite 默认有效并发 4，PostgreSQL 默认有效并发 8；进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
+- 元数据补全使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 的 worker 默认并发均为 4；`FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16。前台 p95、CPU 或内存压力升高时按 1/2、1/4 降档，默认值不是强制启动数。该限制独立于 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求。
 - ffprobe 默认并发 256，可按媒体库配置 1 至 512；实际运行的单库有效上限为 512、进程全局硬上限为 512，
   并根据 CPU、内存和前台 p95 动态降档。4 核 NAS 的默认有效并发目标为 128，8 核目标为 256，16 核及以上目标为 512；ffprobe 只处理本轮
   fingerprint 变化或新增的 source，未变化 source 不得重复探测。
@@ -520,7 +520,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 2 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=2`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 2 路，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -1848,7 +1848,7 @@ services:
     environment:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
-      LUX_SCAN_CONCURRENCY: "8"
+      LUX_SCAN_CONCURRENCY: "2"
       LUX_PROBE_CONCURRENCY: "8"
       LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
@@ -2149,6 +2149,8 @@ services:
 | LUX-320 | src/application/nfo.rs、src/application/probe.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
 | LUX-321 | src/application/nfo.rs、src/storage/media.rs、tests/nfo_writer.rs、docs/COMPATIBILITY.md、docs/；为电影 NFO 写入数据库时间/排序值并提供原子 probe-info 写回服务 |
 | LUX-322 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后调用 NFO 技术信息写回 |
+| LUX-461 | src/application/admin_events.rs、src/application/scanner.rs、src/application/reidentify.rs、docs/LUX-DEVELOPMENT.md；合并高频 Admin Jobs 进度失效通知并保留关键事件即时刷新 |
+| LUX-464 | src/application/reidentify.rs、tests/reidentify.rs、docs/LUX-DEVELOPMENT.md；为指定条目重识别的重复 ID 去重和首次出现顺序补充回归 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
@@ -8496,6 +8498,1011 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-05）：插件卸载 storage 回归通过；双媒体库 fixture 固定为 6 次 query-wrapper 调用，插件卸载实现和 schema 均未变。
 
+#### LUX-394：避免自动补缺仅因可选 provider 详情重复排队
+
+范围：本地扫描完整度计划继续记录缺失的 `EXTERNAL_IDS` 和 `TRAILERS`，但二者单独缺失不启动自动 `FILL_MISSING`。核心 metadata、已启用图片或 credits 缺失仍可排队；这些必要能力触发任务时允许顺带补充外部 ID 和预告片。显式 metadata 任务保持通用 request plan，并且 optional-only 项不额外读取 capability attempt 状态来决定自动排队。
+
+验收：
+
+- [x] 仅缺 `EXTERNAL_IDS` / `TRAILERS` 时自动完整度计划不可排队；核心 metadata、图片或 credits 缺失仍可排队。
+- [x] 显式 `FILL_MISSING` / `FULL_REFRESH` 计划仍包含其原有能力，不改变人工请求行为。
+- [x] 定向 metadata selection、NFO writer 和 `cargo build --locked` 通过。
+- [ ] 全目标 Rust 测试全绿：并行运行中的字幕/HLS 超时在逐项串行复跑时通过；串行全量运行复现无关的 `tests/emby_counts.rs:159` 失败，viewer 无剧集库权限时仍得到 `SeriesCount = 1`。
+- [x] fmt、全目标全 feature Clippy 与差异检查通过。
+- [x] 性能记录只描述计划资格与 attempt 状态读取边界，不推断 FNOS CPU 收益。
+
+文件：`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-06）：固定电影 metadata 测试对象先复现旧逻辑会把 optional-only 计划标记为可排队，再验证仅缺外部 ID/预告片不会启动自动补缺、credits 缺失仍会触发，且通用 metadata request plan 未改变。定向计划单测、`metadata_selection`（31 项）、`nfo_writer`（26 项）和 `cargo build --locked` 通过。并行全目标运行出现的 5 个字幕/HLS 超时逐项串行复跑通过；串行全目标运行则发现无关的 Emby 计数访问范围失败（`tests/emby_counts.rs:159`，实际 1、期望 0），因此全量 Rust 测试门未通过，本任务没有修改该独立行为。未据本地测试推断服务器性能收益。
+
+#### LUX-395：按状态索引统计扫描任务
+
+范围：管理健康数据每次请求都用 `SUM(CASE...)` 聚合整个 `scan_jobs` 历史表。FNOS 只读执行计划显示该表约 25.7 万行；单次并行顺序扫描约 155 ms、读取 8,722 个 shared buffers。改为分别统计活动扫描和失败扫描，让二者都能通过部分索引计数；保持健康 API 字段和统计含义不变。
+
+验收：
+
+- [x] SQLite 与 PostgreSQL 都有仅覆盖 `FAILED` 任务的计数索引；SQLite 从空库迁移成功。
+- [x] 活动任务计数和失败任务计数使用各自匹配的部分索引；SQLite 回归检查查询计划且验证返回计数。
+- [x] `admin_health` / dashboard 的 `scanRunning`、`scanFailed` 字段合同不变。
+- [x] 定向 Rust 测试、build、fmt、Clippy 和差异检查通过；全目标 Rust 测试结果及已有独立失败如实记录。
+- [x] 性能记录区分 FNOS 基线执行计划与本地 SQLite 查询计划，不把未部署变更表述为生产收益。
+
+预计文件：`src/storage/jobs.rs`、`migrations/0163_scan_job_failed_count_index.sql`、`migrations-postgres/0163_scan_job_failed_count_index.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-06）：管理健康计数从一次历史表条件聚合改为两个可由状态部分索引覆盖的 `COUNT(*)` 子查询；新增 SQLite/PostgreSQL `FAILED` 部分索引，schema 版本为 162。SQLite 空库迁移、计数与 `EXPLAIN QUERY PLAN` 单测通过；`admin_health`、dashboard、ready/version、storage 目标通过，storage 47 项全过；scanner 17 项、danmaku 7 项、scanning_jobs 80 项通过。全量 `cargo test --locked --all-targets` 的库测试为 729 passed、11 ignored；随后在既有无关 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）。`scanning_jobs` 全目标中另有一个用例并行运行时超时，单独串行复跑通过。Build、fmt、all-target Clippy 和 `git diff --check` 通过。本机没有 PostgreSQL 服务，Docker daemon 未启动，PostgreSQL 迁移未做运行时验证；FNOS 上仍是旧 revision，未部署、未测生产收益。
+
+#### LUX-396：合并短周期管理健康探测
+
+范围：管理员 dashboard 每 15 秒刷新；每次健康 payload 都会提交一次数据库探针写入、创建并 fsync 4 KB 临时文件，再启动 `ffprobe -version`。将这三项低频诊断结果按 AppState 缓存 30 秒，并合并并发刷新；`/health/ready` 继续执行实时数据库写探测，CPU、连接池、任务计数、媒体库等动态字段继续逐请求读取。
+
+验收：
+
+- [x] 同一状态缓存有效期内，多个健康/dashboard 请求只执行一次数据库、配置目录与 ffprobe 探测；缓存过期后重新探测。
+- [x] admin health/dashboard JSON 字段与降级映射保持不变；`/health/ready` 不使用缓存。
+- [x] 回归覆盖 TTL 命中、过期刷新和并发请求合并；管理健康、dashboard、ready/version 定向测试通过。
+- [x] build、fmt、all-target Clippy 和差异检查通过；全量测试独立失败已如实记录。
+- [x] 性能记录注明 dashboard 的 15 秒轮询与 30 秒探测缓存；不将调用次数变化推断成 FNOS CPU 或时延收益。
+
+预计文件：`src/api/legacy.rs`、`src/api/admin_handlers.rs`、`tests/admin_health.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。缓存测试与 AppState 状态定义同文件。先写 TTL 命中/过期/并发合并测试，再接入健康数据构建。
+
+结果（2026-10-06）：AppState 共享同一个 30 秒探测快照；对并发请求合并数据库写探针、配置目录读写检查与 `ffprobe -version`，TTL 从探测完成时起算；CPU、连接池、任务计数和库状态仍实时生成，`/health/ready` 继续实时检查写能力。缓存 TTL/过期合并/锁等待过期/探测耗时单测 3 项通过；`admin_health`、`admin_dashboard`、`ready_version` 共 4 项通过。`cargo build --locked`、`cargo fmt --all -- --check`、all-target/all-features Clippy 与 `git diff --check` 通过。`cargo test --locked --all-targets` 库测试 732 passed、11 ignored，随后在既有独立 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）；此前 LUX-395 也观察到此失败，本任务未改动计数访问范围。性能记录仅按 dashboard 15 秒轮询/探测 30 秒 TTL 估算调用频率，未部署 FNOS，也未测 CPU、NAS 或 API 时延收益。
+
+#### LUX-397：去重近期 provider-unavailable 的 FILL_MISSING 条目
+
+范围：扫描完整度调度和通用 `create_or_merge_fill_missing_job` 都只将 QUEUED/RUNNING job 中 PENDING/RUNNING 的 item 当作活动去重项。provider 暂时不可用时，job 会进入 DEFERRED，失败 item 会落为 `FAILED/SCRAPER_UNAVAILABLE`，因此现有 1 小时 DEFERRED 窗口没有实际抑制重复调度。两处查询都应将 1 小时内 DEFERRED job 中明确标记 `SCRAPER_UNAVAILABLE` 的 item 纳入去重；其他错误仍可重试，超过窗口仍可重新排队。保留 QUEUED/RUNNING 行为、跨库语义和任务 API。
+
+验收：
+
+- [x] completeness 扫描调度和通用 FILL_MISSING 创建入口都抑制 1 小时内 DEFERRED 且 `FAILED/SCRAPER_UNAVAILABLE` 的同一 item。
+- [x] 其他失败分类和超过 1 小时的 DEFERRED provider-unavailable item 仍可创建新任务。
+- [x] QUEUED/RUNNING 的活动去重、queued job 合并及原子保存 completeness 和调度意向行为保持不变。
+- [x] 相关 storage 回归、build、fmt、全目标全 feature Clippy 与差异检查通过；性能记录只说明去重状态覆盖，不外推 FNOS CPU 收益。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先扩展现有 SQLite storage 回归证明 FAILED provider item 当前会漏过去重，再更新两个查询条件。
+
+结果（2026-10-06）：两处去重查询都将近 1 小时内 DEFERRED job 中 `FAILED/SCRAPER_UNAVAILABLE` item 作为已有工作；普通失败仍能立即重新排队，provider-unavailable 超过一小时后也可重新排队。SQLite storage 回归分别覆盖扫描 completeness 调度和通用 FILL_MISSING 创建入口，原子事务、queued job 合并与既有 active dedup 保持不变。两条定向测试、build、fmt、全目标全 feature Clippy 和差异检查通过。全目标测试的 lib 部分为 732 passed、11 ignored，随后在既有无关 `tests/emby_counts.rs:159` 失败（viewer 无剧集库访问权限时实际计数 1，预期 0）；本任务未改该行为。未部署 FNOS，也未测生产 CPU/队列创建率。
+
+#### LUX-398：校准 Compose 扫描并发注释
+
+范围：README 的 Compose 环境变量注释把索引默认值写成 8，但 Docker 镜像、Compose 与配置代码的默认值均为 2。将注释改为实际的 2/8/2；不改变运行配置、并发算法或环境变量。
+
+验收：
+
+- [x] README 中索引、ffprobe、ffmpeg 的注释值与 Dockerfile、Compose 和配置代码默认值一致。
+- [x] 文档差异检查通过；本任务不涉及运行时行为，不运行 Cargo 测试。
+
+文件：`README.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-06）：Compose 注释已改为索引、ffprobe、ffmpeg 默认并发 `2/8/2`，与 Dockerfile、Compose、Rust 配置常量及相邻说明一致。`git diff --check` 通过；仅改文档，未运行 Cargo 测试。
+
+#### LUX-400：限制跨任务 FILL_MISSING worker 总并发
+
+范围：单个 `FILL_MISSING` job 虽默认最多运行 2 个 worker，但进程级 metadata semaphore 容量为 16；多个媒体库的补缺 job 同时运行时仍可能累计到 16 个在线补缺 worker。增加独立的进程级补缺 semaphore，将所有 `FILL_MISSING` job 的 item worker 总数限制为 2，并继续使用既有 metadata 全局 semaphore。`REIDENTIFY` 和 `FULL_REFRESH` 不获取补缺专用 permit；不改变每库 job 排队、item claim、任务状态、重试或 scraper 请求合同。
+
+验收：
+
+- [x] 同一 Lux 进程中来自不同 job/service 的 `FILL_MISSING` item worker 总并发最多为 2。
+- [x] 每个 worker 同时持有既有 metadata 全局 permit 和补缺 permit，worker 结束、job 退出或 future 取消时通过 RAII 释放。
+- [x] 非 `FILL_MISSING` 模式不获取补缺 permit，既有 metadata 全局并发上限保持 16。
+- [x] 双 job 并发集成回归直接统计两个 job 的 `RUNNING` item；取消等待 worker permit 的 job 会在占用 permit 的 job 释放前结束；相关 `reidentify` 定向目标和补缺 semaphore 单测通过。
+- [x] 完成 Rust build、fmt、all-target Clippy 与全目标 Rust 测试并如实记录已有的独立失败。
+- [x] 性能记录仅陈述代码并发上界与固定 stub 测试结果，不推断 FNOS CPU、墙钟、PostgreSQL 或 NAS 收益。
+
+文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先运行双 job 回归复现旧实现允许多个补缺 worker 同时超过 2，再添加进程级补缺 semaphore。
+
+结果（2026-10-06）：新增独立容量为 2 的进程级 semaphore；每个补缺 item worker 在完整处理期间同时持有补缺 permit 与原有 metadata permit。固定 SQLite fixture 并行运行两个各含 4 个 item 的补缺 job，通过 job-item `RUNNING` 状态统计进程实际 claim 的并发 worker，最大值不超过 2。取消等待 permit 的第二个 job 后，它会在第一个 job 仍占用两个 permit 时结束；独立单测还验证通知被消费后，后续 permit 等待仍会看到锁存的取消状态。相关测试二进制中的 FILL_MISSING 执行用例用异步 mutex 串行，避免共享进程级 semaphore 造成测试相互干扰。`tests/reidentify.rs` 14 项通过，补缺 semaphore 与取消锁存单测通过；build、fmt 和全目标全 feature Clippy 通过。`cargo test --locked --all-targets` 的 library 测试为 734 passed、11 ignored，随后在无关的 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）；本任务没有修改该访问范围行为。开发机架构为 `arm64`；未部署 FNOS，也未测量 CPU 或生产墙钟收益。
+
+#### LUX-401：保留活动 FILL_MISSING 中变化后的补全意图
+
+范围：自动扫描按 item 级去重活动和近期 `DEFERRED` 的 `FILL_MISSING`。当本地 completeness 输入指纹或当前 missing capability 集在旧 job 处理期间变化时，item 级去重可能吞掉新请求；近期 DEFERRED 也可能挡住实际上不同的新能力请求。为 job item 持久保存自动请求的 input fingerprint 与规范化 capability set，并在 claim 时保存处理快照。相同快照继续合并/去重；queued item 更新为最新快照；running item 在新快照到达后只复跑一次最新状态；近期 DEFERRED 仅抑制同快照。旧数据和人工创建的无快照 job 保持兼容，公共任务 DTO 不变。
+
+验收：
+
+- [x] SQLite/PostgreSQL 迁移为 job item 增加可空请求指纹、请求 capability set 与 claim 快照；SQLite 162→163 升级回归确认旧任务状态、计数和快照默认值保持正确。
+- [x] 新的不同 fingerprint 或 capability set 不被近期 DEFERRED item 错误去重；相同快照仍去重，queued job 合并仍有界。
+- [x] 请求在 item RUNNING 期间变化时，当前 worker 结束后该 item 回到 PENDING 并使用最新快照复跑；同一输入重复请求不触发复跑或并发重复 worker。
+- [x] 取消、重试、worker 异常恢复和非 FILL_MISSING job 状态/计数语义保持正确，任务 API DTO 不变。
+- [x] SQLite 状态机回归、migration-from-empty 与 build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同经可用的集成目标验证。
+
+短计划与文件：先在 `src/storage/repository_tests.rs` 为 RUNNING item 收到新 fingerprint/capability 后仍需处理新意图写失败回归；新增 `migrations/0164_metadata_fill_request_snapshots.sql` 与 `migrations-postgres/0164_metadata_fill_request_snapshots.sql`；实现涉及 `src/storage/mod.rs`、`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`，以及 schema version 断言和迁移序列检查；最后更新本任务记录、`docs/PERFORMANCE.md` 与 `docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。只处理自动 FILL_MISSING 请求快照，不扩展到其他 metadata 模式。
+
+结果（2026-10-06）：相同快照重试对 job/item 表执行 0 次 INSERT、0 次 UPDATE；queued 输入变化更新既有 item 一次；RUNNING 期间出现变化的请求在 worker 收尾后重新进入 PENDING，取消不会重排，显式 retry 使用最新 fingerprint。迁移版本推进到 163，更新 SQLite/PostgreSQL schema-version 断言和迁移序列检查。定向状态机、旧任务 migration、claim/recovery fixture、`admin_health`、`ready_version`、`storage` 通过；build、fmt 和全目标全 feature Clippy 通过。全目标测试 `--no-fail-fast` 中 737 个库测试通过、11 个忽略；集成测试中 `emby_counts`（实际 1、期望 0）及 `strm`（401、期望 200）失败，前者已有独立基线记录，后者单独复跑仍失败但与本任务改动路径无关；`library_cover_generation` 全套时曾失败，独立复跑 5 项通过。PostgreSQL 测试端口 127.0.0.1:55432 未监听且 Docker 不可用，故未运行 PostgreSQL 集成迁移；本机 `arm64`，未部署 FNOS，也未测 CPU/生产墙钟收益。完整完成门仍未满足。
+
+发布集成说明（2026-10-06，0.5.19）：保留 GitHub `test` 已发布的 `0162_filesystem_entry_directory_prefix_index.sql` 及全部历史迁移内容。LUX-395/LUX-401 尚未部署的迁移分别顺延为 0163/0164，同步双后端迁移列表、schema-version 断言和请求快照升级 fixture 的起始版本。上方测试结果对应功能分支原编号（162/163），不代表重新编号后的集成验证；本次按项目所有者要求不运行测试、构建或 lint，仅做 Git 差异、迁移编号/引用和合并保留检查。
+
+#### LUX-402：provider 不可用时对自动 FILL_MISSING 进行逐 item 退避
+
+范围：当前自动 `FILL_MISSING` 在 scraper/provider 不可用后将 job 置为 `DEFERRED`，并只依赖固定一小时去重窗口。对于持续不可用的 provider，周期扫描可能每小时再次创建相同 item 请求。为带自动请求快照的 job item 持久化退避次数、下次自动重试时间和到期记录是否已用于一次重试；同一 fingerprint/capability 快照在到期前去重，到期后由后续自动扫描重试一次，避免已完成的重试继续被旧失败记录触发。被新 fingerprint 或 capability 取代的旧失败快照也要消费，避免旧到期记录在新请求成功后再次解锁该 item。退避依次为 5 分钟、30 分钟、最多 6 小时。新请求快照不继承旧快照的退避；无快照的人工 job 不改变现有语义。管理员显式重试立即解除等待、清除已消费标记并保留自动失败次数；取消任务不增加次数。
+
+验收：
+
+- [x] SQLite/PostgreSQL migration 增加自动退避次数、到期时间和一次性消费标记；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` 且带请求快照的 item 升级后有安全的首次到期时间，历史任务状态和计数不变。
+- [x] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
+- [x] 到期重试派发后旧失败记录不再重复触发自动重试；管理员手动重试会重新启用该记录的自动退避。
+- [x] 新 fingerprint/capability 替代旧请求后，旧 provider 失败记录被消费，不会在新请求成功后再次解锁同一 item。
+- [x] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
+- [x] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
+- [x] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在 PostgreSQL 16 集成环境通过。
+
+短计划与文件：实现涉及 `migrations/0165_metadata_fill_missing_retry_backoff.sql`、`migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql`、`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`，以及公开 schema version 断言所在的集成测试文件。先添加红色状态机回归，再实现逐 item 退避、相同快照的跨 job 次数继承和到期去重，最后分别验证 SQLite 与 PostgreSQL 合同。本任务不改元数据 API DTO 或扫描并发策略。
+
+结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却，保持任务状态和计数；无快照旧任务仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有状态机回归。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite migration/state-machine 测试、`tests/storage.rs` 49 项、`tests/postgres_database.rs -- --include-ignored` 16 项及 PostgreSQL progressive-scan storage contract 1 项通过；后者直接验证 provider 失败后的冷却、到期重试和失败次数继承。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；仅 `emby_counts`（实际 1、期望 0）与 `strm`（401、期望 200）失败，两者均在干净 `origin/test=8412cc2a` 上独立复现。开发机 `arm64`；FNOS 尚未部署本分支，未据此宣称生产 CPU 或真实重试节奏改善。
+
+补充结果（2026-10-07）：端到端扫描回归发现并修复 READY 且仍缺失的完整度记录不会在冷却到期后重新入队的问题。当前扫描只对本轮已确认仍缺失、且自动匹配可用的候选 ID 检查到期的 provider 失败；查询限制在每批最多 512 个扫描条目，并复用完整度 claim 事务。0165 不再更新历史 job item 表，而是在 `server_settings` 写入单个首次冷却截止时间；旧失败行继续保持原状态和计数，运行时按兼容规则视为已失败一次。调整旧测试夹具，使它同时把 item 级 retry deadline 设为已到期；精确扫描回归通过，`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81 通过。最终 `cargo test --locked --all-targets --no-fail-fast` 的库测试为 746 passed、0 failed、11 ignored；集成目标仅 `emby_counts`（实际 1、期望 0）及 `strm`（401、期望 200）失败，两者此前均在干净 `origin/test=8412cc2a` 上独立复现。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。此前 PostgreSQL 不可用；恢复 PostgreSQL 16.15 临时实例后，修正 PostgreSQL 合同夹具绕过 `Database` SQL 适配器、把 `?` 占位符原样发给 PostgreSQL 的问题，`postgres_database` 集成目标 16/16 和 progressive-scan storage contract 1/1 通过。开发机为 `arm64`；本分支未部署 FNOS，未据此宣称生产 CPU 或重试流量改善。
+
+补充审查结果（2026-10-07）：SQLite 回归复现到期重试完成后，旧 `DEFERRED/SCRAPER_UNAVAILABLE` 记录仍会触发后续自动入队。未发布的 0165 增加默认关闭的一次性消费标记；派发到期重试时在同一事务内批量消费旧失败记录，完整度扫描与补缺任务去重忽略已消费记录。手动 retry 和新请求快照会重置标记。SQLite 状态机和迁移回归通过，PostgreSQL progressive-scan storage contract 覆盖相同的成功重试路径；FNOS 当前仍在 schema 164，尚未应用该 migration。
+
+最终验证复核（2026-10-07）：加入旧快照被替代的回归后，`cargo test --locked --all-targets --no-fail-fast` 单测为 747 passed、0 failed、12 ignored。集成目标中 `emby_counts`（实际 1、期望 0）和 `strm`（401、期望 200）失败；两项此前均在干净 `origin/test=8412cc2a` 上独立复现。`libraries_api` 有一项在全套运行中短暂返回 `DATABASE_UNAVAILABLE`，随后该用例单独运行通过，整个 `libraries_api` 目标也 13/13 通过。`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81、`cargo test --locked --lib fill_missing` 19/19、SQLite 旧快照回归 1/1 和独立 PostgreSQL 旧快照回归 1/1 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。开发机为 `arm64`；FNOS 仍未部署此分支，不能据此声称生产 CPU 已下降。
+
+补充代码审查（2026-10-07）：新快照不再被旧 deferred 失败阻止，但原实现只消费完全相同快照的到期记录。新增 SQLite 与 PostgreSQL 回归，覆盖旧失败已到期、fingerprint 改变、新请求成功后不得再次被旧记录解锁；自动请求查询按当前批次的 item ID 读取未消费自动失败快照，并在同一事务消费被替代的旧失败。定向状态机与 PostgreSQL progressive-scan contract 通过；FNOS 当前仍在 schema 164，尚未验证生产效果。
+
+#### LUX-403：复用有空位的 queued FILL_MISSING job
+
+范围：`enqueue_fill_missing_jobs_in_transaction` 当前只检查按创建时间排序的第一个 queued job。若该 job 已满，而后续 queued job 仍有容量，就会新建多余 job。分配请求时按创建顺序遍历有空位的 queued job，复用其容量；只在现有容量用尽后创建新 job。每次查询只读取最多与待分配请求数相同的有空位 job，保持分配有界；单 job 最多 100 项及跨库隔离不变。
+
+验收：
+
+- [x] 已有多个 queued job 且最早 job 已满时，新请求合并到最早的后续有空位 job，不新增 job。
+- [x] 请求跨越多个 queued job 的剩余容量时，按创建顺序填充并只为剩余请求新建 job；job/item 计数一致且每个 job 不超过 100 项。
+- [x] 并发/事务、取消、DEFERRED 去重和跨库行为保持不变；SQLite storage 回归、build、fmt、Clippy 及差异检查通过。
+- [x] 性能记录只陈述固定 fixture 中避免的多余 job 创建，不外推 CPU 或生产时延收益。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写含 3 个 queued job（100、100、50 项）和后续追加请求的失败回归，再实现有界多 job 容量分配。
+
+结果（2026-10-07）：补缺分配只查询 `total_count < 100` 的 queued job，按创建顺序复用，并将候选上限限制为待分配 item 数；PostgreSQL 查询额外锁定候选 job 行，SQLite 继续依赖现有写事务。SQLite 回归先确认旧逻辑在 `100/100/50` 后追加 item 会多建 job，再验证后续有 1 项容量时保持 3 个 job、追加 80 项后分布为 `100/100/100/31`，331 个 item 均入队。`fill_missing_job_creation` 两项和 PostgreSQL progressive-scan storage contract 通过；后者验证第二个 item 复用已有 queued job。build、fmt、全目标全 feature Clippy 和差异检查通过。未测量 FNOS CPU 或生产 job 创建率。
+
+#### LUX-404：显式表达扫描完整度补缺策略
+
+范围：扫描完整度流程用 `Option<bool>` 表达是否覆盖媒体库策略，并用 `Option<&str>` 隐含区分扫描任务与后台回填。改为显式 trigger 与策略类型：全量扫描/无任务的后台回填沿用媒体库“新扫描缺失补全”设置；实时增量按任务的 `auto_metadata_match`；已删除或找不到的扫描任务禁用在线补缺。禁用策略不得探测刮削器。保持现有配置语义、API、数据库 schema 和任务状态不变。
+
+验收：
+
+- [x] 完整度 trigger 和解析后的补缺策略均使用具名 enum，不再通过可空任务 ID/布尔值组合隐式表达策略。
+- [x] 回归覆盖全量/后台回填、增量开关开启/关闭、任务不存在及禁用时不探测刮削器；现有媒体库设置读写语义不变。
+- [x] 定向 scanner/storage 测试、build、fmt、全目标全 feature Clippy 和差异检查通过；不新增数据库/API 变化，也不据此宣称 CPU 收益。
+
+预计文件：`src/application/scanner.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先检查现有策略边界测试，再引入类型并保留同一套状态断言。
+
+结果（2026-10-07）：补缺调用现在显式区分 `ScanJob` 与 `LibrarySetting` trigger，并解析成 `UseLibrarySetting`、`Enabled` 或 `Disabled` 策略；存储入口同样接收具名策略类型。全量任务、后台回填和精确目录本地刷新继续读取库级新扫描设置，增量扫描继续服从任务开关，已删除任务禁用在线探测。策略单测、精确目录刷新回归和 PostgreSQL policy/storage contract 通过；build、fmt、全目标全 feature Clippy 通过。没有 schema/API 变化，也未据此推断 FNOS CPU 收益。
+
+#### LUX-405：验证跨媒体库全量扫描串行队列
+
+范围：应用共享的 `ScanJobService` 使用容量为 1 的 `full_scan_queue` 逐个执行全量扫描，但现有测试使用共享的 `scan_lock` 挂起所有任务、并为每个扫描服务分别创建队列，未实际验证这个串行队列。将回归改为两个媒体库共享同一个扫描服务，给共享扫描工作 semaphore 留出并发容量，并在 SQLite 中拒绝第二个全量任务进入 RUNNING，以证明扫描队列本身提供串行约束。增量扫描在全量扫描让出共享扫描工作资源时的优先行为保持不变。
+
+验收：
+
+- [x] 两个不同媒体库的全量 job 通过同一个扫描服务并发启动时，同一时刻最多一个 `RECONCILE_LIBRARY` 处于 RUNNING，最终两者都完成。
+- [x] 测试中的共享 `scan_lock` 有足够 permit，不会替代 `full_scan_queue` 成为串行原因；已有增量优先回归继续通过。
+- [x] `scanning_jobs` 定向目标、build、fmt、全目标全 feature Clippy 和差异检查通过；性能记录不外推 CPU 或 NAS 收益。
+
+预计文件：`tests/scanning_jobs.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先将旧回归改为能在无 `full_scan_queue` 的实现中失败，再验证当前容量为 1 的生命周期队列。
+
+结果（2026-10-07）：回归使用共享 `ScanJobService` 和 2 个扫描 semaphore permit，并由 SQLite trigger 拒绝并发全量任务进入 `RUNNING`；两个不同媒体库的 job 都完成。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs` 81/81 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；集成目标仅 `emby_counts` 与 `strm` 失败，两者在干净 `origin/test=8412cc2a` 上也复现，之前出现的插件查询计数波动和扫描超时本轮未复现。build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。默认扫描并发为 2，全量扫描队列容量为 1。验证环境为 arm64；没有据此推断 FNOS CPU 或 NAS 性能收益。
+
+#### LUX-406：扫描本地 NFO 阶段复用 source 与元数据读取
+
+范围：扫描本地元数据 outbox、库级补回及精确目录刷新先读取 source 并处理图片，随后又按 filesystem entry ID 完整查询一次 source。NFO 阶段改为消费图片阶段返回的 source 快照，并用有界查询确认原 source 仍是当前首选且存在；保留 NFO 处理后的既有新鲜度复核。按批次预取实际存在 NFO 的 item metadata 与路径，避免每个 NFO 各自读取完整 metadata 行；没有 NFO 的 item 不触发 metadata 查询。缩小 image work 分组复制的数据，并保留家庭视频 NFO 路径 I/O 错误的失败语义。普通增量/库级元数据路径继续按需读取，不改变 NFO 字段、任务状态、在线刮削或数据库 schema。
+
+验收：
+
+- [x] 扫描 outbox、后台本地 metadata 补回和精确目录刷新复用图片阶段的 source 快照；NFO 处理前验证当前首选 source，完成后的既有 source 新鲜度复核不变。
+- [x] 一个 NFO 批次仅对包含 NFO 的 item 做一次有界 metadata 批量读取；无 NFO 批次跳过 metadata 查询；陈旧 source 在 NFO 处理前被排除。
+- [x] MOVIE、VIDEO、EPISODE、SERIES、SEASON 的 NFO 路径和层级去重语义保持；家庭视频 `try_exists` 错误仍记录为可重试失败；非批处理路径继续按需读取。
+- [x] NFO 查询计数、陈旧 source 与路径错误单测，以及 `scanned_metadata`、`scanning_jobs`、build、fmt、Clippy 和 `git diff --check` 通过；全目标套件已执行，但 `emby_counts`、`strm` 各有一个已在干净 `origin/test` 复现的基线失败，不能记作全目标全绿；性能记录不把 SQL 调用数变化外推为 FNOS CPU 收益。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先为家庭视频路径查询错误保留行为写回归，再复用 source snapshot、批量预取并验证 outbox、backfill、精确刷新三条入口。
+
+结果（2026-10-07）：source 快照复用、preferred-source 校验、批量 metadata 查询及家庭视频路径错误回归通过；`scanned_metadata` 16/16、`scanning_jobs` 81/81 通过。最终 `cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过。`cargo test --locked --all-targets --no-fail-fast` 完整执行，但 `tests/emby_counts.rs` 的 auth/favorites 计数测试和 `tests/strm.rs` 的 STRM 鉴权测试各失败一次；这两项此前已在干净 `origin/test=8412cc2a` 复现，作为基线失败记录，不归因于本任务。没有据本机 ARM64 验证推断 FNOS CPU 或 NAS 收益。
+
+#### LUX-407：让 scraper 预检临时失败进入自动退避
+
+范围：本地 completeness 流程会在提交 missing 状态前预检所选 scraper。当前预检对某个 item 返回错误时只记录日志并把 item 排除在自动入队之外；同一 fingerprint 的 completeness 随后变成 `READY + is_missing=1`，后续扫描不会重新领取，因此 scraper 恢复后该 item 可能永远不再补全。对“已配置 scraper 但预检临时失败”的 item，允许创建有界 `FILL_MISSING` 请求，由现有 worker 记录 `SCRAPER_UNAVAILABLE` 并应用 LUX-402 的逐 item 退避。明确没有所选 scraper（预检成功返回 false）、自动匹配关闭或没有可请求 capability 时仍不入队。公共 API、schema 和无 scraper 的配置语义不变。
+
+验收：
+
+- [x] 已配置 scraper 的预检错误允许新确认缺失项进入现有 `FILL_MISSING` worker，由 `SCRAPER_UNAVAILABLE` 退避；同一快照冷却期去重由 LUX-402 storage 回归覆盖。
+- [x] 预检成功但没有 scraper、自动匹配关闭或没有可请求 capability 时不创建自动 job；决策单测和现有扫描策略回归通过。
+- [x] 预检错误恢复路径的回归、scanner/scanning_jobs/storage 定向覆盖、fmt、Clippy 和差异检查通过；全目标失败项与独立复测结果如下。
+- [x] 无数据库/API 变化；没有把本地恢复性修复描述为已验证的 FNOS CPU 降幅。
+
+结果（2026-10-07）：预检失败与明确不可用状态现在分开处理。已配置 scraper 的 item 级或整批预检错误会进入现有补全 worker，错误由 worker 记录为 `SCRAPER_UNAVAILABLE` 并使用 LUX-402 退避；明确无 scraper 仍不入队。`cargo test --locked --all-targets --no-fail-fast` 中 library tests 为 750 passed、12 ignored，`scanning_jobs` 81/81、`scanned_metadata` 16/16、`storage` 49/49 通过；全目标的 `emby_counts` 与 `strm` 失败已在干净 `origin/test=8412cc2a` 基线复现，`libraries_api` 全目标并行运行时失败后独立复跑 13/13 通过。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。该分支未部署到 FNOS，也没有生产 CPU 降幅证据。
+
+短计划与文件：预计修改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先在 scanner 单测中固定“预检错误继续排队、明确无 scraper 不排队”的决策，再把预检错误送入已有 provider-unavailable job 流程，最后运行窄测试与相关完整检查。
+
+#### LUX-408：合并扫描本地 metadata outbox 批量写入
+
+范围：workflow 3 每 256 个 source 持久化一条 `scan_local_metadata_batches`，保留该任务粒度以限制 worker 的单次载荷和重试范围；但目前同一 Manifest 事务对每条 batch 分别执行 INSERT。60,000 个文件的固定扫描产生 240 条 outbox INSERT，令现有 LUX-275 基准中的 `<209 DML` 检查在干净 `origin/test` 上失败，尽管扫描索引本身仅执行 119 条 DML。将同一事务中多个 outbox batch 合并为有界多行 INSERT，只有遇到已存在的 batch 序号时才执行一次有界读取并校验原 ID、source 列表和计数。每条 outbox 仍最多含 256 个 source；不改变 worker、重试、序号、事务或公开接口。
+
+验收：
+
+- [x] 新 batch 在一个有界多行 INSERT 中写入；故障注入回归确认 Manifest 索引、outbox 和 manifest/job checkpoint 一同回滚。
+- [x] 重放相同序号与完全相同 source 列表保持幂等；相同序号但 ID、source 列表或 source 数不同仍返回冲突；SQLite 与 PostgreSQL 均运行覆盖。
+- [x] 固定 SQLite 回归对 513 个 source 生成 3 条独立 batch，首次写入只执行 1 条 INSERT；重放使用有界冲突校验，不逐行读取。
+- [x] 每条 batch 最大仍为 256 个 source；最多 64 行、384 个绑定参数的多行 INSERT 在 SQLite 与 PostgreSQL 通过。
+- [x] `lux_270_manifest_job_scan_benchmark` 的 60k SQLite/PostgreSQL 总 DML 均低于既有 209 阈值；索引、target、无变化重扫、前台 p95、SQL/DML 与 WAL 已记录，不把本机 ARM64 数据外推至 FNOS/x86_64。
+
+短计划与文件：修改 `src/storage/jobs.rs`（批量序列化、INSERT、冲突校验及 SQLite/PostgreSQL query-count 回归）、`tests/scanning_jobs.rs`（Manifest 与 checkpoint 回滚）、`tests/performance.rs`（保持总 DML 门槛）、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先写 513-source 回归，再按最多 64 个 outbox row 构造一条多值 SQL、使用 `RETURNING` 识别新写序号，并仅在存在冲突时批量验证。已完成 storage/scanning 定向回归及 PostgreSQL 16 三轮基准；全量 Rust 质量门结果见下。
+
+结果（2026-10-08）：定向 SQLite/PostgreSQL outbox 回归、扫描事务回滚、60k SQLite/PostgreSQL 性能基准、`cargo build --locked`、`cargo fmt --all -- --check` 和全目标全 feature Clippy 通过。`cargo test --locked --all-targets --no-fail-fast` 中 library 为 751 passed、13 ignored，`scanning_jobs` 81/81、`storage` 49/49 通过；全量集成测试仅 `emby_counts` 与 `strm` 两项失败，这两项已在干净 `origin/test` 的 LUX-407 质量门中复现，与本任务改动无关。`git diff --check` 通过。本机为 ARM64；此分支未部署 FNOS，固定 fixture 的语句数改善不代表 NAS CPU 或生产墙钟收益。
+
+#### LUX-409：跳过未变化 NFO 写回的镜像与数据库检查
+
+范围：`NfoWriteService::finish_item_write` 在 NFO 文件内容未改变时仍检查 metadata mirror、重新读取文件时间并访问数据库。未变化时复用原文件状态生成的既有 metadata fingerprint，直接返回，不检查镜像、不重新 stat，也不打开 metadata 写事务；文件发生变化时保留镜像、fingerprint 和状态同步的现有顺序及错误语义。该优化不改变 NFO 内容、文件原子写入、source freshness 或 mirror 的显式配置合同。
+
+验收：
+
+- [x] 首次 probe 写回可创建 metadata mirror 并同步 NFO 状态；重复相同写回不再查询 mirror 策略或写入数据库，NFO 与已有镜像内容保持一致。
+- [x] 未变化路径返回的 metadata fingerprint 与此前 stat 路径的 fingerprint 算法和字节完全一致；变化路径仍刷新 fingerprint 并同步数据库。
+- [x] `nfo` 定向单测、`cargo fmt --all -- --check`、相关 Clippy 与 `git diff --check` 通过；性能记录只报告固定 fixture 的 storage query-wrapper 调用数，不推断墙钟或生产 CPU。
+
+短计划与文件：预计修改 `src/application/nfo.rs`（无变化回归及快速返回）、`src/application/metadata.rs`（从已读取文件状态构造一致的 fingerprint）、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先扩展 probe 写回回归，使其在重复调用时断言 mirror 配置读取和状态写入都被跳过，再实现 fingerprint 复用。
+
+结果（2026-10-08）：重复 probe 写回的 SQLite fixture 从 3 次 storage query-wrapper 调用降为 2 次；首次有内容变化的写入仍创建 mirror 并同步 NFO 状态。NFO writer 单测 4/4、格式检查及 library 全 feature Clippy 通过。重复写回复用写入前已读取的 `FileStamp` 计算原有 metadata fingerprint，单测确认结果与 stat 算法逐字节一致；没有据 SQL 调用数推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+
+#### LUX-410：合并普通电影 metadata 页的图片登记
+
+范围：`enrich_movie_sources` 目前在每部电影的 NFO 处理后立即单独写入本地图片；改为按最多 16 个电影收集图片记录后复用现有批量图片事务。保持 NFO 处理顺序、图片发现和 fallback 规则、每个条目的文件读取错误隔离；批量事务失败时退回逐条写入，以免一个条目的写入错误阻断同页其他电影。扫描 outbox 路径已有的首张海报时机和 16 项批处理不变。
+
+- [x] 普通电影 metadata 页按最多 16 个 item 合并图片登记；超过上限时切页，且每条图片仍按原有路径、索引和 fallback 规则保存。
+- [x] 单个条目的目录/图片错误与批量事务失败继续隔离；能成功的其他条目仍登记，报告的 `images_found` 与原单条路径一致。
+- [x] 固定 SQLite 两电影 fixture 的图片写入 query-wrapper 次数从逐项 2 次降为单批 1 次；电影 NFO 和扫描 outbox 图片回归、格式、相关 Clippy 与 `git diff --check` 通过，不推断墙钟或生产 CPU。
+
+短计划与文件：预计只改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先在 metadata 单测中用两部电影和本地 poster 锁定当前逐项登记 SQL 调用，再在 16 项页内收集共享 helper 的准备结果并批量提交，最后验证单项错误恢复。
+
+结果（2026-10-08）：普通电影 enrichment 逐 16 项收集图片后复用现有有界图片事务，NFO 仍按 item 顺序处理；批次写失败后退回逐 item 事务并隔离错误。两电影本地 fanart fixture 中扫描 source 查询与图片登记共由 3 次 storage query-wrapper 调用降为 2 次；trigger 注入一项写失败时，另一项仍登记成功。新增单测通过，`scanned_metadata` 16/16、`series_metadata` 3/3、fmt、library all-features Clippy 与 `git diff --check` 通过。性能记录仅描述该 SQLite fixture 查询调用数，不外推墙钟或 FNOS CPU。
+
+#### LUX-411：合并电影 NFO source 与辅助字段上下文读取
+
+范围：电影 NFO/probe 写回分别读取 item 类型、preferred source、sort title 和 added_at。新增单 item NFO writeback context 查询，一次返回 target 所需 source/type 与 sort_title/added_at，供电影 NFO target、sorttitle/dateadded 和 probe source 校验复用。保持图片写回使用的通用批量 context 合同不变。保留 MOVIE 限制、首选 source/missing 检查、NFO 路径规则和 source ID freshness；不改变对外 API 或存储 schema。
+
+验收：
+
+- [x] probe 详情写回从上下文查询和辅助字段查询合为一次读；状态同步写入仍保持原事务边界，错误 source、非电影、STRM source 仍拒绝。
+- [x] 电影 NFO 写回从 item kind、source、辅助字段多次读取合并为一次 context 读取；`sorttitle`、`dateadded` 内容一致，非电影和软删除条目不注入电影辅助字段。
+- [x] NFO writer 与 candidate writeback regression、fmt、相关 Clippy 和 `git diff --check` 通过；性能记录只陈述固定 SQLite query-wrapper 调用数。
+
+短计划与文件：预计改 `src/storage/catalog.rs`、`src/storage/media.rs`、`src/application/nfo.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先把 probe 的 storage 查询调用断言由 4 调至 3 并确认失败，再新增单 item 查询并移除不再使用的辅助字段查询，最后覆盖电影 NFO 的辅助 XML 字段和拒绝路径。
+
+结果（2026-10-08）：电影 NFO 与 probe 写回复用单次 NFO writeback context 查询；条件投影保留旧辅助字段仅对未软删除 MOVIE 生效的语义，source 选择仍限制为原有媒体类型。固定 SQLite fixture 中 probe 写回由 4 次降为 3 次 storage query-wrapper 调用；变化中的电影 NFO 写回总计 3 次（context、mirror policy、状态同步）。定向 NFO 单测 1/1、`nfo_writer` 26/26、candidate 模块 22/22、候选写回失败回归 1/1、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。查询计数不代表 PostgreSQL、墙钟或 FNOS CPU 收益。
+
+#### LUX-412：批量登记普通剧集 metadata 图片
+
+范围：普通剧集 enrichment 已按页读取 episode source，但 series、season、episode 图片仍通过 `index_images` 逐项读取已有记录并登记新记录。保留 NFO 按条目处理和系列目录读取顺序，将本页实际发现的本地图片按最多 16 个 item 聚合，批量读取已登记图片并复用现有批量写事务。保留 Thumb/Fanart 去重、poster fallback 清理、图片索引顺序和单 item 错误隔离；不增加 episode 并发，不改变扫描 worker 的 claim 与调度流程。
+
+验收：
+
+- [x] 两个 series fixture 的普通 enrichment 共用已有图片页查询与登记事务；固定 SQLite storage query-wrapper 调用数下降，图片归属、类型和报告计数正确。
+- [x] 空图片、NFO-only 模式和批写失败回退保持原有语义；单条失败不阻止同页其他 item 登记。
+- [x] series 图片与 metadata 回归、fmt、library all-features Clippy 和 `git diff --check` 通过；性能记录限定于固定 SQLite fixture。
+
+短计划与文件：只改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先新增两 series/episode fixture 并锁定逐 item 查询调用数，再按 16 item 边界收集图片候选，复用批量既有图读取和图片登记；最后注入单 item 写失败确认错误隔离。
+
+结果（2026-10-08）：普通剧集 enrichment 按最多 16 个 item 收集 series/season/episode 图片候选，既有图查询与登记共用页级 storage 操作；NFO 仍逐条处理。两 series、各一个 episode、每 series 一个 poster 的固定 SQLite fixture 从 11 次降为 4 次 query-wrapper 调用；其中单次批登记事务同时 upsert 两张 poster 并清除 poster fallback。trigger 注入首个 series 写失败后批事务回滚，逐项恢复仍登记第二个 series，并只将失败 series 记录为错误。metadata module 13/13、`scanned_metadata` 16/16、`series_metadata` 3/3、fmt、library all-features Clippy 与 `git diff --check` 通过。此数据只反映 fixture 调用数，不代表 PostgreSQL、墙钟或 FNOS CPU 收益。
+
+#### LUX-413：避免已知缺失 credits 时读取人物关系文件
+
+范围：本地 metadata completeness 计划对电影和系列总会检查 `people.json`，之后才判断 NFO projection 是否缺导演或编剧。若任一 crew 字段已缺失，credits 必然需要补全，人物关系是否存在不改变结果；先检查 crew completeness，仅在两类本地 crew 信息均齐全时读取 actor relation。保持自动补全能力与 NFO projection 语义不变，不新增跨请求缓存或并发。
+
+验收：
+
+- [x] 缺少 NFO projection、导演或编剧信息时仍标记 credits 缺失，且不进入 actor-relation 检查分支；两类 crew 信息齐全时继续检查 actor relation。
+- [x] 候选计划回归、fmt、相关 Clippy 和 `git diff --check` 通过；不把分支跳过描述成已测得的总体 I/O 或 FNOS CPU 收益。
+
+短计划与文件：只改 `src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先增加 crew completeness 判定回归，再让计划构建仅在 crew 信息完整时读取 actor relation，最后运行候选模块测试、fmt、Clippy 和差异检查。
+
+结果（2026-10-08）：credits 缺失判定先检查本地 NFO projection。缺少 projection、导演或编剧时直接标记缺失，不读取 `people.json`；两类 crew 信息齐全时仍检查人物关系。候选模块回归、fmt、Clippy 和 `git diff --check` 通过。本任务没有统计文件系统调用数、墙钟或生产 CPU；完整的页级 NFO projection 缓存与批量 relation 读取仍属于第 15 项剩余工作。
+
+#### LUX-414：本地 metadata 图片完成时唤醒对应扫描等待者
+
+范围：`wait_for_local_metadata_images` 当前按 1 秒 fallback 轮询数据库，即使本进程中的 outbox worker 已持久化对应 job 的图片阶段完成。为等待中的 job 注册独立 Notify；图片 worker 成功持久化 `images_completed_at` 后唤醒该 job 的等待者。保留周期 fallback，覆盖跨进程状态变化、通知注册竞态和 worker 恢复；失败重试不误报完成。
+
+验收：
+
+- [x] 图片阶段完成的持久化状态后发送对应 job 通知，等待者收到通知后重新读取数据库并退出等待；失败图片批次继续按原有重试策略等待。
+- [x] 回归证明通知可让等待路径早于 1 秒 fallback 返回；fmt、相关 Clippy、`git diff --check` 通过。
+- [x] 性能记录仅说明查询等待边界，不外推文件处理墙钟、PostgreSQL、FNOS 或 NAS 收益。
+
+短计划与文件：只改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先添加包含未完成 image batch 的 scanner 回归并观察 1 秒轮询超时，再增加独立 job 通知注册和完成信号，最后验证扫描等待与批次重试行为。
+
+结果（2026-10-08）：outbox 图片阶段成功写入 `images_completed_at` 后通知对应 job；等待方收到通知后重新查询数据库，周期 fallback 仍为 1 秒。通知单测先保持 batch 为 pending，再完成它并要求 250ms 内唤醒（不含开始时的 50ms 等待）；定向回归、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。失败批次不发送完成通知，仍按原有延迟重试。本结果不测量 SQL 时延、扫描墙钟或 FNOS CPU。
+
+#### LUX-415：本地 metadata worker 仅在 fallback 时刷新 scan job
+
+范围：本地 metadata worker 每次收到 target 状态 Notify 后都会重新读取 scan job，即使 scan job 生命周期由同一个 worker 的 stop watch 控制，且 target 通知已由本地 scan service 发出。改为 Notify 后直接回到 pending-target 查询，仅 1 秒 fallback 重读 job 行，以发现外部状态变化或修复丢失通知；stop watch 仍立即退出。不改变 pending target claim、root 校验、批次大小、worker 状态机或数据库合同。
+
+验收：
+
+- [x] 固定 SQLite worker idle 回归确认一次 Notify 唤醒只执行 pending-target 查询，从原来的两次 query-wrapper 调用降为一次。
+- [x] scan job fallback 刷新和 stop watch 行为保持；本地 metadata worker 定向回归、fmt、Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只说明 query-wrapper 调用数，不外推 PostgreSQL、墙钟或生产收益。
+
+短计划与文件：只改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先让 idle worker 在通知回归中记录 query-wrapper 调用并观察现有 2 次读取，再仅在 fallback 分支刷新 job，最后验证 worker 通知、取消退出与现有扫描回归。
+
+结果（2026-10-08）：idle worker 收到 target Notify 后不再查询 scan job；仍会回到 pending-target 查询，且只有 1 秒 fallback 会检查最新 scan job 状态。SQLite idle fixture 在一次 Notify 后的 query-wrapper 调用由 2 降为 1；stop watch、pending 状态及 scan job 持久化语义未变。候选 worker 与图片等待回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；不推断 PostgreSQL、墙钟或 FNOS 收益。
+
+#### LUX-416：用 NFO 内容指纹跳过无语义变化的重复解析
+
+范围：数据库的 metadata fingerprint 仍使用路径、大小和 mtime 作为快速 stat 指纹。stat 指纹变化时，若 rich NFO cache 保存的原始内容 SHA-256 与当前文件字节一致、NFO defaults 已完整且 actor relation 不需重建，则跳过 XML 解析和完整 metadata 更新，只把新的 stat 指纹写回；内容哈希不同或任何前置条件不满足时保留原解析/修复路径。不尝试仅凭 mtime/大小抑制外部写入，不改变缓存 schema、字段优先级或 actor relation 恢复。
+
+验收：
+
+- [x] 同一 XML 内容位于新旁车路径时命中 rich cache，不解析、不重复更新完整 metadata，并持久化新 stat fingerprint。
+- [x] 相同流程中随后修改 NFO 标题会重新解析并更新媒体标题；缓存不屏蔽内容变化。
+- [x] NFO cache、metadata 模块定向回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录说明仍要读取并哈希旁车字节；本任务只减少 XML 解析和 metadata 更新，不外推墙钟或 FNOS 收益。
+
+短计划与文件：修改 `src/storage/catalog.rs`（同查询读取 cache JSON 与 SHA-256）、`src/application/nfo.rs`（validated cache snapshot API）、`src/application/metadata.rs`（保守内容命中及测试）、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先添加 same-content/new-path 回归并确认旧逻辑仍加载 NFO，再在 rich cache 指纹匹配时跳过解析；最后同时验证内容变化路径。
+
+结果（2026-10-08）：本轮已读取 metadata 快照后，在本地 NFO 文件字节与 rich cache 内容 SHA-256 一致且 defaults 完整、actor relation 正常时复用缓存并只同步新的路径/大小/mtime 指纹。旧实现下 new-path/same-content 回归的 `nfo_skipped` 为 0；按旧路径 6 次 query-wrapper 调用计算，新路径执行 3 次，且随后修改标题仍执行 NFO 加载。cache JSON 与 SHA-256 现在通过一条 query-wrapper 查询同时读取，原 unchanged stat 命中 fixture 也从 3 次降为 2 次。保守路径仍需读取全部 NFO 字节并计算 SHA-256，因此没有消除 NAS 文件读取；不外推 PostgreSQL、墙钟、FNOS 或 CPU 收益。
+
+#### LUX-417：completeness 页复用 NFO projection 的 writeback context
+
+范围：`local_metadata_completeness_plans` 已批量读取每页 item 的 writeback context，图片策略消费该 context，但 rich NFO cache 缺失时 projection fallback 仍逐 item 查询 item kind 和 source path。让 NFO projection 读取复用同页 context，并从当前页 metadata 快照取 SEASON 必需的 season number。继续 canonicalize source、media file、目标目录并验证都位于配置 root 内；context 缺少可写回 source 时保持 ItemNotFound 语义。单 item completeness 规划继续使用既有按需读取路径。
+
+验收：
+
+- [x] metadata 页中 NFO projection 文件读取复用已批量加载的 writeback context，不再对每个 item 重查 kind/source；单 item 入口仍正常读取。
+- [x] MOVIE、EPISODE、SERIES、SEASON 的目标路径与根目录保护保持，SEASON 使用相同编号选择规则；缺失 source 语义不变。
+- [x] query-wrapper 回归、NFO/candidate/scanner 定向测试、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只报告 context SQL 调用数，不把 canonicalize 或 NAS 文件 I/O 推断为已消除。
+
+短计划与文件：修改 `src/application/nfo.rs`（按上下文读取 projection）、`src/application/candidates.rs`（completion 页复用）和两份优化记录。先写 context/projection 查询计数回归，再连接页内消费，最后跑 NFO 与 candidate 相关检查。
+
+结果（2026-10-08）：projection 查询计数回归确认，复用页级 writeback context 后不再执行逐 item kind/source SQL，projection 阶段由 2 次 query-wrapper 调用降为 0；NFO 文件读取及 canonicalize/root 校验保持。`nfo_writer` 26/26、metadata candidate 单测 22/22、`metadata_selection` 31/31、`scanning_jobs` 81/81、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `uname -m=arm64`。`cargo test --locked --all-targets` 的 library 测试 758 passed、13 ignored，随后在 `tests/emby_counts.rs:159` 遇到实际计数 1、期望 0；在未包含 LUX-417 改动的 `2b64ba65` 隔离工作树复跑同一目标得到相同失败，因此记为已有基线失败而非本任务回归。仅报告本地 SQLite 查询边界，不外推文件系统、PostgreSQL、NAS 或 FNOS 收益。
+
+#### LUX-418：电影本地 NFO 有界并发
+
+范围：普通电影 metadata enrichment 已按 16 个 item 分页并批量登记图片，但 NFO 仍逐条执行。对每页独立电影 NFO 使用最多 4 个并发任务，保持结果按来源顺序归并、item 错误隔离、report 计数以及现有图片批事务/单 item 失败回退。不扩展到 series/episode NFO、在线刮削、人物写入或调度器。
+
+验收：
+
+- [x] 有自动化回归证明任务并发数不超过 4、输入结果顺序稳定且所有 item 均被处理。
+- [x] 每个电影 NFO 的错误仍只标记该 item；图片批登记和失败回退行为保持。
+- [x] metadata/scanned_metadata 定向目标、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。
+- [x] 性能记录只描述本地 worker 并发上界，不把 SQL 并发或 fixture 推断为 FNOS CPU/墙钟收益。
+
+短计划与文件：修改 `src/application/metadata.rs`，使用可测试的有界 task helper 驱动电影 NFO page；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md` 记录范围及验收。先写并发上限/顺序回归，再替换逐条 NFO loop，最后验证图片失败隔离与目标测试。
+
+结果（2026-10-08）：普通电影每页最多 4 个 NFO task 并行，任务完成后再补充下一项，最终按输入顺序合并 report；坏 NFO 只使对应电影失败，健康电影仍更新，图片 page transaction 和逐 item 失败回退保持。metadata 单测 13/13、`scanned_metadata` 16/16、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本轮 `cargo test --locked --all-targets` 的 library 测试 760 passed、13 ignored，随后 `tests/emby_counts.rs:159` 再次出现已在未改动基线 `2b64ba65` 复现的实际计数 1、期望 0。性能证据仅确认本地并发上限与结果顺序，没有墙钟、FNOS CPU、PostgreSQL 或 NAS A/B 数据。
+
+#### LUX-419：剧集与分集本地 NFO 有界并发
+
+范围：普通剧集 metadata 页按 series/season/episode 顺序遍历以保留层级图片语义，但各层 NFO enrichment 也在该循环中串行执行。收集当前 source page 中实际存在的 series、season、episode NFO request，再复用 LUX-418 的最多 4 路有界 task helper；保留 source 顺序归并、NFO snapshot metadata 不重复查询、Item 级错误隔离与 `tvshow.nfo`/season/episode 文件选择规则。目录/NFO 路径发现、图片扫描、人物 credits 跨 item 批量写入不属于本任务。
+
+验收：
+
+- [x] 当前 page 中层级 NFO request 最多并发 4 个，按 series/season/episode 原顺序归并统计；没有 NFO 的 item 不创建 task。
+- [x] snapshot metadata 仍被消费一次且不触发逐 item metadata 查询；单 item OnDemand NFO 路径不变。
+- [x] hierarchy、season/episode NFO 路径、NFO failure isolation、series/scanned-series metadata 定向测试、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。
+- [x] 性能记录仅报告 task 上界，不外推墙钟、NAS 或 FNOS 收益。
+
+短计划与文件：修改 `src/application/metadata.rs` 收集拥有型 series NFO request 并以 LUX-418 有界 helper 执行；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`。先覆盖 request/snapshot 消费语义，再连接当前 page 执行，最后运行 `series_metadata`、`scanned_series_metadata` 和候选测试。
+
+结果（2026-10-08）：series、season、episode NFO 路径按层级遍历收集后使用与电影相同的 4-task 上限；snapshot metadata 随 request 一次取出，仍走无额外 metadata read 的 enrichment 入口，OnDemand 调用保留原入口。层级/image traversal 未移动，NFO requests 按其被发现的源顺序汇总 report。`series_metadata` 3/3、`scanned_series_metadata` 2/2、metadata task-order/concurrency 与 NFO isolation 回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。性能记录只陈述并发上限，没有墙钟、query 计数、FNOS 或 NAS 收益数据。
+
+#### LUX-420：降低本地 metadata 完成等待 fallback 轮询
+
+范围：扫描 job 等待本地 metadata target 完成时，每秒 fallback 会重新查询 pending target，即使同进程 worker 完成路径会发送 `Notify`。将此 completion waiter 的 fallback 独立调至 5 秒；通知到达仍立即检查数据库。worker 对 scan job 状态的 1 秒 fallback 保持不变，图片阶段等待也保持原有间隔。跨进程变更最迟通过 fallback 被观察到。
+
+验收：
+
+- [x] 同进程 metadata completion 通知能在 250ms 内唤醒等待者，不等待 5 秒 fallback。
+- [x] fallback 常量仅应用于 completion waiter，worker 状态刷新与 image waiter 的容错间隔未改变。
+- [x] scanner waiter 与 scanning_jobs 定向回归、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。
+- [x] 性能记录区分 waiter fallback 频率和 worker refresh 频率，不推断生产 CPU 收益。
+
+结果（2026-10-08）：completion waiter pending-state 查询从每秒 fallback 降至每 5 秒一次；本进程 worker 的 `notify_waiters` 仍即时唤醒。新增 fixture 在 target 由 PENDING 变为 DONE 后触发 Notify，250ms 内返回；image waiter 原 250ms 通知回归也通过。`scanning_jobs` 81/81、全目标全 feature Clippy、fmt 和 `git diff --check` 通过。跨进程写入的检测延迟窗口扩大至最多 5 秒，性能记录不外推 CPU、PostgreSQL 或 FNOS 收益。
+
+#### LUX-421：合并 completeness 完成后的缺失项筛选
+
+范围：`complete_local_metadata_and_enqueue_fill_missing_with_policy` 在同一事务中完成 completeness 状态后，原先先查询 READY/missing 项，再查询仍有效的媒体项，最后将两组结果求交后交给请求构建器；请求构建器本身已按同样条件筛选 completeness 和媒体项。删除这两次冗余筛选，只把去重后的 eligible IDs 交给批量请求构建器。保留 completeness 更新、并发锁、事务提交、自动补全策略以及目标 eligibility 规则。
+
+验收：
+
+- [x] 固定 SQLite fixture 的应用 query-wrapper 调用从 9 次降为 7 次；对应回归精确断言候选路径调用数。
+- [x] 请求构建器仍限定当前 library、未软删除、有效媒体类型、READY 且 missing 的 capability，并按输入 fingerprint 生成请求。
+- [x] storage 定向测试、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；不把 query-wrapper 数量解释为 SQL 执行时长或生产收益。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先测出旧路径 9 次查询，再去除重复读取并确认新路径为 7 次。
+
+结果（2026-10-08）：旧版隔离基线与候选版各自运行同一 storage fixture，query-wrapper 调用为 9→7。请求构建器的事务内查询继续复核有效媒体项和 READY/missing 状态；本机 `arm64`。只证明固定 SQLite fixture 的应用层调用数变化，不外推 SQL 时长、PostgreSQL、FNOS 或 NAS 收益。
+
+#### LUX-422：有界并行规划本地 metadata completeness 页
+
+范围：完整性规划页已批量读取策略、图片索引、NFO writeback context 和 attempts，但每个 item 的本地图片发现、必要时的 NFO projection 与 actor relation 检查仍串行执行。对只读 item planning 使用最多 4 路并发，收齐后按输入顺序生成计划；保留 attempt state 批量读取、请求 eligibility、最先失败项语义和现有文件/数据库读取边界。不引入文件读取缓存、schema 或依赖。
+
+验收：
+
+- [x] 固定 12 个异步 planning task 的回归证明并发数大于 1 且不超过 4，返回结果按输入顺序稳定。
+- [x] image discovery、NFO projection 或 actor relation 检查错误仍导致该页规划失败，并按输入顺序选择首个错误；这些操作保持只读。
+- [x] 候选模块及相关扫描回归、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只说明页内只读 task 并发上限；不声称减少文件读取次数或已验证墙钟/FNOS/NAS 收益。
+
+预计文件：`src/application/candidates.rs`、`src/storage/repository.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定有界 helper 的并发与稳定顺序，再将完整性页 per-item planning 移入 helper。
+
+结果（2026-10-08）：每页 NFO projection、人物 relation 旁车和本地图片发现最多 4 个 item 并行，所有结果收齐后按原输入顺序处理；策略/图片/context/attempts 查询仍为页级数据库调用。候选模块测试 23/23 通过。该回归只证明任务上界和顺序，不测文件访问总数、墙钟或 FNOS/NAS 性能。
+
+#### LUX-423：降低本地 metadata worker 的空闲 job 状态查询
+
+范围：本地 metadata worker 没有 pending target 时通过 Notify 等待，同时每秒 fallback 重新读取 scan job。只将该 job-state refresh fallback 改为 5 秒；Notify 和 stop watch 仍即时唤醒。worker 启动加载失败重试、image-stage waiter 的 fallback 保持 1 秒，completion waiter 保持 LUX-420 的 5 秒。跨进程 scan job 状态变化的观察窗口扩大至最多 5 秒。
+
+验收：
+
+- [x] job-state refresh fallback 为 5 秒且没有改动其他 idle/retry/image fallback。
+- [x] Notify 到达后仍无需等待 fallback，并保持现有单次通知 query 回归。
+- [x] scanner waiter 定向测试、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录仅报告配置间隔 1 秒→5 秒；不推断实际运行时查询量、CPU 或 FNOS 收益。
+
+预计文件：`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定新 fallback 配置和即时 Notify 路径，再只替换 scan job 状态 refresh timer。
+
+结果（2026-10-08）：worker 空闲时的 scan job 状态 refresh 从 1 秒 fallback 改为 5 秒；通知和 stop watch 仍即时唤醒，worker 启动读取错误及 image-stage waiter 的 1 秒 fallback 未改变。`local_metadata_worker_` 定向测试 4/4、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。只确认 fallback 配置和通知语义，未测总体 query/CPU 或 FNOS 收益；跨进程状态观察最迟延至 5 秒。
+
+#### LUX-424：扫描生成的 FILL_MISSING job 使用按 library 复用的 dispatcher
+
+范围：扫描后处理当前会为每个 `FILL_MISSING` job 建立独立 Tokio task。增加按 library 复用的持久 dispatcher，以有界队列接收 job ID，并由单个 runner 按序处理同一 library 的 job；队列满时对提交方施加背压，已持久化的 job 不得丢弃。将全量扫描、增量扫描和 completeness completion 生成的补全任务接入 dispatcher，保持数据库 job 生命周期、扫描事件、取消语义和现有全局最多两个 `FILL_MISSING` item worker 不变。dispatcher 关闭后拒绝新提交；服务关闭调用不等待队列执行完，已接收任务在 Tokio runtime 仍运行期间继续排空。
+
+验收：
+
+- [x] 同一 library 同时最多运行一个 `FILL_MISSING` job；另一 library 可有独立 dispatcher，item worker 总并发仍不超过 2。
+- [x] dispatcher 队列有明确容量，队列满时提交受背压；重复 job ID 不重复排队，失败提交不会遗失数据库中的 job。
+- [x] 全量扫描和增量扫描的自动补全入口均提交到 dispatcher，不再为每个 job 建立完整 runner task；扫描 job 事件内容保持一致。
+- [x] 关闭后拒绝新提交；关闭唤醒队列容量等待者，已接收队列在 runtime 仍运行期间排空，关闭调用不等待长 job；取消中的 job 按原语义完成收尾。
+- [x] 同 library 串行、不同 library 可调度、队列背压、重复提交、错误 library 路由、关闭唤醒和单个 job runner panic 后继续处理有自动化覆盖；定向 reidentify/scanning jobs、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 调度入口限于扫描和本地 completeness 自动补全；管理员直接请求和计划任务作为独立后续接线任务，不得绕过 dispatcher 扩大 runner 数量。
+- [x] 性能记录只报告队列容量、runner 数和已有 item worker 上限，不推断运行时 CPU、数据库耗时或 FNOS/NAS 收益。
+
+预计文件：`src/application/reidentify.rs`、`src/application/scanner.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加同库串行调度回归，再接入有界 dispatcher 并验证关闭行为。
+
+结果（2026-10-08）：扫描和本地 completeness 自动补全共用按 library 的容量 32 dispatcher；enqueue 先预留容量再在 shutdown 锁内去重，校验 job 的持久化 library/mode，关闭唤醒背压提交，单个 job runner panic 后将该 job 标记为 FAILED 并继续队列。`tests/reidentify.rs` 15/15、`tests/scanning_jobs.rs` 81/81、build、fmt、全目标全 feature Clippy、`git diff --check` 通过。全量测试的 library 部分 765 passed、13 ignored；随后在 `tests/emby_counts.rs:159` 遇到已于基线 `2b64ba65` 复现的无关计数失败（实际 1、预期 0）。本机 ARM64；没有 FNOS/NAS、PostgreSQL 或运行时 task 数/CPU A/B 证据。管理员和计划任务入口仍属后续任务。
+
+#### LUX-425：管理员 FILL_MISSING 请求复用按 library dispatcher
+
+范围：管理员的整库 reidentify、整库 metadata refresh 和单条目 metadata refresh 中，`FILL_MISSING` 仍直接为每个持久化 job spawn runner。统一通过 LUX-424 dispatcher 接收这三类管理员创建的 `FILL_MISSING` job；`FULL_REFRESH` 与 `REIDENTIFY` 继续沿用当前 runner。队列背压时管理员请求等待 dispatcher 容量；dispatcher 关闭或队列不可用时返回结构化服务不可用错误，持久化 job 保持可重试；成功响应、审计事件和 job DTO 不变。本任务不接计划任务、thumbnail retry 或调度窗口。
+
+验收：
+
+- [x] 三个管理员 FILL_MISSING 入口都进入对应 library dispatcher，不再直接 spawn job runner。
+- [x] FULL_REFRESH、REIDENTIFY 的执行与响应合同不变；队列关闭时 FILL_MISSING 返回服务不可用，持久化 job 保持可重试。
+- [x] 管理员 item/library FILL_MISSING HTTP 回归、reidentify dispatcher 定向回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录说明管理员路径复用每库一个 runner，不推断生产吞吐或 CPU 收益。
+
+预计文件：`src/api/admin_handlers.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先补管理员 refresh HTTP 回归，再接入 dispatcher。
+
+结果（2026-10-08）：整库 reidentify、整库 metadata refresh 和 item metadata refresh 的 `FILL_MISSING` 均经由按 library dispatcher 入队；其他模式继续使用原 worker。dispatcher 关闭回归确认 API 返回 `503 DATABASE_UNAVAILABLE`，新建 job 保持 `QUEUED`。`tests/reidentify.rs` 15/15、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；不代表 FNOS/NAS、PostgreSQL 或运行时吞吐/CPU 收益。管理员显式 retry 入口和计划任务入口不属于本任务，仍需逐项核验。
+
+#### LUX-426：管理员重试 FILL_MISSING job 复用 library dispatcher
+
+范围：管理员 `POST /api/v1/admin/metadata/reidentify/{job_id}` retry 当前在将终态 job 重排为 `QUEUED` 后，直接为每个 job spawn runner。对 `FILL_MISSING` 重试复用 LUX-424 library dispatcher；`FULL_REFRESH` 与 `REIDENTIFY` 保持原 runner。dispatcher 关闭/不可用时返回结构化 `503 DATABASE_UNAVAILABLE`，重排后的 job 留在 `QUEUED` 供之后重试；成功响应和审计事件保持不变。不包含计划任务入口。
+
+验收：
+
+- [x] 管理员 FILL_MISSING retry 通过 job 持久化 library 进入 dispatcher；不得直接 spawn 完整 runner。
+- [x] dispatcher 关闭时 retry 返回结构化服务不可用，持久化 job 保持可重试状态；其他模式的 retry 合同不变。
+- [x] HTTP 回归、reidentify dispatcher 定向回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录说明 retry 复用每库 dispatcher，不推断生产收益。
+
+预计文件：`src/api/admin_handlers.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加 dispatcher 已关闭时的 FILL_MISSING retry HTTP 回归，再复用 LUX-425 调度 helper。
+
+结果（2026-10-08）：管理员显式 retry 在 job 重排后复用 LUX-425 调度 helper；dispatcher 关闭时 HTTP 返回 `503 DATABASE_UNAVAILABLE`，job 留在 `QUEUED`。新回归在修复前观察到原 handler 错误返回 `202`，修复后通过。`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有 FNOS/NAS 或运行时收益证据。计划任务入口仍需独立接入与验证。
+
+#### LUX-427：计划 metadata job 复用 library dispatcher
+
+范围：`METADATA_PARSE` 计划任务当前为每个新建的 `FILL_MISSING` job 直接 spawn runner。改为通过 LUX-424 library dispatcher 入队，并将 dispatcher 失败作为计划任务启动错误返回，同时保留已创建的 `QUEUED` job。计划任务成功结果仍返回相同 job DTO。thumbnail scraper retry 的等待完成语义不属于此任务。
+
+验收：
+
+- [x] 计划 metadata job 进入对应 library dispatcher，不直接 spawn 完整 `FILL_MISSING` runner。
+- [x] dispatcher 不可用时计划任务返回错误，job 保持 queued；可用时仍返回同一 metadata job 结果。
+- [x] scheduled task 与 reidentify 定向回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录说明计划入口复用每库 runner，不推断生产收益。
+
+预计文件：`src/application/scheduled_tasks.rs`、`src/api/admin_handlers.rs`、`tests/scheduled_tasks.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加 dispatcher 关闭时的计划任务回归，再接入 dispatcher 并保留既有返回值。
+
+结果（2026-10-08）：`METADATA_PARSE` 计划任务通过 library dispatcher 入队；调度错误使用独立 `MetadataDispatch` 类型并映射成服务不可用。可用路径返回原 metadata job，关闭路径返回错误且 job 留在 `QUEUED`。修复前回归观察到关闭后仍返回成功，修复后通过。`tests/scheduled_tasks.rs` 6/6、`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有生产吞吐或 FNOS/NAS 性能证据。thumbnail scraper retry 仍需单独处理其等待语义。
+
+#### LUX-428：thumbnail scraper retry 复用 dispatcher 并等待完成
+
+范围：到期的 thumbnail scraper retry 会创建 `FILL_MISSING` job 后直接 `metadata.run()`，再检查 poster/thumb 是否仍缺失。改为提交到 LUX-424 library dispatcher；独占入队使用完成通知，job 被合并且没有新的通知接收端时使用低频状态 fallback 等到该 job 终态，再执行原图片检查。dispatcher 不可用时释放 thumbnail retry lease、保留原尝试次数并记录错误；不提前推进退避次数。
+
+验收：
+
+- [x] thumbnail retry 不再绕过 dispatcher；图片缺失检查只在对应 FILL_MISSING job 终态后执行。
+- [x] dispatcher 入队失败释放 retry lease，保持可恢复状态且不增加 attempt count；失败隔离与原截图 fallback 不变。
+- [x] thumbnail/scheduled task 定向回归、reidentify 回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录限定于 dispatcher 路由及等待语义，不推断生产收益。
+
+预计文件：`src/application/scheduled_tasks.rs`、`tests/scheduled_tasks.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 dispatcher 关闭时的到期 thumbnail retry 回归，再接入完成通知与 duplicate-job fallback。
+
+结果（2026-10-08）：thumbnail retry 现经 library dispatcher 提交 FILL_MISSING；独占队列项等待 dispatcher 完成通知，合并项以 1 秒 fallback 读取 job 终态。关闭 dispatcher 时释放 retry lease、保留原 attempt count，job 保持可重试的 QUEUED。测试分别验证拒绝入队的恢复状态，以及 provider 被 gate 时不提前消费 attempt、job 完成后才继续图片缺失检查。旧实现的关闭回归曾观察到 3 秒后 retry 和 metadata job 仍 RUNNING。`tests/scheduled_tasks.rs` 8/8、`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；无生产吞吐或 FNOS/NAS 性能证据。
+
+#### LUX-429：合并空闲窗口内到达的 FILL_MISSING 请求
+
+范围：LUX-424 至 LUX-428 已将补全 job 接入按 library dispatcher，但每个 job 创建后立即被 runner claim，短时间内连续到达的小批次难以合并。dispatcher 从空闲状态收到首个 job 后增加 1 秒聚合窗口，让同库请求仍可并入 QUEUED job；已有积压时后续 job 立即按序执行，不逐项叠加窗口。RUNNING job 的输入保持不变，不改变 job 持久化合同、每库顺序或全局 item worker 上限。
+
+验收：
+
+- [x] dispatcher 空闲时首个 job 在 1 秒窗口中保持 QUEUED，同库后续请求能复用该 job，且不重复排入同一 job ID。
+- [x] dispatcher 已有积压时，首个 job 完成后立即执行下一个 queued job，不再等待额外聚合窗口；队列为空后新一轮请求才开启窗口。
+- [x] 自动化回归覆盖 storage 合并、claim 时序及积压执行；`tests/reidentify.rs`、build、fmt、Clippy 和 `git diff --check` 通过。
+- [x] 性能记录说明窗口只降低空闲后短批请求创建新 job 的机会；不推断真实任务批次、SQL、CPU 或 FNOS/NAS 收益。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加实际 storage 合并回归，再实现 dispatcher 空闲窗口，并用定向 runner 测试确认积压 job 不逐项延迟。
+
+结果（2026-10-08）：library dispatcher 在空闲后 claim 首个 `FILL_MISSING` job 前等待 1 秒；期间新请求可并入同一个 QUEUED job，重复 ID 继续复用原 completion 通知。队列已积压时不逐 job 增加延迟，队列再次排空后新请求重新获得窗口。`tests/reidentify.rs` 16/16、对应 dispatcher library 单测通过；build、fmt、全目标全 feature Clippy 和差异检查通过。本机架构为 ARM64。`cargo test --locked --all-targets` 的 library 部分 766 passed、13 ignored，随后在既有 `tests/emby_counts.rs:159` 失败（实际 1、预期 0；此前 LUX-424 记录已在基线 `2b64ba65` 复现）。未部署 FNOS，也没有生产 job 聚合、吞吐、SQL 或 CPU 测量。
+
+#### LUX-430：消除扫描 run 等待的短间隔轮询
+
+范围：删除媒体库时等待进程内 active scan run 当前每 10ms 检查一次共享 registry；改为 guard 结束时通知，并在等待前注册通知后再复核活动状态，避免丢失唤醒。扫描 job 等待增量 job 或 manifest materialization 的数据库条件仍需跨进程观察，将固定 10ms query loop 改为 10ms 起步、最高 250ms 的有界指数退避；取得 scan semaphore 后的条件复核和重试保留。删除超时、library fence、全量/增量优先关系及跨进程最终可见语义不变。
+
+验收：
+
+- [x] Library deletion 等待 active run 使用 race-safe Notify；guard 释放后立即重新检查，仍保持 30 秒总超时及拒绝新 run 的 fence。
+- [x] scan-lock 数据库条件等待按 10ms、20ms、40ms、80ms、160ms、250ms 退避并封顶；scan permit 获取后的状态复核不变。
+- [x] 自动化覆盖 backoff 边界和删除等待/新 run fence；scanner/scanning jobs 定向回归、build、fmt、Clippy 与差异检查通过。
+- [x] 性能记录只描述轮询/回退间隔与跨进程观察上限，不推断生产 CPU、FNOS 或 NAS 收益。
+
+预计文件：`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先新增 backoff 边界回归并加强现有 deletion/active-run 测试，再接入 race-safe Notify 与有界数据库退避。
+
+结果（2026-10-08）：active run 的最后一个 guard 移除 registry 项后通知等待者；删除等待先注册并启用通知，再复核活动项，避免通知早于 await 时丢失唤醒。原 30 秒超时和 deletion fence 保留。数据库条件等待采用 10、20、40、80、160、250ms 并封顶，拿到 scan semaphore 后仍重新读取优先级条件。退避边界单测、删除 active run/fence 单测、`tests/scanning_jobs.rs` 删除 worker 回归和 `tests/library_deletion.rs` 通过；build、fmt、Clippy 与 `git diff --check` 通过。本机架构 ARM64；记录的 250ms 是进程外数据库变化的退避观察窗口上限，不表示生产 CPU、FNOS 或 NAS 收益。
+
+#### LUX-431：降低人物 manifest 文件锁争用轮询
+
+范围：`acquire_exclusive_file_lock` 遇到已有锁时固定每 10ms 轮询，最多 100 次。改为单调时钟控制的 1 秒总等待期限，以及 10ms、20ms、40ms、80ms、160ms、250ms 后封顶的有界退避；stale lock 检查、跨进程 `create_new` 互斥语义、成功后的锁内容和错误类型保持不变。该文件锁允许其他进程持有，不能依赖进程内 Notify。
+
+验收：
+
+- [x] 自动化覆盖退避序列、封顶和仍被占用的锁在期限内返回 TimedOut；未占用锁仍可立即获取。
+- [x] 人物 relation/manifest 写入及管理 API 定向回归通过；不改变 stale-lock 清理阈值或跨进程锁格式。
+- [x] 性能记录仅报告最长等待与检查间隔，不外推文件系统墙钟、生产 CPU、FNOS 或 NAS 收益。
+
+预计文件：`src/application/people/helpers.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 backoff 序列回归，再替换固定 100 次循环并执行人物关系定向验证。
+
+结果（2026-10-08）：人物 relation/manifest 文件锁等待改用 1 秒单调截止时间及 10、20、40、80、160、250ms 后封顶的退避；未占用锁仍立即通过 `create_new` 获取，stale lock 仍按 300 秒阈值处理。helper 边界和锁超时/立即获取单测、`tests/people_api.rs` 10/10、person relation 持久化与 NFO fingerprint 单测通过；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机架构 ARM64；没有文件系统基准、FNOS/NAS 或生产 CPU 测量。
+
+#### LUX-432：校验人物 relation 与 credits 索引 revision 一致
+
+范围：NFO actor 同步先原子写 `people.json`，再替换数据库 `person_credits` 与 `person_index_item_state`。如果文件写入成功而数据库事务失败，当前 `item_actor_relation_is_current` 仅比较旁车 fingerprint，会把不完整持久化误判为完成，后续扫描跳过 credits 恢复。只有旁车 fingerprint 与请求一致、且数据库 person-index item state 也记录相同 fingerprint/schema 时才返回 current；无数据库的 standalone `PeopleService` 保持原来的旁车检查语义。不改变文件格式或数据库 schema。
+
+验收：
+
+- [x] 回归覆盖 relation 文件已是当前 fingerprint、credits/index state 缺失时判为 stale；重试持久化后恢复 current。
+- [x] 已有 NFO relation revision、people API 和 metadata/NFO 定向回归通过；无数据库服务语义保持。
+- [x] 文档明确该检查提供失败后的自愈，不声称文件和数据库进入同一个原子事务，也不外推运行时收益。
+
+预计文件：`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加模拟 relation 文件已提交但数据库索引 state 未提交的回归，再把数据库 revision 纳入 current 判断。
+
+结果（2026-10-08）：有数据库的 PeopleService 现在只有在旁车 source fingerprint 与数据库 `person_index_item_state` fingerprint/schema revision 同时匹配时才跳过 NFO actor 同步；无数据库服务继续只检查旁车。回归曾在旧逻辑下观察到数据库 credits/index state 删除后仍返回 current，修复后返回 stale，重新写入后恢复 current。NFO relation 单测 3/3、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；该方案通过后续扫描自愈，不提供文件与数据库的跨持久化原子提交，也没有测量运行时收益。
+
+#### LUX-433：按人物索引恢复页批量提交 credits
+
+范围：人物索引重建已按最多 100 个 item 读取关系，并批量解析 canonical identities，但对每个 item 分别获取 metadata/credits 写锁并提交事务。新增批量 credits replacement，使每个最多 16 个 item 的有界写 chunk 共享一次写锁和 metadata transaction，再按现有每 item fingerprint、去重、删除过期 credit、条件 UPSERT 和 relation schema 状态写入。接入 index rebuild 页；保留页内 identity lookup、进度游标和 cancellation 检查边界，不改变 schema/API。
+
+验收：
+
+- [x] 批量存储回归验证多个 item 的 credits 与 fingerprint 一致，且同一写 chunk 内 SQL 错误回滚该 chunk，避免部分更新。
+- [x] 人物索引重建服务与管理 API 定向回归通过，build、fmt、Clippy 与差异检查通过。
+- [x] 代码路径确认每 100 个 item 至多获取 7 次 credits 写锁/metadata transaction；性能记录只陈述事务边界，不外推生产时延或数据库收益。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、`src/application/people/rebuild.rs`、两份开发/性能记录。第一步先添加批量 storage contract 回归，第二步实现单事务批量写入，第三步把重建页连接到新入口。
+
+结果（2026-10-08）：人物索引重建的最多 100-item 页现在交给 credits batch replacement；storage 每 16 个 item 共享一次 metadata/credits 写锁和事务，因此每页最多 7 个事务，事务内保留逐 item 既有键读取、差异删除、条件 UPSERT 与 fingerprint 更新。两 item 回归验证第二个 item 的 SQL 失败会回滚整个当前 16-item chunk，且成功重试后两条索引状态与 credits 正确。storage unchanged-row 回归、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和差异检查通过。本机 ARM64；没有统计 PostgreSQL query latency、生产事务耗时、FNOS/NAS 或 CPU 收益。
+
+#### LUX-434：合并重复的 person manifest restore pending 写入
+
+范围：person manifest 每次 checksum 变化都会标记单行 `person_manifest_restore_state` 为 `PENDING`。批量 actor/person 更新中，若该行已经是当前 schema 的 `PENDING`，避免重复 UPDATE 与 timestamp churn；仍须在状态为 `COMPLETED` 或 schema version 变化时写回。保留存储调用和跨进程可见状态，不增加内存缓存、事件或 schema。
+
+验收：
+
+- [x] storage 回归证明重复标记当前 `PENDING` 不触发 UPDATE；从 `COMPLETED` 恢复 pending 和 schema version 变化仍触发更新。
+- [x] manifest restore/rebuild 与 people API 定向回归、build、fmt、Clippy 和差异检查通过。
+- [x] 性能记录仅描述避免的数据库行 UPDATE，不声称消除了 storage 调用或测得生产收益。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、两份开发/性能记录。先增加 UPDATE trigger 计数回归，再为 UPSERT 增加 conflict update predicate。
+
+结果（2026-10-08）：`mark_person_manifest_restore_pending` 的 UPSERT 仅当状态不是当前 schema 的 PENDING 时执行 conflict UPDATE。storage trigger 回归确认重复 pending 为 0 次 UPDATE，而 COMPLETED→PENDING 与 schema version 变化各执行一次更新。manifest checksum restore、legacy migration completion、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和差异检查通过。本机 ARM64；确认的只是数据库 UPDATE 行数边界，不外推端到端 storage 调用数、墙钟或 FNOS/NAS 收益。
+
+#### LUX-435：本地 NFO 页批量写入 actor credits
+
+范围：本地 scan metadata NFO page 每个 item 完成 actor relation file 后，分别获取 credits lock 和 metadata transaction。增加仅供本地 NFO 页使用的 deferred credits 路径：保持每个 item 的 relation、person manifest、NFO 与 image 文件处理及错误隔离，收齐页内 actor credits 后按最多 16 个 item 一个事务批量提交。普通单 item API、在线刮削和 candidate refresh 保持即时持久化。批事务失败时记录失败 item IDs，relation fingerprint 与数据库 credits revision 不一致，使之后扫描可重试；不声称文件与数据库原子提交。
+
+验收：
+
+- [x] people service 回归验证 relation 文件在 credits flush 前已写入、DB revision 尚未 current，flush 后 revision current。
+- [x] scanner local NFO page regression 验证多项 actor 更新走 batch flush，单项错误仍隔离；storage 16-item rollback 语义不变。
+- [x] metadata/NFO、people API 定向回归、build、fmt、Clippy 与差异检查通过；记录每 16 item 至多一次 credits transaction，不推断生产数据库或 FNOS 收益。
+
+预计文件：`src/application/people/relations.rs`、`src/application/people/service.rs`、`src/application/metadata.rs`、相关 people/scanning tests、两份开发/性能记录。先加 deferred persistence contract 回归，再实现 service batch，最后只连接 local scan NFO batch path。
+
+结果（2026-10-08）：本地 scan NFO page 先完成每项 relation、manifest、NFO 和图片处理，再把 credits 按最多 16 项一组提交；每页 N 项至多执行 `ceil(N/16)` 次 credits replacement 事务。relation 文件早于 credits flush 写入；如果批事务失败，该 chunk 内 item 被报告为失败，数据库 revision 不 current，后续扫描可重试。普通人物 API、在线刮削及单条目 NFO enrichment 仍即时提交。deferred persistence、page flush/错误隔离、metadata NFO 单测、`tests/people_api.rs` 10/10、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、Clippy 和差异检查通过。本机 ARM64。全目标库测试 775 passed、13 ignored；集成目标中 `emby_counts`、`metadata`、`metadata_selection`、`strm` 四个失败已在父提交 `855d890a` 独立复现，`watch` 的 SQLite 锁冲突单独复跑通过。未据此推断生产 SQL 延迟、FNOS/NAS 或 CPU 收益。
+
+#### LUX-436：在 PostgreSQL 诊断报告中提供 pg_stat_statements 摘要
+
+范围：当前数据库诊断报告没有 SQL 聚合执行时间，扫描/metadata 优化只能依赖 query-wrapper 计数和本机 fixture。若连接的 PostgreSQL 已预加载并启用 `pg_stat_statements`，报告新增最多 20 条当前数据库的 statement 聚合指标：query ID、调用数、总/均值/最大执行时间、返回行数和 shared block hit/read。报告不返回 SQL 文本或参数，不尝试创建 extension、改变 PostgreSQL 配置或自动重启服务；extension 未预加载、未创建或当前角色无权读取时明确报告不可用。SQLite 标记为不适用。
+
+验收：
+
+- [x] PostgreSQL extension 可用时输出有界、脱敏的 query statistics；不改变现有 database diagnostics 字段和权限。
+- [x] extension 缺失、未预加载或权限不足时诊断仍成功并标记不可用；SQLite 报告为不适用。
+- [x] 自动化覆盖 available/unavailable JSON 合同；PostgreSQL 集成验证可用时执行，并说明未启用时的限制。
+- [x] `docs/API.md` 记录管理员可选启用步骤、报告字段和无自动数据库变更的行为；性能记录不把诊断值作为改动后的基准。
+
+预计文件：`src/storage/database_diagnostics.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 SQLite/可用状态合同回归，再实现可选只读查询与 unavailable 降级。
+
+结果（2026-10-08）：PostgreSQL 诊断现在只在服务端预加载且当前数据库已安装 `pg_stat_statements` 时读取当前库累计统计，最多返回 20 条 query ID、调用数、总/均值/最大执行时间、行数和 shared block hit/read；不返回 SQL 文本或参数。未预加载、extension 缺失、权限不足、不可用或超时均降级为显式状态，SQLite 标记 `NOT_APPLICABLE`。SQLite 合同、不可用状态单测和 `cargo test --locked --lib database_diagnostics -- --include-ignored` 通过；集成测试在本机 PostgreSQL 配置下通过可用/不可用合同。build、fmt、全目标全 feature Clippy 通过。最终 all-targets 库测试 777 passed、13 ignored；集成目标 `emby_counts`（实际 1、期望 0）、`metadata`（unchanged NFO 期望 nfo_loaded=1，实际 0）、`metadata_selection`（optional actor enrichment wait）及 `strm`（401/200）均在本任务父提交 `855d890a` 独立复现；`watch` 全目标 5/5 通过。本机 ARM64；API 文档提供 DBA 手动启用步骤。本任务没有测量 query latency 或优化收益，统计值只作为后续诊断信号。
+
+#### LUX-437：本地 NFO 页合并人物 manifest restore 标记
+
+范围：一个本地 NFO page 可能修改多个 Lux canonical person manifest；manifest 内容仍需按人物目录分别校验 checksum、持锁并原子写入，但每个人物目前都会重复调用相同数据库 restore-pending 标记。让 LUX-435 的 page context 在首个 checksum 确认变化的 manifest 写入前，最多提交一次当前 schema 的 restore-pending 状态。普通人物 API 和在线刮削仍保持即时标记；checksum 不变时不标记；文件锁与文件写入仍按人物独立，不声称跨文件原子提交。
+
+验收：
+
+- [x] 同一 deferred NFO page 中多个 manifest 均有变化时，只调用一次数据库 restore-pending 写入，且每个人物 manifest 都写入最新 checksum。
+- [x] unchanged checksum 不触发 pending；写文件失败时数据库已标记 pending，之后恢复可重试。
+- [x] 普通人物 API 的即时 restore-pending 语义不变；deferred credits 和 NFO page 回归继续通过。
+- [x] people API、NFO metadata、build、fmt、Clippy、差异检查通过；性能记录仅报告每页状态写调用边界。
+
+预计文件：`src/application/people/service.rs`、`src/application/people/relations.rs`、`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先直接测试两个 manifest 共用 deferred context 的 storage 调用数，再将 page context 接入 canonical manifest 写入。
+
+结果（2026-10-08）：本地 scan NFO page 共享的 deferred context 现在也合并 canonical person manifest restore-pending 标记。并发写入两个不同人物 manifest 的回归确认数据库标记只调用一次，且两个文件都保存各自最新 identity 与 checksum；重复 checksum 不调用标记。标记成功后才原子写 manifest，因此写入失败会保留 PENDING 供后续恢复。非 NFO 人物资产路径仍即时标记。定向单测通过；`tests/people_api.rs` 10/10、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、全目标全 feature Clippy 和差异检查通过。本任务只记录每页一次标记调用上界，不推断时延、PostgreSQL、FNOS/NAS 或 CPU 收益。
+
+#### LUX-438：记录本地 NFO 页运行指标
+
+范围：管理员健康资源已提供固定低基数 `resources.metadata.counters` 和有界 `stageP95Ms`，但本地扫描 NFO page 尚未记录实际运行数据。增加固定 `local_nfo_page` 指标：每页调用数、输入 item 总数、最大 page size、含 item 错误的 page 数，以及该阶段最近 128 个样本的 p95 墙钟时间。耗时范围包含 source 校验、NFO 读取/解析、人物处理和 deferred credits flush。保留现有健康响应形状，不记录 item ID、路径或错误文本；PostgreSQL 单 SQL 延迟由 LUX-436 的可选 `pg_stat_statements` 提供。
+
+验收：
+
+- [x] 本地 NFO page 执行一次时，健康资源计数器准确增加一次并记录 page 输入条目数；p95 stage 有有界样本。
+- [x] item 级 NFO 或 credits 错误将该 page 记为失败；未知指标名不进入输出，标签不含 item ID、路径或错误内容。
+- [x] ScanJobService 的 outbox、job worker、手动 refresh 和 scan 后处理共用同一个 ResourceMetrics 实例。
+- [x] metrics 与本地 NFO page 自动化回归、metadata/scan 定向测试、build、fmt、Clippy、差异检查通过，并记录指标口径及本机验证限制。
+
+预计文件：`src/observability/resources.rs`、`src/application/metadata.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 metrics snapshot 和 NFO page 的失败回归，再实现固定名称批次计数与共享指标注入。
+
+结果（2026-10-08）：本地 NFO page 记录固定 `local_nfo_page` 批次计数、输入条目累计数、最大 page 大小、成功/失败页数及最近 128 个耗时样本的 p95。失败页包含 item 级 NFO/credits 失败和批次级错误；计时覆盖 source 校验、NFO 读取/解析、人物处理及 deferred credits flush。ScanJobService 的 outbox、job worker、手动 refresh 与 scan 后处理都向 MetadataEnricher 传入同一个 ResourceMetrics。指标名称白名单阻止未知名字进入输出，不包含 item ID、路径或错误文本。metrics 单测、metadata 14/14、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有运行独立吞吐基准或 FNOS/NAS/PostgreSQL A/B，不据此声称 CPU、SQL 延迟或生产收益。
+
+#### LUX-439：清理本地 metadata storage 的过期 dead-code 抑制
+
+范围：早期本地 metadata storage API 曾先于 scanner 消费路径建立，代码仍保留“下一阶段 worker 使用”的 `#[allow(dead_code)]` 和过期注释。逐项核对 completeness、扫描 outbox/backfill、批量图片 storage 合同的生产调用点；已被消费的接口去掉无效抑制并更新注释。只在确认没有生产调用、且不是仍需维护的测试合同后，才删除无用接口；保留其他阶段的 manifest API、字幕 API 与无关 storage 范围。
+
+验收：
+
+- [x] 本地 metadata storage 中已接入的类型、字段和方法不再靠宽泛 `#[allow(dead_code)]` 隐藏编译器可发现的问题；注释反映当前消费者。
+- [x] 未使用接口只有在生产调用、测试用途和后续任务依赖均核实后才清理；队列状态、schema、公共行为和存储事务语义不变。
+- [x] storage 定向测试、build、fmt、Clippy 和差异检查通过；报告仍保留的非本地 metadata dead-code 抑制及原因。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`docs/LUX-DEVELOPMENT.md`。先核对抑制范围内的类型/方法实际调用者与测试，再去掉过期抑制或将必要例外缩小到单个接口。
+
+结果（2026-10-08）：移除了扫描 completeness、outbox/backfill 与图片 batch 合同上 7 处“下一阶段消费者”类型抑制和两个实现块级宽泛抑制。正常 build 先暴露 8 组确实只供 storage 合同回归使用的入口/字段；核对调用点后，将例外缩小到具体方法、类型或测试专用常量，并为每项注明它覆盖的持久化行为。没有删仍由回归覆盖的单项状态转换，也未改变 schema、队列状态、事务边界或运行期入口。`cargo test --locked --lib storage::repository::repository_tests` 119 passed、8 ignored；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本轮仍保留的其他范围 dead-code 抑制属于 scan-manifest LUX-266/267 边界、字幕/Emby migration 接口和测试夹具；本任务没有扩大清理范围。
+
+#### LUX-440：记录本地人物 credits 事务耗时与 item 写入量
+
+范围：LUX-435 已将本地 NFO 页人物 credits 按最多 16 个 item 共用一个 storage transaction，但当前运行指标只记录整页耗时。每个 deferred credits storage transaction 增加固定低基数指标：事务数、transaction 输入 item replacement 数及最大批量、输入 actor credit 条目数、成功/失败数和最近 128 个事务耗时样本的 p95。复用 LUX-438 的 `ResourceMetrics`，不记录 item ID、路径、人物 ID 或错误文本；credit 条目数表示去重前的输入量，不伪称数据库实际变更行数。
+
+验收：
+
+- [x] deferred NFO credits 的每个 storage transaction 只记录一次指标；计数区分 transaction 数、输入 item replacement 数、最大每事务 item 数、credit 条目数和成功/失败。
+- [x] 事务耗时覆盖 storage 锁、事务执行与 commit；最近 128 个样本计算 `stageP95Ms`，指标名固定且无 item/person 标签。
+- [x] 本地 NFO page 回归验证 credits 失败会计为失败事务并与现有 page 错误指标一致；成功回归验证 item/credit 数准确。
+- [x] people relation、metadata page 与 metrics 定向测试、build、fmt、Clippy、差异检查通过；文档明确计数口径和本机验证边界，不声称生产收益。
+
+预计文件：`src/observability/resources.rs`、`src/application/people/relations.rs`、`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加资源快照及失败 credits page 的回归，再在每个 deferred storage transaction 周围记录固定名称指标并复用 MetadataEnricher 的 metrics。
+
+结果（2026-10-08）：本地 NFO page 的每个 deferred credits storage 调用均记录固定低基数 transaction 指标。计时覆盖 replacement storage 调用，包括 storage lock、事务执行和 commit；credit entry 数按送入 storage 前的 relation 输入条目计，不冒充数据库变更行数。回归注入 credits 写入失败并重试，确认失败和成功 transaction 各计一次、输入 item/credit 数为 4、最大每事务 2 item，page 错误计数同步增加。资源指标的固定名称、输入/结果计数和最近 128 个样本 p95 单测通过；people deferred credits 与 NFO page 回归通过。`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；本机 ARM64。`cargo test --locked --all-targets --no-fail-fast` 的 library 部分 781 passed、13 ignored，集成测试中 4 项仍失败：`emby_counts`（实际 1、期望 0）、`metadata`（unchanged NFO 期望加载 1、实际 0）、`metadata_selection`（等待可选 actor enrichment 超时）和 `strm`（401、期望 200）。这些与父提交 `855d890a` 的既有验收记录相同；该父提交是当前 HEAD 的祖先，相关集成测试文件未改动，其余已执行目标通过。没有把本机测试推断为生产 PostgreSQL 延迟、FNOS/NAS 或 CPU 收益。
+
+#### LUX-441：让 unchanged NFO revision 回归匹配语义 fingerprint
+
+范围：LUX-416 已规定 NFO stat fingerprint 变化但文件内容 SHA-256 未变、cache defaults 完整且 actor relation current 时跳过 XML 解析并只同步 stat fingerprint。集成测试 `unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_changes` 仍断言旧行为 `nfo_loaded = 1`，导致已优化的 `metadata` target 失败。修正测试为断言该次调用 `nfo_skipped = 1`、`nfo_loaded = 0`，并继续验证 rich NFO snapshot 不变；内容确实变化时重新解析的既有回归保持不变。不修改生产逻辑。
+
+验收：
+
+- [x] 相同内容、变化的 file revision 返回 skipped 且保留 rich snapshot。
+- [x] `cargo test --locked --test metadata`、fmt 与差异检查通过；既有 changed-content 回归仍验证重新加载。
+
+预计文件：`tests/metadata.rs`、`docs/LUX-DEVELOPMENT.md`。先隔离复现旧断言失败，再更新为 LUX-416 的语义 fingerprint 合同并运行 metadata 集成目标。
+
+结果（2026-10-08）：隔离复跑确认旧断言稳定要求 `nfo_loaded = 1`，与当前语义 fingerprint 命中行为冲突；将回归改为要求 `nfo_loaded = 0`、`nfo_skipped = 1`，仍校验 snapshot 未变化。`cargo test --locked --test metadata` 20/20 通过，其中 changed-content 回归继续验证 NFO 会重新加载；fmt 与 `git diff --check` 通过。修正后 `cargo test --locked --all-targets --no-fail-fast` 的 library 测试为 781 passed、13 ignored；`metadata` 20/20 通过。全量门禁仍有 3 个已在父提交 `855d890a` 记录的独立失败：`emby_counts`（计数 1、期望 0）、`metadata_selection`（等待可选 actor enrichment 超时）、`strm`（401、期望 200）；本次没有修改这些测试文件或对应行为。只修正测试合同，没有改变生产代码。
+
+#### LUX-442：原子提交本地 completeness claim、结果与补缺调度
+
+范围：本地 metadata completeness worker 目前先以一个 storage transaction prepare/claim 一页 checks，再以一个或最多六个 transaction 写入 completeness 结果并创建或合并 `FILL_MISSING` job。由于本地检查计划已在进入 storage 前完成，claim 和结果提交之间没有耗时工作；把同一最多 512-check 批次的 prepare/claim、READY 结果写入、due provider retry 筛选及补缺调度放进同一个 metadata write transaction。保留输入 fingerprint、已 READY/RUNNING 去重、失败/取消重领、library/item 锁顺序、自动补缺策略和 job/item 去重语义。事务失败时整批回滚，不留下已提交的 RUNNING claim 或部分 job 状态；不改变 schema 或公共 API。
+
+验收：
+
+- [x] scanner 每个 completeness check batch 只调用一次合并 storage 操作；最多 512 个 check/result 与最多 512 个候选可在同一事务内处理，due retry 筛选与 FILL_MISSING SQL 均按最多 100 个 item 分片，不重复写入结果。
+- [x] 同 fingerprint 的 READY/RUNNING 不重领；变化 fingerprint 与可重试 FAILED/CANCELLED 可完成一次检查；due provider-unavailable retry、不可用 scraper 退避和 library 自动策略与当前行为一致。
+- [x] 注入 enqueue SQL 失败时，原子事务不遗留 RUNNING/READY 部分结果或 metadata job/item；在到期 retry 已进入消费流程后再注入失败，也会回滚 retry 消费和 job/item 变更；移除故障后同一输入可以成功重试且只创建有效 job。
+- [x] 覆盖多个 capability、已 READY missing、due retry、自动策略关闭、独立数据库连接并发重复提交和 205 项分页；SQLite/PostgreSQL storage 合同、build、fmt、Clippy、`git diff --check` 通过。
+- [x] 性能记录按事务路径说明每个批次由 2–7 个 metadata write transactions 降至 1 个；不将事务数推断为 SQL 时延、PostgreSQL/NAS/FNOS 吞吐或 CPU 收益。
+
+预计文件：`src/storage/metadata.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加故障注入回归，再合并 storage 事务并切换 scanner 调用，最后更新事务边界记录。
+
+结果（2026-10-08）：扫描 worker 每页改为一次 combined storage 调用，在同一 metadata write transaction 内 claim、写 READY 结果、筛选 due retry 和调度补缺；due retry 候选也按 100 项分片。205 项 SQLite 回归确认查询包装器计数从未分片时的 11 次变为 13 次（due retry 查询为 3 片），明确记录这是大页的有界查询代价。故障注入覆盖新 job item 插入失败和 due retry 消费后插入失败，两者均整体回滚；并发回归使用独立 SQLite database handles。`metadata_completeness` 定向测试 8/8、原子提交测试、205 项分页测试和 PostgreSQL `postgres_progressive_scan_metadata_storage_contract` 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 通过。`cargo test --locked --all-targets --no-fail-fast` 的 library 为 780 passed、13 ignored；全量集成仅有三个已在父提交 `855d890a` 记录的独立失败：`emby_counts`（实际 1、期望 0）、`metadata_selection`（可选 actor enrichment 等待超时）、`strm`（401、期望 200）；本轮 `watch` 5/5 通过。`git diff --check` 通过。本机 `arm64`；没有运行 FNOS/NAS 性能验证，也不推断 PostgreSQL 时延、吞吐或 CPU 收益。
+
+#### LUX-443：合并本地 metadata worker 的 pending、page 与 manifest 状态读取
+
+范围：本地 metadata worker 每个处理批次先查询 pending target，再读取 manifest 和 postprocessing roots，最后按电影、home video、episode 顺序最多查询三次目标页。将 pending 状态与按既有优先级选出的首个有界 target page 合并为一个 storage 查询；将 manifest workflow/discovery 状态与 root 身份记录合并为一个 storage 查询。worker 直接处理已读取的 page，不重新查询；仍在每个有 pending 的批次处理前 stat 正向 manifest roots，并保留身份不匹配时标记 pending target 失败、记录脱敏事件的行为。无可用 source 但仍有 pending target 时，继续进入原有 source unavailable 失败路径。无 schema、公共 API 或 target 顺序变化。
+
+验收：
+
+- [x] 一个有界 storage page 查询同时返回 `has_pending` 与最多请求上限的 target source；优先级仍为 MOVIE、VIDEO、EPISODE，每类内按 target ID 稳定排序。无 source 但有 pending 时能区分于无 pending。
+- [x] manifest 与所有 postprocessing root 身份信息由单个 storage 查询加载；每个 pending 批次仍执行本地 root identity stat，变化时不处理媒体文件并保留原有失败/告警语义。
+- [x] worker 不再单独调用 pending existence 查询，也不重复加载 metadata page；空闲通知回归仍为一次 query-wrapper 调用。
+- [x] SQLite 回归覆盖三种 target 类型、顺序、无 source pending、无 pending 和 root metadata；PostgreSQL storage contract、相关 scanner/metadata 测试、build、fmt、Clippy、`git diff --check` 通过。
+- [x] 性能记录只对比固定 fixture 的 query-wrapper 调用边界，不推断 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
+预计文件：`src/application/scanner.rs`、`src/application/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写 storage 查询计数与 source-order 回归，再实现 page/manifest 合并查询并让 worker 消费已加载 page。
+
+结果（2026-10-08）：本地 metadata worker 一次读取 pending 状态与首个有界 source page，保持 MOVIE、VIDEO、EPISODE 优先级以及每类按 target ID 的稳定顺序；pending 条目无 source 时仍与无 pending 区分。manifest workflow/discovery 状态、全部 root identity 与 target cursor 信息合并为一次 storage query，仍在每个 pending 批次 stat 正向 roots；root identity 变化时目标被标记 FAILED、root 标为不可用，NFO 不会被应用。固定 SQLite query-wrapper 回归覆盖三类顺序和 source unavailable 状态，worker/manifest 回归覆盖 root mismatch。`metadata` 20/20、`scanned_metadata` 16/16、`scanning_jobs` 81/81、PostgreSQL `postgres_progressive_scan_metadata_storage_contract`、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。全量 all-targets 有三个失败目标（`emby_counts`、`metadata_selection`、`strm`），与父提交 `855d890a` 已记录的独立失败一致；相关集成测试文件未被本任务修改。开发机 `arm64`；未在 FNOS/NAS 上部署或测量运行性能，query-wrapper 计数不代表 SQL 墙钟。
+
+#### LUX-444：本地 completeness 页按路径复用 NFO projection 与人物关系检查
+
+范围：LUX-422 已把本地 completeness 的 item 检查限制为最多 4 路并发，metadata row 中可解析的 NFO projection 已直接复用；但多个 episode 共用 `episode.nfo` 时仍重复读取和解析 sidecar，legacy `people/items` fallback 也逐 item 查询目录。给一次 planning page 增加按 canonical NFO target path 键控的惰性缓存，让相同路径共用一次读取和解析；给 actor relation 检查增加惰性 page cache，在新式 per-item relation 不存在后只枚举一次 legacy relation 目录，并仅对命中 ID 读取旧文件。目录枚举最多读取 4096 个 entry；达到上限但目标 ID 尚未齐全，或目录枚举失败时，对未确定 item 保留原逐路径 fallback。缓存只活到本次 page planning 结束。每项仍独立做 root/source canonicalization 与目标安全检查。缓存错误按 item 传播，planning task 仍按原输入顺序选择首错误；数据库已有的 NFO projection 仍优先，LUX-413 的 crew 缺失短路不变。
+
+预计文件：`src/application/nfo.rs`、`src/application/people/service.rs`、`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+验收：
+
+- [x] 同目录多个 episode 共用 `episode.nfo` 时，并发 page lookup 只有一个调用执行 sidecar read/parse initializer，所有 item 得到相同 projection；互不相同的 target 不合并。
+- [x] 新 relation 缺失的多个 item 共用一次 legacy `people/items` 目录快照；命中旧 relation 仍解析文件，完整快照中的未命中 ID 不逐项 stat legacy 路径，4096-entry 上限或目录枚举失败时回退原路径检查。
+- [x] NFO path/read/parse error 保持原类型并按既有输入顺序汇总；数据库 projection 快路径不触发旁车读取；storage item/context/attempt 批量查询不变。
+- [x] page planning 总并发仍不超过 4；新增缓存回归、NFO/scanned metadata 定向目标、fmt、build、全目标全 feature Clippy 与差异检查完成。全量目标测试执行时命中已有且与本改动无关的集成测试失败，具体结果见下。
+- [x] 性能记录只陈述同路径重复解析被去重及并发上界，不推断实际文件系统时延、PostgreSQL 或 FNOS/NAS CPU 收益。
+
+短计划与文件：修改 `src/application/nfo.rs`、`src/application/people/service.rs`、`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先为同一 canonical sidecar 和 legacy directory snapshot 加并发回归，再将两个缓存限制在 planning page，并验证错误顺序、目录读失败 fallback、数据库 projection 快路径与既有并发上限。
+
+结果（2026-10-08）：固定测试确认同一 page 内共享 sidecar 只解析一次、不同 target 不共享、下一页读取变更后的内容，错误类型保持且 database projection 可避开失效 source；relation cache 一页只枚举一次，读取命中的旧 JSON，不可读目录和超过 4096 项后的未确定 ID 均走原路径 fallback。候选 page planning 回归、NFO projection 回归、relation cache 3 项回归、`nfo_writer` 26/26、`scanned_metadata` 16/16、build、fmt 和全目标全 feature Clippy 通过。全量测试的库单测为 789 通过、13 忽略；集成阶段在 `emby_counts` 失败并停止（未收藏计数期望 0、实际 1）。单独运行 `metadata_selection` 为 30/31（可选 actor enrichment 等待超时），`strm` 的认证请求返回 401 而期望 200；这些失败此前已在父提交记录，且对应集成测试不在本任务改动中。开发机 `arm64`；未测文件系统耗时、PostgreSQL、FNOS/NAS 或生产 CPU 收益。
+
+#### LUX-445：以 viewer 身份验证 Emby viewer 计数权限
+
+范围：`tests/emby_counts.rs` 的 viewer 计数断言使用管理员 token，同时传入 viewer `UserId`，因此请求仍保留管理员的媒体库权限；该夹具不能证明 viewer 只能统计获授权的媒体库。用 viewer 自己登录得到的 token 发起计数请求，保持其仅获电影库权限的 fixture，并继续核验 viewer 收藏数。生产鉴权逻辑和 Emby 管理员代查语义不变。
+
+验收：
+
+- [x] viewer token 只统计 viewer 有权限的媒体库，并正确按 viewer 收藏状态筛选；管理员 token 的全库计数断言保持。
+- [x] `cargo test --locked --test emby_counts`、fmt 与 `git diff --check` 通过。
+
+预计文件：`tests/emby_counts.rs`、`docs/LUX-DEVELOPMENT.md`。先复现管理员 token 触发 viewer 权限断言失败，再改为 viewer token 并运行专用集成测试。
+
+结果（2026-10-08）：原测试以管理员 token 传入 viewer `UserId`，管理员权限因此包含 Shows 库，稳定得到 `SeriesCount = 1`；用 viewer 登录 token 请求后，viewer 可见范围的影片计数与收藏计数均符合预期。`cargo test --locked --test emby_counts` 1/1 通过。
+
+#### LUX-446：用可控门闩验证自动元数据任务不等待可选人物详情
+
+范围：自动匹配测试用“整个 scan + metadata job 必须在 1 秒内完成”的墙钟断言验证可选 actor enrichment 不阻塞；该固定阈值受本机及 CI 负载影响，无法区分扫描本身耗时和人物详情网络等待。将 mock 人物详情响应改为测试控制的门闩：metadata job 进入终态后才放行人物详情响应，并继续确认人物简介最终写入。生产任务调度和 enrichment worker 保持不变。
+
+验收：
+
+- [x] 自动 metadata job 必须在被门闩暂停的人物详情响应前完成；之后响应释放，人物简介在有界等待内持久化。
+- [x] `cargo test --locked --test metadata_selection`、fmt 与 `git diff --check` 通过。
+
+预计文件：`tests/metadata_selection.rs`、`docs/LUX-DEVELOPMENT.md`。先复现固定 1 秒阈值因实际 1.15 秒工作流耗时而失败，再改为确定性请求门闩与终态断言。
+
+结果（2026-10-08）：原失败重现为 1.15 秒，低于 mock 人物详情请求的 1.5 秒响应延迟，因此并非任务等待该响应；固定的 1 秒总时延限制误判了本机工作流耗时。新回归在 actor endpoint 收到请求后保持其未响应，确认 metadata job 已 `COMPLETED` 后才释放，并继续验证人物 NFO 得到补充。`cargo test --locked --test metadata_selection` 31/31 通过。
+
+#### LUX-447：区分共享管理 API key 与个人 PlaybackInfo 身份
+
+范围：STRM PlaybackInfo 集成用例只传共享管理 API key，却期待创建用户播放上下文成功。共享管理 key 代表服务器身份，不能替代个人会话；PlaybackInfo 需使用真实 Emby 用户 token。保留 key 单独请求应返回 401 的合同，并在提供真实用户 token 时验证 PlaybackInfo 成功且共享 key 不进入播放 URL。生产鉴权边界保持不变。
+
+验收：
+
+- [x] 只有共享管理 API key 的 PlaybackInfo 请求返回 401；用户会话 token 请求成功。
+- [x] 同时带用户 token 与共享 key query 时，成功响应的播放 URL 不包含共享 key；STRM 重定向、用户播放和本地路径播放行为回归通过。
+- [x] `cargo test --locked --test strm`、fmt 与 `git diff --check` 通过。
+
+预计文件：`tests/strm.rs`、`docs/LUX-DEVELOPMENT.md`。先复现共享 key 单独请求返回 401，再明确区分服务器与用户身份，运行完整 STRM 集成目标。
+
+结果（2026-10-08）：共享 key 单独请求稳定返回 401；带真实 `X-Emby-Token` 的 PlaybackInfo 返回 200，响应播放 URL 不含共享 key。完整 STRM 集成目标 1/1 通过，现有 Emby 302 handoff 与本地 path 播放断言保持。
+
+#### LUX-448：跳过相同人物图片与 provider index 的原子替换
+
+范围：人物 profile 图片和 provider index 的写入目前即使目标字节完全相同，也会创建临时文件、写入、`fsync` 并 `rename`。新增按现有安全 metadata 检查和有界内容读取判断是否相同的原子写入口；相同内容保留原文件，不同或缺失内容仍走原子替换。图片权限约束必须在跳过与写入两条路径都执行；不改变图片下载、provider identity 或 index rebuild 语义。
+
+验收：
+
+- [x] 重复上传相同图片后，人物图片和 provider index 文件不被替换；测试通过 inode 保持验证。
+- [x] 不同图片字节仍原子替换图片及索引；缺失文件仍按原路径创建。
+- [x] 非普通文件和符号链接仍被拒绝，目标权限仍为私有；不扩大可读取图片的最大输入范围。
+- [x] people service 定向测试、fmt、build、Clippy 和 `git diff --check` 通过；性能记录只说明固定回归验证的文件替换边界，不推断墙钟、FNOS/NAS 或生产收益。
+
+预计文件：`src/application/people/helpers.rs`、`src/application/people/assets.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先扩展重复图片上传回归确认原实现会替换 inode，再增加安全的 unchanged-write 路径并复测。
+
+结果（2026-10-09）：相同 profile 图片再次写入时，人物图片、provider index 和 legacy TMDb index 三个目标均保留原 inode；helper 回归确认缺失目标仍创建、不同内容走原子写、相同内容保持私有权限，符号链接和目录目标拒绝。旧实现回归先稳定观察到重复上传替换了人物图片 inode。People service 定向测试 39/39 通过；`cargo build --locked`、`cargo test --locked --all-targets --quiet`（791 library tests 通过、13 忽略，集成目标全部通过）、fmt、全 target/all features Clippy 与 `git diff --check` 通过。本机 `arm64`。固定测试只证明跳过相同内容的临时文件写入、`fsync` 和 `rename`，不测量总文件系统调用或墙钟，也不外推 FNOS/NAS/生产收益。
+
+#### LUX-449：按页合并本地 NFO metadata 写事务
+
+范围：本地 metadata worker 已在一次 item 更新中提交 NFO metadata、provider ID、premiere date 与 fingerprint，但一页中每个 item 仍独立获取 metadata 写锁并提交事务。将已成功解析的状态按最多 16 个 item 聚合，每个 chunk 只获取一次写锁并提交一个事务；标题或年份身份检查前先提交此前暂存项，保持同页 identity conflict 检查顺序。普通在线/单条 NFO 写回继续使用单条事务。若 chunk 事务失败，回退到逐 item 写入以保持既有错误隔离，并只将真正失败的 item 计为 NFO 失败。不改变字段优先级、provider ID 合并、NFO fingerprint 或失败重试语义。
+
+验收：
+
+- [x] 存储批量更新按最多 16 个 item 共用写锁和事务；注入后续 item 失败时，批次前面已执行的 UPDATE 也整体回滚。
+- [x] 本地 NFO page 在解析完成后批量提交；标题或年份变更前提交前序状态并检查同页身份冲突。批次失败后逐 item 回退，成功 item 保留更新，失败 item 单独标记。
+- [x] 定向 storage 与 metadata page 回归、build、fmt、Clippy、全目标测试和差异检查通过。
+- [x] 性能记录区分事务/锁次数与 SQL UPDATE 次数；不把事务合并表述成 SQL 调用减少或 FNOS/NAS 收益。
+
+预计文件：`src/application/metadata.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加跨 item 回滚回归，再实现 storage 批量提交和失败回退。
+
+结果（2026-10-09）：本地 NFO metadata/provider ID/premiere date/fingerprint 更新按最多 16 个 item 共用一次 metadata 写锁和事务；标题或年份改变前先提交已暂存状态，再检查同页身份冲突。注入批次中途 UPDATE 失败后，存储回归确认整个 chunk 回滚；应用层逐项回退，成功项保留、失败项单独标记。`cargo test --locked --all-targets` 的 793 项库测试与所有集成目标通过（13 项忽略）；`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 通过。本机 ARM64。SQL UPDATE 仍逐 item 执行；未测量事务墙钟或部署后 PostgreSQL/FNOS/NAS 收益。
+
+#### LUX-450：合并本地 NFO 缺失默认字段修复事务
+
+范围：unchanged NFO 的 semantic fingerprint、rich cache 和 actor relation 均已命中时，会跳过重新解析；若 provider ID 或 premiere date 仍缺失，当前 `repair_local_nfo_defaults` 对每个 item 单独获取 metadata 写锁并开启事务。将该修复接入 local NFO page 的 deferred 状态写入，按最多 16 个 item 共用一次 metadata 写锁和事务；只补填仍为空的 provider ID/premiere date，保留并发写入时已补齐的字段，并与 LUX-449 的 metadata 状态批次共享页级 flush。批次失败时逐 item 回退并保持失败隔离。记录固定低基数的 state transaction 次数、metadata/default-repair item 数、成功/失败与有界耗时 p95；普通单 item/在线 NFO enrichment 仍立即修复且不进入 page 指标。
+
+验收：
+
+- [x] 本地 NFO page 的已检查 NFO 缺失默认字段修复纳入页级批次；单 item/在线路径保留即时写入。
+- [x] provider ID 仅合并新 key、premiere date 仅填空；并发或预先存在的非空值不被覆盖；无字段变化不执行 UPDATE。
+- [x] 批次后续写失败会整体回滚，应用层逐 item 回退并仅报告实际失败项。
+- [x] state transaction 指标覆盖页级批次与失败后的逐项回退，且不记录 item ID、路径或 SQL 文本。
+- [x] 定向 storage 与 metadata page 回归、build、fmt、Clippy、全目标测试和差异检查通过；性能记录区分事务合并与逐 item SQL 语句数。
+
+预计文件：`src/application/metadata.rs`、`src/storage/catalog.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`src/observability/resources.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 storage 混合写批次回滚、metadata deferred repair 与 transaction metric 回归，再把 unchanged-NFO repair 接入既有页级 flush。
+
+结果（2026-10-09）：unchanged NFO 的缺失 provider ID/premiere date repair 与 metadata 更新共用最多 16 项的页级 metadata 写事务；仅补缺失字段，并发已补齐值不会覆盖；无变化不会执行 UPDATE。混合写批次故障回归确认事务回滚，应用层逐 item fallback 保持错误隔离，指标覆盖批次及 fallback 的成功/失败与耗时。移除被新入口替代的无用 storage wrapper。定向测试通过；`cargo build --locked`、`cargo test --locked --all-targets`（库 796 passed、13 ignored，所有集成目标通过）、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `arm64`；PostgreSQL 专用测试/基准按标记未运行，未部署 FNOS/NAS，也没有生产 CPU 或墙钟收益测量。
+
+#### LUX-451：为人物关系运行索引预留快照 checksum
+
+范围：`person_index_item_state` 目前只记录 NFO source fingerprint 与 relation schema version。人物关系文件可以在 source fingerprint 不变时变化；如果文件原子替换成功而 credits transaction 失败，旧索引状态仍可能被误判为 current。新增 nullable `relation_checksum` 列以保存 `people.json` 完整快照 checksum；旧行迁移后 checksum 为空，后续消费路径必须将其视为 stale。文件快照继续作为配置卷恢复来源，数据库仍只是运行索引；本任务不声称文件系统与数据库可共享原子事务，也不改变 public API、人物关系模型或关系文件格式。
+
+验收：
+
+- [x] SQLite 与 PostgreSQL 均新增 nullable `person_index_item_state.relation_checksum`，历史 migration 文件和 checksum 不变。
+- [x] 从空库运行全部 migration 后新列存在；从已有 0165 schema 升级保留 relation state 行和原 source fingerprint/schema version，checksum 初始为空。
+- [x] migration 序号/双后端合同回归、`tests/storage.rs`、build、fmt、Clippy 与 `git diff --check` 通过。
+
+预计文件：`migrations/0166_person_index_relation_checksum.sql`、`migrations-postgres/0166_person_index_relation_checksum.sql`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/scanner.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/ready_version.rs`、`docs/LUX-DEVELOPMENT.md`。新 migration 会提升当前 schema version；因此本任务也更新这些测试目标中的 latest-schema 断言。先添加既有 state 行升级回归并确认旧 schema 缺少该列，再增加双后端 additive migration 与空库/升级验证；随后由独立应用任务将 checksum 写入 credits transaction 并在跳过路径比较。
+
+结果（2026-10-09）：SQLite/PostgreSQL 均新增 nullable `relation_checksum`，旧 migration 未修改。SQLite `tests/storage.rs` 51/51 通过，覆盖从空库迁移和从 0165 升级时保留 source fingerprint、relation schema version 与时间戳，旧 checksum 为 NULL；静态双后端合同确认 PostgreSQL 使用相同 additive nullable DDL。schema-version 相关 `scanning_jobs` 81/81、`scanner` 17/17、`danmaku` 7/7、`admin_health` 1/1、`ready_version` 2/2 通过；PostgreSQL 数据库目标 16 项因本机无 PostgreSQL 实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本次 `cargo test --locked --all-targets` 的 796 个库测试通过、13 项忽略；集成测试在 `watch` 中遇到 SQLite `database is locked`。该目标独立复跑 5/5 通过，其后 5 个 Web/webhook 目标也通过，因此记录为并行测试时的偶发锁冲突，不归因于 migration。开发机 `arm64`；未部署 PostgreSQL/FNOS，也没有生产性能验证。应用层 checksum 写入与比较留给后续独立任务。
+
+#### LUX-452：在人物 credits 事务中保存关系快照 checksum
+
+范围：LUX-451 已增加 nullable `person_index_item_state.relation_checksum`，本任务补齐 storage 写入边界：credits 批量替换与 source fingerprint、关系 checksum 和 schema version 在同一事务写入。关系 checksum 由调用方对实际持久化的 `people.json` 字节计算并以 SHA-256 小写十六进制传入。fingerprint-only 兼容 API 写入时清空 checksum，避免保留已过期快照值。文件 checksum 读取与全部应用层调用方接入在后续独立任务完成。
+
+验收：
+
+- [x] 单项与批量 credits 写入均能原子保存 relation checksum；批次失败时 credits 和 checksum state 一起回滚。
+- [x] SQLite storage 回归覆盖 checksum 持久化、批次回滚与旧 API 清空 checksum；不改变 PostgreSQL/SQLite 通用 SQL 边界。
+- [x] 相关 storage 测试、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先添加单项/批量写入与回滚回归，再增加 checksum-aware batch writer。此任务不修改应用层读写调用方。
+
+结果（2026-10-09）：storage 的单项和批量 credits replacement 均在同一 metadata transaction 写 source fingerprint、relation schema version 和 relation checksum；fingerprint-only 兼容入口明确清空 checksum，避免沿用旧值。SQLite 回归覆盖单项/批量保存、旧 API 行为，以及第二个 item 写 state 失败时整页 credits/state 回滚。`cargo test --locked --all-targets` 通过（库 797 passed、13 ignored，所有未忽略集成目标通过）；`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `arm64`；PostgreSQL 16 项按需实例的测试在本机 ignored，未运行 PostgreSQL/FNOS 部署或生产性能验证。测试与 build 均使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+#### LUX-453：从人物关系文件快照贯通 checksum 写入
+
+范围：人物关系持久化和 NFO deferred credits 页批次对即将原子写入的 `people.json` 字节计算 SHA-256 小写十六进制，并将同一份待写字节的 checksum 随 credits 一起交给 LUX-452 storage API。不从解析对象再次序列化计算，也不重复读取文件。人物 metadata 改写留给 LUX-454；读取快照、索引重建与 current 检查留给 LUX-455。文件系统与数据库不能共享原子事务；DB 写失败后关系文件仍可作为恢复来源。
+
+验收：
+
+- [x] checksum 对即将持久化的原始文件字节计算，不重序列化关系对象，也不额外读取同一文件。
+- [x] 人物关系 immediate 持久化与 NFO deferred credits 批次均将正确 checksum 与 credits/fingerprint 一起提交。
+- [x] `service.rs` 人物服务回归覆盖 immediate 与 deferred 写回均保存实际文件 checksum；相关 storage/people tests、build、fmt、Clippy 与差异检查通过。
+
+预计文件：`src/application/people/helpers.rs`、`src/application/people/relations.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 raw snapshot checksum 读写回归，再贯通 immediate/deferred credits 路径。
+
+结果（2026-10-09）：即将写入的关系 JSON 字节只序列化一次，并对同一份字节计算 SHA-256 小写十六进制；immediate relation persist 与 deferred NFO credits flush 在 credits transaction 中保存相同 checksum。服务回归核对数据库值等于实际文件字节 checksum。`application::people::service::tests` 39/39、`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。PostgreSQL/FNOS 未运行；跨文件系统与数据库的恢复校验留给 LUX-455。
+
+#### LUX-454：人物 metadata 改写同步关系快照 checksum
+
+范围：`update_item_actor_metadata` 和 `update_person_metadata` 会改写 `people.json` 并替换对应 credits；将待写文件原始字节的 SHA-256 checksum 与 credits、source fingerprint 一起提交，避免这些写回路径留下 checksum 为空或过期的索引状态。迁移完调用方后，将不再使用的 fingerprint-only 单项 wrapper 限制为测试使用。文件格式和 public API 不变，文件系统与数据库的持久化边界仍分别处理。
+
+验收：
+
+- [x] actor metadata 与 person metadata 更新后，数据库保存的 relation checksum 等于实际 `people.json` 字节的 SHA-256。
+- [x] relation 文件先写入、credits/checksum 事务失败时保留文件作为恢复来源；不重复读盘或重序列化计算 checksum。
+- [x] service 回归覆盖两种 metadata 更新路径；相关 people tests、build、fmt、Clippy 与差异检查通过。
+
+预计文件：`src/application/people/metadata.rs`、`src/application/people/service.rs`、`src/storage/people.rs`、`docs/LUX-DEVELOPMENT.md`。先在现有 metadata 更新回归中加入实际文件 checksum 断言，再将 checksum 传入 credits transaction，并把已退出生产路径的 wrapper 限制为测试使用。
+
+结果（2026-10-09）：actor metadata 与 person metadata 两种改写都对即将写入的 JSON 字节计算 checksum，并与对应 credits/source fingerprint 在同一数据库事务持久化；写文件仍先于数据库事务，失败时保留可供后续重建读取的文件。旧 fingerprint-only 单项入口只供测试使用。回归先在旧实现下失败（数据库 checksum 为 NULL），再以 39/39 people service tests 通过；`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。全目标测试在合并实现状态下通过（797 passed、13 ignored；其中 16 个 PostgreSQL 专项因无本地 PostgreSQL 而 ignored）。本机 `arm64`，未做 FNOS/生产性能验证。
+
+#### LUX-455：人物关系 current 检查比较快照 checksum
+
+范围：`item_actor_relation_is_current` 与 `nfo_relation_snapshot_is_current` 读取关系文件原始字节，并要求数据库中的 source fingerprint、relation checksum 和 schema version 三者匹配。checksum 缺失的旧行和文件变化但 source fingerprint 不变的记录必须判 stale；无数据库时保留当前文件内 source fingerprint 校验语义。索引重建的 checksum-aware skip/write 留给 LUX-456。
+
+验收：
+
+- [x] `item_actor_relation_is_current` 与 `nfo_relation_snapshot_is_current` 都比较关系 checksum。
+- [x] 旧行 checksum 为 NULL、文件 checksum 改变、source fingerprint 改变或 schema version 变化都会触发重建；全部匹配才跳过。
+- [x] service/storage 回归覆盖旧 NULL 行和相同 source fingerprint 下文件字节改变；storage predicate 仅在 checksum、source fingerprint 和 schema version 均匹配时返回 current。
+- [x] 相关 people/storage tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+
+预计文件：`src/storage/library.rs`、`src/application/people/service.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先锁定 checksum mismatch/legacy stale 回归，再替换 current 判定入口。
+
+结果（2026-10-09）：service current 判断从关系文件一次读取的 raw bytes 计算 SHA-256，并要求数据库 source fingerprint、relation checksum、relation schema version 都匹配；NULL checksum、不同文件字节、不同 fingerprint 或 schema version 都判为 stale。SQLite service 与 storage 定向回归通过；rebuild 现已在 LUX-456 接入同一 checksum 判定并移除旧 current API。PostgreSQL/FNOS 未运行，未据此推断生产收益。
+
+#### LUX-456：人物关系索引重建比较并保存快照 checksum
+
+范围：索引重建读取新旧关系文件时保留原始字节，并只解析一次；skip 判定比较 source fingerprint、文件 checksum 和 relation schema version，重建时把该次读取的 checksum 与 credits/fingerprint 在同一事务保存。旧 checksum 为 NULL 或文件 checksum 已变化时进入现有批量重建。文件格式和 rebuild job 状态机不变。
+
+验收：
+
+- [x] rebuild skip 只有三维 state 与关系快照完全匹配才跳过；旧 checksum 为 NULL 或关系文件变化时重建。
+- [x] rebuild credits batch 使用所读 raw bytes 的 checksum，不重读关系文件或重序列化关系对象计算。
+- [x] service regression 覆盖相同 source fingerprint 下文件 bytes 变化，确认 rebuild 更新 credits 和 checksum；不改变 legacy relation 路径读取语义。
+- [x] people tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+
+预计文件：`src/storage/library.rs`、`src/storage/people.rs`、`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 changed-bytes rebuild 回归，再贯通 raw snapshot checksum 到 batch commit，并删除不再被消费的 fingerprint-only batch wrapper。
+
+结果（2026-10-09）：rebuild 同一次安全读取同时计算 raw-byte checksum 并解析 relation；skip 现在比较 source fingerprint、relation checksum、state schema version，batch credits commit 保存该 checksum。相同 source fingerprint 下改写 actor bytes 的回归先失败后通过，且验证 rebuild 保存值与实际文件匹配。删除无调用方 fingerprint-only batch wrapper。people service 40/40、storage checksums/current 回归通过；全量 `cargo test --locked --all-targets` 通过（798 passed、13 ignored；PostgreSQL 16 项因本机无实例而 ignored），`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 通过。本机 `arm64`，未部署 FNOS/生产测量。
+
+#### LUX-457：本地 metadata 页复用重复 episode NFO 路径检查
+
+范围：本地 metadata 页在逐 episode 发现 NFO 时，先检查媒体同名 NFO，再回退到同目录 `episode.nfo`。同一目录的多个 episode 或多个媒体版本会重复检查相同 sidecar 路径。为一次 page 的 NFO 路径发现增加惰性存在性缓存，避免重复文件系统查询；保持同名 NFO 优先级、`episode.nfo` fallback、每个 item 的路径映射及现有错误传播语义。缓存仅在本次 page 内有效，不缓存解析内容，不改变 NFO 选择、安全校验和 metadata 写回。
+
+验收：
+
+- [x] 两个 episode 共用 `episode.nfo` 时都解析到相同目标，page 内重复 sidecar 目标只触发一次文件系统存在性检查。
+- [x] 同名 NFO 仍优先于 `episode.nfo`；存在性检查错误仍按原逻辑终止该 item 的 NFO 查找。
+- [x] NFO 路径发现和剧集 metadata 定向回归、fmt、全目标全 feature Clippy、全量 `cargo test --locked --all-targets` 与 `git diff --check` 通过；不推断 NAS/FNOS 墙钟或 CPU 收益。
+
+短计划与文件：修改 `src/application/metadata.rs`，给本地 NFO page 增加仅 page 生命周期的 sidecar existence cache，并回归共享 fallback 与同名优先级；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md` 记录调用边界及限制。先加可观测 probe-count 回归，再接入缓存，最后运行库内 metadata 与剧集 NFO 目标。
+
+结果（2026-10-09）：一次本地 scan NFO page 用惰性 `PathBuf` cache 复用 episode sidecar 的 `try_exists` 结果；三 episode 回归确认两项共享同一 `episode.nfo`，第三项仍优先同名 NFO，page 对四个唯一候选路径各检查一次。OnDemand 单 item 入口保留独立 cache，缓存不跨 page；文件系统错误仍被 `Option` 传播并停止该 item 的 fallback 查找。新增 metadata library regression 与 `series_metadata` 3/3 通过；第二轮全量 `cargo test --locked --all-targets` 通过，`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。PostgreSQL 专项 16 项因本机无实例而 ignored。本机 ARM64，未测量 NAS/FNOS 文件系统墙钟或 CPU。
+
+#### LUX-458：有界并发扫描本地 metadata NFO 路径
+
+范围：LUX-419 已将 series/season/episode NFO enrichment 限制为最多 4 路并发，LUX-457 已按 page 复用重复 episode sidecar 检查，但 `scan_local_metadata_nfo_paths` 仍按 source 串行做路径发现。将一次 source page 的 NFO 路径发现改为最多 4 路并发，并按原 source 顺序归并路径与错误。多个任务检查同一 sidecar 路径时共用同一个异步结果，包括同目录 `episode.nfo`、重复 series/season 候选；缓存只活到该 page。保留每类原有候选优先级、hierarchy 仅由每个 series/season 的首个 source 决定、VIDEO 显式 I/O 错误、其他 NFO 查找错误通过 `Option` 终止 fallback 的行为。OnDemand 单项路径和后续 NFO enrichment/page metadata transaction 不变。
+
+验收：
+
+- [x] local scan NFO 路径发现的并发不超过 4，source-order 路径/error 结果稳定；测试能观察到并发大于 1。
+- [x] 多个 episode 并发检查共享 `episode.nfo` 时，该 page 只执行一次底层 existence probe；同名 NFO 优先级、hierarchy 首 source 选择和 path errors 保持。
+- [x] 不同 series/season ID 指向同一 hierarchy NFO 候选路径时，共享 page cache 只执行一次底层 existence probe。
+- [x] NFO path discovery、`series_metadata`、`scanned_series_metadata` 定向回归、fmt、build、全目标全 feature Clippy、全量 `cargo test --locked --all-targets` 与 `git diff --check` 通过。
+- [x] 性能记录只报告固定 page 的 probe 次数和并发上界，不外推 NAS/FNOS 墙钟、PostgreSQL 或 CPU 收益。
+
+短计划与文件：修改 `src/application/metadata.rs`，用现有有界 task runner 执行拥有型 path-discovery request，以异步 per-path cell 合并同页重叠 probe，并按输入顺序合并结果；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`。先增加 concurrency/probe/order 回归并确认旧串行实现使其失败，再接入 bounded path discovery，最后运行剧集 NFO 定向目标。
+
+结果（2026-10-09）：新增 12-episode fixture 在旧串行实现下先失败（最大并发为 1）；有界执行后观察到并发大于 1 且不超过 4，12 个 item 共用的 `episode.nfo` 只检查一次，同名 NFO 优先级和 series/season 首个 source 选择保持。另一 fixture 先在旧实现下以 3 次 cache probe 对 5 次期望失败，随后确认两个 episode 以及重复 hierarchy ID 路径合计只检查 5 个唯一候选。路径发现单测 6/6、`series_metadata` 3/3、`scanned_series_metadata` 2/2 通过；全量 `cargo test --locked --all-targets` 通过，库测试 802 passed、13 ignored，PostgreSQL 专项 16 项因本机没有实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；未测量 NAS/FNOS 文件系统墙钟或 CPU，也未据本地 SQLite 测试外推 PostgreSQL 收益。
+
+#### LUX-459：用完整 NFO 语义 fingerprint 跳过等价内容重处理
+
+范围：现有 NFO cache 用原始字节 fingerprint 做无变化快路径；字节因 XML 注释、属性顺序或格式化空白变化时，仍会重新解析，并可能重复写 rich metadata 与人物关系。增加完整 XML 文档的语义 fingerprint，在保留原始字节快路径的同时，识别仅词法变化且 XML 语义未变的 NFO。语义 fingerprint 必须覆盖未知节点、未知属性与文本，不能复用仅比较已知 projection 的 NFO writer fingerprint；忽略 XML 声明、注释、属性顺序、空元素写法差异和纯 element-only 格式空白，将 CDATA 与相同文本按相同内容处理。继续遵守 NFO 字节数、事件数和禁止 DTD 的解析限制。旧 cache 中没有 semantic fingerprint 时安全地完整处理一次并写入新格式。只有 cache、默认字段和基于旧 raw fingerprint 的人物关系快照均可复用时，才更新当前 raw/stat fingerprint 并跳过 metadata 与 relation 写入；语义内容变化或快照过期仍走原 enrichment。
+
+验收：
+
+- [x] 相同 XML 内容在注释、属性顺序、CDATA/文本表示、空元素写法或纯格式化空白变化后得到相同 semantic fingerprint；metadata enrichment 跳过重复 metadata/person relation 写入并更新当前 revision state。
+- [x] 已知字段变化、未知节点/属性/文本变化都会产生不同 fingerprint 并执行正常 enrichment；NFO 原始字节不被重写或规范化。
+- [x] 原始字节完全相同的 fingerprint 快路径保持；没有 semantic fingerprint 的旧 cache 安全回退一次并可生成新 cache；资源限制和非法 XML 行为保持。
+- [x] NFO fingerprint 单元回归与 `cargo test --locked --test metadata`、fmt、Clippy 和差异检查通过。性能记录明确区分文件读取、XML 解析和后续数据库/关系写入，不把本机正确性测试描述成 FNOS/NAS 性能收益。
+
+预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`src/application/candidates.rs`、`tests/metadata.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 lexical/unknown XML/metadata-state 回归，再实现有界、保留未知结构的 semantic fingerprint 与 cache 兼容，最后运行定向 NFO 与 metadata 验证。
+
+进度（2026-10-09）：核心实现及 lexical、未知 XML、metadata state、旧 cache、`xml:space` 和属性规范化回归已补。cache-enabled projection 保留字段内部空白，projection-only 路径仍保持既有行为；属性规范化区分字面 TAB/换行与字符引用，并将 CRLF 与 LF 字面换行按相同值处理。cache-enabled 解析接受合法预定义/数字引用进入 metadata projection，并拒绝未声明 general entity。首次全量测试发现完整性规划仍按旧 JSON 结构解码 rich cache，导致完整本地 NFO 被误判缺少 credits/trailers 并发起候选搜索；现改为复用版本化 cache decoder，`fill_missing_skips_complete_movie_without_scraper_request` 回归通过，旧格式兼容不变。NFO 单测 8/8、metadata 单测 21/21、`tests/metadata.rs` 21/21 与 `tests/reidentify.rs` 16/16 通过。最终复跑 `cargo test --locked --all-targets` 成功：library 807 passed、13 ignored；所有 integration targets 通过。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过；PostgreSQL 专项因本机无默认实例而 ignored。
+#### LUX-460：扫描本地 metadata page 普通电影 NFO 有界并发
+
+范围：scan-local metadata NFO page 当前逐个 await 普通电影的 NFO enrichment。复用现有有界有序 task runner 和电影 NFO 并发上限（最多 4 路），让一个 page 内独立电影并发处理，并按原 source 顺序归并结果。单个 NFO 失败或 task 异常仍只影响对应 item。page 级延迟 metadata 更新继续在所有电影、home video 与剧集处理后统一 flush；actor credits 继续使用共享 deferred collector 并在 page 末统一 flush。只修改 scan-local page 的 MOVIE 路径；库级 `enrich_movie_sources`、home-video、series/season/episode 和 OnDemand 路径不扩大范围。
+
+身份变更的电影在同一 page 共享的异步 guard 下检查数据库现存身份及 deferred collector 中尚未 flush 的同页身份 reservation，然后完成 NFO cache/actor relation 写入和 metadata update 入队；入队后释放 guard。pending reservation 的冲突候选仍由数据库按当前 parent、可用 source 和 active 状态条件复核。冲突检查不触发 page metadata flush；只有电影 title/year 变化的 item 等待该 guard。这样并发 item 使用旧 page snapshot 时，仍可保留 page-end batching 并避免同页重复身份入队。
+
+验收：
+
+- [x] 回归证明 scan-local 普通电影 NFO enrichment 的最大并发大于 1 且不超过 4，结果合并顺序与输入 source 顺序一致。
+- [x] 一个电影 NFO 无效或 task 失败时，其余电影仍完成；单 item 错误隔离语义保持。
+- [x] 两个并发电影将改为相同 title/year 时只允许一个身份更新入队，另一个作为不可重试冲突单独失败；同页普通电影仍成功，且冲突检查顺序由回归同步控制。
+- [x] 冲突检查期间已有的普通 metadata update 不提前 flush；普通更新与唯一成功身份更新在 page 末同一事务 flush，actor credits 仍只在 page 末统一 flush；metadata batch transaction 失败后的逐 item fallback 回归通过。
+- [x] 只改变 scan-local page 的 MOVIE 路径；series、home-video、OnDemand 和库级电影 enrichment 行为不变。
+- [x] 相关 metadata 定向回归、格式、build、Clippy、全量 Rust 完成门及 `git diff --check` 通过。
+- [x] 性能记录仅报告固定 task runner 的并发上界和行为边界，不推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+
+短计划与文件：先在 `src/application/metadata.rs` 为 scan-local movie page 增加有界并发、顺序、错误隔离、身份冲突串行化及 page-end flush 回归，再将该路径接入现有有界有序 runner，同时保留 page flush 边界；在 `src/storage/media.rs` 按既有 movie identity eligibility 复核同页 pending reservation；更新两份任务和性能记录。预计修改 `src/application/metadata.rs`、`src/storage/media.rs`、`docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`，共 4 个文件。
+
+实现进度（2026-10-09）：scan-local MOVIE NFO 已接入最多 4 路有序 runner；并发、错误隔离、同页 identity reservation 与 page-end flush 回归均覆盖。身份 guard 跨越数据库与 page pending reservation 检查、cache/relation 写入和 metadata update 入队，并在入队后释放；storage 按 parent、available source 和 active 条件复核待检查 reservation。fallback 用例确认同页两项先参加一次失败 page batch、再逐项回退，故指标中的事务数为 3、item/update 尝试数为 4；与旧提前 flush 路径相比，page metadata 不会在 identity 检查中提前提交。定向 metadata 21/21、build、Clippy 与全量 Rust 测试通过；性能记录只报告固定 runner 行为，不外推生产性能。
+#### LUX-461：合并高频 Admin Jobs 进度失效通知
+
+范围：扫描活动项更新、Manifest `DISCOVERY_PROGRESS` 和 metadata reidentify 进度会反复使 Admin Jobs SSE 失效。为这些进度通知增加有界合并：首个通知立即发送，持续更新最多每秒补发一次尾随失效。任务创建、取消、错误和完成等关键状态变化继续立即发送；即时发送要取消旧进度窗口的待发尾随通知，确保结束状态刷新及时。事件 payload、SSE 协议和任务持久状态不变。
+
+验收：
+
+- [x] burst 内首个 Jobs 进度失效立即发送，后续事件合并；有持续更新时每秒最多发送一次尾随失效。
+- [x] 即时 Jobs 状态事件在调用时发送并撤销已排队的进度尾随事件，最终完成状态不会被合并丢失或延迟。
+- [x] 只合并扫描活动项、`DISCOVERY_PROGRESS` 与 reidentify progress；JOB_CREATED、取消、失败、阶段完成和任务完成仍即时发送。
+- [x] AdminEventHub 单测覆盖 burst、尾随刷新和即时刷新。
+- [x] 相关应用路径编译/测试、全量完成门通过；`git diff --check` 与 rustfmt 检查通过。
+
+短计划与文件：先在 `src/application/admin_events.rs` 添加通知时序回归，再增加仅用于 Jobs 进度的 1 秒有界 coalescing 和可取消尾随刷新；在 `src/application/scanner.rs` 接入扫描活动项与发现进度，在 `src/application/reidentify.rs` 接入已节流的重识别进度。更新本文件记录边界和结果。预计修改文件共 4 个。
+
+结果（2026-10-09）：Jobs 进度现在首个即时广播，窗口内后续变更置脏，由每秒一次的尾随广播合并刷新；连续压力最多每秒广播一次。任意即时 Jobs 发布会使旧窗口失效并清空待发尾随刷新。扫描活动项、`DISCOVERY_PROGRESS` 与 reidentify 进度接入该路径；其他扫描事件和任务创建/取消/完成继续即时刷新。AdminEventHub 单测 6/6、集成目标 `admin_events` 3/3 通过；build、全量 Rust 测试、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。未在 FNOS 或生产负载上验证效果。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
@@ -8585,12 +9592,121 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### 阶段 23 总体验收与阶段门
 
+2026-10-10 复核：阶段 23 仍开放，六项证据、失败和关闭条件见[阶段 23 证据复核](STAGE-23-GATE-REVIEW-2026-10-09.md)。冻结 `32c158ec` 已完成公平请求计时修复、provider 空候选专项和常规 Rust 全门（1514 passed、0 failed、36 ignored）；LUX-469 的最终三个目标分别 22/22、3/3、81/81。原不公平 1k A/B 不作产品回退证据。
+
+原始三轮矩阵有 3 对发现 Cargo 干扰；只补齐 LUX-270/10k SQLite，现存 44 行诊断样本，两组 SQLite poster 各少一轮。基线默认 scan 并发 16、冻结候选 2，最新 `test=0980dd36` 已改为 4；相同配置最终 A/B 未运行，不能判定实现回退或性能达标。逐请求 cohort、完整扫描窗口 null、本地/在线独立时段及 SQL/pool/RSS 数据见 `PERFORMANCE.md`，5% 门槛保留。
+
+在线补缺 1k 两后端均真实处理 10 jobs/1000 items，在 provider gate 关闭时 scan/local 完成；10k SQLite 却被容量 32 dispatcher 背压卡住本地 worker，600 秒后超时。LUX-424 的提交方背压与本阶段/LUX-303 的不阻塞本地 worker 存在冲突；已按 AGENTS.md Source of truth 报告，在选择修订合同前不改变公共调度/存储边界。10k PostgreSQL 尚未运行。
+
+另一会话已集成冻结提交链并推送到 `test=0980dd36`；本轮运行证据不覆盖其后续修改。基于该 revision 的 `18b88888` 的首页组件回归验证 mock 空列表→home 通知→电影标题/poster URL；Web Node134/Vitest570/build 通过。该测试未建模 scan lifecycle、未请求或解码 poster，不证明浏览器与真实 scan 的端到端行为，新的最终源码还须重跑 Rust/性能门。所有技术验收通过后才按 AGENTS.md Stage gates 请求项目所有者确认；当前不关闭、不进入后续阶段。
+
+最终远端刷新又观察到 `origin/test=b4635ee3`（PR #43 的 PostgreSQL movie merge 修复），同样不在本轮 Rust/性能证据的覆盖范围内；记录工作树保持基于 `0980dd36`。
+
+#### LUX-462：补全阶段 23 基准的 SQL 延迟、连接池与后台队列观测
+
+范围：LUX-270 当前记录 SQL 调用数和 manifest 内部阶段，但没有 SQLx 执行时间分布、测量期间的连接池压力或目录 API 冷/热页面对照，无法把用户请求 p95 回退定位到 cache miss、数据库执行或连接池等待。LUX-304 的“本地海报队列完成”只依据 poster 行数；改为同时确认该 scan job 的全部本地图片阶段已有完成标记，并单独呈现扫描结束后但图片仍在排队的目录 API p95。只改性能测试 harness 与性能记录，不增加生产指标、不改变扫描或 API 行为。所有 SQL 汇总仅使用规范化 statement summary，不采集 bind 值或完整 SQL。
+
+验收：
+
+- [x] LUX-270 结果包含按规范化 statement summary 分组的 SQLx 调用数、累计时间、p50/p95/max；时间为空时明确报告不可用，不伪造零耗时。
+- [x] 前台管理请求与目录请求各自测量期间记录连接池 `size/idle/in-use/saturated` 峰值或采样计数；目录请求增加预热缓存后的对照，以区分 cache miss 等待与热页 hydration/query 负载。
+- [x] LUX-304 区分 scan-active、scan-finished/image-pending 和所有 scan job image batch 完成后的目录列表 p95；队列完成条件同时核验本地 poster 数与 `images_completed_at`，失败或残留批次不得被误记为 drain 完成。
+- [x] 固定统计 helper 单测、LUX-270/LUX-304 小 fixture SQLite 定向运行、fmt、build、全目标 Clippy 和差异检查通过。
+- [x] 性能文档明确记录 ARM64 SQLite 单轮观测、临时 PostgreSQL 历史样本及观测边界；当前 LUX-304 1k/10k 非 A/B 结果不用于关闭既有回退或性能阶段门，也不外推 FNOS/NAS。
+
+预计文件：`tests/performance.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先为 SQL 延迟摘要统计添加确定性单测，再采集 query/连接池样本，接着为 LUX-304 增加严格 image-stage drain 和中间阶段测量；使用 1k SQLite 先确认输出完整后再决定是否运行双后端全矩阵。
+
+进度记录（2026-10-09）：基准 harness 已接入规范化 SQLx 延迟摘要、5 ms 连接池采样、管理/目录请求各自的 pool 观测、目录页首次与热页对照，以及 LUX-304 scan 完成后 image-pending 采样和严格 image batch drain。SQL 延迟对象显式标注 phase window 和后台 SQL 可能混入；单次首次目录请求只记录单次延迟。image-pending 只接受请求窗口首尾都存在有效 pending/running batch 的样本；失败/取消不计作 pending，已完成但缺少 `images_completed_at` 会使 drain 立即失败。pool 无样本报告保持 unavailable，所有未观测数值为 null。helper 测试 10/10 通过。LUX-270 与 LUX-304 的 1k SQLite fixture 通过；另有 10k SQLite LUX-304 fixture，扫描中、image-pending、strict drain 后三个窗口均记录目录 p95，完整输出见 `docs/PERFORMANCE.md`。这些是单轮 ARM64 SQLite fixture 检查，不是 A/B 或性能收益结论；原 1k 回退和阶段 23 双后端 A/B 仍待修复/复测。`cargo build --locked`、fmt、全目标全 feature Clippy 和全量 Rust 测试完成门通过；本机无 PostgreSQL 实例的专项测试保持 ignored。上述数据不外推 FNOS/NAS。
+
+#### LUX-463：将 scan-job lifecycle 状态并入本地 metadata page 读取
+
+范围：LUX-443 已把 pending target 与有界 source page 合并读取，但本地 metadata worker 启动时仍单独读取一次 scan job；空闲 fallback 到期时又单独刷新 scan job，之后回到 page 查询。扩展现有 `load_scan_job_metadata_page` 单次查询，同时返回 job 是否存在、job type、job status、`auto_metadata_match`、pending 状态和首个有界 source page。worker 使用该 page lifecycle 判定不存在、FAILED、CANCELLED 的退出路径，并读取 `INCREMENTAL_SCAN` 类型及 completeness policy；删除独立的初始 `find_scan_job`、fallback refresh 和增量 completeness policy 的重复 job 查询。保留没有 page snapshot 的其他调用点原有策略解析、`Notify`、stop watch、5 秒跨进程状态 fallback、page 顺序、source unavailable 失败语义，以及每个 pending page 的 manifest root 身份复核。
+
+验收：
+
+- [x] page storage query 一次返回 lifecycle、`auto_metadata_match` 与既有 pending/source page；job 不存在可与空 job 区分，job status/type/auto-match 不引入第二次 query。
+- [x] worker 启动和每次 Notify/fallback 后只通过 page 查询读取最新 lifecycle；missing、FAILED、CANCELLED 的退出行为与原实现一致，INCREMENTAL_SCAN completeness 从同一 page snapshot 取策略，不重复读取 job。
+- [x] query-wrapper 回归证明 worker 启动与 Notify 分别只产生一次 lifecycle/page 查询，completeness policy 使用 page snapshot 时不增加查询；storage 回归覆盖 auto-match 开关、存在、终态和不存在 job，同时保留 target 优先级与无 source pending 行为。
+- [x] root identity 校验、stop watch、Notify 即时唤醒与 5 秒跨进程 fallback 语义保持；相关 scanner/storage 测试、fmt、build、Clippy 和 `git diff --check` 通过。
+- [x] 不把 query-wrapper 调用数变化描述成 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
+短计划与文件：先扩展 `StoredScanJobMetadataPage` 并在原有单条 page query 返回 job lifecycle 与 `auto_metadata_match`，添加 storage 回归；再将 scanner worker 的启动/刷新状态判断及增量 completeness policy 切到 page snapshot，并扩展 idle worker query-count 回归。预计修改 `src/storage/repository.rs`、`src/storage/jobs.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`，共 5 个文件。
+
+进度记录（2026-10-09）：page lifecycle 合并 query 额外返回 `auto_metadata_match`，增量 metadata completeness 复用 page snapshot 解析策略，不再第二次读取 scan job；没有 page snapshot 的调用点保留既有策略读取路径。query counter 回归先复现了 1 次冗余 query，修复后策略解析增加 0 次 query；storage 覆盖 enabled flag、空 page、终态和不存在 job。相关定向测试、`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 和 `cargo test --locked --all-targets` 通过；library 为 808 passed、13 ignored，需本地 PostgreSQL 的集成测试与手动性能基准仍按其条件 ignored。以上是调用次数与本机测试证据，不推断 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
+#### LUX-464：指定条目重识别的稳定去重回归
+
+范围：为原性能审计清单第 13 项补齐回归保护。指定条目重识别收到重复 item ID 时，只保留每个 ID 的首次出现，稳定保留其余首次出现的输入顺序，并按唯一条目数创建任务。不得改变请求合同、数据库模型或 job item 的对外排序。
+
+验收：
+
+- [x] 单元回归证明去重后保留首次出现顺序，例如 `[b, a, b, c, a]` 得到 `[b, a, c]`。
+- [x] 集成回归提交含重复 ID 的任务，确认任务总数等于唯一 ID 数，且持久化 job item 中每个唯一 ID 恰好出现一次。
+- [x] `cargo test --locked --lib reidentify::tests::metadata_reidentify_deduplication_keeps_first_occurrence_order`、`cargo test --locked --test reidentify`、build、fmt、Clippy 和 `git diff --check` 通过。
+
+短计划与文件：将现有保序 HashSet 逻辑抽成私有纯函数并先添加单元回归；再在 `tests/reidentify.rs` 通过真实 SQLite 数据库创建含重复 ID 的重识别任务，检查计数和持久化条目；最后记录测试结果。预计修改 `src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`，共 3 个文件。
+
+结果（2026-10-09）：保序去重 helper 的单元回归 1/1 通过；SQLite 集成用例确认 5 个输入 ID 去重为 3 个 job item、`total_count` 为 3，持久化 ID 与 3 个唯一 ID 一致；service 返回的 `job.items` 仍按既有 `item_id` 顺序排序。`tests/reidentify.rs` 17/17、`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。一次并行全量测试中 `libraries_api` 的库更新用例返回 `DATABASE_UNAVAILABLE`；随后隔离重跑该用例和 `tests/libraries_api.rs` 全目标（13/13）通过。该全量测试的串行重跑尚待最终阶段门执行。
+
+#### LUX-465：合并本地 metadata 完成 waiter 状态查询
+
+范围：完成等待器每次被通知或 5 秒 fallback 唤醒时，先查询是否还有 PENDING metadata target；有待处理 target 时又分别读取 scan job 是否存在和 cancel 状态。将三次读取合并为一个 SQLite/PostgreSQL 共用的 storage 查询，返回 pending、取消或缺失 job 状态。等待器在读取状态前启用 `Notify` future，避免 `notify_waiters` 恰好发生于状态读取期间而丢失；同进程完成和取消通知都即时唤醒，内存取消标记、5 秒跨进程 fallback 和既有 stop 行为保持不变。
+
+验收：
+
+- [x] 固定 SQLite storage fixture 将 pending 状态及 job 取消检查从 3 次 query-wrapper 调用收敛到 1 次；无 pending、已取消和不存在的 job 仍退出等待。
+- [x] `Notify` 在状态查询前完成注册；同进程完成及取消通知都在 250ms 内唤醒，跨进程 fallback 仍为 5 秒。
+- [x] 相关定向测试、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只描述固定 fixture 的 query-wrapper 数量，不外推 PostgreSQL 时延、FNOS/NAS 或生产 CPU 收益。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加单 query 与状态语义回归，再合并 storage 查询并在 DB read 前注册通知 future。
+
+结果（2026-10-09）：旧实现红灯回归观测到每次状态检查 3 次 query-wrapper 调用；合并后 storage 状态查询为 1 次。SQLite 回归覆盖 pending、complete、cancel requested 与 missing job；completion/cancellation waiter 通知 250ms 回归及固定 5 秒 fallback 测试通过。`cargo test --locked --lib local_metadata_completion`、`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；只验证 query-wrapper 计数和本地通知边界，没有 PostgreSQL/FNOS/NAS 时延或 CPU 收益证据。跨进程状态继续由最多 5 秒 fallback 发现。
+#### LUX-469：补齐渐进扫描故障与竞态回归
+
+范围：阶段 23 的故障清单需要区分已覆盖路径与真正未覆盖路径。为扫描本地图片 worker 增加首个 poster 读取阻塞、电影/剧集 poster 权限拒绝、outbox 发布后媒体根暂时不可用的 fixture；并检查已 claim 的 outbox 在 scan job 取消时是否会越过 READY/completeness 提交。I/O 读取错误或根不可用只能使图片批次可重试，不能将 image stage 标为完成或写入 `POSTER` 完整性结论；恢复后同一批次应成功。扫描索引应在本地图片读取阻塞时继续运行。复用现有慢 NFO、页后段图片事务失败、不可用根、取消/重试、全量/增量 CAS 与增量扫描图片回归，不重复造等价覆盖。fixture 只使用临时目录，不读取外部媒体库或 FNOS 数据。
+
+验收：
+
+- [x] 首个 poster FIFO 读取被阻塞时，workflow 3 仍完成扫描索引；释放 FIFO 后本地图片批次完成且两项 poster 可查。
+- [x] 电影和剧集 poster 权限拒绝都使本地 outbox image stage 失败且可重试；恢复权限后同一批次完成，故障期间不写入 `POSTER` completeness 结论。
+- [x] outbox 已发布后暂时移走 fixture 根路径会使图片批次失败且不确认缺失；恢复根路径后可重试成功。
+- [x] 图片 FIFO read 已打开且 batch 为 RUNNING 时取消 scan job，会先取消该 job 的未完成 outbox；释放读闸门后不能提交 image READY/completeness。
+- [x] 结果记录把慢 NFO、后段海报写事务失败、扫描取消/重试、不可用根恢复、全量/增量 CAS、扫描期间增量补图及未访问目录新增 poster 映射到现有测试；未覆盖的竞态明确保留为开放项。
+- [x] 运行三个定向 Rust 集成目标（串行测试线程）、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check`。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`tests/scanned_metadata.rs`、`tests/scanned_series_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。先分别写电影/剧集权限拒绝、首项图片阻塞、取消 outbox 与根离线回归，确认旧行为，再修复只记录日志却将 image stage 当成功的路径及生产取消未终结其 local outbox 的路径；最后完成定向验证。
+
+进度记录（2026-10-09）：电影 `unreadable_local_poster_keeps_image_check_retryable` 与剧集 `unreadable_series_poster_keeps_local_image_batch_retryable` 先复现旧行为：chmod 000 的 poster 被跳过，outbox 错误地完成图片阶段；修复后两项定向回归各 1/1 通过，并确认故障时无 POSTER completeness、恢复权限后同一批次成功。`cancelling_scan_during_running_local_image_claim_cancels_before_completeness` 在确定 outbox 已发布且 worker 阻塞在 FIFO 后复现批次仍为 RUNNING；取消流程现在先取消该 job 的未完成 outbox，修复后定向回归 1/1 通过，释放 FIFO 后不会完成图片阶段或写 completeness。`blocked_first_local_poster_does_not_block_manifest_scan` 与 `unavailable_media_root_keeps_local_image_batch_retryable` 分别 1/1 通过；前者通过非阻塞 FIFO writer 成功打开确认 image reader 确实阻塞，再验证 workflow 3 扫描完成、释放后两张海报可查；后者验证 root 暂离线时 batch FAILED、未写 `images_completed_at`/POSTER completeness，恢复同一路径后同一批次成功。电影权限、剧集权限、取消竞态与两个 fixture 共五项新回归均已绿。完整目标 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs -- --test-threads=1` 通过：`scanned_metadata` 20/20、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81。默认并行测试先后两次让既有 `local_nfo_retry_excludes_non_retryable_conflict_item` 报 SQLx `RowNotFound`；该测试单独运行通过，另一次并行运行中 FIFO fixture 超过 60 秒。按顺序模式重跑三个目标全绿，归类为测试并行争用，不改变无关 NFO 生产逻辑。验证：`cargo build --locked` 通过（dev profile 41.87s；之后仅将测试权限字面值规范为 `0o000`，电影/剧集回归及全目标 Clippy均在该修改后重新通过）；`cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（dev profile 22.34s）；`git diff --check` 通过。已有覆盖映射：慢 NFO=`manifest_scan_indexes_poster_while_local_nfo_is_blocked`；图片登记事务失败=`failed_local_poster_insert_does_not_mark_image_stage_complete`；扫描根不可用/恢复=`scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore`；Manifest 取消/恢复=`manifest_cancellation_preserves_committed_frontier_and_observations`、`cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`；全量/增量 CAS=`manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry`、`manifest_add_conflicts_with_incremental_entry_claimed_after_diff`、`streamed_manifest_change_cas_does_not_overwrite_a_newer_incremental_entry`；增量图片=`incremental_movie_scan_indexes_local_images`、`incremental_sidecar_change_replaces_local_image`；扫描期间未访问目录新增 poster=`workflow3_running_discovery_indexes_poster_added_to_unvisited_directory`。本记录验证的是本机 SQLite 自动化 fixture，不外推 PostgreSQL/NAS/FNOS 性能。
+
+补充进度（2026-10-09）：新增 `workflow3_running_discovery_indexes_poster_added_to_unvisited_directory`，验证同一 workflow 3 job 保持 `RUNNING`/`DISCOVERING` 时，本地 worker 能索引刚在已访问电影目录新增的 poster，且后续目录当时尚未访问。原测试按路径原始字符串查 poster 行导致误报；按目标媒体 source 的 `item_id` 查询并比较 poster 路径 canonical form 后，诊断版精确目标 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanned_metadata workflow3_running_discovery_indexes_poster_added_to_unvisited_directory -- --exact --test-threads=1` 通过（1/1）。随后将 SQL 查询收敛为只读取目标 item 的 POSTER 路径，canonical path 断言语义不变。最终整理版本的精确回归 1/1 通过；串行运行 `scanned_metadata` 21/21、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81。没有修改生产代码。验证环境为本机 Mac ARM64、SQLite 临时 fixture；这不证明 PostgreSQL、NAS/FNOS 性能或部署运行行为。
+
+
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
 - [ ] 人为阻塞首项图片、后段海报、慢 NFO、权限错误、不可用根、取消/重试、全量/增量竞态和扫描期间本地补图均有自动化覆盖。
 - [ ] 缺失分类、自动补缺策略、队列去重、provider 无候选/失败冷却、执行前重新检查和禁止覆盖本地/锁定数据均有回归覆盖。
 - [ ] SQLite 与 PostgreSQL 同 fixture A/B 分开报告索引完成耗时、首批可见、首张海报、local queue、在线 queue、前台 p95、事务/队列规模和内存；稳定索引或前台 p95 回退超过 5% 时先调度/并发并重测。
 - [ ] 扫描索引耗时与本地/在线处理耗时分别呈现；不以任务仍有后台工作为由把索引时间混入扫描性能结论。
 - [ ] 完成相关 Rust/Web 全量质量门、兼容性和性能记录、本机架构记录，并由项目所有者确认后结束阶段。
+
+#### LUX-466：合并本地 NFO 页重复人物资产并跳过相同人物文件写入
+
+范围：本地 NFO 页跨媒体条目重复引用同一人物时，使用该页共享的 deferred context 对人物资产请求做内容指纹去重；不同人物资产最多 4 路并发，单个人物失败不得阻断其他人物和 relation 保存。对人物 NFO、provider/canonical index 的写入仅在目标字节变化时原子替换。复用既有 person manifest checksum no-op、profile-image unchanged 写入和 person credits 页批处理；不把文件系统与数据库伪装为一个原子事务，不改变 identity、人物关系或 credits 数据模型。
+
+验收：
+
+- [x] 同一 page context 下重复引用的相同人物资产输入共用一个持久化结果；人物名、metadata 或 identity 输入变化时不错误复用旧结果。
+- [x] 多人物处理保持每页最多 4 个不同人物资产并发；一人 provider index 写入失败时，该人物保留 pending 状态，其他人物资产与全部 relation 仍保存。
+- [x] 相同人物 NFO、provider/canonical index 字节不替换文件；变化后的人物 metadata 仍写入新内容。
+- [x] 定向人物资产、同页重复人物、scan-local NFO relation/credits 回归及 `cargo fmt --all -- --check`、`git diff --check` 通过。
+- [ ] `cargo build --locked` 和全目标全 feature Clippy 待阶段 23 A/B 采样结束后运行，避免干扰同机测量。
+- [x] 性能记录区分同页请求去重与 byte-identical write 的边界，不将调用上界推断为 FNOS/NAS CPU 或生产收益。
+
+短计划与文件：先检查同页 actor relation/credits 生命周期和人物资产写入边界，再以 `src/application/people/relations.rs`、`src/application/people/service.rs` 补充有界去重与回归，最后更新本文件和 `docs/PERFORMANCE.md`。本任务不新增 storage schema 或依赖。
+
+进度记录（2026-10-09）：同页共享缓存以人物 NFO/身份/metadata 写入输入的 SHA-256 标识一次资产结果，使用共享 semaphore 将跨 item 的不同人物资产任务限制为最多 4 路；person NFO 与 provider/canonical index 在目标字节未变时跳过临时文件、fsync 和 rename。person manifest 继续用其内容 checksum 避免无变化写入，profile image 沿用 LUX-448 的 unchanged-write，relation credits 沿用最多 16 item 的批量提交。覆盖的文件类型包括 `person.nfo`、人物 manifest、profile image、provider identity index 与 canonical person index；`people.json` relation 仍逐 item 持久化，credits 仍按现有 chunk 事务提交。测试专用闸门令 8 个不同人物请求竞争同一页 semaphore，确认 4 个 permit 全部占用且最大活动数为 4；symlink provider-index 故障 fixture 通过另一 provider 的可读 profile index 到达目标写回，确认只有失败人物标记 `personIndex` pending、其他人物 NFO 和全部 relation 仍保存。`cargo test --locked --lib local_nfo_person_assets_keep_page_concurrency_at_four`（1/1）、`local_nfo_person_asset_batch_isolates_failures_between_people`（1/1）、`local_nfo_person_`（3/3）、同页重复人物资产（1/1）、scan-local relation/credits（1/1）和 `cargo fmt --all -- --check` 通过，`git diff --check` 通过。`cargo build --locked` 和全目标全 feature Clippy 暂缓至阶段 23 A/B 采样结束。本机 `arm64`；测试没有测量系统调用墙钟、PostgreSQL/NAS 延迟、FNOS CPU 或生产收益，也不声称跨文件/数据库原子性。
+
+补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes`（1/1）直接覆盖 `lux-*` canonical index 写入路径；相同 index 字节保留 inode，metadata 改变仍更新 person NFO，且不替换未变化的 canonical index。`local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets`（1/1）覆盖同一 canonical person 的改名目录和新增 identity；分别临时移除 name、identity 指纹字段时测试均按预期失败，恢复实现后通过。上述项目只运行定向单测，build 与全目标 Clippy 仍待阶段门统一执行。
 
 ### 资源详情入库时间
 
@@ -8621,6 +9737,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
 - [x] 音频和字幕选择器在可用宽度至少 572px 时各保留 280px 并横向排列；更窄时上下排列，不发生重叠。
 - [x] 选择器标题、轨道数提示、已选轨道文字和下拉选项使用紧凑字号及控件高度；过长的已选轨道文字在选择框内省略。
+- [x] 版本选择器与音频、字幕选择器使用相同的 280px 最大宽度、38px 控件高度、标题字号和间距；已选版本单行省略，展开选项保留容器或版本说明。
 
 依赖：LUX-307。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web build`。
 
@@ -8631,6 +9748,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 追加（2026-09-29）：轨道选择器按可用宽度自动换列，两个控件能各保留 320px 时并排，窄于 657px 时堆叠。`node --test web/tests/detail-layout.test.mjs` 27 项通过，完整 Web 测试 75 个文件/529 项通过，`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。测试仍输出既存 jsdom `load/pause` 告警；构建保留既存大 chunk 提示。
 
 追加（2026-09-30）：轨道选择器容器收窄为 572px，两列各 280px；每项明确限制宽度，长文本在框内省略，标签、已选文本和选项字号缩小，控件高 38px。Playwright 以 1400px、600px、320px 视口验证并排、堆叠和无页面横向溢出；`node --test web/tests/detail-layout.test.mjs` 27 项、`vitest run tests/media-detail.test.tsx` 26 项及完整 Web 测试 75 个文件/529 项通过，冻结锁文件安装和 Web 构建通过。测试仍输出 jsdom 媒体 `load/pause` 告警；构建有 Vite 大 chunk 提示。
+
+追加（2026-10-10）：版本选择器复用轨道选择器的标题、宽度、间距、控件和菜单样式；折叠时只显示单行版本标签，容器或版本说明保留在展开选项中。Playwright 本地模拟 API 的尺寸断言在旧实现下失败、修复后通过，320px、390px、768px、1024px 和 1440px 视口下版本与音频控件尺寸和字号一致且无页面横向溢出；浅色、深色和长版本标签检查通过，键盘切换版本同步更新播放链接及对应轨道并恢复焦点。详情布局 Node 29/29、详情 Vitest 26/26、完整 Node 134/134、Vitest 569/569、冻结锁文件安装、生产构建、Cargo fmt、全目标全 feature Clippy 和 `git diff --check` 通过；Web 测试仍有既存 jsdom 媒体 `load/pause` 告警。本机 `arm64`，Cargo 使用 Toshiba 共享 target；仅修改 Web 样式及结构，未运行 Rust 测试，验证不代表部署状态。
 
 #### LUX-309：配置目录日志分段归档与有界保留
 
@@ -8996,6 +10115,71 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 阶段：A SDK/宿主安全托管及全目标质量门已于 2026-09-30 通过；原 shutdown 集成测试门限从 10 秒调整到 30 秒（本机冷启动实测约 12 秒），连续定向和完整 all-targets 验证通过。阶段 B（设置 UI 与统一插件）已于 2026-09-30 完成并通过：Lux Web 全量测试 540 项及构建通过，Lux-plugins GitHub Actions run `36738619827` 的 x86_64/aarch64 测试、Clippy、构建、ZIP/manifest/hash 校验全部成功。统一插件分支 `codex/unified-login-background` 已推送；活动 `plugins.json`、正式 Release 与旧包/tag 未改。阶段 B 结束后按阶段门等待项目所有者确认，再进入阶段 C（正式目录切换、旧 Release/tag 清理及手动迁移说明）。完整验证边界见 `docs/LUX-317-PLAN.md`。
 
 明确不做：多图/轮播、任意 URL/路径、插件读宿主文件、图片服务端代理/CDN/转码、媒体库写入、许可同意自动迁移、远程卸载已装插件或重写 Git 历史。
+
+#### LUX-467：让 deferred relation credits 失败后可重试
+
+范围：本地 NFO page 先原子写入 `people.json`，再按最多 16 项提交 credits、source fingerprint 和 relation checksum。文件写入和数据库事务不共享 ACID 边界；数据库写入失败时保留 relation 文件作为恢复快照，并确保 index state/checksum mismatch 让该 revision 保持 stale。deferred credits flush 失败时将失败 chunk 保留在同一个 page collector 中，允许存储故障清除后重试；credits replacement 和 checksum state 继续在单个数据库事务内提交。扫描 batch 在 metadata 处理后统一失效 Home cache 并发送合并后的 Home event。文件、数据库和进程内事件不能组成一个跨系统事务；进程重启后的关系恢复依赖文件快照及既有 person index rebuild reconciliation。
+
+验收：
+
+- [x] 注入 credits/index-state 数据库失败后，relation 文件保留且 current 检查返回 stale；同一 deferred collector 在故障解除后可重试，并保存与文件字节匹配的 checksum。
+- [x] 重试后 credits 只有一份；成功 flush 消费 pending 项，重复 flush 为 no-op；flush 串行化以避免同一 collector 的并发重复提交。
+- [x] 现有扫描 page/job 边界仍统一失效 Home cache 并 coalesce Home event；文档不将它与文件或数据库提交描述为原子事务。
+- [x] people service、metadata/scanner relation-retry 定向测试、build、fmt、Clippy 与 `git diff --check` 通过；验证边界如实记录。
+
+预计文件：`src/application/people/relations.rs`、`src/application/people/service.rs`、`src/storage/repository.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加 database failure / retry / idempotency regression，再保留失败 chunk 并串行化 flush。文件系统与数据库之间没有共同事务；durable relation snapshot 和 stale revision 检测用于恢复，Home invalidation/event 在 scan batch 完成边界合并。
+
+结果（2026-10-09）：旧实现下新回归先失败，证明 DB index-state 写入失败后 relation 文件虽仍在且判 stale，同一个 deferred collector 已丢弃 pending，解除 SQL 故障后无法 flush。修复将 flush 串行化，失败 chunk 按原顺序放回队列头部，避免并发追加的较新快照被失败旧项覆盖；数据库缺失时不消费队列。SQLite trigger 回归确认 failure 后 stale、同 collector retry 后 checksum/current 恢复、重复 flush 无副作用且仅一条 credit。people service library tests 45/45、scanner Home-event worker regression 1/1、`tests/metadata.rs` 21/21 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 与 `git diff --check` 通过。使用 Toshiba 的共享 Cargo target，本机 `arm64`。没有运行 PostgreSQL、FNOS 或生产性能测量；relation file、DB transaction 与进程内 Home event 仍是分开的持久化/缓存边界，不声称跨系统 ACID。
+
+补充重启恢复回归（2026-10-09）：`deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 注入 credits/index-state 写入失败后丢弃 page-local collector、关闭并重新打开 SQLite 与 PeopleService；确认 `people.json` 的字节 checksum 保持不变、重启后的 current 检查仍判 stale，再由既有 person index rebuild 从文件快照恢复 credits/checksum 并转为 current。定向命令 `cargo test --locked --lib deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 通过（1/1），使用 Toshiba 共享 Cargo target。本用例模拟持久化边界上的服务状态丢失，不等同于断电/文件系统崩溃测试，也不证明 PostgreSQL 或 FNOS 行为。
+
+#### LUX-470：Logo 银灰默认强调色
+
+范围：个人设置新增「银灰」强调色，并作为未保存颜色偏好时的默认值。沿用 Logo 的中性灰色：深色模式使用 `#CBD5E1`，浅色模式使用 `#3A3F4B`。强调色实心控件使用独立前景色，深色模式为 `#181B22`、浅色模式为白色；选中状态保持既有勾选和开关位置反馈。已保存的莓果、海蓝、琥珀、薄荷偏好继续有效。
+
+验收：
+
+- [x] 无本地偏好或无效强调色时默认银灰；已保存的五种颜色可读取、切换并按账户持久化。
+- [x] 个人设置显示银灰选项，使用 `aria-pressed` 标记选择；切换主题保持所选色系并调整银灰明度。
+- [x] 银灰文字、实心按钮文字、勾选和启用开关在深浅模式均清晰，相关文字对比度至少 4.5:1。
+- [x] Web 全量测试与构建、定向浏览器检查、Rust 格式与静态检查通过；记录本机 ARM 验证边界。
+
+实施切片：A 修改 `web/src/features/account/account-settings.ts`、`web/src/features/account/AccountPage.tsx`、`web/src/react.css`、`web/tests/account-settings.test.tsx` 和本文档；先用账户偏好回归验证默认值、旧颜色兼容和银灰切换。B 修改 `web/src/features/admin/plugin-library.css` 的启用开关前景色，并进行深浅模式控件对比度与 Web 全量验收。只调整 Web 外观和本地偏好，不修改服务端设置或数据库。
+
+结果（2026-10-10）：新账户默认值、银灰偏好读取和银灰选项的回归先失败；实现后账户设置测试 21/21 通过。Web 全量 Node 测试 132/132、Vitest 567/567 和生产构建通过；本机通过 Corepack 调用 pnpm，安装使用 frozen lockfile。Playwright 在模拟 API 的真实账户页面验证默认银灰、海蓝与银灰刷新恢复、主题切换和 Tab/Space 选择；1440/1024/768/320px 下五个选项均无横向溢出，页面无控制台错误。实际 CSS 控件测量中，深色银灰按钮文字对比度 11.61:1、浅色石墨灰按钮文字 10.54:1，强调色对页面分别为 13.72:1 和 9.50:1；检查普通 checkbox、权限勾选、账户/策略/插件启用开关。播放器始终使用黑色背景，因此银灰播放器控件在浅色页面主题下也使用浅银灰与深色前景。`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过，Cargo 使用 Toshiba 共享 target，本机 `arm64`。本任务没有 Rust 逻辑变化，未运行 Rust 测试；浏览器验证使用模拟账号和 API，不证明部署状态、服务端持久化或 NAS 行为。
+
+#### LUX-471：浅色媒体操作菜单与手机详情顶部遮罩
+
+范围：修复媒体操作菜单和手机详情页顶部遮罩遗漏的浅色主题样式。其他浅色配色问题只报告，等待项目所有者选择后再修改。
+
+验收：
+
+- [x] 浅色媒体操作菜单使用浅色背景，标题、图标、悬停和键盘焦点清晰；挂载在 body 的菜单继续继承主题。
+- [x] 手机详情页顶部使用浅色渐变遮罩，品牌、返回和菜单按钮同步使用深色前景；保留原有模糊、渐隐与安全区几何。
+- [x] 深色模式菜单与顶部遮罩保留原配色；窄屏菜单不超出视口。
+- [x] 两项回归在旧实现下失败，修复后定向测试、Web 全量测试和构建通过。
+
+修改文件：`web/src/react.css`、`web/tests/light-theme-contrast.test.ts` 和本文档。仅新增这两处的浅色样式，不调整其他界面配色、服务端逻辑或数据库。
+
+结果（2026-10-10）：定向 Vitest 18/18、全量 Node 134/134、Vitest 569/569 与生产构建通过。Playwright 使用本地模拟 API，在 390px 和 320px 视口检查浅色菜单、独立手机顶部遮罩与菜单视口边界，1440px 检查桌面菜单，并验证深色原配色。截图和 computed style 确认 body portal 正常应用浅色主题，菜单悬停使用深色文字。`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过；本机 `arm64`，Cargo 使用 Toshiba 共享 target。本任务没有 Rust 行为变化，未运行 Rust 测试；不证明部署状态或真实 iOS Safari 渲染。
+
+#### LUX-472：浅色模式其余颜色问题
+
+范围：根据 LUX-471 浅色模式检查报告，修复获准修改的七类问题：媒体编辑弹窗、手机详情操作、失败状态标题、提示和后台任务/日志状态颜色、加载骨架、缺失图片占位图，以及浅色背景上的键盘焦点轮廓。播放器控件处于深色背景，继续使用白色焦点轮廓。
+
+验收：
+
+- [x] 媒体编辑相关弹窗在浅色主题中使用浅色表面、深色标题和可读输入文字；深色配色不变。
+- [x] 手机详情页收藏、已看和更多操作在浅色主题中没有深色图标底或白色悬停字；已看状态使用可读的绿色。
+- [x] 普通页面与媒体库失败状态标题使用浅色主题文字颜色。
+- [x] 通用错误/成功、账户通知、任务状态与日志级别使用浅色背景上满足 4.5:1 对比度的语义色。
+- [x] 首页和媒体库加载骨架、媒体海报与后台媒体库封面占位图使用浅色渐变。
+- [x] 浅色页面的通用和后台策略焦点轮廓清晰；播放器保留白色焦点轮廓。
+- [x] 新增回归覆盖全部七类问题；Web 全量测试、生产构建和本地浏览器样式检查通过。
+
+修改文件：`web/src/react.css`、`web/tests/light-theme-contrast.test.ts` 和本文档。只调整 Web 外观与回归覆盖，不修改服务端或数据库。
+
+结果（2026-10-10）：旧样式下新增七组回归全部失败，修复后主题定向测试 18/18、Web 全量 Node 134/134、Vitest 576/576 通过，TypeScript 检查和 Vite 生产构建通过。Playwright 以本地样式夹具在 390px 与 320px 检查计算样式；320px 页面宽度未溢出，手机操作默认文字为深灰、悬停文字为深色，已看状态为深绿，焦点轮廓为深色；播放器键盘焦点仍为白色 3px。语义错误、成功、警告、活动色对浅色背景的自动对比度断言均达到 4.5:1。`cargo fmt --all -- --check`、Toshiba 共享 target 上的全目标全 feature Clippy 和 `git diff --check` 通过；本任务仅修改 Web，没有 Rust 行为变化，未运行 Rust 测试。这里只验证本地 Web 样式，不代表部署状态或真实 iOS Safari 渲染。
 
 ## 28. 参考资料
 

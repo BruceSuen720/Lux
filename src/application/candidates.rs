@@ -16,8 +16,11 @@ use crate::{
         images::{ImageWriteError, ImageWriteService, MAX_IMAGE_VARIANTS, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
-        nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
-        people::{ActorCredit, PeopleError},
+        nfo::{
+            LocalNfoProjectionCache, MovieNfoCredit, MovieNfoMetadata, NfoWriteError,
+            NfoWriteService, local_nfo_details_from_cache_json,
+        },
+        people::{ActorCredit, LocalActorRelationPageCache, PeopleError},
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
             ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
@@ -38,6 +41,7 @@ const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_ACTOR_DETAIL_FETCHES: usize = 12;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 const IMAGE_ITEM_CONCURRENCY: usize = 4;
+const COMPLETENESS_PLAN_ITEM_CONCURRENCY: usize = 4;
 const SCRAPER_IMAGE_TYPES: [&str; 8] = [
     "POSTER",
     "FANART",
@@ -53,6 +57,47 @@ const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 const COMPLETENESS_INPUT_VERSION: u64 = 1;
+
+#[derive(Clone)]
+struct LocalCompletenessPlanningCaches {
+    nfo_projection: LocalNfoProjectionCache,
+    actor_relation: LocalActorRelationPageCache,
+}
+
+impl LocalCompletenessPlanningCaches {
+    fn new(item_ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            nfo_projection: LocalNfoProjectionCache::default(),
+            actor_relation: LocalActorRelationPageCache::new(item_ids),
+        }
+    }
+}
+
+type CompletenessPlanTask<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
+
+async fn run_bounded_completeness_plan_tasks<T: Send + 'static>(
+    tasks: Vec<(usize, CompletenessPlanTask<T>)>,
+) -> Result<Vec<(usize, T)>, tokio::task::JoinError> {
+    let mut queued = tasks.into_iter();
+    let mut pending = JoinSet::new();
+    let mut results = Vec::new();
+
+    while pending.len() < COMPLETENESS_PLAN_ITEM_CONCURRENCY {
+        let Some((index, task)) = queued.next() else {
+            break;
+        };
+        pending.spawn(async move { (index, task.await) });
+    }
+    while let Some(result) = pending.join_next().await {
+        results.push(result?);
+        if let Some((index, task)) = queued.next() {
+            pending.spawn(async move { (index, task.await) });
+        }
+    }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    Ok(results)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataRequestPlan {
@@ -226,6 +271,12 @@ fn metadata_request_plan_has_work(plan: MetadataRequestPlan) -> bool {
         || plan.needs_trailers
 }
 
+fn automatic_fill_missing_plan_has_work(plan: MetadataRequestPlan) -> bool {
+    // Optional provider extras are collected when real fill work runs, but do not
+    // start an automatic scan job by themselves.
+    plan.needs_metadata || plan.needs_images || plan.needs_credits
+}
+
 fn missing_image_mask(image_types: &[&str], local_image_types: &BTreeSet<String>) -> u16 {
     image_types.iter().fold(0_u16, |mask, image_type| {
         if local_image_types.contains(*image_type) {
@@ -317,16 +368,14 @@ fn local_metadata_completeness_plan(
             requestable_plan,
         ),
         capabilities: completeness_capabilities(current, actual_plan),
-        has_requestable_capability: metadata_request_plan_has_work(requestable_plan),
+        has_requestable_capability: automatic_fill_missing_plan_has_work(requestable_plan),
     })
 }
 
-fn credits_are_missing(
-    actor_relation_exists: bool,
+fn credits_need_actor_relation_check(
     details: Option<&crate::application::nfo::LocalNfoDetails>,
 ) -> bool {
-    !actor_relation_exists
-        || details.is_none_or(|value| value.directors.is_empty() || value.writers.is_empty())
+    details.is_some_and(|value| !value.directors.is_empty() && !value.writers.is_empty())
 }
 
 fn has_complete_external_ids(current: &StoredMediaMetadata) -> bool {
@@ -727,12 +776,15 @@ impl MetadataCandidateService {
             )
         } else {
             (
-                search_generic(scraper, item_type, query, year)
+                search_generic(scraper, item_type, query, year, automatic_match)
                     .await
                     .map_err(MetadataCandidateError::Scraper)?,
                 None,
             )
         };
+        if automatic_match && response.items.is_empty() {
+            return Ok(empty_candidate_page());
+        }
         let expires_at = candidate_expiry();
         let automatic_search = matches!(
             mode,
@@ -1344,9 +1396,12 @@ impl MetadataCandidateService {
         }
 
         let parents = self
-            .parent_providers(current, scraper, series_query, series_year)
+            .parent_providers(current, scraper, series_query, series_year, automatic_match)
             .await?;
         if parents.is_empty() {
+            if automatic_match {
+                return Ok(empty_candidate_page());
+            }
             return Err(MetadataCandidateError::Scraper(ScraperError::Provider(
                 "series scraper returned no candidates".to_owned(),
             )));
@@ -1481,6 +1536,7 @@ impl MetadataCandidateService {
         scraper: &ScraperProvider,
         series_query: &str,
         series_year: Option<i32>,
+        allow_empty_result: bool,
     ) -> Result<Vec<ParentProvider>, MetadataCandidateError> {
         if let (Some(provider), Some(provider_id)) = (
             current.series_provider_name.as_deref(),
@@ -1509,9 +1565,15 @@ impl MetadataCandidateService {
                 }]);
             }
         }
-        let response = search_generic(scraper, ScraperItemType::Series, series_query, series_year)
-            .await
-            .map_err(MetadataCandidateError::Scraper)?;
+        let response = search_generic(
+            scraper,
+            ScraperItemType::Series,
+            series_query,
+            series_year,
+            allow_empty_result,
+        )
+        .await
+        .map_err(MetadataCandidateError::Scraper)?;
         let best = response
             .items
             .into_iter()
@@ -1731,6 +1793,7 @@ async fn search_generic(
     item_type: crate::application::scraper::ScraperItemType,
     query: &str,
     year: Option<i32>,
+    allow_empty_result: bool,
 ) -> Result<
     crate::application::scraper::ScraperSearchResponse,
     crate::application::scraper::ScraperError,
@@ -1740,6 +1803,7 @@ async fn search_generic(
         Some(year) => vec![Some(year), None],
         None => vec![None],
     };
+    let mut last_empty_response = None;
     for search_year in years {
         for term in &terms {
             let response = scraper
@@ -1753,11 +1817,24 @@ async fn search_generic(
             if !response.items.is_empty() {
                 return Ok(response);
             }
+            last_empty_response = Some(response);
         }
+    }
+    if allow_empty_result {
+        return Ok(last_empty_response.unwrap_or_default());
     }
     Err(crate::application::scraper::ScraperError::Provider(
         "scraper returned no candidates".to_owned(),
     ))
+}
+
+fn empty_candidate_page() -> MetadataCandidatePage {
+    MetadataCandidatePage {
+        items: Vec::new(),
+        total: 0,
+        offset: 0,
+        limit: 50,
+    }
 }
 
 fn candidate_expiry() -> Option<i64> {
@@ -2347,55 +2424,91 @@ impl MetadataSelectionService {
 
         let mut actual_plans = Vec::with_capacity(supported_items.len());
         let mut attempt_item_ids = Vec::new();
-        for (item_id, current) in &supported_items {
-            let Some((library_strategy, global_strategy)) = strategies.get(*item_id) else {
-                return Err(MetadataSelectionError::ItemNotFound);
-            };
-            let image_policy = ImageSelectionPolicy::from_json(
-                library_strategy.as_deref(),
-                global_strategy.as_deref(),
-            );
-            let image_types = image_policy.enabled_types().collect::<Vec<_>>();
-            let indexed_images = indexed_images
-                .get(*item_id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let writeback_context = writeback_contexts
-                .get(*item_id)
-                .ok_or(MetadataSelectionError::ItemNotFound)?;
-            let local_image_types = self
-                .images
-                .local_image_types_with_indexed_images_and_context(
-                    item_id,
-                    &image_types,
-                    image_policy.thumbnail_scraping_mode.prefers_screenshots(),
-                    indexed_images,
-                    writeback_context,
-                )
-                .await?;
-            let actual_missing_image_mask = missing_image_mask(&image_types, &local_image_types);
-            let (actual_plan, capability_identity) = self
-                .actual_request_plan_for_current(
-                    item_id,
-                    current,
-                    image_policy,
-                    actual_missing_image_mask,
-                )
-                .await?;
-            let should_read_attempt_state =
-                capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
-            if should_read_attempt_state {
-                attempt_item_ids.push((*item_id).to_owned());
+        let page_caches = LocalCompletenessPlanningCaches::new(
+            supported_items
+                .iter()
+                .map(|(item_id, _)| (*item_id).to_owned()),
+        );
+        for (chunk_index, supported_chunk) in supported_items
+            .chunks(COMPLETENESS_PLAN_ITEM_CONCURRENCY)
+            .enumerate()
+        {
+            let chunk_start = chunk_index * COMPLETENESS_PLAN_ITEM_CONCURRENCY;
+            let mut planning_tasks = Vec::with_capacity(supported_chunk.len());
+            for (chunk_offset, supported_item) in supported_chunk.iter().enumerate() {
+                let index = chunk_start + chunk_offset;
+                let (item_id, current) = **supported_item;
+                let Some((library_strategy, global_strategy)) = strategies.get(item_id) else {
+                    return Err(MetadataSelectionError::ItemNotFound);
+                };
+                let image_policy = ImageSelectionPolicy::from_json(
+                    library_strategy.as_deref(),
+                    global_strategy.as_deref(),
+                );
+                let image_types = image_policy.enabled_types().collect::<Vec<_>>();
+                let indexed_item_images = indexed_images.get(item_id).cloned().unwrap_or_default();
+                let writeback_context = writeback_contexts
+                    .get(item_id)
+                    .cloned()
+                    .ok_or(MetadataSelectionError::ItemNotFound)?;
+                let item_id = item_id.to_owned();
+                let current = (*current).clone();
+                let page_caches = page_caches.clone();
+                let service = self.clone();
+                let task: CompletenessPlanTask<Result<_, MetadataSelectionError>> =
+                    Box::pin(async move {
+                        let local_image_types = service
+                            .images
+                            .local_image_types_with_indexed_images_and_context(
+                                &item_id,
+                                &image_types,
+                                image_policy.thumbnail_scraping_mode.prefers_screenshots(),
+                                &indexed_item_images,
+                                &writeback_context,
+                            )
+                            .await?;
+                        let actual_missing_image_mask =
+                            missing_image_mask(&image_types, &local_image_types);
+                        let (actual_plan, capability_identity) = service
+                            .actual_request_plan_for_current(
+                                &item_id,
+                                &current,
+                                image_policy,
+                                actual_missing_image_mask,
+                                Some(&writeback_context),
+                                Some(page_caches),
+                            )
+                            .await?;
+                        let should_read_attempt_state = capability_identity.is_some()
+                            && automatic_fill_missing_plan_has_work(actual_plan);
+                        Ok((
+                            item_id,
+                            image_types,
+                            actual_plan,
+                            capability_identity,
+                            should_read_attempt_state,
+                        ))
+                    });
+                planning_tasks.push((index, task));
             }
-            actual_plans.push((
-                (*item_id).to_owned(),
-                current,
-                image_types,
-                actual_plan,
-                capability_identity,
-                should_read_attempt_state,
-            ));
+            let chunk_plans = run_bounded_completeness_plan_tasks(planning_tasks)
+                .await
+                .map_err(|_| {
+                    MetadataSelectionError::InvalidCandidate(
+                        "local completeness planning task failed".to_owned(),
+                    )
+                })?
+                .into_iter()
+                .map(|(index, result)| result.map(|plan| (index, plan)))
+                .collect::<Result<Vec<_>, _>>()?;
+            actual_plans.extend(chunk_plans);
         }
+        attempt_item_ids.extend(
+            actual_plans
+                .iter()
+                .filter(|(_, (_, _, _, _, should_read_attempt_state))| *should_read_attempt_state)
+                .map(|(_, (item_id, _, _, _, _))| item_id.clone()),
+        );
 
         let attempts = self
             .database
@@ -2403,14 +2516,13 @@ impl MetadataSelectionService {
             .await?;
         let mut plans = HashMap::with_capacity(items.len());
         for (
-            item_id,
-            current,
-            image_types,
-            actual_plan,
-            capability_identity,
-            should_read_attempt_state,
+            index,
+            (item_id, image_types, actual_plan, capability_identity, should_read_attempt_state),
         ) in actual_plans
         {
+            let (_, current) = **supported_items
+                .get(index)
+                .ok_or(MetadataSelectionError::ItemNotFound)?;
             let attempt_state = should_read_attempt_state
                 .then(|| attempts.get(&item_id))
                 .flatten();
@@ -2437,12 +2549,31 @@ impl MetadataSelectionService {
         current: &StoredMediaMetadata,
         image_policy: ImageSelectionPolicy,
         actual_missing_image_mask: u16,
+        writeback_context: Option<&crate::storage::StoredMediaWritebackContext>,
+        page_caches: Option<LocalCompletenessPlanningCaches>,
     ) -> Result<(MetadataRequestPlan, Option<(String, String)>), MetadataSelectionError> {
-        let details = current.nfo_metadata_json.as_deref().and_then(|value| {
-            serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
-        });
+        let details = current
+            .nfo_metadata_json
+            .as_deref()
+            .and_then(local_nfo_details_from_cache_json);
         let details = if details.is_some() {
             details
+        } else if let (Some(page_caches), Some(context)) = (page_caches.as_ref(), writeback_context)
+        {
+            self.nfo
+                .read_item_projection_with_writeback_context_cached(
+                    current.season_number,
+                    context,
+                    &page_caches.nfo_projection,
+                )
+                .await?
+                .0
+                .map(|projection| projection.details)
+        } else if let Some(context) = writeback_context {
+            self.nfo
+                .read_item_projection_with_writeback_context(current.season_number, context)
+                .await?
+                .map(|projection| projection.details)
         } else {
             self.nfo
                 .read_item_projection(item_id)
@@ -2451,12 +2582,22 @@ impl MetadataSelectionService {
         };
         let credits_missing = match current.item_type.as_str() {
             "MOVIE" | "SERIES" => {
-                let actor_relation_exists = self
-                    .people
-                    .item_actor_relation_exists(item_id)
-                    .await
-                    .map_err(MetadataSelectionError::People)?;
-                credits_are_missing(actor_relation_exists, details.as_ref())
+                if credits_need_actor_relation_check(details.as_ref()) {
+                    let exists = if let Some(page_caches) = page_caches.as_ref() {
+                        self.people
+                            .item_actor_relation_exists_with_page_cache(
+                                item_id,
+                                &page_caches.actor_relation,
+                            )
+                            .await?
+                            .0
+                    } else {
+                        self.people.item_actor_relation_exists(item_id).await?
+                    };
+                    !exists
+                } else {
+                    true
+                }
             }
             _ => false,
         };
@@ -2534,6 +2675,8 @@ impl MetadataSelectionService {
                 current,
                 image_policy,
                 actual_missing_image_mask,
+                None,
+                None,
             )
             .await?;
         let capability_identity = matches!(attempt_mode, MetadataAttemptMode::RespectRetryState)
@@ -4160,16 +4303,19 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
-        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
-        MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors,
-        capability_needs_request, completeness_capabilities, credits_are_missing,
+        ACTOR_METADATA_FETCH_CONCURRENCY, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
+        FillMissingRequestPlan, ImageSelectionPolicy, MAX_ACTOR_DETAIL_FETCHES,
+        MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
+        SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors, capability_needs_request,
+        completeness_capabilities, credits_need_actor_relation_check,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_actors,
         generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
-        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
+        metadata_match_score, metadata_request_plan, metadata_request_plan_has_work,
+        parse_image_selection_policy, run_bounded_completeness_plan_tasks,
         selected_scraper_provider_id,
     };
+    use crate::application::images::ImageWriteService;
     use crate::application::scraper::{
         ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
         ScraperExternalIdsResponse, ScraperFuture, ScraperGetRequest, ScraperImage,
@@ -4178,7 +4324,7 @@ mod tests {
         ScraperTrailersResponse,
     };
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
-    use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
+    use crate::storage::{Database, StoredMediaMetadata, StoredMetadataCapabilityAttempt};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::{
@@ -4186,6 +4332,114 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn local_completeness_page_shares_movie_projection_and_relation_caches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("movies");
+        tokio::fs::create_dir_all(&root).await?;
+        tokio::fs::write(root.join("First.mkv"), b"one").await?;
+        tokio::fs::write(root.join("Second.mkv"), b"two").await?;
+        tokio::fs::write(
+            root.join("movie.nfo"),
+            b"<movie><title>Shared movie</title><director>Director</director><writer>Writer</writer></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE item_type = 'MOVIE' ORDER BY id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        let metadata_by_item = database
+            .list_active_media_item_metadata_with_libraries(&item_ids)
+            .await?;
+        let plan_inputs = item_ids
+            .iter()
+            .filter_map(|item_id| {
+                metadata_by_item
+                    .get(item_id)
+                    .map(|(_, current)| (item_id.as_str(), current))
+            })
+            .collect::<Vec<_>>();
+        let service = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir,
+        );
+
+        let plans = service
+            .local_metadata_completeness_plans(&plan_inputs)
+            .await?;
+        let first_item_id = item_ids.first().ok_or("movie fixture has no items")?;
+        let (_, stored_current) = metadata_by_item
+            .get(first_item_id)
+            .ok_or("movie metadata row missing")?;
+        let mut current_with_projection = stored_current.clone();
+        current_with_projection.nfo_metadata_json =
+            Some(json!({"directors": [], "writers": []}).to_string());
+        let mut contexts = database
+            .list_media_item_writeback_contexts_by_ids(&item_ids)
+            .await?;
+        let mut context = contexts
+            .remove(first_item_id)
+            .ok_or("movie writeback context missing")?;
+        context
+            .source
+            .as_mut()
+            .ok_or("movie source path missing")?
+            .root_path = root.join("missing-root").to_string_lossy().into_owned();
+        let (database_projection_plan, _) = service
+            .actual_request_plan_for_current(
+                first_item_id,
+                &current_with_projection,
+                super::ImageSelectionPolicy::default(),
+                0,
+                Some(&context),
+                Some(super::LocalCompletenessPlanningCaches::new([
+                    first_item_id.clone()
+                ])),
+            )
+            .await?;
+        assert!(
+            database_projection_plan.needs_credits,
+            "a parsed database projection should avoid the invalid sidecar source"
+        );
+
+        for item_id in item_ids {
+            let plan = plans
+                .get(&item_id)
+                .and_then(Option::as_ref)
+                .ok_or("movie completeness plan missing")?;
+            assert!(
+                plan.capabilities
+                    .iter()
+                    .any(|(name, missing)| { name == "CREDITS" && *missing })
+            );
+        }
+        Ok(())
+    }
 
     #[derive(Clone)]
     struct DelayedActorAdapter {
@@ -4291,6 +4545,70 @@ mod tests {
         assert!(actors.iter().all(|actor| actor.person.is_some()));
         assert!(maximum.load(Ordering::SeqCst) > 1);
         assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn completeness_plan_page_tasks_are_bounded_and_keep_input_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..12)
+            .map(|index| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                (
+                    index,
+                    Box::pin(async move {
+                        let active_count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(active_count, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        index
+                    }) as super::CompletenessPlanTask<usize>,
+                )
+            })
+            .collect();
+
+        let results = run_bounded_completeness_plan_tasks(tasks)
+            .await
+            .expect("bounded completeness planning tasks should join");
+
+        assert_eq!(
+            results.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+        assert!(maximum.load(Ordering::SeqCst) <= COMPLETENESS_PLAN_ITEM_CONCURRENCY);
+
+        let error_tasks = (0..3)
+            .map(|index| {
+                (
+                    index,
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(if index == 0 { 20 } else { 1 }))
+                            .await;
+                        Err::<usize, _>(if index == 0 {
+                            "first input error"
+                        } else {
+                            "later error"
+                        })
+                    })
+                        as super::CompletenessPlanTask<Result<usize, &'static str>>,
+                )
+            })
+            .collect();
+        let error_results = run_bounded_completeness_plan_tasks(error_tasks)
+            .await
+            .expect("bounded error tasks should join");
+        let first_error = error_results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("input-order error should be preserved");
+        assert_eq!(first_error, "first input error");
     }
 
     #[tokio::test]
@@ -4511,7 +4829,75 @@ mod tests {
         assert!(!plan.needs_trailers);
         // Existing items are not re-scraped solely because their local NFO lacks
         // optional rich fields. A user-triggered full refresh still uses the full plan.
-        assert!(MetadataRequestPlan::full().needs_metadata);
+        let explicit_full_plan = MetadataRequestPlan::full();
+        assert!(explicit_full_plan.needs_metadata);
+        assert!(explicit_full_plan.needs_external_ids);
+        assert!(explicit_full_plan.needs_trailers);
+
+        let complete_provider_ids = current.provider_ids_json.clone();
+        current.provider_ids_json = Some(json!({"tmdb": "1"}).to_string());
+        let optional_details = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            writers: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "writer-1".to_owned(),
+                name: "Writer".to_owned(),
+            }],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
+        assert!(optional_details.tagline.is_none());
+        assert!(optional_details.website.is_none());
+        assert!(optional_details.certification.is_none());
+        assert!(optional_details.countries.is_empty());
+        assert!(optional_details.genres.is_empty());
+        assert!(optional_details.studios.is_empty());
+        let optional_details_plan =
+            metadata_request_plan(&current, false, false, Some(&optional_details));
+        assert!(!optional_details_plan.needs_metadata);
+        assert!(optional_details_plan.needs_external_ids);
+        assert!(optional_details_plan.needs_trailers);
+        assert!(metadata_request_plan_has_work(optional_details_plan));
+        let optional_details_completeness = local_metadata_completeness_plan(
+            "movie-1",
+            &current,
+            optional_details_plan,
+            optional_details_plan,
+        )
+        .expect("movie completeness plan is supported");
+        assert!(
+            !optional_details_completeness.has_requestable_capability,
+            "optional trailers and external IDs must not alone enqueue automatic FILL_MISSING"
+        );
+        assert!(
+            optional_details_completeness
+                .capabilities
+                .contains(&("EXTERNAL_IDS".to_owned(), true))
+        );
+        assert!(
+            optional_details_completeness
+                .capabilities
+                .contains(&("TRAILERS".to_owned(), true))
+        );
+        let required_work_completeness = local_metadata_completeness_plan(
+            "movie-1",
+            &current,
+            MetadataRequestPlan {
+                needs_credits: true,
+                ..optional_details_plan
+            },
+            MetadataRequestPlan {
+                needs_credits: true,
+                ..optional_details_plan
+            },
+        )
+        .expect("movie completeness plan is supported");
+        assert!(
+            required_work_completeness.has_requestable_capability,
+            "optional provider extras may accompany required automatic fill work"
+        );
+        current.provider_ids_json = complete_provider_ids;
 
         let poster_index = SCRAPER_IMAGE_TYPES
             .iter()
@@ -4752,16 +5138,29 @@ mod tests {
     }
 
     #[test]
-    fn fill_missing_fetches_credits_when_one_crew_list_is_missing() {
-        let details = crate::application::nfo::LocalNfoDetails {
+    fn credits_relation_check_is_needed_only_when_local_crew_details_are_complete() {
+        let missing_director = crate::application::nfo::LocalNfoDetails {
             directors: vec![crate::application::nfo::LocalNfoCredit {
                 provider_id: "director-1".to_owned(),
                 name: "Director".to_owned(),
             }],
             ..crate::application::nfo::LocalNfoDetails::default()
         };
+        let complete_crew = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            writers: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "writer-1".to_owned(),
+                name: "Writer".to_owned(),
+            }],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
 
-        assert!(credits_are_missing(true, Some(&details)));
+        assert!(!credits_need_actor_relation_check(None));
+        assert!(!credits_need_actor_relation_check(Some(&missing_director)));
+        assert!(credits_need_actor_relation_check(Some(&complete_crew)));
     }
 
     #[test]

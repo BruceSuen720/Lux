@@ -1177,16 +1177,20 @@ impl Database {
             "INSERT INTO media_sources (
                  id, item_id, source_kind, filesystem_entry_id, container, size,
                  external_url, strm_target_kind, is_default, probe_status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING')",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                 CASE WHEN EXISTS (
+                     SELECT 1 FROM media_sources WHERE item_id = ? AND is_default = 1
+                 ) THEN 0 ELSE 1 END, 'PENDING')",
         )
         .bind(&file.source_id)
-        .bind(item_id)
+        .bind(&item_id)
         .bind(&file.source_kind)
         .bind(&file.filesystem_entry_id)
         .bind(&file.container)
         .bind(file.size)
         .bind(file.external_url.as_deref())
         .bind(file.strm_target_kind.as_deref())
+        .bind(&item_id)
         .execute(&mut **transaction)
         .await
         .map(|_| ())
@@ -2934,6 +2938,52 @@ impl Database {
         })
     }
 
+    pub(crate) async fn movie_metadata_pending_identity_conflict(
+        &self,
+        item_id: &str,
+        pending_item_ids: &[String],
+    ) -> Result<Option<String>, StorageError> {
+        if pending_item_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = std::iter::repeat_n("?", pending_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT conflicting_item.id
+             FROM media_items current_item
+             JOIN media_items conflicting_item
+               ON conflicting_item.library_id = current_item.library_id
+              AND conflicting_item.id <> current_item.id
+              AND conflicting_item.id IN ({placeholders})
+              AND conflicting_item.item_type = 'MOVIE'
+              AND conflicting_item.removed_at IS NULL
+              AND conflicting_item.has_available_source = 1
+              AND (
+                  current_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+              )
+             WHERE current_item.id = ?
+               AND current_item.item_type = 'MOVIE'
+               AND current_item.removed_at IS NULL
+             ORDER BY conflicting_item.id
+             LIMIT 1"
+        );
+        let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+        for pending_item_id in pending_item_ids {
+            statement = statement.bind(pending_item_id);
+        }
+        statement
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_media_item_by_identity(
         &self,
         identity_key: &str,
@@ -3117,24 +3167,6 @@ impl Database {
             .list_media_item_metadata_by_ids(&[item_id.to_owned()])
             .await?;
         Ok(metadata.remove(item_id))
-    }
-
-    pub(crate) async fn find_movie_nfo_auxiliary_fields(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<(String, i64)>, StorageError> {
-        self.query(
-            "SELECT sort_title, added_at FROM media_items
-             WHERE id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| row.map(|row| (row.get("sort_title"), row.get("added_at"))))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
     }
 
     pub(crate) async fn list_media_item_metadata_by_ids(

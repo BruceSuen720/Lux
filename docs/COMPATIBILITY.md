@@ -204,6 +204,7 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 
 | 请求 | 成功行为 | 主要错误行为 |
 |---|---|---|
+| `POST /Library/Media/Updated` | 管理员 token/API key。按 `Updates[].Path`（Lux 视角的绝对路径）入队局部增量扫描，返回 `202`、`scope: "PATH"`。`UpdateType: "Modified"` 时，额外对该目录（路径是文件时取其父目录）精确重新索引 NFO 与图片，用于外部工具改写旁车文件而视频未变的场景，响应的 `localMetadataEntries` 为受影响的条目数；`Created` 等其他类型只入队扫描 | 普通用户 `403`；路径不属于任何媒体库 `404`；服务未就绪 `503` |
 | `POST /Library/Refresh` | 管理员 token/API key 使用空 body 触发所有启用媒体库的异步全量校验，返回 `202` 和 `scope: "ALL"`、`jobs`；已有活动任务直接复用 | 普通用户 `403`；服务未就绪 `503` |
 | `POST /Users/New?Name=...` | 允许空 body、无 `Content-Type`；从查询参数读取名称，返回创建用户 DTO `200`；原有 JSON/XML body 仍保留 | 缺少/非法名称 `400`；重复用户名 `409`；非管理员 `403` |
 | `POST /Sessions/{sessionId}/Playing/Stop` | `sessionId` 使用 `GET /Sessions` 返回的 `Id`；会话所有者或管理员可停止，停止 HLS 资源并返回 `204`；已停止会话重复请求仍为 `204` | 未知或非本人会话 `404`；服务未就绪 `503` |
@@ -216,6 +217,28 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 `tests/catalog.rs`，以及存储层 `recommended_catalog_rows_use_rating_median_for_missing_ratings` 回归。
 这些测试证明 Lux 服务端的请求路径、权限、状态码、响应字段和资源清理，不替代 Qmby 在 FNOS 部署实例上的完整
 登录、首页、详情、播放、进度和停止请求序列复测。
+
+## LUX-057 多版本重扫保持元数据身份
+
+电影文件名的通用连字符后缀仍要求同目录存在唯一匹配的基础视频。重新扫描已入库版本时，
+以基础视频当前关联的电影条目 ID 确定归属，包含其管理员合并后的主条目；NFO 或在线元数据
+修改标题、年份不会使版本脱离原条目。稳定全量扫描保留媒体源 ID 和 READY 探测状态；
+视频内容变化或目录重扫仍更新文件索引，已拆分的旧版本可在重扫时归回基础视频的条目。
+
+自动化覆盖：`tests/scanned_metadata.rs::movie_variant_rescan_preserves_nfo_identity_and_filename_poster`
+使用 `ABS-123.mp4`、`ABS-123-C.mp4`、本地 NFO 和 `ABS-123-poster.jpg`，
+验证元数据改写后的连续全量扫描、文件变化、目录重扫和旧拆分修复；
+`tests/scanner.rs::movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases`
+覆盖通用多段后缀、不同扩展名、旧拆分修复和稳定重扫。验证环境为本机 ARM64/SQLite，
+不代表已部署实例或第三方客户端验证。
+
+验证记录（2026-10-10）：相关 `scanner`、`scanning_jobs`、`scanned_metadata` 和 `item_merge`
+目标共 122 项通过；build、fmt、Clippy 全目标/全特性零警告、Web 561 项测试和构建、
+5 项 Python 工具测试及 `git diff --check` 通过。`check-all.sh` 的库测试阶段出现两项失败：
+NFO 人物关系故障注入断言和插件迁移查询计数；插件计数失败在修复前的 `21782159` 定向复现，
+NFO 测试在该基线定向和整组运行通过。基线整组另出现弹幕查询计数失败。
+后续完整集成运行受其他 Cargo 任务覆盖共享 target 二进制影响，出现新增回归缺失，不能作为本次完整门禁证据；
+相关目标重新编译后复制测试二进制、确认包含新增回归再运行。完整 Rust 门禁未全绿。
 
 ## LUX-266 全量扫描 Manifest 存储兼容
 
@@ -239,7 +262,13 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 
 新建扫描 workflow 3 的目标行为是：已提交的正向索引按批次向 Lux Web 目录/首页可见；本地 NFO/图片读取由独立有界 worker 早于全库遍历结束启动；本地检查确认的缺失才进入独立 FILL_MISSING 作业。`ScanCompleted` 与 `JOB_COMPLETED` 仍表示索引完成，不等待在线补缺；Emby 路由、DTO、图片标签与授权合同不变。删除仍要求根路径完整、二次文件状态确认和基线 CAS。
 
-这条记录是产品兼容性决策，当前不证明 workflow 3、增量事件或在线补缺队列已在运行时实现。实现结果和 SQLite/PostgreSQL A/B 数据须在阶段 23 相关 LUX 任务完成后追加；既有 workflow 1/2 继续按其原合同恢复。
+运行复核（2026-10-10）：冻结 `32c158ec` 的本机 SQLite 故障/竞态回归通过：scanned_metadata 22/22、scanned_series_metadata 3/3、scanning_jobs 81/81；专门断言空 provider 后 `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL。1k 自动补缺在 SQLite/PostgreSQL 16.15 各真实处理 10 jobs/1000 items，provider 被阻塞时 scan/local 均完成；每 job 最多 100 项。此前零候选 REIDENTIFY 阻止备用 provider 接管的回归已在 `0f6d8a9c` 修复。
+
+**阶段 23 仍开放。** 10k SQLite online fixture 达到容量 32 dispatcher 后反向阻塞本地 worker，600 秒等待失败；10k PG 未运行。LUX-424 背压条款与 LUX-303 不阻塞本地 worker 的合同冲突，等待所有者选择后再修订调度/存储边界。性能记录有逐请求公平计时，但两组 SQLite poster 尚不足三轮，基线/候选默认并发分别 16/2，相同配置最终复测未完成；不能认定回退或达标。详见 [阶段 23 复核](STAGE-23-GATE-REVIEW-2026-10-09.md) 与 [性能记录](PERFORMANCE.md)。
+
+另一个会话已将冻结提交链集成到 `test=0980dd36` 并增加后续修改。基于该 revision 的 `18b88888` 的组件回归验证 mock 空首页收到 home 通知后出现电影标题和 poster URL；Web 冻结安装、Node134、Vitest570、build 通过。该测试未建模 scan lifecycle、未请求/解码 poster，不是浏览器/真实扫描端到端验证，`32c158ec` 的 Rust/性能门不覆盖新的 test。既有 workflow 1/2 保留原合同；上述结果不证明 FNOS/NAS、部署或第三方客户端行为。
+
+最终远端刷新又观察到 `origin/test=b4635ee3`（PR #43 PostgreSQL movie merge 修复）；该后续 revision 的 Rust/性能验收也未由本轮记录覆盖。
 
 ## 目标矩阵
 
@@ -255,6 +284,13 @@ Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries
 | VidHub | 3.0.1 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 通过（隔离测试服务器） | 通过 | 媒体库、条目详情通过 | 通过 | 进度/已观看通过；收藏另有实测 | 未测试 | 2026-08-28 使用独立临时媒体 `VidHub Green Compatibility` 进入 VideoPlayActivity；DirectPlay 会话播放完成，进度约 20 秒且 `Played=true` |
 | 网易爆米花 | 2.12.5 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 未单独验证（已有远程连接） | 未单独验证（已有会话） | 通过 | 通过（资源差异） | 进度通过；收藏未测试 | 未测试 | 2026-08-28 使用现有远程 Lux 服务器播放《黑色月光》第 1 集；画面稳定，进度由约 00:56 推进至 02:00，退出后详情页读回约 03:14，未出现网络错误提示。此前《风柜来的人》和另一资源曾出现网络提示，暂按资源相关风险记录 |
 | Lux Web | Chrome 151 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | Direct、服务器 HLS、客户端 HEVC fallback 通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本 source 切换、SRT 字幕、已登记 Bilibili XML 弹幕和可见性开关通过 | Chrome headless：普通用户无管理入口、Direct Range、HLS manifest/init/segment、HEVC Worker/WASM/MSE、390/768/1440 viewport、键盘/触摸 seek、覆盖层和会话清理通过；播放器联合 smoke 为 0 error / 0 warning、无外部请求；`scripts/browser-smoke.mjs`、`scripts/admin-smoke.mjs` 和 `scripts/player-danmaku-smoke.mjs` 已固化 |
+
+## LUX-114 iOS 输入框聚焦缩放修复（2026-10-10）
+
+- 原触屏规则使用零优先级的 `:where(...)`，被登录框的 `13px` 和管理页的局部字号覆盖。触屏文本输入框、文本域和原生选择框现以 `!important` 保证至少 `16px`，避免小字号触发 iOS 聚焦自动放大。
+- 大字号输入框通过 `--lux-input-font-size` 保留字号；已有的大字号继承也保留。复选框、单选框、滑块、文件/颜色选择和输入按钮不应用字号下限。viewport 继续允许手动缩放。
+- macOS arm64 Chromium 的 iPhone 15 触屏模拟中，登录框实际字号由 `13px` 变为 `16px`；聚焦后模拟 viewport scale 为 `1`，无横向溢出。加载真实样式的 24 个合成文本控件在 `320`、`393`、`844`、`768`、`1024px` 下均不小于 `16px`，包括横屏、文本域和原生选择框；人物标题保持大字号，滑块/复选框尺寸保持 `18px`。桌面 `1440px` 登录框保持 `13px`。
+- 自动化证据为响应式样式回归、Web 全量测试和构建，以及 Playwright 的 computed-style/聚焦检查。Chromium 触屏模拟不能证明 iOS 软件键盘和 Safari 真机缩放行为；仍需部署后在真实 iPhone/iPad 上复测。
 
 ## Android 真机实测（2026-08-28）
 
