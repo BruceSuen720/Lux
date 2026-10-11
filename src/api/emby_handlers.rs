@@ -2544,7 +2544,9 @@ pub(super) async fn emby_access_principal_for_target(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     match auth.user_by_id(&target_user_id.to_string()).await {
-        Ok(Some(user)) if !user.is_disabled => Ok(access_principal),
+        Ok(Some(user)) if !user.is_disabled => {
+            Ok(AccessPrincipal::new(target_user_id, user.is_admin))
+        }
         Ok(Some(_) | None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
