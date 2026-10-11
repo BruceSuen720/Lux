@@ -28,8 +28,8 @@ async fn concurrent_media_deletions_leave_no_orphaned_file()
     let media_file = root.join("Example.Movie.2024.mkv");
     let danmaku_file = root.join("Example.Movie.2024.xml");
     let mediainfo_file = root.join("Example.Movie.2024-mediainfo.json");
-    let other_danmaku_file = root.join("Other.Movie.2024.xml");
-    let other_mediainfo_file = root.join("Other.Movie.2024-mediainfo.json");
+    let other_danmaku_file = root.join("Example.Movie.2024.Extended.xml");
+    let other_mediainfo_file = root.join("Example.Movie.2024.Extended-mediainfo.json");
     fs::write(&media_file, b"fixture")?;
     fs::write(&danmaku_file, b"<i></i>")?;
     fs::write(&mediainfo_file, b"{}")?;
